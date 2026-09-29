@@ -442,6 +442,9 @@ public class DetailActivity extends BaseActivity {
                 if (vodInfo != null && !vodInfo.playFlag.equals(newFlag)) {
                     String oldFlag = vodInfo.playFlag;
                     int oldIndex = vodInfo.playIndex;
+                    // 预览模式下实际在播对象是 previewVodInfo，旧进度 key 要按它拼
+                    String actualOldFlag = (previewVodInfo != null && !TextUtils.isEmpty(previewVodInfo.playFlag)) ? previewVodInfo.playFlag : oldFlag;
+                    int actualOldIndex = previewVodInfo != null ? previewVodInfo.playIndex : oldIndex;
                     VodInfo.VodSeries currentSeries = getPlayingSeries(previewVodInfo, previewVodInfo == null ? null : previewVodInfo.playFlag);
                     List<VodInfo.VodSeries> oldSeriesList = vodInfo.seriesMap.get(oldFlag);
                     if (currentSeries == null && previewVodInfo == null && oldIndex >= 0 && oldSeriesList != null && !oldSeriesList.isEmpty()) {
@@ -477,6 +480,11 @@ public class DetailActivity extends BaseActivity {
                         if (vodInfo.playIndex >= 0) {
                             newSeriesList.get(vodInfo.playIndex).selected = true;
                             routeSwitchSeries = newSeriesList.get(vodInfo.playIndex);
+                            // 跨线路迁移播放时间（hhyun -> hhm3u8 等）：先落盘实时进度，再把旧线路 key 的时间复制到新线路 key
+                            if (playFragment != null) playFragment.saveCurrentProgressNow();
+                            migratePlaybackTimeAcrossFlags(actualOldFlag, actualOldIndex,
+                                    currentSeries == null ? "" : currentSeries.name,
+                                    newFlag, vodInfo.playIndex, newSeriesList.get(vodInfo.playIndex).name);
                         } else if (currentSeries != null) {
                             routeSwitchSeries = currentSeries;
                         }
@@ -2038,7 +2046,38 @@ public class DetailActivity extends BaseActivity {
             return 0;
         }
     }
-
+    
+    /**
+     * 同一源内跨线路迁移播放时间（如 hhyun -> hhm3u8）。
+     * sourceKey/vodId 不变，仅 playFlag 变化，把旧线路对应集的时间复制到新线路对应集。
+     * key 拼法必须与 PlayFragment 第 1988 行 progressKey 完全一致。
+     */
+    private void migratePlaybackTimeAcrossFlags(String oldFlag, int oldIndex, String oldName,
+                                                String newFlag, int newIndex, String newName) {
+        try {
+            if (TextUtils.isEmpty(oldFlag) || TextUtils.isEmpty(newFlag)
+                    || TextUtils.isEmpty(oldName) || TextUtils.isEmpty(newName)
+                    || oldIndex < 0 || newIndex < 0) {
+                return;
+            }
+            if (TextUtils.equals(oldFlag, newFlag) && oldIndex == newIndex && TextUtils.equals(oldName, newName)) {
+                return;
+            }
+            String newKey = sourceKey + vodId + newFlag + newIndex + newName;
+            if (readCachedLong(newKey) > 0) {
+                return; // 新线路这一集已有进度记忆，不覆盖
+            }
+            String oldKey = sourceKey + vodId + oldFlag + oldIndex + oldName;
+            long t = readCachedLong(oldKey);
+            if (t > 0) {
+                CacheManager.save(MD5.string2MD5(newKey), t);
+                LOG.i("echo-migrate play time across flags: " + oldFlag + " -> " + newFlag + " ep=" + newName + " time=" + t);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+    
     private long readCachedLong(String key) {
         if (TextUtils.isEmpty(key)) {
             return 0;
