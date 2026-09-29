@@ -919,7 +919,9 @@ public class SearchActivity extends BaseActivity {
             }
             String key = (video.sourceKey == null ? "" : video.sourceKey) + "|" + video.id;
             if (keys.add(key)) {
-                candidates.add(video);
+                // 只保留 fallback 缓存需要的轻量字段，剥离 urlBean（播放列表），
+                // 避免长剧多候选序列化后 Intent 超过 Binder 1MB 触发 TransactionTooLargeException 崩溃。
+                candidates.add(trimVideoForIntent(video));
                 if (candidates.size() >= 20) {
                     break;
                 }
@@ -929,7 +931,31 @@ public class SearchActivity extends BaseActivity {
             bundle.putSerializable(DetailActivity.EXTRA_DETAIL_FALLBACK_CANDIDATES, candidates);
         }
     }
-
+    
+    private Movie.Video trimVideoForIntent(Movie.Video src) {
+        Movie.Video dst = new Movie.Video();
+        if (src == null) return dst;
+        dst.last = src.last;
+        dst.id = src.id;
+        dst.tid = src.tid;
+        dst.name = src.name;
+        dst.type = src.type;
+        dst.pic = src.pic;
+        dst.lang = src.lang;
+        dst.area = src.area;
+        dst.year = src.year;
+        dst.state = src.state;
+        dst.note = src.note;
+        dst.actor = src.actor;
+        dst.director = src.director;
+        dst.des = src.des;
+        dst.sourceKey = src.sourceKey;
+        dst.tag = src.tag;
+        dst.action = src.action;
+        // urlBean 有意不复制（超大 Playlist 是 Bundle 超限的主要来源）
+        return dst;
+    }
+    
     private void scheduleSearchAdvance(final String sourceKey, final String searchToken) {
         if (searchTimeoutExecutor == null) return;
         searchTimeoutExecutor.schedule(new Runnable() {
