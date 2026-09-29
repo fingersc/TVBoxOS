@@ -923,17 +923,24 @@ public class DetailActivity extends BaseActivity {
                         mEmptyPlayList.setVisibility(View.GONE);
 
                         VodInfo vodInfoRecord = RoomDataManger.getVodInfo(sourceKey, vodId);
-                        // 读取历史记录
+                        // 读取历史记录；当前源没有本片历史时，换源场景尝试从其他同名称源的历史里带拥有播放位置
+                        boolean sameNameRestored = false;
+                        if (vodInfoRecord == null) {
+                            vodInfoRecord = RoomDataManger.getVodInfoBySameName(sourceKey, vodId, vodInfo.name);
+                            sameNameRestored = (vodInfoRecord != null);
+                        }
                         if (vodInfoRecord != null) {
                             vodInfo.playIndex = Math.max(vodInfoRecord.playIndex, 0);
                             vodInfo.playFlag = vodInfoRecord.playFlag;
                             vodInfo.playerCfg = vodInfoRecord.playerCfg;
                             vodInfo.reverseSort = vodInfoRecord.reverseSort;
+                            vodInfo.playNote = vodInfoRecord.playNote == null ? "" : vodInfoRecord.playNote;
                         } else {
                             vodInfo.playIndex = 0;
                             vodInfo.playFlag = null;
                             vodInfo.playerCfg = "";
                             vodInfo.reverseSort = false;
+                            vodInfo.playNote = "";
                         }
 
                         if (vodInfo.reverseSort) {
@@ -942,6 +949,14 @@ public class DetailActivity extends BaseActivity {
 
                         if (vodInfo.playFlag == null || !vodInfo.seriesMap.containsKey(vodInfo.playFlag))
                             vodInfo.playFlag = (String) vodInfo.seriesMap.keySet().toArray()[0];
+
+                        // 跨源换源：不同源的集数列表顺序/集数不一致，用历史记住的集数名重新映射到当前源
+                        if (sameNameRestored && !TextUtils.isEmpty(vodInfo.playNote)) {
+                            int mapped = remapPlayIndexFromNote(vodInfo.playNote, vodInfo.playIndex);
+                            if (mapped >= 0) {
+                                vodInfo.playIndex = mapped;
+                            }
+                        }
 
                         restoreDetailFallbackEpisode();
                         resetDetailFallback();
@@ -1880,7 +1895,66 @@ public class DetailActivity extends BaseActivity {
         }
         return -1;
     }
+    private int remapPlayIndexFromNote(String episodeNote, int fallbackIndex) {
+        if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.isEmpty() || TextUtils.isEmpty(episodeNote)) {
+            return -1;
+        }
+        VodInfo.VodSeries probe = new VodInfo.VodSeries();
+        probe.name = episodeNote;
+        String preferredFlag = vodInfo.playFlag;
 
+        // 线路访问顺序：当前已选线路在前，其余线路在后
+        List<String> flagOrder = new ArrayList<>();
+        if (!TextUtils.isEmpty(preferredFlag) && vodInfo.seriesMap.containsKey(preferredFlag)) {
+            flagOrder.add(preferredFlag);
+        }
+        for (String flag : vodInfo.seriesMap.keySet()) {
+            if (!flagOrder.contains(flag)) {
+                flagOrder.add(flag);
+            }
+        }
+
+        String base = normalizeSeriesLabel(episodeNote);
+        for (String flag : flagOrder) {
+            List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(flag);
+            if (list == null || list.isEmpty()) {
+                continue;
+            }
+            // 单条目线路（电影/唯一版本）：无论叫 "正片"、"HD" 还是 "HD国语"，都定位到 0
+            if (list.size() == 1) {
+                vodInfo.playFlag = flag;
+                return 0;
+            }
+            int idx = findMatchingEpisodeIndex(probe, list);
+            if (idx >= 0) {
+                vodInfo.playFlag = flag;
+                return idx;
+            }
+            // 集数名/集数号都匹配不到时，用归一化标签就近匹配
+            if (!TextUtils.isEmpty(base)) {
+                for (int i = 0; i < list.size(); i++) {
+                    VodInfo.VodSeries s = list.get(i);
+                    if (s != null && base.equals(normalizeSeriesLabel(s.name))) {
+                        vodInfo.playFlag = flag;
+                        return i;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    private String normalizeSeriesLabel(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return "";
+        }
+        String t = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "").toLowerCase(Locale.ROOT);
+        t = t.replaceAll("\\b(hd|hdr|uhd|4k|2160p|1080p|720p|480p|2k|bluray|remux)\\b", "")
+             .replaceAll("国语|粤语|普语|原声|配音|无声|无字幕|中字|字幕|台词|高清|蓝光", "");
+        t = t.replaceAll("[\\s._\\-]+", "").trim();
+        return t;
+    }
+    
     private void insertVod(String sourceKey, VodInfo vodInfo) {
         try {
             vodInfo.playNote = vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex).name;
