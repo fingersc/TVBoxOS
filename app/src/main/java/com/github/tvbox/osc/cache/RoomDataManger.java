@@ -50,7 +50,16 @@ public class RoomDataManger {
 
     public static void insertVodRecord(String sourceKey, VodInfo vodInfo) {
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-        if (Hawk.get(HawkConfig.HISTORY_MERGE, false)) {
+        if (Hawk.get(HawkConfig.HISTORY_MERGE, false) && vodInfo != null) {
+            // 合并同名历史开启：本次保存后同名称的旧源记录会被删除。
+            // 若本次保存的位置信息缺失（如跨源映射失败导致集数名未取到），先从同名称的其他源记录接续集数记忆，
+            // 避免旧源记忆在合并删除时被清空。
+            if (TextUtils.isEmpty(vodInfo.playNote)) {
+                VodInfo sameName = getVodInfoBySameName(sourceKey, vodInfo.id, vodInfo.name);
+                if (sameName != null && !TextUtils.isEmpty(sameName.playNote)) {
+                    vodInfo.playNote = sameName.playNote;
+                }
+            }
             removeSameNameVodRecords(dao, sourceKey, vodInfo);
         }
         VodRecord record = dao.getVodRecord(sourceKey, vodInfo.id);
@@ -80,6 +89,35 @@ public class RoomDataManger {
         return null;
     }
 
+    /**
+     * ↓换源时跨源找回播放记忆：按视频名称在其他源的历史记录里查找（排除当前 sourceKey+vodId 本身）。
+     * 返回的记录带有所在源的 sourceKey/vodId 以及记住的 playFlag/playIndex/playNote。
+     * 多个同名记录时优先返回最近更新的一个（getAll 已按 updateTime desc 排序）。
+     */
+    public static VodInfo getVodInfoBySameName(String sourceKey, String vodId, String name) {
+        if (TextUtils.isEmpty(name)) return null;
+        String trimName = name.trim();
+        VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+        List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+        if (all == null) return null;
+        for (VodRecord record : all) {
+            if (record == null
+                    || (TextUtils.equals(sourceKey, record.sourceKey) && TextUtils.equals(vodId, record.vodId))) {
+                continue;
+            }
+            try {
+                if (record.dataJson == null || TextUtils.isEmpty(record.dataJson)) continue;
+                VodInfo info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {}.getType());
+                if (info != null && info.name != null && TextUtils.equals(trimName, info.name.trim())) {
+                    info.sourceKey = record.sourceKey;
+                    info.vodId = record.vodId;
+                    return info;
+                }
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
+    
     public static void deleteVodRecord(String sourceKey, VodInfo vodInfo) {
         VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodInfo.id);
         if (record != null) {
