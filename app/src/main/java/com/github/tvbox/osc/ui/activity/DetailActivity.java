@@ -1300,9 +1300,9 @@ public class DetailActivity extends BaseActivity {
             }
             String oldKey = sourceKey + vodId + playingInfo.playFlag + playingInfo.playIndex + oldSeries.name;
             String newKey = sourceKey + vodId + newFlag + newIndex + newSeries.name;
-            #if (readCachedLong(newKey) > 0) {
-            #    return; // 新版本已有进度记忆，不覆盖
-            #}
+            //if (readCachedLong(newKey) > 0) {
+            //    return; // 新版本已有进度记忆，不覆盖
+            //}
             long t = readCachedLong(oldKey);
             if (t > 0) {
                 CacheManager.save(MD5.string2MD5(newKey), t);
