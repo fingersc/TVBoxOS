@@ -523,6 +523,14 @@ public class DetailActivity extends BaseActivity {
                     }
                     //解决倒叙不刷新
                     if (vodInfo.playIndex != position) {
+                        // 同片多版本切换（如"HD中字"↔"HD国语"）：先落盘实时进度，再把旧版本时间迁移到新版本
+                        VodInfo playingInfo = getActualPlayingVodInfo();
+                        VodInfo.VodSeries oldSeries = getCurrentSeriesOf(playingInfo);
+                        VodInfo.VodSeries newSeries = vodInfo.seriesMap.get(vodInfo.playFlag).get(position);
+                        if (isSameContentVariant(oldSeries, newSeries)) {
+                            if (playFragment != null) playFragment.saveCurrentProgressNow();
+                            migrateSameContentPlaybackTime(playingInfo, oldSeries, vodInfo.playFlag, position, newSeries);
+                        }
                         seriesAdapter.getData().get(position).selected = true;
                         seriesAdapter.notifyItemChanged(position);
                         vodInfo.playIndex = position;
@@ -1233,7 +1241,78 @@ public class DetailActivity extends BaseActivity {
             vodInfo.playIndex = actual.playIndex;
         }
     }
+    
+    /**
+     * 实际在播对象：预览模式下是 previewVodInfo（播放器切集/自动连播只更新它），否则详情页 vodInfo
+     */
+    private VodInfo getActualPlayingVodInfo() {
+        return (showPreview && previewVodInfo != null) ? previewVodInfo : vodInfo;
+    }
 
+    private VodInfo.VodSeries getCurrentSeriesOf(VodInfo info) {
+        if (info == null || info.seriesMap == null || TextUtils.isEmpty(info.playFlag)) {
+            return null;
+        }
+        List<VodInfo.VodSeries> list = info.seriesMap.get(info.playFlag);
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        int idx = Math.max(0, Math.min(info.playIndex, list.size() - 1));
+        return list.get(idx);
+    }
+
+    /**
+     * 判断两个条目是否"同一内容的两个版本"：
+     * - 两边都提取到集数号：号相同且名字不同 → 同内容（第01集中字 ↔ 第01集国语）
+     * - 两边都提取不到集数号：仅当该线路条目 ≤3（电影多版本场景）且名字不同 → 同内容（HD中字 ↔ HD国语）
+     * - 一边有号一边没有：视为不同集，不迁移
+     * 电视剧正常切集（第01集 → 第02集）因集数号不同，不会命中。
+     */
+    private boolean isSameContentVariant(VodInfo.VodSeries a, VodInfo.VodSeries b) {
+        if (a == null || b == null || TextUtils.isEmpty(a.name) || TextUtils.isEmpty(b.name)) {
+            return false;
+        }
+        if (TextUtils.equals(a.name.trim(), b.name.trim())) {
+            return false;
+        }
+        int aNum = extractEpisodeNumber(a.name);
+        int bNum = extractEpisodeNumber(b.name);
+        if (aNum >= 0 && bNum >= 0) {
+            return aNum == bNum;
+        }
+        if (aNum < 0 && bNum < 0) {
+            List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(vodInfo.playFlag);
+            return list != null && list.size() <= 3;
+        }
+        return false;
+    }
+
+    /**
+     * 同内容版本之间迁移播放时间。key 拼法必须与 PlayFragment 第 1988 行 progressKey 完全一致。
+     * 默认幂等：新版本已有进度则不覆盖（与修改点⑩跨线路迁移规则一致）。
+     */
+    private void migrateSameContentPlaybackTime(VodInfo playingInfo, VodInfo.VodSeries oldSeries,
+                                                String newFlag, int newIndex, VodInfo.VodSeries newSeries) {
+        try {
+            if (playingInfo == null || oldSeries == null || newSeries == null
+                    || TextUtils.isEmpty(playingInfo.playFlag)) {
+                return;
+            }
+            String oldKey = sourceKey + vodId + playingInfo.playFlag + playingInfo.playIndex + oldSeries.name;
+            String newKey = sourceKey + vodId + newFlag + newIndex + newSeries.name;
+            #if (readCachedLong(newKey) > 0) {
+            #    return; // 新版本已有进度记忆，不覆盖
+            #}
+            long t = readCachedLong(oldKey);
+            if (t > 0) {
+                CacheManager.save(MD5.string2MD5(newKey), t);
+                LOG.i("echo-migrate play time same content: " + oldSeries.name + " -> " + newSeries.name + " time=" + t);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+    
     private void captureDetailFallbackEpisode() {
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
