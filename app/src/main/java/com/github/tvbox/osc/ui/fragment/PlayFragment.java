@@ -250,6 +250,23 @@ public class PlayFragment extends BaseLazyFragment {
         return Math.max(rec, skip);
     }
 
+    /**
+     * 切源/换线路前调用：立即把当前播放位置写入缓存。
+     * 播放器只在 release/onPause 时才自动保存进度，切源时迁移逻辑读到的
+     * 是滞后值或 0，导致时间记忆丢失。此方法强制落盘实时位置。
+     */
+    public void saveCurrentProgressNow() {
+        try {
+            if (mVideoView == null) return;
+            long pos = mVideoView.getCurrentPosition();
+            if (pos > 0 && !TextUtils.isEmpty(progressKey)) {
+                CacheManager.save(MD5.string2MD5(progressKey), pos);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
     private void initView() {
         EventBus.getDefault().register(this);
         mHandler = new Handler(new Handler.Callback() {
