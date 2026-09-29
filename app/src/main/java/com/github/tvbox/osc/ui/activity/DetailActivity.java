@@ -2068,9 +2068,9 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         String newKey = newSourceKey + newVodId + (newFlag == null ? "" : newFlag) + newIndex + newSeriesName;
-        if (readCachedLong(newKey) > 0) {
-            return; // 当前源同一集数已有有效时间记忆，无需覆盖
-        }
+        //if (readCachedLong(newKey) > 0) {
+        //    return; // 当前源同一集数已有有效时间记忆，无需覆盖
+        //}
         // 路径 A：按 Room 旧记录（sourceKey+vodId+flag+playIndex+playNote）拼旧 key 读时间
         long oldTime = readOldTimeFromRecord(oldRecord);
         // 路径 B：兜底——按切源前捕获的"实际正在播"的集拼旧 key 读时间。
