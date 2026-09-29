@@ -103,8 +103,8 @@
                     android:maxLines="1"
                     android:tag="vod_control_pause_time"
                     android:text="0Gbs"
-                    android:textColor="@android:color/white"
-                    android:textSize="@dimen/ts_20"
+                    android:textColor="#B3FFFFFF"
+                    android:textSize="@dimen/ts_16"
                     tools:ignore="RtlSymmetry" />
 
                 <TextView
@@ -118,8 +118,8 @@
                     android:maxLines="1"
                     android:tag="vod_control_pause_time"
                     android:text="@string/_00_00_00_00"
-                    android:textColor="@android:color/white"
-                    android:textSize="@dimen/ts_20"
+                    android:textColor="#B3FFFFFF"
+                    android:textSize="@dimen/ts_16"
                     tools:ignore="RtlSymmetry" />
 
                 <TextView
@@ -133,8 +133,8 @@
                     android:maxLines="1"
                     android:tag="vod_control_pause_time"
                     android:text="@string/_00_00_00"
-                    android:textColor="@android:color/white"
-                    android:textSize="@dimen/ts_20"
+                    android:textColor="#B3FFFFFF"
+                    android:textSize="@dimen/ts_16"
                     tools:ignore="RtlSymmetry" />
 
             </LinearLayout>
