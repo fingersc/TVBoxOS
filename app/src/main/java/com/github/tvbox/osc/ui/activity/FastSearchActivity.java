@@ -784,7 +784,9 @@ public class FastSearchActivity extends BaseActivity {
             }
             String key = (video.sourceKey == null ? "" : video.sourceKey) + "|" + video.id;
             if (keys.add(key)) {
-                candidates.add(video);
+                // 只保留 fallback 缓存需要的轻量字段，剥离 urlBean（播放列表），
+                // 避免长剧多候选序列化后 Intent 超过 Binder 1MB 触发 TransactionTooLargeException 崩溃。
+                candidates.add(trimVideoForIntent(video));
                 if (candidates.size() >= 20) {
                     break;
                 }
