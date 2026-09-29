@@ -118,12 +118,9 @@ public class VodController extends BaseController {
                         mBottomRoot.setVisibility(VISIBLE);
                         mTopRoot1.setVisibility(VISIBLE);
                         mTopRoot2.setVisibility(VISIBLE);
-                        mPlayLoadNetSpeedRightTop.setVisibility(VISIBLE);
-                        if(Hawk.get(HawkConfig.SCREEN_DISPLAY,GONE)==GONE){
-                            mPlayPauseTime.setVisibility(VISIBLE);
-                        }else {
-                            net_play_speed.setVisibility(VISIBLE);
-                        }
+                        net_play_speed.setVisibility(VISIBLE);
+                        mPlayPauseTime.setVisibility(VISIBLE);
+                        mPlayLoadNetSpeedRightTop.setVisibility(GONE);
                         boolean isPortrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
                         backBtn.setVisibility(ScreenUtils.isTv(context) || isPortrait ? INVISIBLE : VISIBLE);
                         showLockView();
@@ -141,10 +138,11 @@ public class VodController extends BaseController {
                             mPlayTitle.setVisibility(GONE);
                         }
                         if(Hawk.get(HawkConfig.SCREEN_DISPLAY,GONE)==GONE){
-                            mPlayPauseTime.setVisibility(GONE);
+                            net_play_speed.setVisibility(GONE);
                         }else {
                             net_play_speed.setVisibility(VISIBLE);
                         }
+                        mPlayPauseTime.setVisibility(GONE);
                         backBtn.setVisibility(INVISIBLE);
                         mHandler.removeCallbacks(lockRunnable);
                         if (mLockView != null) {
