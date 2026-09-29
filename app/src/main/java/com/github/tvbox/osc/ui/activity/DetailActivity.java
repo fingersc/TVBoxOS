@@ -40,6 +40,7 @@ import com.github.tvbox.osc.bean.AbsXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
+import com.github.tvbox.osc.cache.CacheManager;
 import com.github.tvbox.osc.cache.RoomDataManger;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.ui.adapter.SeriesAdapter;
@@ -962,7 +963,13 @@ public class DetailActivity extends BaseActivity {
                         resetDetailFallback();
                         List<VodInfo.VodSeries> playingSeriesList = vodInfo.seriesMap.get(vodInfo.playFlag);
                         vodInfo.playIndex = Math.max(0, Math.min(vodInfo.playIndex, playingSeriesList.size() - 1));
-
+                        
+                        // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
+                        if (sameNameRestored) {
+                            migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
+                                    playingSeriesList.get(vodInfo.playIndex).name, vodInfoRecord);
+                        }
+                        
                         int flagScrollTo = 0;
                         for (int j = 0; j < vodInfo.seriesFlags.size(); j++) {
                             VodInfo.VodSeriesFlag flag = vodInfo.seriesFlags.get(j);
@@ -1895,6 +1902,67 @@ public class DetailActivity extends BaseActivity {
         }
         return -1;
     }
+    
+    private void migratePlaybackTimeFromOldSource(String newSourceKey, String newVodId, String newFlag, int newIndex,
+                                              String newSeriesName, VodInfo oldRecord) {
+    try {
+        if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId) || TextUtils.isEmpty(newSeriesName)) {
+            return;
+        }
+        String newKey = newSourceKey + newVodId + (newFlag == null ? "" : newFlag) + newIndex + newSeriesName;
+        long newVal = 0;
+        Object newCache = CacheManager.getCache(MD5.string2MD5(newKey));
+        if (newCache instanceof Long) {
+            newVal = (Long) newCache;
+        } else if (newCache instanceof String) {
+            try {
+                newVal = Long.parseLong((String) newCache);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (newVal > 0) {
+            return; // 当前源同一集数已有有效时间记忆，无需覆盖
+        }
+        if (oldRecord == null) {
+            return;
+        }
+        String oldFlag = oldRecord.playFlag;
+        String oldSeriesName = oldRecord.playNote;
+        if (TextUtils.isEmpty(oldSeriesName)) {
+            try {
+                List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null ? null : oldRecord.seriesMap.get(oldFlag);
+                if (oldList != null && oldRecord.playIndex >= 0 && oldRecord.playIndex < oldList.size()) {
+                    oldSeriesName = oldList.get(oldRecord.playIndex).name;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (TextUtils.isEmpty(oldSeriesName)) {
+            return;
+        }
+        String oldKey = (oldRecord.sourceKey == null ? "" : oldRecord.sourceKey)
+                + (oldRecord.id == null ? "" : oldRecord.id)
+                + (oldFlag == null ? "" : oldFlag) + oldRecord.playIndex + oldSeriesName;
+        long oldTime = 0;
+        Object oldCache = CacheManager.getCache(MD5.string2MD5(oldKey));
+        if (oldCache instanceof Long) {
+            oldTime = (Long) oldCache;
+        } else if (oldCache instanceof String) {
+            try {
+                oldTime = Long.parseLong((String) oldCache);
+            } catch (NumberFormatException ignored) {
+                return;
+            }
+        }
+        if (oldTime > 0) {
+            CacheManager.save(MD5.string2MD5(newKey), oldTime);
+            LOG.i("echo-migrate play time: old=" + oldKey + " new=" + newKey + " time=" + oldTime);
+        }
+    } catch (Throwable th) {
+        th.printStackTrace();
+    }
+}
+    
     private int remapPlayIndexFromNote(String episodeNote, int fallbackIndex) {
         if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.isEmpty() || TextUtils.isEmpty(episodeNote)) {
             return -1;
