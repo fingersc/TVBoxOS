@@ -928,6 +928,11 @@ public class DetailActivity extends BaseActivity {
                         boolean sameNameRestored = false;
                         if (vodInfoRecord == null) {
                             vodInfoRecord = RoomDataManger.getVodInfoBySameName(sourceKey, vodId, vodInfo.name);
+                            if (vodInfoRecord == null && !TextUtils.isEmpty(vod_name)
+                                    && !TextUtils.equals(vod_name.trim(), vodInfo.name == null ? "" : vodInfo.name.trim())) {
+                                // 新源详情名与搜索结果名不一致（如"航海王"vs"海贼王"）时，用搜索名再找一次
+                                vodInfoRecord = RoomDataManger.getVodInfoBySameName(sourceKey, vodId, vod_name);
+                            }
                             sameNameRestored = (vodInfoRecord != null);
                         }
                         if (vodInfoRecord != null) {
@@ -963,11 +968,16 @@ public class DetailActivity extends BaseActivity {
                         resetDetailFallback();
                         List<VodInfo.VodSeries> playingSeriesList = vodInfo.seriesMap.get(vodInfo.playFlag);
                         vodInfo.playIndex = Math.max(0, Math.min(vodInfo.playIndex, playingSeriesList.size() - 1));
-                        
+
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
                             migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
                                     playingSeriesList.get(vodInfo.playIndex).name, vodInfoRecord);
+                        } else if (fallbackFromValid) {
+                            // 同名记录没找到（片名跨源不一致等）：用切源前快照兜底迁移时间。
+                            // 集数恢复已由 restoreDetailFallbackEpisode() 按实际播放集完成。
+                            migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
+                                    playingSeriesList.get(vodInfo.playIndex).name, null);
                         }
                         
                         int flagScrollTo = 0;
@@ -1115,6 +1125,10 @@ public class DetailActivity extends BaseActivity {
         if (detailFallbackActive) {
             return true;
         }
+        // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
+        if (playFragment != null) playFragment.saveCurrentProgressNow();
+        syncActualPlayingIntoVodInfo();
+        captureLivePlaybackSnapshot();
         detailFallbackKeepCurrentDetail = mVideo != null && vodInfo != null
                 && vodInfo.seriesMap != null && !vodInfo.seriesMap.isEmpty();
         llLayout.removeCallbacks(detailFallbackDetailTimeout);
@@ -1169,18 +1183,62 @@ public class DetailActivity extends BaseActivity {
         LOG.i("echo-detail fallback search: " + detailFallbackTitle + ", sources=" + detailFallbackSourceOrder.size());
         scheduleDetailFallbackSearch();
     }
+    
+    /**
+     * 切源前调用：记录切源前实际正在播放的 源/线路/集。
+     * 预览模式下实际播放对象是 previewVodInfo（PlayFragment.mVodInfo 指向它），
+     * 播放器里的切集/自动连播只更新它，详情页 vodInfo.playIndex 是过期的，
+     * 所以必须读实际对象，并且必须在 loadDetail 覆盖 sourceKey/vodId 之前捕获。
+     */
+    private void captureLivePlaybackSnapshot() {
+        fallbackFromValid = false;
+        VodInfo playing = showPreview && previewVodInfo != null ? previewVodInfo : vodInfo;
+        if (playing == null || playing.seriesMap == null || TextUtils.isEmpty(playing.playFlag)) {
+            return;
+        }
+        List<VodInfo.VodSeries> list = playing.seriesMap.get(playing.playFlag);
+        if (list == null || list.isEmpty()) {
+            return;
+        }
+        int idx = Math.max(0, Math.min(playing.playIndex, list.size() - 1));
+        fallbackFromSourceKey = sourceKey == null ? "" : sourceKey;
+        fallbackFromVodId = vodId == null ? "" : vodId;
+        fallbackFromFlag = playing.playFlag;
+        fallbackFromIndex = idx;
+        fallbackFromName = list.get(idx).name == null ? "" : list.get(idx).name;
+        fallbackFromValid = !TextUtils.isEmpty(fallbackFromName);
+    }
+
+    /**
+     * 预览模式下把实际播放位置回写详情页 vodInfo，
+     * 保证后续 insertVod 存的集数记忆与用户实际看到的一致。
+     */
+    private void syncActualPlayingIntoVodInfo() {
+        VodInfo actual = showPreview ? previewVodInfo : null;
+        if (actual == null || vodInfo == null || actual == vodInfo) {
+            return;
+        }
+        if (!TextUtils.isEmpty(actual.playFlag)) {
+            vodInfo.playFlag = actual.playFlag;
+        }
+        if (actual.playIndex >= 0) {
+            vodInfo.playIndex = actual.playIndex;
+        }
+    }
 
     private void captureDetailFallbackEpisode() {
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
-        if (vodInfo == null || vodInfo.seriesMap == null || TextUtils.isEmpty(vodInfo.playFlag)) {
+        // 预览模式下实际播放对象是 previewVodInfo，详情页 vodInfo.playIndex 可能已过期
+        VodInfo playing = showPreview && previewVodInfo != null ? previewVodInfo : vodInfo;
+        if (playing == null || playing.seriesMap == null || TextUtils.isEmpty(playing.playFlag)) {
             return;
         }
-        List<VodInfo.VodSeries> seriesList = vodInfo.seriesMap.get(vodInfo.playFlag);
+        List<VodInfo.VodSeries> seriesList = playing.seriesMap.get(playing.playFlag);
         if (seriesList == null || seriesList.isEmpty()) {
             return;
         }
-        detailFallbackEpisodeIndex = Math.max(0, Math.min(vodInfo.playIndex, seriesList.size() - 1));
+        detailFallbackEpisodeIndex = Math.max(0, Math.min(playing.playIndex, seriesList.size() - 1));
         detailFallbackEpisode = seriesList.get(detailFallbackEpisodeIndex);
     }
 
@@ -1565,6 +1623,10 @@ public class DetailActivity extends BaseActivity {
         } else if (event.type == RefreshEvent.TYPE_QUICK_SEARCH_SELECT) {
             if (event.obj != null) {
                 Movie.Video video = (Movie.Video) event.obj;
+                // 与手动切源一致：先落盘实时进度、同步实际播放位置、留快照
+                if (playFragment != null) playFragment.saveCurrentProgressNow();
+                syncActualPlayingIntoVodInfo();
+                captureLivePlaybackSnapshot();
                 vod_name = video.name;
                 vod_picture = video.pic;
                 loadDetail(video.id, video.sourceKey);
@@ -1598,6 +1660,15 @@ public class DetailActivity extends BaseActivity {
     private final Set<String> detailFallbackTriedKeys = new HashSet<>();
     private VodInfo.VodSeries detailFallbackEpisode;
     private int detailFallbackEpisodeIndex = -1;
+    
+    // 切源前快照：记录"实际正在播"的源/线路/集，供进度迁移兜底（详见 readOldTimeFromSnapshot）
+    private String fallbackFromSourceKey = "";
+    private String fallbackFromVodId = "";
+    private String fallbackFromFlag = "";
+    private int fallbackFromIndex = -1;
+    private String fallbackFromName = "";
+    private boolean fallbackFromValid = false;
+    
     private boolean detailFallbackActive;
     private boolean detailFallbackSearching;
     private boolean detailFallbackSearchCollecting;
@@ -1910,58 +1981,80 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         String newKey = newSourceKey + newVodId + (newFlag == null ? "" : newFlag) + newIndex + newSeriesName;
-        long newVal = 0;
-        Object newCache = CacheManager.getCache(MD5.string2MD5(newKey));
-        if (newCache instanceof Long) {
-            newVal = (Long) newCache;
-        } else if (newCache instanceof String) {
-            try {
-                newVal = Long.parseLong((String) newCache);
-            } catch (NumberFormatException ignored) {
-            }
-        }
-        if (newVal > 0) {
+        if (readCachedLong(newKey) > 0) {
             return; // 当前源同一集数已有有效时间记忆，无需覆盖
         }
-        if (oldRecord == null) {
-            return;
-        }
-        String oldFlag = oldRecord.playFlag;
-        String oldSeriesName = oldRecord.playNote;
-        if (TextUtils.isEmpty(oldSeriesName)) {
-            try {
-                List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null ? null : oldRecord.seriesMap.get(oldFlag);
-                if (oldList != null && oldRecord.playIndex >= 0 && oldRecord.playIndex < oldList.size()) {
-                    oldSeriesName = oldList.get(oldRecord.playIndex).name;
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        if (TextUtils.isEmpty(oldSeriesName)) {
-            return;
-        }
-        String oldKey = (oldRecord.sourceKey == null ? "" : oldRecord.sourceKey)
-                + (oldRecord.id == null ? "" : oldRecord.id)
-                + (oldFlag == null ? "" : oldFlag) + oldRecord.playIndex + oldSeriesName;
-        long oldTime = 0;
-        Object oldCache = CacheManager.getCache(MD5.string2MD5(oldKey));
-        if (oldCache instanceof Long) {
-            oldTime = (Long) oldCache;
-        } else if (oldCache instanceof String) {
-            try {
-                oldTime = Long.parseLong((String) oldCache);
-            } catch (NumberFormatException ignored) {
-                return;
-            }
+        // 路径 A：按 Room 旧记录（sourceKey+vodId+flag+playIndex+playNote）拼旧 key 读时间
+        long oldTime = readOldTimeFromRecord(oldRecord);
+        // 路径 B：兜底——按切源前捕获的"实际正在播"的集拼旧 key 读时间。
+        // 覆盖两种情况：同名记录没找到（片名跨源不一致）/ 旧记录 playNote 为空。
+        if (oldTime <= 0) {
+            oldTime = readOldTimeFromSnapshot();
         }
         if (oldTime > 0) {
             CacheManager.save(MD5.string2MD5(newKey), oldTime);
-            LOG.i("echo-migrate play time: old=" + oldKey + " new=" + newKey + " time=" + oldTime);
+            LOG.i("echo-migrate play time: new=" + newKey + " time=" + oldTime);
         }
     } catch (Throwable th) {
         th.printStackTrace();
     }
 }
+
+    private long readOldTimeFromRecord(VodInfo oldRecord) {
+        try {
+            if (oldRecord == null) {
+                return 0;
+            }
+            String oldFlag = oldRecord.playFlag;
+            String oldSeriesName = oldRecord.playNote;
+            if (TextUtils.isEmpty(oldSeriesName)) {
+                // 注意：oldRecord.seriesMap 未持久化（序列化时被排除），无法回退取集名
+                return 0;
+            }
+            String oldKey = (oldRecord.sourceKey == null ? "" : oldRecord.sourceKey)
+                    + (oldRecord.id == null ? "" : oldRecord.id)
+                    + (oldFlag == null ? "" : oldFlag) + oldRecord.playIndex + oldSeriesName;
+            return readCachedLong(oldKey);
+        } catch (Throwable th) {
+            return 0;
+        }
+    }
+
+    private long readOldTimeFromSnapshot() {
+        try {
+            if (!fallbackFromValid || fallbackFromIndex < 0 || TextUtils.isEmpty(fallbackFromName)) {
+                return 0;
+            }
+            String oldKey = (fallbackFromSourceKey == null ? "" : fallbackFromSourceKey)
+                    + (fallbackFromVodId == null ? "" : fallbackFromVodId)
+                    + (fallbackFromFlag == null ? "" : fallbackFromFlag)
+                    + fallbackFromIndex + fallbackFromName;
+            long t = readCachedLong(oldKey);
+            if (t > 0) {
+                fallbackFromValid = false; // 快照一次性消费，防止残留影响后续切源
+            }
+            return t;
+        } catch (Throwable th) {
+            return 0;
+        }
+    }
+
+    private long readCachedLong(String key) {
+        if (TextUtils.isEmpty(key)) {
+            return 0;
+        }
+        Object cache = CacheManager.getCache(MD5.string2MD5(key));
+        if (cache instanceof Long) {
+            return (Long) cache;
+        }
+        if (cache instanceof String) {
+            try {
+                return Long.parseLong((String) cache);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0;
+    }
     
     private int remapPlayIndexFromNote(String episodeNote, int fallbackIndex) {
         if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.isEmpty() || TextUtils.isEmpty(episodeNote)) {
