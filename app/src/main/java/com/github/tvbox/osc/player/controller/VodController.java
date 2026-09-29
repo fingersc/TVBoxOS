@@ -122,7 +122,7 @@ public class VodController extends BaseController {
                         if(Hawk.get(HawkConfig.SCREEN_DISPLAY,GONE)==GONE){
                             mPlayPauseTime.setVisibility(VISIBLE);
                         }else {
-                            net_play_speed.setVisibility(GONE);
+                            net_play_speed.setVisibility(VISIBLE);
                         }
                         boolean isPortrait = getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
                         backBtn.setVisibility(ScreenUtils.isTv(context) || isPortrait ? INVISIBLE : VISIBLE);
@@ -941,17 +941,17 @@ public class VodController extends BaseController {
         //屏显
         int disPlay = Hawk.get(HawkConfig.SCREEN_DISPLAY, GONE);
         mTopRoot2.setVisibility(disPlay);
-        seekTime.setVisibility(disPlay);
+        seekTime.setVisibility(GONE);
         net_play_speed.setVisibility(disPlay);
-        mPlayPauseTime.setVisibility(disPlay);
+        mPlayPauseTime.setVisibility(GONE);
         mScreenDisplay.setTextColor(disPlay==VISIBLE?getResources().getColor(R.color.color_02F8E1): Color.WHITE);
         mScreenDisplay.setOnClickListener(new OnClickListener() {
             @Override
             public void onClick(View view) {
                 int disPlay =(Hawk.get(HawkConfig.SCREEN_DISPLAY, GONE) == VISIBLE) ? GONE : VISIBLE;
-                seekTime.setVisibility(disPlay);
+                seekTime.setVisibility(GONE);
                 net_play_speed.setVisibility(disPlay);
-                if(disPlay==VISIBLE)mPlayPauseTime.setVisibility(disPlay);
+                mPlayPauseTime.setVisibility(GONE);
                 Hawk.put(HawkConfig.SCREEN_DISPLAY, disPlay);
                 mScreenDisplay.setTextColor(disPlay==VISIBLE?getResources().getColor(R.color.color_02F8E1): Color.WHITE);
                 hideBottom();
