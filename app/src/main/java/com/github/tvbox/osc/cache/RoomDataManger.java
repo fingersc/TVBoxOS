@@ -110,7 +110,7 @@ public class RoomDataManger {
                 VodInfo info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {}.getType());
                 if (info != null && info.name != null && TextUtils.equals(trimName, info.name.trim())) {
                     info.sourceKey = record.sourceKey;
-                    info.vodId = record.vodId;
+                    info.id = record.vodId;
                     return info;
                 }
             } catch (Exception ignored) { }
