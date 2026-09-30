@@ -1007,8 +1007,6 @@ public class DetailActivity extends BaseActivity {
                             }
                         }
 
-                        int beforeRestore = vodInfo.playIndex;
-                        String flagBeforeRestore = vodInfo.playFlag;
                         if (!positionResolvedByContent) {
                             // remap 未给出内容级结果时，才用兜底集重定位；
                             // 否则会把 remap 算对的精确下标覆盖成"就近/裸下标"结果
