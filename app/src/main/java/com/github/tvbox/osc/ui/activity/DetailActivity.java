@@ -976,15 +976,37 @@ public class DetailActivity extends BaseActivity {
 
                         // 跨源换源：不同源的集数列表顺序/集数不一致，用历史记住的集数名重新映射到当前源
                         if (sameNameRestored && !TextUtils.isEmpty(vodInfo.playNote)) {
+                            String flagBeforeRemap = vodInfo.playFlag;
                             int mapped = remapPlayIndexFromNote(vodInfo.playNote, vodInfo.playIndex);
                             if (mapped >= 0) {
                                 vodInfo.playIndex = mapped;
+                            } else {
+                                // 未匹配到：恢复原线路，避免半途被改写
+                                vodInfo.playFlag = flagBeforeRemap;
                             }
                         }
 
                         restoreDetailFallbackEpisode();
                         resetDetailFallback();
+
+                        // 线路回退：remapPlayIndexFromNote 可能改写 playFlag、或该线路列表为 null，
+                        // 这里兜底回退到第一条有效线路，避免 seriesMap.get() 返回 null 导致 NPE
                         List<VodInfo.VodSeries> playingSeriesList = vodInfo.seriesMap.get(vodInfo.playFlag);
+                        if (playingSeriesList == null || playingSeriesList.isEmpty()) {
+                            for (String flagKey : vodInfo.seriesMap.keySet()) {
+                                List<VodInfo.VodSeries> candidate = vodInfo.seriesMap.get(flagKey);
+                                if (candidate != null && !candidate.isEmpty()) {
+                                    vodInfo.playFlag = flagKey;
+                                    playingSeriesList = candidate;
+                                    break;
+                                }
+                            }
+                        }
+                        if (playingSeriesList == null || playingSeriesList.isEmpty()) {
+                            // 整部影片没有任何有效线路：走空态，不要继续往下走
+                            showEmpty();
+                            return;
+                        }
                         vodInfo.playIndex = Math.max(0, Math.min(vodInfo.playIndex, playingSeriesList.size() - 1));
 
                         // 切源前先把实时播放位置落盘，否则迁移读到的是滞后值/0
