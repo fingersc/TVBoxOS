@@ -20,6 +20,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import com.github.tvbox.osc.cache.PlayProgressManager;
+
 /**
  * @author pj567
  * @date :2021/1/7
@@ -119,6 +121,7 @@ public class RoomDataManger {
     }
     
     public static void deleteVodRecord(String sourceKey, VodInfo vodInfo) {
+        PlayProgressManager.deleteByVod(sourceKey, vodInfo.id);
         VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodInfo.id);
         if (record != null) {
             AppDataManager.get().getVodRecordDao().delete(record);
@@ -215,6 +218,7 @@ public class RoomDataManger {
     }
 
     public static void deleteVodRecordAll() {
+        PlayProgressManager.deleteAll();
         AppDataManager.get().getVodRecordDao().deleteAll();
     }
 

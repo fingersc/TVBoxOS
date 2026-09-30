@@ -52,6 +52,7 @@ import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.Subtitle;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.CacheManager;
+import com.github.tvbox.osc.cache.PlayProgressManager;
 import com.github.tvbox.osc.dlna.CastVideo;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.player.ExoPlayer;
@@ -231,21 +232,20 @@ public class PlayFragment extends BaseLazyFragment {
             e.printStackTrace();
         }
         long skip = st * 1000L;
-        Object theCache=CacheManager.getCache(MD5.string2MD5(url));
-        if (theCache == null) {
-            return skip;
-        }
         long rec = 0;
-        if (theCache instanceof Long) {
-            rec = (Long) theCache;
-        } else if (theCache instanceof String) {
-            try {
-                rec = Long.parseLong((String) theCache);
-            } catch (NumberFormatException e) {
-                LOG.i("echo-String value is not a valid long.");
-            }
+        if (!TextUtils.isEmpty(pkVodId)) {
+            rec = PlayProgressManager.get(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName);
         } else {
-            LOG.i("echo-Value cannot be converted to long.");
+            Object theCache = CacheManager.getCache(MD5.string2MD5(url));
+            if (theCache instanceof Long) {
+                rec = (Long) theCache;
+            } else if (theCache instanceof String) {
+                try {
+                    rec = Long.parseLong((String) theCache);
+                } catch (NumberFormatException e) {
+                    LOG.i("echo-String value is not a valid long.");
+                }
+            }
         }
         return Math.max(rec, skip);
     }
@@ -307,7 +307,11 @@ public class PlayFragment extends BaseLazyFragment {
         ProgressManager progressManager = new ProgressManager() {
             @Override
             public void saveProgress(String url, long progress) {
-                CacheManager.save(MD5.string2MD5(url), progress);
+                if (!TextUtils.isEmpty(pkVodId)) {
+                    PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, progress);
+                } else {
+                    CacheManager.save(MD5.string2MD5(url), progress);
+                }
                 if (webPlayUrl != null && progress > 0) {
                     markPlaybackStarted();
                     hideTipOnUiThread();
@@ -383,10 +387,11 @@ public class PlayFragment extends BaseLazyFragment {
 
             @Override
             public void playNext(boolean rmProgress) {
-                String preProgressKey = progressKey;
+                String preSrc = pkSourceKey, preVod = pkVodId, preFlag = pkFlag, preEp = pkEpName;
+                int preIdx = pkPlayIndex;
                 PlayFragment.this.playNext(rmProgress);
-                if (rmProgress && preProgressKey != null)
-                    CacheManager.delete(MD5.string2MD5(preProgressKey), 0);
+                if (rmProgress && !TextUtils.isEmpty(preVod))
+                    PlayProgressManager.delete(preSrc, preVod, preFlag, preIdx, preEp);
             }
 
             @Override
@@ -1989,8 +1994,8 @@ public class PlayFragment extends BaseLazyFragment {
         if(mVideoView!=null) {
             if (reusePlayer) {
                 long previousPosition = mVideoView.getCurrentPosition();
-                if (previousPosition > 0 && !TextUtils.isEmpty(progressKey)) {
-                    CacheManager.save(MD5.string2MD5(progressKey), previousPosition);
+                if (previousPosition > 0 && !TextUtils.isEmpty(pkVodId)) {
+                    PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, previousPosition);
                 }
                 AbstractPlayer mediaPlayer = mVideoView.getMediaPlayer();
                 if (mediaPlayer != null) {
@@ -2003,10 +2008,15 @@ public class PlayFragment extends BaseLazyFragment {
         ImgUtil.clearMemoryCache();
         subtitleCacheKey = mVodInfo.sourceKey + "-" + mVodInfo.id + "-" + mVodInfo.playFlag + "-" + mVodInfo.playIndex+ "-" + vs.name + "-subt";
         progressKey = mVodInfo.sourceKey + mVodInfo.id + mVodInfo.playFlag + mVodInfo.playIndex + vs.name;
+        pkSourceKey = mVodInfo.sourceKey;
+        pkVodId = mVodInfo.id;
+        pkFlag = mVodInfo.playFlag;
+        pkPlayIndex = mVodInfo.playIndex;
+        pkEpName = vs.name;
         startResolvePlayUrlTimeout();
         //重新播放清除现有进度
         if (reset) {
-            CacheManager.delete(MD5.string2MD5(progressKey), 0);
+            PlayProgressManager.delete(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName);
             CacheManager.delete(MD5.string2MD5(subtitleCacheKey), 0);
         }else{
             inheritProgressIfNeeded();
@@ -2062,10 +2072,7 @@ public class PlayFragment extends BaseLazyFragment {
             if (TextUtils.isEmpty(inheritProgressKey) || TextUtils.isEmpty(progressKey)) return;
             if (TextUtils.equals(inheritProgressKey, progressKey)) return;
             if (inheritProgress <= 0) return;
-            Object targetCache = CacheManager.getCache(MD5.string2MD5(progressKey));
-            if (targetCache == null) {
-                CacheManager.save(MD5.string2MD5(progressKey), inheritProgress);
-            }
+            PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, inheritProgress);
         } finally {
             inheritProgressKey = null;
             inheritProgress = 0;
@@ -2075,6 +2082,12 @@ public class PlayFragment extends BaseLazyFragment {
     private String playSubtitle;
     private String subtitleCacheKey;
     private String progressKey;
+    // 当前进度元组快照：与 progressKey 同时赋值（P2），供新表按列读写
+    private String pkSourceKey;
+    private String pkVodId;
+    private String pkFlag;
+    private int pkPlayIndex;
+    private String pkEpName;
     private String inheritProgressKey;
     private long inheritProgress;
     private String parseFlag;

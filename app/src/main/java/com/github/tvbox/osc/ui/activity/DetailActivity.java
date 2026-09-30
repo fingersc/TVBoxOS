@@ -84,6 +84,8 @@ import me.jessyan.autosize.utils.AutoSizeUtils;
 
 import android.graphics.Paint;
 
+import com.github.tvbox.osc.cache.PlayProgressManager;
+
 /**
  * @author pj567
  * @date :2020/12/22
@@ -2067,20 +2069,28 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId) || TextUtils.isEmpty(newSeriesName)) {
             return;
         }
-        String newKey = newSourceKey + newVodId + (newFlag == null ? "" : newFlag) + newIndex + newSeriesName;
-        //if (readCachedLong(newKey) > 0) {
-        //    return; // 当前源同一集数已有有效时间记忆，无需覆盖
-        //}
-        // 路径 A：按 Room 旧记录（sourceKey+vodId+flag+playIndex+playNote）拼旧 key 读时间
-        long oldTime = readOldTimeFromRecord(oldRecord);
-        // 路径 B：兜底——按切源前捕获的"实际正在播"的集拼旧 key 读时间。
-        // 覆盖两种情况：同名记录没找到（片名跨源不一致）/ 旧记录 playNote 为空。
-        if (oldTime <= 0) {
-            oldTime = readOldTimeFromSnapshot();
+        long newVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+        if (oldRecord == null) {
+            return;
         }
+        String oldFlag = oldRecord.playFlag;
+        String oldSeriesName = oldRecord.playNote;
+        if (TextUtils.isEmpty(oldSeriesName)) {
+            try {
+                List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null ? null : oldRecord.seriesMap.get(oldFlag);
+                if (oldList != null && oldRecord.playIndex >= 0 && oldRecord.playIndex < oldList.size()) {
+                    oldSeriesName = oldList.get(oldRecord.playIndex).name;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (TextUtils.isEmpty(oldSeriesName)) {
+            return;
+        }
+        long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
         if (oldTime > 0) {
-            CacheManager.save(MD5.string2MD5(newKey), oldTime);
-            LOG.i("echo-migrate play time: new=" + newKey + " time=" + oldTime);
+            PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+            LOG.i("echo-migrate play time: new=" + newSourceKey + "/" + newVodId + "/" + newFlag + "/" + newIndex + "/" + newSeriesName + " time=" + oldTime + " overwritten=" + newVal);
         }
     } catch (Throwable th) {
         th.printStackTrace();

@@ -108,6 +108,20 @@ public class AppDataManager {
         }
     };
 
+    static final Migration MIGRATION_V1_V2_PLAY_PROGRESS = new Migration(1, 2) {
+        @Override
+        public void migrate(SupportSQLiteDatabase database) {
+            try {
+                database.execSQL("CREATE TABLE IF NOT EXISTS `play_progress` (" +
+                        "`sourceKey` TEXT NOT NULL, `vodId` TEXT NOT NULL, `flag` TEXT NOT NULL, " +
+                        "`playIndex` INTEGER NOT NULL, `epName` TEXT NOT NULL, `position` INTEGER NOT NULL, " +
+                        "`updateTime` INTEGER NOT NULL, PRIMARY KEY(`sourceKey`, `vodId`, `flag`, `playIndex`, `epName`))");
+            } catch (SQLiteException e) {
+                e.printStackTrace();
+            }
+        }
+    };
+
     static String dbPath() {
         return DB_NAME + ".v" + DB_FILE_VERSION + ".db";
     }
@@ -119,10 +133,7 @@ public class AppDataManager {
         if (dbInstance == null)
             dbInstance = Room.databaseBuilder(App.getInstance(), AppDataBase.class, dbPath())
                     .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
-                    //.addMigrations(MIGRATION_1_2)
-                    //.addMigrations(MIGRATION_2_3)
-                    //.addMigrations(MIGRATION_3_4)
-                    //.addMigrations(MIGRATION_4_5)
+                    .addMigrations(MIGRATION_V1_V2_PLAY_PROGRESS)
                     .addCallback(new RoomDatabase.Callback() {
                         @Override
                         public void onCreate(@NonNull SupportSQLiteDatabase db) {
