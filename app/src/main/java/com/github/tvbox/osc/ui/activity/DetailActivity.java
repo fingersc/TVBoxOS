@@ -86,6 +86,8 @@ import android.graphics.Paint;
 
 import com.github.tvbox.osc.cache.PlayProgressManager;
 
+import java.util.Collections;
+
 /**
  * @author pj567
  * @date :2020/12/22
@@ -393,8 +395,9 @@ public class DetailActivity extends BaseActivity {
                     isReverse = !isReverse;
                     tvSeriesSort.setText(isReverse?"倒序":"正序");
                     vodInfo.reverse();
-                    if (vodInfo.playIndex >= 0) {
-                        vodInfo.playIndex=(vodInfo.seriesMap.get(vodInfo.playFlag).size()-1)-vodInfo.playIndex;
+                    List<VodInfo.VodSeries> revList = getPlayingSeriesList();
+                    if (vodInfo.playIndex >= 0 && !revList.isEmpty()) {
+                        vodInfo.playIndex = (revList.size() - 1) - vodInfo.playIndex;
                     }
                     firstReverse = !firstReverse;
                     setSeriesGroupOptions();
@@ -475,21 +478,20 @@ public class DetailActivity extends BaseActivity {
                     vodInfo.playFlag = newFlag;
                     List<VodInfo.VodSeries> newSeriesList = vodInfo.seriesMap.get(newFlag);
                     if (newSeriesList != null && !newSeriesList.isEmpty()) {
-                        vodInfo.playIndex = findMatchingEpisodeIndex(currentSeries, newSeriesList);
+                        vodInfo.playIndex = clampIndex(findMatchingEpisodeIndex(currentSeries, newSeriesList), newSeriesList);
                         for (VodInfo.VodSeries series : newSeriesList) {
                             series.selected = false;
                         }
-                        if (vodInfo.playIndex >= 0) {
-                            newSeriesList.get(vodInfo.playIndex).selected = true;
-                            routeSwitchSeries = newSeriesList.get(vodInfo.playIndex);
-                            // 跨线路迁移播放时间（hhyun -> hhm3u8 等）：先落盘实时进度，再把旧线路 key 的时间复制到新线路 key
-                            if (playFragment != null) playFragment.saveCurrentProgressNow();
-                            migratePlaybackTimeAcrossFlags(actualOldFlag, actualOldIndex,
-                                    currentSeries == null ? "" : currentSeries.name,
-                                    newFlag, vodInfo.playIndex, newSeriesList.get(vodInfo.playIndex).name);
-                        } else if (currentSeries != null) {
-                            routeSwitchSeries = currentSeries;
-                        }
+                        VodInfo.VodSeries switchedSeries = newSeriesList.get(vodInfo.playIndex);
+                        switchedSeries.selected = true;
+                        routeSwitchSeries = switchedSeries;
+                        // 跨线路迁移播放时间（hhyun -> hhm3u8 等）：先落盘实时进度，再把旧线路 key 的时间复制到新线路 key
+                        if (playFragment != null) playFragment.saveCurrentProgressNow();
+                        migratePlaybackTimeAcrossFlags(actualOldFlag, actualOldIndex,
+                                currentSeries == null ? "" : currentSeries.name,
+                                newFlag, vodInfo.playIndex, switchedSeries.name);
+                    } else if (currentSeries != null) {
+                        routeSwitchSeries = currentSeries;
                     }
                     refreshList();
                 }
@@ -517,21 +519,25 @@ public class DetailActivity extends BaseActivity {
             @Override
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
                 FastClickCheckUtil.check(view);
-                if (vodInfo != null && vodInfo.seriesMap.get(vodInfo.playFlag).size() > 0) {
+                List<VodInfo.VodSeries> clickList = getPlayingSeriesList();
+                if (vodInfo != null && !clickList.isEmpty()) {
                     boolean reload = false;
-                    for (int j = 0; j < vodInfo.seriesMap.get(vodInfo.playFlag).size(); j++) {
+                    for (int j = 0; j < clickList.size(); j++) {
                         seriesAdapter.getData().get(j).selected = false;
                         seriesAdapter.notifyItemChanged(j);
                     }
                     //解决倒叙不刷新
                     if (vodInfo.playIndex != position) {
                         // 同片多版本切换（如"HD中字"↔"HD国语"）：先落盘实时进度，再把旧版本时间迁移到新版本
-                        VodInfo playingInfo = getActualPlayingVodInfo();
-                        VodInfo.VodSeries oldSeries = getCurrentSeriesOf(playingInfo);
-                        VodInfo.VodSeries newSeries = vodInfo.seriesMap.get(vodInfo.playFlag).get(position);
-                        if (isSameContentVariant(oldSeries, newSeries)) {
-                            if (playFragment != null) playFragment.saveCurrentProgressNow();
-                            migrateSameContentPlaybackTime(playingInfo, oldSeries, vodInfo.playFlag, position, newSeries);
+                        List<VodInfo.VodSeries> curSeriesList = getPlayingSeriesList();
+                        if (position >= 0 && position < curSeriesList.size()) {
+                            VodInfo playingInfo = getActualPlayingVodInfo();
+                            VodInfo.VodSeries oldSeries = getCurrentSeriesOf(playingInfo);
+                            VodInfo.VodSeries newSeries = curSeriesList.get(position);
+                            if (isSameContentVariant(oldSeries, newSeries)) {
+                                if (playFragment != null) playFragment.saveCurrentProgressNow();
+                                migrateSameContentPlaybackTime(playingInfo, oldSeries, vodInfo.playFlag, position, newSeries);
+                            }
                         }
                         seriesAdapter.getData().get(position).selected = true;
                         seriesAdapter.notifyItemChanged(position);
@@ -572,7 +578,7 @@ public class DetailActivity extends BaseActivity {
             @Override
             public void onItemSelected(TvRecyclerView parent, View itemView, int position) {
                 selectSeriesGroup(itemView, position);
-                if (vodInfo != null && vodInfo.seriesMap.get(vodInfo.playFlag).size() > 0) {
+                if (vodInfo != null && !getPlayingSeriesList().isEmpty()) {
                     int targetPos = position * GroupCount;
 //                    mGridView.smoothScrollToPosition(targetPos);
                     customSeriesScrollPos(targetPos);
@@ -586,7 +592,7 @@ public class DetailActivity extends BaseActivity {
         });
         tvSeriesSort.setOnFocusChangeListener((view, hasFocus) -> {
             if (hasFocus) {
-                if (vodInfo != null && Objects.requireNonNull(vodInfo.seriesMap.get(vodInfo.playFlag)).size() > 0) {
+                if (vodInfo != null && !getPlayingSeriesList().isEmpty()) {
                     int firstVisible = mGridView.getFirstVisiblePosition();
                     int lastVisible = mGridView.getLastVisiblePosition();
                     if (vodInfo.playIndex >= 0 && (vodInfo.playIndex < firstVisible || vodInfo.playIndex > lastVisible)) {
@@ -602,7 +608,7 @@ public class DetailActivity extends BaseActivity {
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
                 FastClickCheckUtil.check(view);
                 selectSeriesGroup(view, position);
-                if (vodInfo != null && vodInfo.seriesMap.get(vodInfo.playFlag).size() > 0) {
+                if (vodInfo != null && !getPlayingSeriesList().isEmpty()) {
                     int targetPos =  position * GroupCount+1;
 
                     customSeriesScrollPos(targetPos);
@@ -654,10 +660,12 @@ public class DetailActivity extends BaseActivity {
     private List<Runnable> pauseRunnable = null;
 
     private void jumpToPlay() {
-        if (vodInfo != null && vodInfo.seriesMap.get(vodInfo.playFlag).size() > 0) {
+        List<VodInfo.VodSeries> jumpList = getPlayingSeriesList();
+        if (vodInfo != null && !jumpList.isEmpty()) {
             preFlag = vodInfo.playFlag;
             //更新播放地址
-            setTextShow(tvPlayUrl, "播放地址：", vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex).url);
+            VodInfo.VodSeries jumpSeries = jumpList.get(clampIndex(vodInfo.playIndex, jumpList));
+            setTextShow(tvPlayUrl, "播放地址：", jumpSeries.url);
             Bundle bundle = new Bundle();
             //保存历史
             insertVod(firstsourceKey, vodInfo);
@@ -696,20 +704,23 @@ public class DetailActivity extends BaseActivity {
 
     @SuppressLint("NotifyDataSetChanged")
     void refreshList() {
-        if (vodInfo.seriesMap.get(vodInfo.playFlag).size() <= vodInfo.playIndex) {
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
+        int listSize = list.size();
+
+        if (listSize <= vodInfo.playIndex) {
             vodInfo.playIndex = 0;
         }
 
-        if (vodInfo.seriesMap.get(vodInfo.playFlag) != null) {
+        if (!list.isEmpty()) {
             boolean canSelect = true;
-            for (int j = 0; j < vodInfo.seriesMap.get(vodInfo.playFlag).size(); j++) {
-                if(vodInfo.seriesMap.get(vodInfo.playFlag).get(j).selected){
+            for (int j = 0; j < listSize; j++) {
+                if (list.get(j).selected) {
                     canSelect = false;
                     break;
                 }
             }
-            if(canSelect && vodInfo.playIndex >= 0 && vodInfo.playIndex < vodInfo.seriesMap.get(vodInfo.playFlag).size()) {
-                vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex).selected = true;
+            if (canSelect && vodInfo.playIndex >= 0 && vodInfo.playIndex < listSize) {
+                list.get(vodInfo.playIndex).selected = true;
             }
         }
 
@@ -717,23 +728,21 @@ public class DetailActivity extends BaseActivity {
 //        pFont.setTypeface(Typeface.DEFAULT );
         Rect rect = new Rect();
 
-        List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(vodInfo.playFlag);
-        int listSize = list.size();
         int w = 1;
-        for(int i =0; i < listSize; ++i){
+        for (int i = 0; i < listSize; ++i) {
             String name = list.get(i).name;
             pFont.getTextBounds(name, 0, name.length(), rect);
-            if(w < rect.width()){
+            if (w < rect.width()) {
                 w = rect.width();
             }
         }
         w += 32;
-        int screenWidth = getWindowManager().getDefaultDisplay().getWidth()/3;
-        int offset = screenWidth/w;
-        if(offset <=2) offset =2;
-        if(offset > 6) offset =6;
+        int screenWidth = getWindowManager().getDefaultDisplay().getWidth() / 3;
+        int offset = screenWidth / w;
+        if (offset <= 2) offset = 2;
+        if (offset > 6) offset = 6;
         mGridViewLayoutMgr.setSpanCount(offset);
-        seriesAdapter.setNewData(vodInfo.seriesMap.get(vodInfo.playFlag));
+        seriesAdapter.setNewData(list.isEmpty() ? null : list);
 
         setSeriesGroupOptions();
 
@@ -748,7 +757,7 @@ public class DetailActivity extends BaseActivity {
 
     @SuppressLint("NotifyDataSetChanged")
     private void setSeriesGroupOptions(){
-        List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(vodInfo.playFlag);
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
         int listSize = list.size();
         int offset = mGridViewLayoutMgr.getSpanCount();
         seriesGroupOptions.clear();
@@ -1007,22 +1016,27 @@ public class DetailActivity extends BaseActivity {
                             showEmpty();
                             return;
                         }
-                        vodInfo.playIndex = Math.max(0, Math.min(vodInfo.playIndex, playingSeriesList.size() - 1));
+                        vodInfo.playIndex = clampIndex(vodInfo.playIndex, playingSeriesList);
 
                         // 切源前先把实时播放位置落盘，否则迁移读到的是滞后值/0
                         if (playFragment != null) playFragment.saveCurrentProgressNow();
                         syncActualPlayingIntoVodInfo();
                         captureLivePlaybackSnapshot();
 
+                        // syncActualPlayingIntoVodInfo 可能用预览对象的 playIndex 覆盖，
+                        // 与当前线路长度未必匹配，迁移前必须重新钳位
+                        vodInfo.playIndex = clampIndex(vodInfo.playIndex, playingSeriesList);
+                        VodInfo.VodSeries currentEpisode = playingSeriesList.get(vodInfo.playIndex);
+
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
                             migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                    playingSeriesList.get(vodInfo.playIndex).name, vodInfoRecord);
+                                    currentEpisode.name, vodInfoRecord);
                         } else if (fallbackFromValid) {
                             // 同名记录没找到（片名跨源不一致等）：用切源前快照兜底迁移时间。
                             // 集数恢复已由 restoreDetailFallbackEpisode() 按实际播放集完成。
                             migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                    playingSeriesList.get(vodInfo.playIndex).name, null);
+                                    currentEpisode.name, null);
                         }
                         
                         int flagScrollTo = 0;
@@ -1263,8 +1277,14 @@ public class DetailActivity extends BaseActivity {
         if (actual == null || vodInfo == null || actual == vodInfo) {
             return;
         }
-        if (!TextUtils.isEmpty(actual.playFlag)) {
-            vodInfo.playFlag = actual.playFlag;
+        // 只同步「确实有效」的线路：actual.playFlag 必须在 vodInfo.seriesMap 里能取到非空列表
+        if (!TextUtils.isEmpty(actual.playFlag)
+                && vodInfo.seriesMap != null
+                && vodInfo.seriesMap.containsKey(actual.playFlag)) {
+            List<VodInfo.VodSeries> target = vodInfo.seriesMap.get(actual.playFlag);
+            if (target != null && !target.isEmpty()) {
+                vodInfo.playFlag = actual.playFlag;
+            }
         }
         if (actual.playIndex >= 0) {
             vodInfo.playIndex = actual.playIndex;
@@ -1708,7 +1728,8 @@ public class DetailActivity extends BaseActivity {
                     syncPlayingVodInfo((VodInfo) event.obj);
                 } else if (event.obj instanceof Integer) {
                     int index = (int) event.obj;
-                    for (int j = 0; j < Objects.requireNonNull(vodInfo.seriesMap.get(vodInfo.playFlag)).size(); j++) {
+                    List<VodInfo.VodSeries> eventList = getPlayingSeriesList();
+                    for (int j = 0; j < eventList.size(); j++) {
                         seriesAdapter.getData().get(j).selected = false;
                         seriesAdapter.notifyItemChanged(j);
                     }
@@ -1997,6 +2018,25 @@ public class DetailActivity extends BaseActivity {
         return playingList.get(safeIndex);
     }
 
+    /**
+     * 取当前播放线路的剧集列表：任何一环为空都返回空列表，绝不返回 null。
+     */
+    private List<VodInfo.VodSeries> getPlayingSeriesList() {
+        if (vodInfo == null || vodInfo.seriesMap == null || TextUtils.isEmpty(vodInfo.playFlag)) {
+            return Collections.emptyList();
+        }
+        List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(vodInfo.playFlag);
+        return list == null ? Collections.emptyList() : list;
+    }
+
+    /**
+     * 把索引钳位到列表合法范围内，越界返回 0（列表为空时返回 0，调用方需自行判空）。
+     */
+    private int clampIndex(int index, List<?> list) {
+        if (list == null || list.isEmpty()) return 0;
+        return Math.max(0, Math.min(index, list.size() - 1));
+    }
+
     private boolean isCurrentPreviewPlaying(int position) {
         if (!showPreview || previewVodInfo == null || vodInfo == null || vodInfo.seriesMap == null || TextUtils.isEmpty(vodInfo.playFlag)) {
             return false;
@@ -2265,10 +2305,11 @@ public class DetailActivity extends BaseActivity {
     }
     
     private void insertVod(String sourceKey, VodInfo vodInfo) {
-        try {
-            vodInfo.playNote = vodInfo.seriesMap.get(vodInfo.playFlag).get(vodInfo.playIndex).name;
-        } catch (Throwable th) {
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
+        if (list.isEmpty()) {
             vodInfo.playNote = "";
+        } else {
+            vodInfo.playNote = list.get(clampIndex(vodInfo.playIndex, list)).name;
         }
         RoomDataManger.insertVodRecord(sourceKey, vodInfo);
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));

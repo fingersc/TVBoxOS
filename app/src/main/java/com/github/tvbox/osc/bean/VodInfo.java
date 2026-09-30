@@ -101,16 +101,21 @@ public class VodInfo implements Serializable {
         return 0;
     }
     private boolean isReverse(List<VodInfo.VodSeries> list) {
+        // 元素不足 2 个无法判断正倒序；list 为 null 时直接返回 false（原实现会在 size() 处 NPE）
+        if (list == null || list.size() < 2) return false;
         int ascCount = 0, descCount = 0;
         // 比较最多前 6 个相邻元素对
         int limit = Math.min(list.size() - 1, 6);
         for (int i = 0; i < limit; i++) {
-            int current = extractNumber(list.get(i).name);
-            int next = extractNumber(list.get(i + 1).name);
-            if (current < next) {
+            VodInfo.VodSeries cur = list.get(i);
+            VodInfo.VodSeries next = list.get(i + 1);
+            if (cur == null || next == null || cur.name == null || next.name == null) continue;
+            int current = extractNumber(cur.name);
+            int nextNum = extractNumber(next.name);
+            if (current < nextNum) {
                 ascCount++;
                 if (ascCount == 2) return false;
-            } else if (current > next) {
+            } else if (current > nextNum) {
                 descCount++;
                 if (descCount == 2) return true;
             }
@@ -119,9 +124,11 @@ public class VodInfo implements Serializable {
     }
 
     public void reverse() {
-        Set<String> flags = seriesMap.keySet();
-        for (String flag : flags) {
-            Collections.reverse(seriesMap.get(flag));
+        if (seriesMap == null) return;
+        for (Map.Entry<String, List<VodSeries>> entry : seriesMap.entrySet()) {
+            if (entry.getValue() != null) {
+                Collections.reverse(entry.getValue());
+            }
         }
     }
 

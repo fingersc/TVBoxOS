@@ -136,6 +136,8 @@ import xyz.doikki.videoplayer.player.AbstractPlayer;
 import xyz.doikki.videoplayer.player.ProgressManager;
 import xyz.doikki.videoplayer.player.VideoView;
 
+import java.util.Collections;
+
 public class PlayFragment extends BaseLazyFragment {
     private static final int MSG_PARSE_TIMEOUT = 100;
     private static final int MSG_RESOLVE_PLAY_URL_TIMEOUT = 101;
@@ -515,12 +517,11 @@ public class PlayFragment extends BaseLazyFragment {
 
     private String getCastTitle() {
         if (mVodInfo == null) return "TVBox";
-        try {
-            VodInfo.VodSeries series = mVodInfo.seriesMap.get(mVodInfo.playFlag).get(mVodInfo.playIndex);
-            return mVodInfo.name + " " + series.name;
-        } catch (Exception e) {
-            return TextUtils.isEmpty(mVodInfo.name) ? "TVBox" : mVodInfo.name;
-        }
+        String fallback = TextUtils.isEmpty(mVodInfo.name) ? "TVBox" : mVodInfo.name;
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
+        if (list.isEmpty()) return fallback;
+        VodInfo.VodSeries series = list.get(clampIndex(mVodInfo.playIndex, list));
+        return mVodInfo.name + " " + series.name;
     }
 
     private long getCastPosition() {
@@ -1018,8 +1019,9 @@ public class PlayFragment extends BaseLazyFragment {
                             int playerType = mVodPlayerCfg.getInt("pl");
                             if (playerType >= 10) {
                                 mVideoView.release();
-                                VodInfo.VodSeries vs = mVodInfo.seriesMap.get(mVodInfo.playFlag).get(mVodInfo.playIndex);
-                                String playTitle = mVodInfo.name + " " + vs.name;
+                                List<VodInfo.VodSeries> list = getPlayingSeriesList();
+                                VodInfo.VodSeries vs = list.isEmpty() ? null : list.get(clampIndex(mVodInfo.playIndex, list));
+                                String playTitle = mVodInfo.name + (vs == null ? "" : " " + vs.name);
                                 setTip("调用外部播放器" + PlayerHelper.getPlayerName(playerType) + "进行播放", true, false);
                                 boolean callResult = false;
                                 long progress = getSavedProgress(progressKey);
@@ -1607,12 +1609,8 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void playNext(boolean isProgress) {
         triedLineFlags.clear();
-        boolean hasNext;
-        if (mVodInfo == null || mVodInfo.seriesMap.get(mVodInfo.playFlag) == null) {
-            hasNext = false;
-        } else {
-            hasNext = mVodInfo.playIndex + 1 < mVodInfo.seriesMap.get(mVodInfo.playFlag).size();
-        }
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
+        boolean hasNext = mVodInfo != null && mVodInfo.playIndex + 1 < list.size();
         if (!hasNext) {
             Toast.makeText(requireContext(), "已经是最后一集了!", Toast.LENGTH_SHORT).show();
             return;
@@ -1625,12 +1623,8 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void playPrevious() {
         triedLineFlags.clear();
-        boolean hasPre = true;
-        if (mVodInfo == null || mVodInfo.seriesMap.get(mVodInfo.playFlag) == null) {
-            hasPre = false;
-        } else {
-            hasPre = mVodInfo.playIndex - 1 >= 0;
-        }
+        List<VodInfo.VodSeries> list = getPlayingSeriesList();
+        boolean hasPre = mVodInfo != null && !list.isEmpty() && mVodInfo.playIndex - 1 >= 0;
         if (!hasPre) {
             Toast.makeText(requireContext(), "已经是第一集了!", Toast.LENGTH_SHORT).show();
             return;
@@ -1865,6 +1859,19 @@ public class PlayFragment extends BaseLazyFragment {
         return currentList.get(safeIndex);
     }
 
+    private List<VodInfo.VodSeries> getPlayingSeriesList() {
+        if (mVodInfo == null || mVodInfo.seriesMap == null || TextUtils.isEmpty(mVodInfo.playFlag)) {
+            return Collections.emptyList();
+        }
+        List<VodInfo.VodSeries> list = mVodInfo.seriesMap.get(mVodInfo.playFlag);
+        return list == null ? Collections.emptyList() : list;
+    }
+
+    private int clampIndex(int index, List<?> list) {
+        if (list == null || list.isEmpty()) return 0;
+        return Math.max(0, Math.min(index, list.size() - 1));
+    }
+
     private int findSameEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList, int fallbackIndex) {
         if (targetList == null || targetList.isEmpty()) {
             return 0;
@@ -1949,9 +1956,11 @@ public class PlayFragment extends BaseLazyFragment {
     public void setPlayTitle(boolean show)
     {
         if(show){
-            String playTitleInfo= "";
-            if(mVodInfo!=null){
-                playTitleInfo = mVodInfo.name + " " + mVodInfo.seriesMap.get(mVodInfo.playFlag).get(mVodInfo.playIndex).name;
+            String playTitleInfo = "";
+            if (mVodInfo != null) {
+                List<VodInfo.VodSeries> list = getPlayingSeriesList();
+                VodInfo.VodSeries vs = list.isEmpty() ? null : list.get(clampIndex(mVodInfo.playIndex, list));
+                playTitleInfo = mVodInfo.name + (vs == null ? "" : " " + vs.name);
             }
             mController.setTitle(playTitleInfo);
         }else {
@@ -1968,7 +1977,13 @@ public class PlayFragment extends BaseLazyFragment {
         audioPlayback = false;
         playArtwork = "";
         exitingPreview = false;
-        VodInfo.VodSeries vs = mVodInfo.seriesMap.get(mVodInfo.playFlag).get(mVodInfo.playIndex);
+        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        if (playList.isEmpty()) {
+            setTip("当前线路无可播放内容", false, true);
+            switchingPlayback = false;
+            return;
+        }
+        VodInfo.VodSeries vs = playList.get(clampIndex(mVodInfo.playIndex, playList));
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_REFRESH, mVodInfo));
         if (reusePlayer) {
             mPlayLoadTip.setVisibility(View.GONE);
@@ -2376,10 +2391,12 @@ public class PlayFragment extends BaseLazyFragment {
                     HashMap<String, String> headerMap = getHeaders(jsonObject);
                     if (headerMap != null) {
                         for (String key : headerMap.keySet()) {
+                            String headerValue = headerMap.get(key);
+                            if (headerValue == null) continue;
                             if (key.equalsIgnoreCase("user-agent")) {
-                                webUserAgent = headerMap.get(key).trim();
+                                webUserAgent = headerValue.trim();
                             } else {
-                                reqHeaders.put(key, headerMap.get(key));
+                                reqHeaders.put(key, headerValue);
                             }
                         }
                         if(reqHeaders.size()>0)webHeaderMap = reqHeaders;
