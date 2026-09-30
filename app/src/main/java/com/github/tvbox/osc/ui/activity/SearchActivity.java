@@ -7,6 +7,10 @@ import android.content.Intent;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+
+import android.os.Handler;
+import android.os.Looper;
+
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -777,6 +781,9 @@ public class SearchActivity extends BaseActivity {
     private final List<Movie.Video> pendingResultBuffer = new ArrayList<>();
     private boolean flushScheduled = false;
     private static final long RESULT_FLUSH_DELAY_MS = 200;
+    // 用主线程 Handler 管理延时提交，便于在重新搜索时统一取消（View.postDelayed 无 removeCallbacksAndMessages API）
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
 
     private final AtomicInteger totalSearchCount = new AtomicInteger(0);
     private String currentSearchToken = "";
@@ -801,7 +808,7 @@ public class SearchActivity extends BaseActivity {
         } finally {
             pendingResultBuffer.clear();
             flushScheduled = false;
-            if (mGridView != null) mGridView.removeCallbacksAndMessages(null);
+            mainHandler.removeCallbacksAndMessages(null);
             searchAdapter.setNewData(new ArrayList<>());
             allRunCount.set(0);
             pendingSearchKeys.clear();
@@ -873,7 +880,7 @@ public class SearchActivity extends BaseActivity {
         pendingResultBuffer.addAll(data);
         if (flushScheduled) return;
         flushScheduled = true;
-        mGridView.postDelayed(new Runnable() {
+        mainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
                 flushScheduled = false;
