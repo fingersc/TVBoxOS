@@ -20,6 +20,11 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 public class OkHttp {
 
     private static final long TIMEOUT = TimeUnit.SECONDS.toMillis(30);
@@ -46,6 +51,41 @@ public class OkHttp {
 
     public static OkHttpClient client(long timeout) {
         return client().newBuilder().connectTimeout(timeout, TimeUnit.MILLISECONDS).readTimeout(timeout, TimeUnit.MILLISECONDS).writeTimeout(timeout, TimeUnit.MILLISECONDS).build();
+    }
+
+    /**
+     * 封面/图片专用 client：
+     * 1) 缩短超时 —— 死链快速失败，不长期占用连接槽；
+     * 2) DNS 结果按 IPv4 优先排序 —— 规避"设备解析到 IPv6 但 IPv6 不通盲等 20s"。
+     * 仅用于图片加载，不影响播放/解析链路。
+     */
+    public static OkHttpClient imageClient() {
+        return client().newBuilder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(8, TimeUnit.SECONDS)
+                .dns(ipv4FirstDns())
+                .build();
+    }
+
+    private static Dns ipv4FirstDns() {
+        return hostname -> {
+            List<InetAddress> list = dns().lookup(hostname);
+            if (list == null || list.size() < 2) return list;
+            List<InetAddress> sorted = new ArrayList<>(list);
+            // IPv4 排前：Android 下 InetAddress 无好用的类型判断，用 hostAddress 含 ':' 判定 IPv6
+            Collections.sort(sorted, (a, b) -> {
+                int ra = isIpv6(a) ? 1 : 0;
+                int rb = isIpv6(b) ? 1 : 0;
+                return ra - rb;
+            });
+            return sorted;
+        };
+    }
+
+    private static boolean isIpv6(InetAddress addr) {
+        String host = addr == null ? "" : addr.getHostAddress();
+        return host != null && host.contains(":");
     }
 
     public static OkHttpClient noRedirect() {

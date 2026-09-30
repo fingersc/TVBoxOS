@@ -16,7 +16,8 @@ import java.io.InputStream;
 public class OkHttpAppGlideModule extends AppGlideModule {
     @Override
     public void registerComponents(@NonNull Context context, @NonNull Glide glide, @NonNull Registry registry) {
-        registry.replace(GlideUrl.class, InputStream.class, new OkHttpUrlLoader.Factory(com.github.catvod.net.OkHttp.client()));
+        registry.replace(GlideUrl.class, InputStream.class,
+                new OkHttpUrlLoader.Factory(com.github.catvod.net.OkHttp.imageClient()));
     }
 
     @Override

@@ -771,6 +771,13 @@ public class SearchActivity extends BaseActivity {
     private final Set<String> startedSearchKeys = Collections.synchronizedSet(new HashSet<String>());
     private final Set<String> releasedSearchKeys = Collections.synchronizedSet(new HashSet<String>());
     private final AtomicInteger searchTokenSeq = new AtomicInteger(0);
+
+    // 聚合搜索：把短时间内的多次源结果合并为一次列表提交，避免 RecyclerView 高频重排
+    // 导致封面请求被反复取消、同一张失败图被反复重试
+    private final List<Movie.Video> pendingResultBuffer = new ArrayList<>();
+    private boolean flushScheduled = false;
+    private static final long RESULT_FLUSH_DELAY_MS = 200;
+
     private final AtomicInteger totalSearchCount = new AtomicInteger(0);
     private String currentSearchToken = "";
     private boolean searchPaused = false;
@@ -792,6 +799,9 @@ public class SearchActivity extends BaseActivity {
         } catch (Throwable th) {
             th.printStackTrace();
         } finally {
+            pendingResultBuffer.clear();
+            flushScheduled = false;
+            if (mGridView != null) mGridView.removeCallbacksAndMessages(null);
             searchAdapter.setNewData(new ArrayList<>());
             allRunCount.set(0);
             pendingSearchKeys.clear();
@@ -858,13 +868,25 @@ public class SearchActivity extends BaseActivity {
 
     private void addSearchResults(List<Movie.Video> data) {
         if (data == null || data.isEmpty()) return;
-        if (searchAdapter.getData().size() > 0) {
-            searchAdapter.addData(data);
-        } else {
-            showSuccess();
-            mGridView.setVisibility(View.VISIBLE);
-            searchAdapter.setNewData(data);
-        }
+        showSuccess();
+        mGridView.setVisibility(View.VISIBLE);
+        pendingResultBuffer.addAll(data);
+        if (flushScheduled) return;
+        flushScheduled = true;
+        mGridView.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                flushScheduled = false;
+                if (pendingResultBuffer.isEmpty()) return;
+                List<Movie.Video> batch = new ArrayList<>(pendingResultBuffer);
+                pendingResultBuffer.clear();
+                if (searchAdapter.getData().isEmpty()) {
+                    searchAdapter.setNewData(batch);
+                } else {
+                    searchAdapter.addData(batch);
+                }
+            }
+        }, RESULT_FLUSH_DELAY_MS);
     }
 
     private void searchData(AbsXml absXml) {
