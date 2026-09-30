@@ -994,18 +994,41 @@ public class DetailActivity extends BaseActivity {
                             vodInfo.playFlag = (String) vodInfo.seriesMap.keySet().toArray()[0];
 
                         // 跨源换源：不同源的集数列表顺序/集数不一致，用历史记住的集数名重新映射到当前源
+                        // === echo-diag: 重定位前 ===
+                        LOG.i("echo-diag BEFORE: src=" + sourceKey + " vodId=" + vodId
+                                + " record=" + (vodInfoRecord == null ? "null" : (vodInfoRecord.sourceKey + "/" + vodInfoRecord.id))
+                                + " sameNameRestored=" + sameNameRestored
+                                + " recIndex=" + (vodInfoRecord == null ? -1 : vodInfoRecord.playIndex)
+                                + " recFlag=" + (vodInfoRecord == null ? "" : vodInfoRecord.playFlag)
+                                + " recNote=" + (vodInfoRecord == null ? "" : vodInfoRecord.playNote)
+                                + " flags=" + (vodInfo.seriesMap == null ? "null" : vodInfo.seriesMap.keySet().toString()));
                         if (sameNameRestored && !TextUtils.isEmpty(vodInfo.playNote)) {
                             String flagBeforeRemap = vodInfo.playFlag;
+                            int remapFallback = vodInfo.playIndex;
                             int mapped = remapPlayIndexFromNote(vodInfo.playNote, vodInfo.playIndex);
+                            LOG.i("echo-diag REMAP: note=" + vodInfo.playNote + " fallbackIdx=" + remapFallback
+                                    + " mapped=" + mapped + " flagBefore=" + flagBeforeRemap + " flagAfter=" + vodInfo.playFlag);
                             if (mapped >= 0) {
                                 vodInfo.playIndex = mapped;
                             } else {
-                                // 未匹配到：恢复原线路，避免半途被改写
                                 vodInfo.playFlag = flagBeforeRemap;
                             }
+                        } else {
+                            LOG.i("echo-diag REMAP SKIPPED: sameNameRestored=" + sameNameRestored
+                                    + " note=" + vodInfo.playNote + " playIndex=" + vodInfo.playIndex);
                         }
 
+                        int beforeRestore = vodInfo.playIndex;
+                        String flagBeforeRestore = vodInfo.playFlag;
+                        LOG.i("echo-diag RESTORE-IN: fbEpisode="
+                                + (detailFallbackEpisode == null ? "null" : detailFallbackEpisode.name)
+                                + " fbIndex=" + detailFallbackEpisodeIndex
+                                + " snapshotValid=" + fallbackFromValid
+                                + " snapshotName=" + fallbackFromName
+                                + " index=" + vodInfo.playIndex + " flag=" + vodInfo.playFlag);
                         restoreDetailFallbackEpisode();
+                        LOG.i("echo-diag RESTORE-OUT: " + flagBeforeRestore + "#" + beforeRestore
+                                + " -> " + vodInfo.playFlag + "#" + vodInfo.playIndex);
                         resetDetailFallback();
 
                         // 线路回退：remapPlayIndexFromNote 可能改写 playFlag、或该线路列表为 null，
@@ -1037,6 +1060,10 @@ public class DetailActivity extends BaseActivity {
                         // 与当前线路长度未必匹配，迁移前必须重新钳位
                         vodInfo.playIndex = clampIndex(vodInfo.playIndex, playingSeriesList);
                         VodInfo.VodSeries currentEpisode = playingSeriesList.get(vodInfo.playIndex);
+                        
+                        LOG.i("echo-diag FINAL: flag=" + vodInfo.playFlag + " index=" + vodInfo.playIndex
+                                + " episode=" + (currentEpisode == null ? "null" : currentEpisode.name)
+                                + " playlistSize=" + playingSeriesList.size());
 
                         // 迁移一致性守卫：定位到的集与期望集（同名记录的 playNote / 快照集名）集数号不一致时，
                         // 说明定位可能错位（如"特别篇"导致整体后移），宁可不迁移，也不能把时间盖到错误的集上
