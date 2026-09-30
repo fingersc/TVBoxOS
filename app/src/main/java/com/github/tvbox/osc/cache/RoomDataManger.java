@@ -120,6 +120,44 @@ public class RoomDataManger {
         return null;
     }
     
+       /** 查询本源某影片记录的更新时间；无记录返回 0。 */
+    public static long getVodRecordUpdateTime(String sourceKey, String vodId) {
+        VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodId);
+        return record == null ? 0 : record.updateTime;
+    }
+
+    /**
+     * 在同名（其他源）历史记录里找「比 newerThan 更新」的一条。
+     * getAll 已按 updateTime desc 排序，遇到不比 newerThan 新的可直接终止。
+     * 用于：本源有旧记录、但其他源刚看过同一部片时，以最新者为准。
+     */
+    public static VodInfo getVodInfoBySameNameNewerThan(String sourceKey, String vodId, String name, long newerThan) {
+        if (TextUtils.isEmpty(name)) return null;
+        String trimName = name.trim();
+        VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+        List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+        if (all == null) return null;
+        for (VodRecord record : all) {
+            if (record == null
+                    || (TextUtils.equals(sourceKey, record.sourceKey) && TextUtils.equals(vodId, record.vodId))) {
+                continue;
+            }
+            if (record.updateTime <= newerThan) {
+                return null; // 已排序，后面只会更旧
+            }
+            try {
+                if (record.dataJson == null || TextUtils.isEmpty(record.dataJson)) continue;
+                VodInfo info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {}.getType());
+                if (info != null && info.name != null && TextUtils.equals(trimName, info.name.trim())) {
+                    info.sourceKey = record.sourceKey;
+                    info.id = record.vodId;
+                    return info;
+                }
+            } catch (Exception ignored) { }
+        }
+        return null;
+    }
+
     public static void deleteVodRecord(String sourceKey, VodInfo vodInfo) {
         PlayProgressManager.deleteByVod(sourceKey, vodInfo.id);
         VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodInfo.id);

@@ -951,13 +951,23 @@ public class DetailActivity extends BaseActivity {
                         mEmptyPlayList.setVisibility(View.GONE);
 
                         VodInfo vodInfoRecord = RoomDataManger.getVodInfo(sourceKey, vodId);
-                        // 读取历史记录；当前源没有本片历史时，换源场景尝试从其他同名称源的历史里带拥有播放位置
                         boolean sameNameRestored = false;
-                        if (vodInfoRecord == null) {
+                        if (vodInfoRecord != null) {
+                            // 本源有记录时，若其他源的同名记录更新，则以最新者为准（与"以最新播放时长为准"一致）
+                            long curUpdate = RoomDataManger.getVodRecordUpdateTime(sourceKey, vodId);
+                            VodInfo newerSameName = RoomDataManger.getVodInfoBySameNameNewerThan(sourceKey, vodId, vodInfo.name, curUpdate);
+                            if (newerSameName == null && !TextUtils.isEmpty(vod_name)
+                                    && !TextUtils.equals(vod_name.trim(), vodInfo.name == null ? "" : vodInfo.name.trim())) {
+                                newerSameName = RoomDataManger.getVodInfoBySameNameNewerThan(sourceKey, vodId, vod_name, curUpdate);
+                            }
+                            if (newerSameName != null) {
+                                vodInfoRecord = newerSameName;
+                                sameNameRestored = true;   // 触发按内容重映射，防止下标错位
+                            }
+                        } else {
                             vodInfoRecord = RoomDataManger.getVodInfoBySameName(sourceKey, vodId, vodInfo.name);
                             if (vodInfoRecord == null && !TextUtils.isEmpty(vod_name)
                                     && !TextUtils.equals(vod_name.trim(), vodInfo.name == null ? "" : vodInfo.name.trim())) {
-                                // 新源详情名与搜索结果名不一致（如"航海王"vs"海贼王"）时，用搜索名再找一次
                                 vodInfoRecord = RoomDataManger.getVodInfoBySameName(sourceKey, vodId, vod_name);
                             }
                             sameNameRestored = (vodInfoRecord != null);
@@ -1028,15 +1038,29 @@ public class DetailActivity extends BaseActivity {
                         vodInfo.playIndex = clampIndex(vodInfo.playIndex, playingSeriesList);
                         VodInfo.VodSeries currentEpisode = playingSeriesList.get(vodInfo.playIndex);
 
+                        // 迁移一致性守卫：定位到的集与期望集（同名记录的 playNote / 快照集名）集数号不一致时，
+                        // 说明定位可能错位（如"特别篇"导致整体后移），宁可不迁移，也不能把时间盖到错误的集上
+                        String expectedName = sameNameRestored && vodInfoRecord != null ? vodInfoRecord.playNote
+                                : (fallbackFromValid ? fallbackFromName : "");
+                        int expectedNum = TextUtils.isEmpty(expectedName) ? -1 : extractEpisodeNumber(expectedName);
+                        int actualNum = TextUtils.isEmpty(currentEpisode.name) ? -1 : extractEpisodeNumber(currentEpisode.name);
+                        boolean positionTrusted = expectedNum < 0 || actualNum < 0 || expectedNum == actualNum;
+
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
-                            migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                    currentEpisode.name, vodInfoRecord);
+                            if (positionTrusted) {
+                                migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
+                                        currentEpisode.name, vodInfoRecord);
+                            } else {
+                                LOG.i("echo-migrate skip: expect ep" + expectedNum + " but landed ep" + actualNum + ", avoid stamping wrong episode");
+                            }
                         } else if (fallbackFromValid) {
-                            // 同名记录没找到（片名跨源不一致等）：用切源前快照兜底迁移时间。
-                            // 集数恢复已由 restoreDetailFallbackEpisode() 按实际播放集完成。
-                            migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                    currentEpisode.name, null);
+                            if (positionTrusted) {
+                                migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
+                                        currentEpisode.name, null);
+                            } else {
+                                LOG.i("echo-migrate skip(snapshot): expect ep" + expectedNum + " but landed ep" + actualNum);
+                            }
                         }
                         
                         int flagScrollTo = 0;
@@ -1376,12 +1400,20 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void restoreDetailFallbackEpisode() {
-        if (detailFallbackEpisode == null || detailFallbackEpisodeIndex < 0 || vodInfo == null || vodInfo.seriesMap == null) {
+        VodInfo.VodSeries fallback = detailFallbackEpisode;
+        int fallbackIndex = detailFallbackEpisodeIndex;
+        if (fallback == null && fallbackFromValid) {
+            // 各切换入口都会留 live 快照；用它合成兜底集，保证任何入口都按内容重定位
+            fallback = new VodInfo.VodSeries();
+            fallback.name = fallbackFromName;
+            fallbackIndex = fallbackFromIndex;
+        }
+        if (fallback == null || fallbackIndex < 0 || vodInfo == null || vodInfo.seriesMap == null) {
             return;
         }
         String preferredFlag = vodInfo.playFlag;
         List<VodInfo.VodSeries> preferredList = vodInfo.seriesMap.get(preferredFlag);
-        int matchedIndex = findMatchingEpisodeIndex(detailFallbackEpisode, preferredList);
+        int matchedIndex = findMatchingEpisodeIndex(fallback, preferredList);
         if (matchedIndex >= 0) {
             vodInfo.playIndex = matchedIndex;
             return;
@@ -1392,7 +1424,7 @@ public class DetailActivity extends BaseActivity {
                     continue;
                 }
                 List<VodInfo.VodSeries> seriesList = vodInfo.seriesMap.get(seriesFlag.name);
-                matchedIndex = findMatchingEpisodeIndex(detailFallbackEpisode, seriesList);
+                matchedIndex = findMatchingEpisodeIndex(fallback, seriesList);
                 if (matchedIndex >= 0) {
                     vodInfo.playFlag = seriesFlag.name;
                     vodInfo.playIndex = matchedIndex;
@@ -1405,7 +1437,7 @@ public class DetailActivity extends BaseActivity {
                 continue;
             }
             List<VodInfo.VodSeries> seriesList = vodInfo.seriesMap.get(flag);
-            matchedIndex = findMatchingEpisodeIndex(detailFallbackEpisode, seriesList);
+            matchedIndex = findMatchingEpisodeIndex(fallback, seriesList);
             if (matchedIndex >= 0) {
                 vodInfo.playFlag = flag;
                 vodInfo.playIndex = matchedIndex;
@@ -1413,7 +1445,7 @@ public class DetailActivity extends BaseActivity {
             }
         }
         if (preferredList != null && !preferredList.isEmpty()) {
-            vodInfo.playIndex = Math.max(0, Math.min(detailFallbackEpisodeIndex, preferredList.size() - 1));
+            vodInfo.playIndex = nearestEpisodeIndex(fallback, fallbackIndex, preferredList);
         }
     }
 
@@ -2085,6 +2117,32 @@ public class DetailActivity extends BaseActivity {
         return matchedIndex;
     }
 
+    /**
+     * 重定位最终兜底：能提取集数号时，取"集数号最接近"的条目（差值相同取靠前的），
+     * 避免列表前部有"特别篇"等额外条目导致整体后移时，裸下标指向错误的集；
+     * 无法提取集数号时才退回钳位后的原始下标。
+     */
+    private int nearestEpisodeIndex(VodInfo.VodSeries target, int fallbackIndex, List<VodInfo.VodSeries> list) {
+        if (list == null || list.isEmpty()) return 0;
+        int clamped = Math.max(0, Math.min(fallbackIndex, list.size() - 1));
+        if (target == null || TextUtils.isEmpty(target.name)) return clamped;
+        int targetNum = extractEpisodeNumber(target.name);
+        if (targetNum < 0) return clamped;
+        int bestIndex = -1, bestDiff = Integer.MAX_VALUE;
+        for (int i = 0; i < list.size(); i++) {
+            VodInfo.VodSeries s = list.get(i);
+            if (s == null || TextUtils.isEmpty(s.name)) continue;
+            int n = extractEpisodeNumber(s.name);
+            if (n < 0) continue;
+            int diff = Math.abs(n - targetNum);
+            if (diff < bestDiff) { bestDiff = diff; bestIndex = i; }
+        }
+        if (bestIndex >= 0 && bestDiff > 0) {
+            LOG.i("echo-remap nearest: ep" + targetNum + " -> index " + bestIndex + " (diff=" + bestDiff + ")");
+        }
+        return bestIndex >= 0 ? bestIndex : clamped;
+    }
+
     private int getEpisodeMatchScore(String currentName, int currentEpisode, String targetName) {
         if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(targetName)) {
             return 0;
@@ -2290,6 +2348,28 @@ public class DetailActivity extends BaseActivity {
                 }
             }
         }
+        // 各线路精确匹配都失败时，按集数号就近兜底，避免调用方退回裸下标错位
+        int targetNum = extractEpisodeNumber(episodeNote);
+        if (targetNum >= 0) {
+            int bestFlagPos = -1, bestIndex = -1, bestDiff = Integer.MAX_VALUE;
+            for (int pos = 0; pos < flagOrder.size(); pos++) {
+                List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(flagOrder.get(pos));
+                if (list == null || list.isEmpty() || list.size() == 1) continue;
+                for (int i = 0; i < list.size(); i++) {
+                    VodInfo.VodSeries s = list.get(i);
+                    if (s == null || TextUtils.isEmpty(s.name)) continue;
+                    int n = extractEpisodeNumber(s.name);
+                    if (n < 0) continue;
+                    int diff = Math.abs(n - targetNum);
+                    if (diff < bestDiff) { bestDiff = diff; bestIndex = i; bestFlagPos = pos; }
+                }
+            }
+            if (bestIndex >= 0) {
+                vodInfo.playFlag = flagOrder.get(bestFlagPos);
+                LOG.i("echo-remap nearest: note=" + episodeNote + " -> " + vodInfo.playFlag + "#" + bestIndex + " diff=" + bestDiff);
+                return bestIndex;
+            }
+        }
         return -1;
     }
 
@@ -2301,6 +2381,10 @@ public class DetailActivity extends BaseActivity {
         t = t.replaceAll("\\b(hd|hdr|uhd|4k|2160p|1080p|720p|480p|2k|bluray|remux)\\b", "")
              .replaceAll("国语|粤语|普语|原声|配音|无声|无字幕|中字|字幕|台词|高清|蓝光", "");
         t = t.replaceAll("[\\s._\\-]+", "").trim();
+        // 特殊集统一归一化：跨源"特別篇/特别篇/SP/OVA/剧场版"可互认
+        if (t.matches(".*(特别篇|特別篇|特别编|剧场版|劇場版|番外|ova|oad|special|sp\\d*).*")) {
+            return "sp";
+        }
         return t;
     }
     
