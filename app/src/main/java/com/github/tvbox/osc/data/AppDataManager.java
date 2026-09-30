@@ -116,6 +116,8 @@ public class AppDataManager {
                         "`sourceKey` TEXT NOT NULL, `vodId` TEXT NOT NULL, `flag` TEXT NOT NULL, " +
                         "`playIndex` INTEGER NOT NULL, `epName` TEXT NOT NULL, `position` INTEGER NOT NULL, " +
                         "`updateTime` INTEGER NOT NULL, PRIMARY KEY(`sourceKey`, `vodId`, `flag`, `playIndex`, `epName`))");
+                // 一次性清掉历史遗留的 MD5 行：进度已改走新表；字幕路径缓存会按需自动重建
+                database.execSQL("DELETE FROM cache");
             } catch (SQLiteException e) {
                 e.printStackTrace();
             }

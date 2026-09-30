@@ -259,8 +259,9 @@ public class PlayFragment extends BaseLazyFragment {
         try {
             if (mVideoView == null) return;
             long pos = mVideoView.getCurrentPosition();
-            if (pos > 0 && !TextUtils.isEmpty(progressKey)) {
-                CacheManager.save(MD5.string2MD5(progressKey), pos);
+            if (pos <= 0) return;
+            if (!TextUtils.isEmpty(pkVodId)) {
+                PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, pos);
             }
         } catch (Throwable th) {
             th.printStackTrace();

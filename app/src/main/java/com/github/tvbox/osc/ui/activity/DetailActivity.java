@@ -987,6 +987,11 @@ public class DetailActivity extends BaseActivity {
                         List<VodInfo.VodSeries> playingSeriesList = vodInfo.seriesMap.get(vodInfo.playFlag);
                         vodInfo.playIndex = Math.max(0, Math.min(vodInfo.playIndex, playingSeriesList.size() - 1));
 
+                        // 切源前先把实时播放位置落盘，否则迁移读到的是滞后值/0
+                        if (playFragment != null) playFragment.saveCurrentProgressNow();
+                        syncActualPlayingIntoVodInfo();
+                        captureLivePlaybackSnapshot();
+
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
                             migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
@@ -1300,14 +1305,11 @@ public class DetailActivity extends BaseActivity {
                     || TextUtils.isEmpty(playingInfo.playFlag)) {
                 return;
             }
-            String oldKey = sourceKey + vodId + playingInfo.playFlag + playingInfo.playIndex + oldSeries.name;
-            String newKey = sourceKey + vodId + newFlag + newIndex + newSeries.name;
-            //if (readCachedLong(newKey) > 0) {
-            //    return; // 新版本已有进度记忆，不覆盖
-            //}
-            long t = readCachedLong(oldKey);
+            String oldSourceKey = TextUtils.isEmpty(playingInfo.sourceKey) ? sourceKey : playingInfo.sourceKey;
+            String oldVodId = TextUtils.isEmpty(playingInfo.id) ? vodId : playingInfo.id;
+            long t = PlayProgressManager.get(oldSourceKey, oldVodId, playingInfo.playFlag, playingInfo.playIndex, oldSeries.name);
             if (t > 0) {
-                CacheManager.save(MD5.string2MD5(newKey), t);
+                PlayProgressManager.save(sourceKey, vodId, newFlag, newIndex, newSeries.name, t);
                 LOG.i("echo-migrate play time same content: " + oldSeries.name + " -> " + newSeries.name + " time=" + t);
             }
         } catch (Throwable th) {
@@ -2152,15 +2154,11 @@ public class DetailActivity extends BaseActivity {
             if (TextUtils.equals(oldFlag, newFlag) && oldIndex == newIndex && TextUtils.equals(oldName, newName)) {
                 return;
             }
-            String newKey = sourceKey + vodId + newFlag + newIndex + newName;
-            if (readCachedLong(newKey) > 0) {
-                return; // 新线路这一集已有进度记忆，不覆盖
-            }
-            String oldKey = sourceKey + vodId + oldFlag + oldIndex + oldName;
-            long t = readCachedLong(oldKey);
+            long newVal = PlayProgressManager.get(sourceKey, vodId, newFlag, newIndex, newName);
+            long t = PlayProgressManager.get(sourceKey, vodId, oldFlag, oldIndex, oldName);
             if (t > 0) {
-                CacheManager.save(MD5.string2MD5(newKey), t);
-                LOG.i("echo-migrate play time across flags: " + oldFlag + " -> " + newFlag + " ep=" + newName + " time=" + t);
+                PlayProgressManager.save(sourceKey, vodId, newFlag, newIndex, newName, t);
+                LOG.i("echo-migrate play time across flags: " + oldFlag + " -> " + newFlag + " ep=" + newName + " time=" + t + " overwritten=" + newVal);
             }
         } catch (Throwable th) {
             th.printStackTrace();
