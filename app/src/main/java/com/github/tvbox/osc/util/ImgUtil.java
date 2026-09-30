@@ -243,7 +243,6 @@ public class ImgUtil {
         clearCache();
         try {
             Glide.get(App.getInstance()).clearMemory();
-            LOG.i("echo-img-clear-memory-cache");
         } catch (Throwable th) {
             LOG.i("echo-img-clear-memory-cache-error:" + th.getMessage());
         }

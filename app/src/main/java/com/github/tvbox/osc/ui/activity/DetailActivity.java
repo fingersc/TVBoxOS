@@ -1230,7 +1230,6 @@ public class DetailActivity extends BaseActivity {
         if (loadDetailFallbackCache()) {
             return true;
         }
-        LOG.i("echo-detail fallback " + (manual ? "manual" : "after lines exhausted") + ": " + vod_name);
         startDetailFallback();
         return detailFallbackActive;
     }
@@ -1265,7 +1264,6 @@ public class DetailActivity extends BaseActivity {
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
         detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
-        LOG.i("echo-detail fallback search: " + detailFallbackTitle + ", sources=" + detailFallbackSourceOrder.size());
         scheduleDetailFallbackSearch();
     }
     
@@ -1527,7 +1525,6 @@ public class DetailActivity extends BaseActivity {
         }
         if (!detailFallbackLoadingCandidate && !detailFallbackCandidates.isEmpty()
                 && (!detailFallbackSearchTimedOut || detailFallbackDetailTimedOut)) {
-            LOG.i("echo-detail fallback candidates: " + detailFallbackCandidates.size());
             loadNextDetailFallbackSource();
         }
         if (!detailFallbackLoadingCandidate) {
@@ -1550,7 +1547,6 @@ public class DetailActivity extends BaseActivity {
             detailFallbackSearching = false;
             llLayout.removeCallbacks(detailFallbackTimeout);
             stopDetailFallbackSearchExecutor();
-            LOG.i("echo-detail fallback candidates: " + detailFallbackCandidates.size());
             loadNextDetailFallbackSource();
             return;
         }
@@ -1582,13 +1578,11 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         detailFallbackSearchTimeoutScheduled = false;
-        LOG.i("echo-detail fallback search timeout: " + detailFallbackBatchToken);
         // Keep the current 20 searches alive so late results can be used by the next fallback source.
         detailFallbackSearching = false;
         detailFallbackSearchTimedOut = true;
         detailFallbackNextSourceIndex = detailFallbackSourceOrder.size();
         if (!detailFallbackLoadingCandidate) {
-            LOG.i("echo-detail fallback candidates: " + detailFallbackCandidates.size());
             if (!detailFallbackCandidates.isEmpty()) {
                 loadNextDetailFallbackSource();
             } else {
@@ -1604,7 +1598,6 @@ public class DetailActivity extends BaseActivity {
             if (isDetailFallbackSourceUsed(video.sourceKey) || !detailFallbackTriedKeys.add(candidateKey)) {
                 continue;
             }
-            LOG.i("echo-detail fallback source: " + video.sourceKey + ", id=" + video.id);
             detailFallbackLoadingCandidate = true;
             detailFallbackDetailTimedOut = false;
             addDetailFallbackUsedSource(video.sourceKey);
@@ -1656,7 +1649,6 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackActive || !detailFallbackLoadingCandidate) {
             return;
         }
-        LOG.i("echo-detail fallback detail timeout: " + sourceKey);
         detailFallbackLoadingCandidate = false;
         detailFallbackDetailTimedOut = true;
         OkGo.getInstance().cancelTag("detail");
@@ -1689,7 +1681,6 @@ public class DetailActivity extends BaseActivity {
         detailFallbackActive = true;
         detailFallbackLoadingCandidate = false;
         detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
-        LOG.i("echo-detail fallback cache: " + detailFallbackTitle + ", candidates=" + detailFallbackCandidates.size());
         loadNextDetailFallbackSource();
         return true;
     }
