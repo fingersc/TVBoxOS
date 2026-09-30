@@ -1002,6 +1002,7 @@ public class DetailActivity extends BaseActivity {
                                 + " recFlag=" + (vodInfoRecord == null ? "" : vodInfoRecord.playFlag)
                                 + " recNote=" + (vodInfoRecord == null ? "" : vodInfoRecord.playNote)
                                 + " flags=" + (vodInfo.seriesMap == null ? "null" : vodInfo.seriesMap.keySet().toString()));
+                        boolean positionResolvedByContent = false;
                         if (sameNameRestored && !TextUtils.isEmpty(vodInfo.playNote)) {
                             String flagBeforeRemap = vodInfo.playFlag;
                             int remapFallback = vodInfo.playIndex;
@@ -1010,6 +1011,7 @@ public class DetailActivity extends BaseActivity {
                                     + " mapped=" + mapped + " flagBefore=" + flagBeforeRemap + " flagAfter=" + vodInfo.playFlag);
                             if (mapped >= 0) {
                                 vodInfo.playIndex = mapped;
+                                positionResolvedByContent = true;
                             } else {
                                 vodInfo.playFlag = flagBeforeRemap;
                             }
@@ -1026,9 +1028,13 @@ public class DetailActivity extends BaseActivity {
                                 + " snapshotValid=" + fallbackFromValid
                                 + " snapshotName=" + fallbackFromName
                                 + " index=" + vodInfo.playIndex + " flag=" + vodInfo.playFlag);
-                        restoreDetailFallbackEpisode();
-                        LOG.i("echo-diag RESTORE-OUT: " + flagBeforeRestore + "#" + beforeRestore
-                                + " -> " + vodInfo.playFlag + "#" + vodInfo.playIndex);
+                        if (!positionResolvedByContent) {
+                            // remap 未给出内容级结果时，才用兜底集重定位；
+                            // 否则会把 remap 算对的精确下标覆盖成"就近/裸下标"结果
+                            restoreDetailFallbackEpisode();
+                        } else {
+                            LOG.i("echo-diag RESTORE-BYPASS: remap already resolved, skip fallback restore");
+                        }
                         resetDetailFallback();
 
                         // 线路回退：remapPlayIndexFromNote 可能改写 playFlag、或该线路列表为 null，
@@ -1060,7 +1066,7 @@ public class DetailActivity extends BaseActivity {
                         // 与当前线路长度未必匹配，迁移前必须重新钳位
                         vodInfo.playIndex = clampIndex(vodInfo.playIndex, playingSeriesList);
                         VodInfo.VodSeries currentEpisode = playingSeriesList.get(vodInfo.playIndex);
-                        
+
                         LOG.i("echo-diag FINAL: flag=" + vodInfo.playFlag + " index=" + vodInfo.playIndex
                                 + " episode=" + (currentEpisode == null ? "null" : currentEpisode.name)
                                 + " playlistSize=" + playingSeriesList.size());
@@ -1322,24 +1328,74 @@ public class DetailActivity extends BaseActivity {
     /**
      * 预览模式下把实际播放位置回写详情页 vodInfo，
      * 保证后续 insertVod 存的集数记忆与用户实际看到的一致。
+     *
+     * 注意：切源时 previewVodInfo 仍是【旧源】对象，其 playFlag/playIndex 是旧源的语义。
+     * 只有当旧源的线路在新源里确实存在、且该线路下"下标对应同一集"时才能采纳，
+     * 否则会把新源刚按内容重定位好的下标覆盖错（如新源前部多了特别篇）。
      */
     private void syncActualPlayingIntoVodInfo() {
         VodInfo actual = showPreview ? previewVodInfo : null;
         if (actual == null || vodInfo == null || actual == vodInfo) {
             return;
         }
+        if (vodInfo.seriesMap == null || vodInfo.seriesMap.isEmpty()) {
+            return;
+        }
+        // 判断是否为跨源同步：actual 的影片标识与当前 vodInfo 不一致 → 下标语义不同，不可直接搬
+        boolean crossSource = !TextUtils.isEmpty(actual.sourceKey)
+                && !TextUtils.isEmpty(vodInfo.sourceKey)
+                && !TextUtils.equals(actual.sourceKey, vodInfo.sourceKey);
+
         // 只同步「确实有效」的线路：actual.playFlag 必须在 vodInfo.seriesMap 里能取到非空列表
-        if (!TextUtils.isEmpty(actual.playFlag)
-                && vodInfo.seriesMap != null
-                && vodInfo.seriesMap.containsKey(actual.playFlag)) {
+        boolean flagSynced = false;
+        if (!TextUtils.isEmpty(actual.playFlag) && vodInfo.seriesMap.containsKey(actual.playFlag)) {
             List<VodInfo.VodSeries> target = vodInfo.seriesMap.get(actual.playFlag);
             if (target != null && !target.isEmpty()) {
                 vodInfo.playFlag = actual.playFlag;
+                flagSynced = true;
             }
         }
-        if (actual.playIndex >= 0) {
-            vodInfo.playIndex = actual.playIndex;
+
+        if (actual.playIndex < 0) {
+            return;
         }
+
+        if (!crossSource) {
+            // 同源：直接同步即可（播放器切集/自动连播只更新 previewVodInfo）
+            vodInfo.playIndex = actual.playIndex;
+            return;
+        }
+
+        // 跨源：必须做「内容一致性」校验后才能采纳下标
+        if (!flagSynced) {
+            // 旧源线路在新源不存在，下标毫无参考价值，采纳必然错位
+            LOG.i("echo-sync skip(cross, no flag): actual=" + actual.playFlag
+                    + "#" + actual.playIndex + " keep=" + vodInfo.playFlag + "#" + vodInfo.playIndex);
+            return;
+        }
+        String actualName = getSeriesNameSafely(actual, actual.playFlag, actual.playIndex);
+        String targetName = getSeriesNameSafely(vodInfo, vodInfo.playFlag, actual.playIndex);
+        int actualNum = TextUtils.isEmpty(actualName) ? -1 : extractEpisodeNumber(actualName);
+        int targetNum = TextUtils.isEmpty(targetName) ? -1 : extractEpisodeNumber(targetName);
+        if (actualNum >= 0 && targetNum >= 0 && actualNum != targetNum) {
+            // 下标同名不同集 → 说明两源集序不一致，不能用下标搬
+            LOG.i("echo-sync skip(cross, mismatch): actual=" + actualName
+                    + " vs target=" + targetName + " keep=" + vodInfo.playIndex);
+            return;
+        }
+        vodInfo.playIndex = actual.playIndex;
+    }
+
+    private String getSeriesNameSafely(VodInfo info, String flag, int index) {
+        if (info == null || info.seriesMap == null || TextUtils.isEmpty(flag) || index < 0) {
+            return "";
+        }
+        List<VodInfo.VodSeries> list = info.seriesMap.get(flag);
+        if (list == null || index >= list.size()) {
+            return "";
+        }
+        VodInfo.VodSeries s = list.get(index);
+        return s == null || s.name == null ? "" : s.name;
     }
     
     /**
@@ -2362,6 +2418,8 @@ public class DetailActivity extends BaseActivity {
             int idx = findMatchingEpisodeIndex(probe, list);
             if (idx >= 0) {
                 vodInfo.playFlag = flag;
+                LOG.i("echo-remap exact: note=" + episodeNote + " -> " + flag + "#" + idx
+                        + " name=" + (list.get(idx) == null ? "null" : list.get(idx).name));
                 return idx;
             }
             // 集数名/集数号都匹配不到时，用归一化标签就近匹配
@@ -2370,6 +2428,8 @@ public class DetailActivity extends BaseActivity {
                     VodInfo.VodSeries s = list.get(i);
                     if (s != null && base.equals(normalizeSeriesLabel(s.name))) {
                         vodInfo.playFlag = flag;
+                        LOG.i("echo-remap label: note=" + episodeNote + " base=" + base
+                                + " -> " + flag + "#" + i + " name=" + s.name);
                         return i;
                     }
                 }
