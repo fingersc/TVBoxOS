@@ -1229,7 +1229,6 @@ public class DetailActivity extends BaseActivity {
         detailFallbackTitle = vod_name.trim();
         // 每一轮切源都重新开始“已用源”记录：清掉历史轮次累积的记录，只把当前正在播放的源标记为已用。  
         // 不清会让 Set 只增不减，最终所有源都被判定“已用”→ 候选为空 → 点击静默无响应。  
-        detailFallbackUsedSourceKeys.remove(detailFallbackTitle);
         addDetailFallbackUsedSource(sourceKey);
         // 预热：把该片名的历史缓存候选先塞进待试队列（加速本轮切源）。  
         // 注意：不再据此 return —— 必须继续执行 startDetailFallback() 发起全网搜索。  
