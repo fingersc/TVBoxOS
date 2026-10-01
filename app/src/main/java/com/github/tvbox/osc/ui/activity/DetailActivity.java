@@ -1641,7 +1641,9 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void showDetailFallbackEmptyIfNeeded() {
-        if (!detailFallbackKeepCurrentDetail) {
+        boolean keepCurrentDetail = detailFallbackKeepCurrentDetail;
+        resetDetailFallback();
+        if (!keepCurrentDetail) {
             showDetailEmpty();
         } else {
             showSuccess();
