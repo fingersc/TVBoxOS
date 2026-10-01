@@ -87,6 +87,7 @@ import android.graphics.Paint;
 import com.github.tvbox.osc.cache.PlayProgressManager;
 
 import java.util.Collections;
+import java.util.Comparator;
 
 /**
  * @author pj567
@@ -101,6 +102,16 @@ public class DetailActivity extends BaseActivity {
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
     private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000L;
     private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = 6000L;
+    // ===== 方案A：探路请求 =====
+    private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
+    private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = 2500L;
+    // ===== 方案B：按源超时（替代 8s 全局超时）=====
+    private static final long DETAIL_FALLBACK_SOURCE_TIMEOUT_MS = 3500L;
+    // ===== 方案D：缓存持久化 =====
+    private static final String HAWK_FALLBACK_CACHE_PREFIX = "fb_cache_";
+    private static final long FALLBACK_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
+    // ===== 方案E：站点命中率统计 =====
+    private static final String HAWK_FALLBACK_STAT_PREFIX = "fb_stat_";
     private LinearLayout llLayout;
     private FragmentContainerView llPlayerFragmentContainer;
     private View llPlayerFragmentContainerBlock;
@@ -1236,7 +1247,6 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(vod_name)) {
             return false;
         }
-        detailFallbackExcludedSourceKey = sourceKey;
         detailFallbackTitle = vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
             return false;
@@ -1297,7 +1307,6 @@ public class DetailActivity extends BaseActivity {
 
         detailFallbackLoadingCandidate = true;
         detailFallbackDetailTimedOut = false;
-        addDetailFallbackUsedSource(nextSource);
         Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource);
         if (video != null) {
             vod_name = video.name == null ? "" : video.name;
@@ -1341,12 +1350,19 @@ public class DetailActivity extends BaseActivity {
                 continue;
             }
             String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            // 圈内已轮转过 → 跳过；全局已试过 → 跳过（避免重复加载同一个详情）
-            if (detailFallbackCycleKeys.contains(candidateKey) || detailFallbackTriedKeys.contains(candidateKey)) {
+            // 圈内已轮转过 → 跳过（本圈不重复）
+            if (detailFallbackCycleKeys.contains(candidateKey)) {
+                continue;
+            }
+            // 确认不可用 → 永久跳过
+            if (detailFallbackDeadKeys.contains(candidateKey)) {
+                continue;
+            }
+            // 软失败（超时/网络错误）：本圈内跳过，但开新圈时允许重试
+            if (detailFallbackSoftTriedKeys.contains(candidateKey) && !detailFallbackNewCycle) {
                 continue;
             }
             detailFallbackCycleKeys.add(candidateKey);
-            detailFallbackTriedKeys.add(candidateKey);
             return video.sourceKey;
         }
         return "";
@@ -1384,6 +1400,10 @@ public class DetailActivity extends BaseActivity {
      * 供后续点击切源时零网络地轮转。
      */
     private void startDetailFallback() {
+        // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
+        restoreDetailFallbackCache(detailFallbackTitle);
+        // 方案A：先朝历史命中率最高的站点单独打一枪，命中即刻切，不等整批
+        startDetailFallbackProbe();
         detailFallbackTitle = vod_name == null ? "" : vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
             showDetailEmpty();
@@ -1660,9 +1680,22 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void onDetailFallbackSearchResult(AbsXml data) {
-        if (!detailFallbackActive || !detailFallbackSearchCollecting || data == null || !detailFallbackBatchToken.equals(data.searchToken)) {
+        if (data == null) {
             return;
         }
+        // ===== 方案A：探路结果单独处理（与批次互不干扰）=====
+        if (detailFallbackProbePending && !TextUtils.isEmpty(detailFallbackProbeToken)
+                && detailFallbackProbeToken.equals(data.searchToken)) {
+            handleDetailFallbackProbeResult(data);
+            return;
+        }
+        if (!detailFallbackActive || !detailFallbackSearchCollecting || !detailFallbackBatchToken.equals(data.searchToken)) {
+            return;
+        }
+        // 方案E：批次里每个源返回，记录命中/失败统计（耗时从本批发出时刻起算）
+        recordFallbackStat(data.sourceKey,
+                data.movie != null && data.movie.videoList != null && !data.movie.videoList.isEmpty(),
+                detailFallbackBatchStartMs > 0 ? System.currentTimeMillis() - detailFallbackBatchStartMs : 0L);
         detailFallbackPendingSources.remove(data.sourceKey);
         if (data.movie != null && data.movie.videoList != null) {
             for (Movie.Video video : data.movie.videoList) {
@@ -1702,25 +1735,32 @@ public class DetailActivity extends BaseActivity {
         stopDetailFallbackSearchExecutor();
         detailFallbackSearchExecutor = Executors.newFixedThreadPool(DETAIL_FALLBACK_MAX_SEARCH);
         detailFallbackBatchToken = detailFallbackToken + "_batch_" + (++detailFallbackBatchIndex);
+        detailFallbackBatchStartMs = System.currentTimeMillis();
         int batchEnd = Math.min(detailFallbackNextSourceIndex + DETAIL_FALLBACK_MAX_SEARCH, detailFallbackSourceOrder.size());
+        // 方案E：本批按「历史命中率降序」发，让更可能命中的源先回来
+        List<String> batchKeys = new ArrayList<>();
         while (detailFallbackNextSourceIndex < batchEnd) {
-            final String searchKey = detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++);
+            batchKeys.add(detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++));
+        }
+        sortSourcesByHitRate(batchKeys);
+        for (final String searchKey : batchKeys) {
             final String searchTitle = detailFallbackTitle;
             final String searchToken = detailFallbackBatchToken;
             detailFallbackPendingSources.add(searchKey);
+            // 方案B：每个源各挂一个超时，卡死的站点不再拖累整批
+            scheduleDetailFallbackSourceTimeout(searchKey, searchToken);
             detailFallbackSearchExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
+                    long startMs = System.currentTimeMillis();
                     sourceViewModel.getDetailFallbackSearch(searchKey, searchTitle, searchToken);
                 }
             });
         }
         if (!detailFallbackSearchTimeoutScheduled) {
             detailFallbackSearchTimeoutScheduled = true;
-            llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);          
+            llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
         }
-        // 首次搜索期间不抢跳：本轮搜索的职责是建立完整缓存，
-        // 跳转交给 loadNextDetailFallbackSource() 在收集结束时统一决定。
     }
 
     private void finishDetailFallbackSearchOnTimeout() {
@@ -1753,7 +1793,6 @@ public class DetailActivity extends BaseActivity {
                 Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource);
                 detailFallbackLoadingCandidate = true;
                 detailFallbackDetailTimedOut = false;
-                addDetailFallbackUsedSource(nextSource);
                 if (video != null) {
                     vod_name = video.name == null ? "" : video.name;
                     vod_picture = video.pic == null ? "" : video.pic;
@@ -1813,12 +1852,253 @@ public class DetailActivity extends BaseActivity {
         }
         detailFallbackLoadingCandidate = false;
         detailFallbackDetailTimedOut = true;
+        // 方案C：详情超时只是网络抖动，记为「软失败」——本圈跳过，下圈可重试，
+        // 绝不写进 deadKeys 永久拉黑（这是「越切越少」的根因之一）。
+        detailFallbackSoftTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
         OkGo.getInstance().cancelTag("detail");
         loadNextDetailFallbackSource();
     }
 
     private String getDetailFallbackKey(String key, String id) {
         return (key == null ? "" : key) + "|" + (id == null ? "" : id);
+    }
+
+
+    // ==================== 方案A：探路请求 ====================
+
+    /**
+     * 探路：朝「历史命中率最高」的站点单独打一枪搜索。
+     * 与 20 个一组的批处理**并行**执行、互不干扰，谁先回来谁先切。
+     * 命中 → 立刻抢跳（门槛 1）；未命中 → 什么都不做，交给批处理兜底。
+     */
+    private void startDetailFallbackProbe() {
+        if (!detailFallbackActive) {
+            return;
+        }
+        String probeKey = pickBestProbeSource();
+        if (TextUtils.isEmpty(probeKey)) {
+            return;
+        }
+        detailFallbackProbeSourceKey = probeKey;
+        detailFallbackProbeToken = detailFallbackToken + "_probe_" + System.currentTimeMillis();
+        detailFallbackProbeStartMs = System.currentTimeMillis();
+        detailFallbackProbePending = true;
+        llLayout.removeCallbacks(detailFallbackProbeTimeout);
+        llLayout.postDelayed(detailFallbackProbeTimeout, DETAIL_FALLBACK_PROBE_TIMEOUT_MS);
+        final String title = detailFallbackTitle;
+        final String token = detailFallbackProbeToken;
+        OkGo.getInstance().cancelTag(DETAIL_FALLBACK_PROBE_TAG);
+        sourceViewModel.getDetailFallbackSearch(probeKey, title, token);
+    }
+
+    /** 探路结果：命中就抢跳，没命中就静默放弃（批处理会继续）。 */
+    private void handleDetailFallbackProbeResult(AbsXml data) {
+        detailFallbackProbePending = false;
+        llLayout.removeCallbacks(detailFallbackProbeTimeout);
+        boolean hit = false;
+        if (data.movie != null && data.movie.videoList != null) {
+            for (Movie.Video video : data.movie.videoList) {
+                if (video == null || TextUtils.isEmpty(video.id)
+                        || !detailFallbackTitle.equals(video.name == null ? "" : video.name.trim())) {
+                    continue;
+                }
+                cacheDetailFallbackCandidate(video);
+                hit = true;
+            }
+        }
+        recordFallbackStat(data.sourceKey, hit, System.currentTimeMillis() - detailFallbackProbeStartMs);
+        if (!hit) {
+            return;
+        }
+        // 探路命中 → 立即从缓存取最优候选切换（此时门槛=1 也安全，
+        // 因为批处理同时在跑，用户第二次点击必有货）
+        if (!detailFallbackLoadingCandidate) {
+            loadNextDetailFallbackSource();
+        }
+    }
+
+    /** 探路超时：放弃探路，批处理继续走，不打扰用户。 */
+    private void finishDetailFallbackProbeOnTimeout() {
+        if (!detailFallbackProbePending) {
+            return;
+        }
+        detailFallbackProbePending = false;
+        recordFallbackStat(detailFallbackProbeSourceKey, false,
+                System.currentTimeMillis() - detailFallbackProbeStartMs);
+    }
+
+    // ==================== 方案B：按源超时 ====================
+
+    /**
+     * 给单个源挂超时。到点若还没回来，就把它从 pending 里摘掉；
+     * pending 空了且当前无加载 → 立即推进（不必等 8 秒全局超时）。
+     */
+    private void scheduleDetailFallbackSourceTimeout(final String searchKey, final String searchToken) {
+        llLayout.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!detailFallbackActive || !detailFallbackSearching) {
+                    return;
+                }
+                if (!searchToken.equals(detailFallbackBatchToken)) {
+                    return;
+                }
+                // 该源仍未返回 → 认为是慢源，摘掉它
+                if (detailFallbackPendingSources.remove(searchKey)) {
+                    recordFallbackStat(searchKey, false, DETAIL_FALLBACK_SOURCE_TIMEOUT_MS);
+                    if (!detailFallbackLoadingCandidate) {
+                        if (detailFallbackPendingSources.isEmpty()) {
+                            scheduleDetailFallbackSearch();
+                        }
+                    }
+                }
+            }
+        }, DETAIL_FALLBACK_SOURCE_TIMEOUT_MS);
+    }
+
+    // ==================== 方案D：缓存持久化 ====================
+
+    /** 把候选池落盘到 Hawk，供下次进同一部片直接复用。 */
+    private void persistDetailFallbackCache(String title) {
+        title = title == null ? "" : title.trim();
+        List<Movie.Video> candidates = detailFallbackCache.get(title);
+        if (TextUtils.isEmpty(title) || candidates == null || candidates.isEmpty()) {
+            return;
+        }
+        List<String[]> slim = new ArrayList<>();
+        for (Movie.Video v : candidates) {
+            if (v != null && !TextUtils.isEmpty(v.id) && !TextUtils.isEmpty(v.sourceKey)) {
+                slim.add(new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name});
+            }
+        }
+        if (slim.isEmpty()) {
+            return;
+        }
+        try {
+            Hawk.put(HAWK_FALLBACK_CACHE_PREFIX + title,
+                    new FallbackCacheBox(slim, System.currentTimeMillis()));
+        } catch (Throwable th) {
+            LOG.e("persistDetailFallbackCache fail: " + th);
+        }
+    }
+
+    /** 从 Hawk 恢复候选池（带 24h TTL）。 */
+    private void restoreDetailFallbackCache(String title) {
+        title = title == null ? "" : title.trim();
+        if (TextUtils.isEmpty(title)) {
+            return;
+        }
+        try {
+            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + title);
+            if (box == null || box.entries == null || box.entries.isEmpty()) {
+                return;
+            }
+            if (System.currentTimeMillis() - box.savedAt > FALLBACK_CACHE_TTL_MS) {
+                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + title);
+                return;
+            }
+            for (String[] e : box.entries) {
+                if (e == null || e.length < 2 || TextUtils.isEmpty(e[0]) || TextUtils.isEmpty(e[1])) {
+                    continue;
+                }
+                Movie.Video v = new Movie.Video();
+                v.sourceKey = e[0];
+                v.id = e[1];
+                v.name = e.length > 2 && e[2] != null ? e[2] : title;
+                cacheDetailFallbackCandidate(v);
+            }
+        } catch (Throwable th) {
+            LOG.e("restoreDetailFallbackCache fail: " + th);
+        }
+    }
+
+    /** Hawk 里存的精简缓存（只留 sourceKey/id/name，避免序列化整个 Movie.Video）。 */
+    private static class FallbackCacheBox {
+        final List<String[]> entries;
+        final long savedAt;
+
+        FallbackCacheBox(List<String[]> entries, long savedAt) {
+            this.entries = entries;
+            this.savedAt = savedAt;
+        }
+    }
+
+    // ==================== 方案E：站点命中率统计 ====================
+
+    /** 记录某站点的命中/失败与耗时（Hawk，key = fb_stat_<sourceKey>）。 */
+    private void recordFallbackStat(String sourceKey, boolean hit, long elapsedMs) {
+        if (TextUtils.isEmpty(sourceKey)) {
+            return;
+        }
+        try {
+            String raw = Hawk.get(HAWK_FALLBACK_STAT_PREFIX + sourceKey, "0,0,0");
+            String[] parts = raw.split(",");
+            int hitCnt = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
+            int failCnt = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
+            long totalMs = parts.length > 2 ? Long.parseLong(parts[2]) : 0L;
+            if (hit) {
+                hitCnt++;
+            } else {
+                failCnt++;
+            }
+            totalMs += Math.max(0L, elapsedMs);
+            Hawk.put(HAWK_FALLBACK_STAT_PREFIX + sourceKey, hitCnt + "," + failCnt + "," + totalMs);
+        } catch (Throwable th) {
+            LOG.e("recordFallbackStat fail: " + th);
+        }
+    }
+
+    /** 站点评分：命中率（0~1）+ 速度奖励（越快越高）；无历史给中性分 0.5。 */
+    private double detailFallbackSourceScore(String sourceKey) {
+        try {
+            String raw = Hawk.get(HAWK_FALLBACK_STAT_PREFIX + sourceKey, "0,0,0");
+            String[] parts = raw.split(",");
+            int hitCnt = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
+            int failCnt = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
+            long totalMs = parts.length > 2 ? Long.parseLong(parts[2]) : 0L;
+            int total = hitCnt + failCnt;
+            if (total == 0) {
+                return 0.5;
+            }
+            double hitRate = (double) hitCnt / total;
+            double avgMs = totalMs > 0 ? (double) totalMs / total : 0;
+            double speedBonus = avgMs > 0 ? Math.min(0.3, 300.0 / avgMs) : 0;
+            return hitRate + speedBonus;
+        } catch (Throwable th) {
+            return 0.5;
+        }
+    }
+
+    /** 挑探路站点：历史分最高者。 */
+    private String pickBestProbeSource() {
+        String best = "";
+        double bestScore = -1;
+        for (String key : detailFallbackSourceOrder) {
+            SourceBean bean = ApiConfig.get().getSource(key);
+            if (bean == null || !bean.isChangeable()) {
+                continue;
+            }
+            double score = detailFallbackSourceScore(key);
+            if (score > bestScore) {
+                bestScore = score;
+                best = key;
+            }
+        }
+        return best;
+    }
+
+    /** 把一批源按键的分数降序重排（分数高的先发，先回来的概率更大）。 */
+    private void sortSourcesByHitRate(List<String> keys) {
+        try {
+            Collections.sort(keys, new Comparator<String>() {
+                @Override
+                public int compare(String a, String b) {
+                    return Double.compare(detailFallbackSourceScore(b), detailFallbackSourceScore(a));
+                }
+            });
+        } catch (Throwable th) {
+            LOG.e("sortSourcesByHitRate fail: " + th);
+        }
     }
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
@@ -1832,7 +2112,7 @@ public class DetailActivity extends BaseActivity {
             detailFallbackCache.put(title, cachedCandidates);
         }
         for (Movie.Video video : candidates) {
-            if (cachedCandidates.size() >= DETAIL_FALLBACK_MAX_SEARCH || video == null
+            if (video == null
                     || TextUtils.isEmpty(video.id) || !TextUtils.equals(title, video.name == null ? "" : video.name.trim())) {
                 continue;
             }
@@ -1865,23 +2145,6 @@ public class DetailActivity extends BaseActivity {
         cachedCandidates.add(video);
     }
 
-    private void addDetailFallbackUsedSource(String sourceKey) {
-        if (TextUtils.isEmpty(detailFallbackTitle) || TextUtils.isEmpty(sourceKey)) {
-            return;
-        }
-        Set<String> usedSources = detailFallbackUsedSourceKeys.get(detailFallbackTitle);
-        if (usedSources == null) {
-            usedSources = new HashSet<>();
-            detailFallbackUsedSourceKeys.put(detailFallbackTitle, usedSources);
-        }
-        usedSources.add(sourceKey);
-    }
-
-    private boolean isDetailFallbackSourceUsed(String sourceKey) {
-        Set<String> usedSources = detailFallbackUsedSourceKeys.get(detailFallbackTitle);
-        return usedSources != null && usedSources.contains(sourceKey);
-    }
-
     private void showDetailEmpty() {
         showEmpty();
         llPlayerFragmentContainer.setVisibility(View.GONE);
@@ -1901,9 +2164,15 @@ public class DetailActivity extends BaseActivity {
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "";
         detailFallbackBatchToken = "";
-        detailFallbackExcludedSourceKey = "";
+        // 方案D：复位前把候选池落盘，供下次进同一部片直接复用
+        persistDetailFallbackCache(detailFallbackTitle);
         detailFallbackSourceOrder.clear();
         detailFallbackPendingSources.clear();
+        // 方案A：清理探路状态
+        detailFallbackProbePending = false;
+        detailFallbackProbeSourceKey = "";
+        detailFallbackProbeToken = "";
+        llLayout.removeCallbacks(detailFallbackProbeTimeout);
         // 注意：这里不清 detailFallbackTriedKeys / detailFallbackCycleKeys / detailFallbackTitle，
         // 因为「一圈」跨越多轮点击；清掉会让候选池每轮重置回起点，导致只有两三个源来回循环。
         // TriedKeys / CycleKeys 由 startDetailFallback(boolean) 在换片名或开新圈时负责重置。
@@ -1915,6 +2184,13 @@ public class DetailActivity extends BaseActivity {
         }
         stopDetailFallbackSearchExecutor();
         OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+    }
+
+    /** 取消探路请求（tag 与批处理不同，需单独取消）。 */
+    private void cancelDetailFallbackProbe() {
+        detailFallbackProbePending = false;
+        llLayout.removeCallbacks(detailFallbackProbeTimeout);
+        OkGo.getInstance().cancelTag(DETAIL_FALLBACK_PROBE_TAG);
     }
 
     private void stopDetailFallbackSearchExecutor() {
@@ -1992,7 +2268,6 @@ public class DetailActivity extends BaseActivity {
     private ExecutorService detailFallbackSearchExecutor;
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     private final HashMap<String, List<Movie.Video>> detailFallbackCache = new HashMap<>();
-    private final HashMap<String, Set<String>> detailFallbackUsedSourceKeys = new HashMap<>();
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
     private final Set<String> detailFallbackTriedKeys = new HashSet<>();
     /**
@@ -2031,7 +2306,24 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackTitle = "";
     /** 当前 CycleKeys / TriedKeys 归属的片名；片名一变说明换剧了，圈记录必须重置。 */
     private String detailFallbackCycleTitle = "";
-    private String detailFallbackExcludedSourceKey = "";
+    // ===== 方案A：探路状态 =====
+    private String detailFallbackProbeSourceKey = "";
+    private String detailFallbackProbeToken = "";
+    private long detailFallbackProbeStartMs;
+    private boolean detailFallbackProbePending;
+    /** 本批搜索的发出时刻，用于统计每个源的响应耗时。 */
+    private long detailFallbackBatchStartMs;
+    private final Runnable detailFallbackProbeTimeout = new Runnable() {
+        @Override
+        public void run() {
+            finishDetailFallbackProbeOnTimeout();
+        }
+    };
+    // ===== 方案C：TriedKeys 分级 =====
+    /** 确认不可用（详情成功但无地址 / 明确空）：永久排除。 */
+    private final Set<String> detailFallbackDeadKeys = new HashSet<>();
+    /** 软失败（超时 / 网络错误）：只本圈跳过，下圈可重试。 */
+    private final Set<String> detailFallbackSoftTriedKeys = new HashSet<>();
     private final Runnable detailFallbackTimeout = new Runnable() {
         @Override
         public void run() {
