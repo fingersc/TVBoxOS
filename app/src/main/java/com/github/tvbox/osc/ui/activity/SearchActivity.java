@@ -46,6 +46,7 @@ import com.github.tvbox.osc.ui.tv.widget.SearchKeyboard;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
+import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
@@ -841,6 +842,9 @@ public class SearchActivity extends BaseActivity {
             }
             searchTasks.add(new SearchTask(bean.getKey(), searchTitle, currentSearchToken, isBlockingSearchSource(bean)));
         }
+        // 按源质量重排下发顺序：好源先搜、先出结果。
+        // 冷启动（无统计数据）时得分相同，稳定排序保持原始顺序，与改动前一致。
+        sortSearchTasksByQuality(searchTasks);
         if (searchTasks.size() <= 0) {
             Toast.makeText(mContext, "没有指定搜索源", Toast.LENGTH_SHORT).show();
             showEmpty();
@@ -916,6 +920,32 @@ public class SearchActivity extends BaseActivity {
             return copy;
         } catch (Throwable th) {
             return data;
+        }
+    }
+
+    /**
+     * 按源质量重排「搜索任务的下发顺序」——决定先搜哪个源，而不是先显示哪条结果。
+     *
+     * <p>好源先发 ⇒ 好源的结果先回来 ⇒ 用户更早看到能播的片子。
+     * 冷启动（无统计数据）时所有源得分相同，稳定排序保持仓库原始顺序。
+     */
+    private void sortSearchTasksByQuality(List<SearchTask> tasks) {
+        if (tasks == null || tasks.size() <= 1) {
+            return;
+        }
+        try {
+            Collections.sort(tasks, new Comparator<SearchTask>() {
+                @Override
+                public int compare(SearchTask a, SearchTask b) {
+                    String ka = a == null ? null : a.sourceKey;
+                    String kb = b == null ? null : b.sourceKey;
+                    double sa = TextUtils.isEmpty(ka) ? 0 : SourceQualityStore.searchScore(ka);
+                    double sb = TextUtils.isEmpty(kb) ? 0 : SourceQualityStore.searchScore(kb);
+                    return Double.compare(sb, sa);
+                }
+            });
+        } catch (Throwable th) {
+            LOG.e("sortSearchTasksByQuality fail: " + th);
         }
     }
 
