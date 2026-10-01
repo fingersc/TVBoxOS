@@ -4,6 +4,9 @@ import android.text.TextUtils;
 
 import com.orhanobut.hawk.Hawk;
 
+import java.util.HashMap;
+import java.util.List;
+
 /**
  * 源质量档案（公共类）。
  *
@@ -195,6 +198,80 @@ public class SourceQualityStore {
         } catch (Throwable th) {
             return NEUTRAL;
         }
+    }
+
+    // ==================== 批量快照 ====================
+
+    /**
+     * 一组源的质量分快照。
+     *
+     * <p><b>为什么要它</b>：排序比较器会被调用 O(n log n) 次，若在比较器里直接调
+     * {@link #score(String)} / {@link #searchScore(String)}，每次都会读一遍 Hawk，
+     * 100 个源会产生上千次读取（详情页同步执行时会明显卡顿）；而且排序过程中若有并发写入，
+     * 同一个源两次比较可能得到不同分数，违反 {@code Comparator} 传递性契约。
+     *
+     * <p><b>做法</b>：排序前先按源逐个读一次并缓存分数，之后的比较全部走内存。
+     * 读取次数从 O(n log n) 降到 O(n)，且比较结果在本次排序内恒定。
+     */
+    public static class Snapshot {
+
+        /** 仅供本类填充，外部勿直接修改。 */
+        private final HashMap<String, Double> scores;
+
+        private Snapshot(HashMap<String, Double> scores) {
+            this.scores = scores;
+        }
+
+        /** 取某源的分数；未收录（含空 key）时返回中性分。 */
+        public double get(String sourceKey) {
+            if (TextUtils.isEmpty(sourceKey)) {
+                return NEUTRAL;
+            }
+            Double v = scores.get(sourceKey);
+            return v == null ? NEUTRAL : v;
+        }
+
+        /** 本次快照里的源数量。 */
+        public int size() {
+            return scores.size();
+        }
+
+        /**
+         * 快照里是否「完全没有可参考的历史」。
+         *
+         * <p>冷启动（首次安装、尚无任何统计）时所有源都是中性分，
+         * 排序不会改变任何顺序，调用方可据此**跳过整个排序**，省下这轮开销。
+         */
+        public boolean isEmpty() {
+            return scores.isEmpty();
+        }
+    }
+
+    /**
+     * 为一批源建立分数快照（切源选站用）。
+     *
+     * @param sourceKeys 参与排序的源 key
+     */
+    public static Snapshot snapshot(List<String> sourceKeys) {
+        return buildSnapshot(sourceKeys, false);
+    }
+
+    /** 为一批源建立分数快照（搜索排序用）。 */
+    public static Snapshot snapshotForSearch(List<String> sourceKeys) {
+        return buildSnapshot(sourceKeys, true);
+    }
+
+    private static Snapshot buildSnapshot(List<String> sourceKeys, boolean forSearch) {
+        HashMap<String, Double> map = new HashMap<>();
+        if (sourceKeys != null) {
+            for (String key : sourceKeys) {
+                if (TextUtils.isEmpty(key) || map.containsKey(key)) {
+                    continue;
+                }
+                map.put(key, forSearch ? searchScore(key) : score(key));
+            }
+        }
+        return new Snapshot(map);
     }
 
     /** 平均响应耗时（毫秒），无数据返回 0。 */

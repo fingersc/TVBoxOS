@@ -907,14 +907,25 @@ public class SearchActivity extends BaseActivity {
 
     /** 按源质量分降序稳定排序（H1：不给聚合站加权；I1：全自动无用户开关）。 */
     private List<Movie.Video> sortBySourceQuality(List<Movie.Video> data) {
+        if (data == null || data.size() <= 1) {
+            return data;
+        }
         try {
             List<Movie.Video> copy = new ArrayList<>(data);
+            // ★ 先批量取分，比较器内不再读 Hawk（否则 O(n log n) 次读会卡列表）
+            SourceQualityStore.Snapshot snapshot =
+                    SourceQualityStore.snapshotForSearch(collectSourceKeys(copy));
+            if (snapshot.isEmpty()) {
+                // 冷启动：一条历史都没有，全是中性分，排序不会改变顺序 —— 直接跳过
+                return data;
+            }
+            final SourceQualityStore.Snapshot scores = snapshot;
             Collections.sort(copy, new Comparator<Movie.Video>() {
                 @Override
                 public int compare(Movie.Video a, Movie.Video b) {
-                    double sa = a == null ? 0 : SourceQualityStore.searchScore(a.sourceKey);
-                    double sb = b == null ? 0 : SourceQualityStore.searchScore(b.sourceKey);
-                    return Double.compare(sb, sa);
+                    String ka = a == null ? null : a.sourceKey;
+                    String kb = b == null ? null : b.sourceKey;
+                    return Double.compare(scores.get(kb), scores.get(ka));
                 }
             });
             return copy;
@@ -934,19 +945,39 @@ public class SearchActivity extends BaseActivity {
             return;
         }
         try {
+            // ★ 先批量取分，比较器内不再读 Hawk
+            List<String> keys = new ArrayList<>(tasks.size());
+            for (SearchTask task : tasks) {
+                if (task != null && !TextUtils.isEmpty(task.sourceKey)) {
+                    keys.add(task.sourceKey);
+                }
+            }
+            final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshotForSearch(keys);
+            if (snapshot.isEmpty()) {
+                return;   // 冷启动：无可参考历史，保持原下发顺序
+            }
             Collections.sort(tasks, new Comparator<SearchTask>() {
                 @Override
                 public int compare(SearchTask a, SearchTask b) {
                     String ka = a == null ? null : a.sourceKey;
                     String kb = b == null ? null : b.sourceKey;
-                    double sa = TextUtils.isEmpty(ka) ? 0 : SourceQualityStore.searchScore(ka);
-                    double sb = TextUtils.isEmpty(kb) ? 0 : SourceQualityStore.searchScore(kb);
-                    return Double.compare(sb, sa);
+                    return Double.compare(snapshot.get(kb), snapshot.get(ka));
                 }
             });
         } catch (Throwable th) {
             LOG.e("sortSearchTasksByQuality fail: " + th);
         }
+    }
+
+    /** 从视频列表里收集源 key（去重交给快照内部处理）。 */
+    private List<String> collectSourceKeys(List<Movie.Video> data) {
+        List<String> keys = new ArrayList<>(data.size());
+        for (Movie.Video video : data) {
+            if (video != null && !TextUtils.isEmpty(video.sourceKey)) {
+                keys.add(video.sourceKey);
+            }
+        }
+        return keys;
     }
 
     private void searchData(AbsXml absXml) {

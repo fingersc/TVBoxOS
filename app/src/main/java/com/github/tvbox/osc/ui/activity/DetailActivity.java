@@ -2173,11 +2173,21 @@ public class DetailActivity extends BaseActivity {
 
     /** 把一批源按键的分数降序重排（分数高的先发，先回来的概率更大）。 */
     private void sortSourcesByHitRate(List<String> keys) {
+        if (keys == null || keys.size() <= 1) {
+            return;
+        }
         try {
+            // ★ 先批量取一次分数：比较器内部严禁再读 Hawk。
+            // 排序比较次数是 O(n log n)，直接读 Hawk 会产生上千次读取（本方法在详情页
+            // 主线程同步执行，会明显卡顿）；且并发写入时比较结果会漂移，违反比较器契约。
+            final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshot(keys);
+            if (snapshot.isEmpty()) {
+                return;   // 冷启动：无可参考历史，保持原顺序
+            }
             Collections.sort(keys, new Comparator<String>() {
                 @Override
                 public int compare(String a, String b) {
-                    return Double.compare(detailFallbackSourceScore(b), detailFallbackSourceScore(a));
+                    return Double.compare(snapshot.get(b), snapshot.get(a));
                 }
             });
         } catch (Throwable th) {
