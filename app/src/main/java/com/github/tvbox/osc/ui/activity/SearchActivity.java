@@ -47,6 +47,7 @@ import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.SearchHelper;
+import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -67,6 +68,7 @@ import org.greenrobot.eventbus.ThreadMode;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -887,6 +889,9 @@ public class SearchActivity extends BaseActivity {
                 if (pendingResultBuffer.isEmpty()) return;
                 List<Movie.Video> batch = new ArrayList<>(pendingResultBuffer);
                 pendingResultBuffer.clear();
+                // 排序在 flush 时机统一做（每 200ms 一批），而不是每来一条就重排，
+                // 避免列表高频跳动、封面请求被反复取消。
+                batch = sortBySourceQuality(batch);
                 if (searchAdapter.getData().isEmpty()) {
                     searchAdapter.setNewData(batch);
                 } else {
@@ -894,6 +899,24 @@ public class SearchActivity extends BaseActivity {
                 }
             }
         }, RESULT_FLUSH_DELAY_MS);
+    }
+
+    /** 按源质量分降序稳定排序（H1：不给聚合站加权；I1：全自动无用户开关）。 */
+    private List<Movie.Video> sortBySourceQuality(List<Movie.Video> data) {
+        try {
+            List<Movie.Video> copy = new ArrayList<>(data);
+            Collections.sort(copy, new Comparator<Movie.Video>() {
+                @Override
+                public int compare(Movie.Video a, Movie.Video b) {
+                    double sa = a == null ? 0 : SourceQualityStore.searchScore(a.sourceKey);
+                    double sb = b == null ? 0 : SourceQualityStore.searchScore(b.sourceKey);
+                    return Double.compare(sb, sa);
+                }
+            });
+            return copy;
+        } catch (Throwable th) {
+            return data;
+        }
     }
 
     private void searchData(AbsXml absXml) {

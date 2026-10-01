@@ -81,6 +81,7 @@ import com.github.tvbox.osc.util.ImgUtil;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.PlayerHelper;
+import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
 import com.github.tvbox.osc.util.VideoParseRuler;
 import com.github.tvbox.osc.util.XWalkUtils;
@@ -333,6 +334,9 @@ public class PlayFragment extends BaseLazyFragment {
                 if (webPlayUrl != null && isStartedPlayState(playState)) {
                     markPlaybackStarted();
                     hideTipOnUiThread();
+                } else if (playState == VideoView.STATE_ERROR) {
+                    // 播放器层报错（解码失败 / 拉流中断），记为一次失败尝试
+                    recordPlaybackFailure("playerError");
                 }
                 if (switchingPlayback) {
                     if (playState == VideoView.STATE_PLAYBACK_COMPLETED) {
@@ -2080,6 +2084,8 @@ public class PlayFragment extends BaseLazyFragment {
             mController.showParse(false);
             return;
         }
+        // 播放画质数据采集：从这里开始计时（连接资源站 → 播放器出画面）
+        startPlayQualityTimer();
         sourceViewModel.getPlay(sourceKey, mVodInfo.playFlag, progressKey, vs.url, subtitleCacheKey);
     }
 
@@ -2280,6 +2286,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void pauseForHidden() {
         cancelPlayTimeout();
+        recordPlaybackFailure("hidden");
         stopParse();
         playbackStarted = false;
         if (mVideoView != null) {
@@ -2296,7 +2303,87 @@ public class PlayFragment extends BaseLazyFragment {
     void markPlaybackStarted() {
         playbackStarted = true;
         cancelPlayTimeout();
+        recordPlaybackReady("firstFrame");
     }
+
+    // ==================== 播放质量数据采集（第 1 阶段）====================
+    // 目的：为切源选站 / 聚合搜索排序提供「这个源起播快不快、稳不稳」的实测依据。
+    // 计时口径：从「向资源站发起解析请求」到「播放器真正出画面（PREPARED/BUFFERED/PLAYING）」。
+    // 中断影响：中途换线路/换集/暂停都会重置起点，避免把上一次的等待时间算到本次头上。
+
+    /** 本次播放请求的起点（毫秒时间戳），0 表示当前没有在计时。 */
+    private long playReqStartMs;
+    /** 本次播放请求对应的源 key（防止播放过程中 sourceKey 被切走导致记错账）。 */
+    private String playReqSourceKey;
+
+    /**
+     * 开始为「一次播放尝试」计时。
+     *
+     * <p>调用点：向资源站发起 getPlay 请求之前。若上一次尝试尚未结算（例如换线途中），
+     * 先按失败结算掉，保证每个源每次尝试都有且仅有一条记录。
+     */
+    void startPlayQualityTimer() {
+        settlePlayQualityIfPending(false, 0, "superseded");
+        playReqStartMs = System.currentTimeMillis();
+        playReqSourceKey = sourceKey;
+    }
+
+    /**
+     * 播放器出画面时调用：把本次尝试记为成功，并记录首帧耗时。
+     *
+     * @param reason 触发来源（仅用于排查，不影响计分）
+     */
+    void recordPlaybackReady(String reason) {
+        settlePlayQualityIfPending(true, 0, reason);
+    }
+
+    /**
+     * 播放失败/超时/取消时调用：把本次尝试记为失败。
+     *
+     * @param reason 失败原因（仅用于排查）
+     */
+    void recordPlaybackFailure(String reason) {
+        settlePlayQualityIfPending(false, 0, reason);
+    }
+
+    /**
+     * 结算本次播放尝试。
+     *
+     * <p>只有「有起点、有源 key」才记账；结算后立即清空起点，
+     * 因此重复调用（例如 PREPARED 后又收到 BUFFERED）不会重复计数。
+     *
+     * @param elapsedHint 调用方已知的耗时；<=0 时用当前时间减去起点
+     */
+    private void settlePlayQualityIfPending(boolean ok, long elapsedHint, String reason) {
+        try {
+            if (playReqStartMs <= 0) {
+                return;
+            }
+            String key = playReqSourceKey;
+            long cost = elapsedHint > 0 ? elapsedHint : (System.currentTimeMillis() - playReqStartMs);
+            playReqStartMs = 0;
+            playReqSourceKey = null;
+            if (TextUtils.isEmpty(key) || cost < 0) {
+                return;
+            }
+            // 明显不合理的耗时（比如被系统挂起数分钟）直接丢弃，避免污染均值
+            if (cost > PLAY_QUALITY_MAX_VALID_MS) {
+                LOG.i("[PQ] drop " + key + " cost=" + cost + "ms reason=" + reason);
+                return;
+            }
+            SourceQualityStore.recordPlay(key, ok, ok ? cost : 0);
+            if (ok) {
+                LOG.i("[PQ] ok " + key + " firstFrame=" + cost + "ms reason=" + reason);
+            } else {
+                LOG.i("[PQ] fail " + key + " cost=" + cost + "ms reason=" + reason);
+            }
+        } catch (Throwable th) {
+            LOG.e("[PQ] settle fail: " + th);
+        }
+    }
+
+    /** 超过这个耗时就认为不是正常的起播等待（例如应用被切到后台），不计入统计。 */
+    private static final long PLAY_QUALITY_MAX_VALID_MS = 120 * 1000L;
 
     boolean isPlaybackStarted() {
         if (playbackStarted) return true;
@@ -2315,6 +2402,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     void handleResolvePlayUrlTimeout() {
         LOG.i("echo-resolvePlayUrl timeout, try next line");
+        recordPlaybackFailure("resolveTimeout");
         if (sourceViewModel != null) sourceViewModel.cancelPlayRequest();
         stopParse();
         if (!tryNextLineIfEnabled()) {
@@ -2325,6 +2413,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     void handleResolvePlayUrlFailed(String err) {
         LOG.i("echo-resolvePlayUrl failed, try next line: " + err);
+        recordPlaybackFailure("resolveFailed");
         if (sourceViewModel != null) sourceViewModel.cancelPlayRequest();
         stopParse();
         if (tryNextLineIfEnabled()) return;

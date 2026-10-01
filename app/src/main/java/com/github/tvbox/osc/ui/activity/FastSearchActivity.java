@@ -34,6 +34,7 @@ import com.github.tvbox.osc.ui.adapter.SearchWordAdapter;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.SearchHelper;
+import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
 import com.owen.tvrecyclerview.widget.TvRecyclerView;
@@ -46,6 +47,7 @@ import org.greenrobot.eventbus.ThreadMode;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -713,14 +715,41 @@ public class FastSearchActivity extends BaseActivity {
         return threshold > 0 && total - allRunCount.get() >= threshold;
     }
 
+    /**
+     * 提交一批搜索结果到列表。
+     *
+     * <p>排序策略（H1 + I1：不加权聚合站、全自动无开关）：
+     * 结果按源质量分降序排列，同一个源内部保持其原始顺序（稳定排序）。
+     * 排序在「批次提交」时机统一做，而不是每来一条就重排，
+     * 避免列表高频跳动导致封面请求被反复取消。
+     */
     private void addMainSearchResults(List<Movie.Video> data) {
         if (data == null || data.isEmpty()) return;
+        List<Movie.Video> ordered = sortBySourceQuality(data);
         if (searchAdapter.getData().size() > 0) {
-            searchAdapter.addData(data);
+            searchAdapter.addData(ordered);
         } else {
             showSuccess();
             if (!isFilterMode) mGridView.setVisibility(View.VISIBLE);
-            searchAdapter.setNewData(data);
+            searchAdapter.setNewData(ordered);
+        }
+    }
+
+    /** 按源质量分降序稳定排序（同分保持原顺序，结果可预测）。 */
+    private List<Movie.Video> sortBySourceQuality(List<Movie.Video> data) {
+        try {
+            List<Movie.Video> copy = new ArrayList<>(data);
+            Collections.sort(copy, new Comparator<Movie.Video>() {
+                @Override
+                public int compare(Movie.Video a, Movie.Video b) {
+                    double sa = a == null ? 0 : SourceQualityStore.searchScore(a.sourceKey);
+                    double sb = b == null ? 0 : SourceQualityStore.searchScore(b.sourceKey);
+                    return Double.compare(sb, sa);
+                }
+            });
+            return copy;
+        } catch (Throwable th) {
+            return data;
         }
     }
 
