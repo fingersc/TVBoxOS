@@ -2286,7 +2286,12 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void pauseForHidden() {
         cancelPlayTimeout();
-        recordPlaybackFailure("hidden");
+        // 注意：这里【不能】记为播放失败。
+        // pauseForHidden 是「页面切走/预览收起」触发的，属于正常的中断，
+        // 把它计入 playFail 会污染 SourceQualityStore 的播放成功率，
+        // 进而让切源选站和搜索排序依据的数据越用越不准。
+        // 未结算的计时直接作废即可（不写任何统计）。
+        discardPlayQualityTimer();
         stopParse();
         playbackStarted = false;
         if (mVideoView != null) {
@@ -2344,6 +2349,17 @@ public class PlayFragment extends BaseLazyFragment {
      */
     void recordPlaybackFailure(String reason) {
         settlePlayQualityIfPending(false, 0, reason);
+    }
+
+    /**
+     * 丢弃本次计时，不产生任何统计记录。
+     *
+     * <p>用于「正常中断」场景（页面切走、预览收起、用户主动换集等）：
+     * 这些既不是成功也不是失败，记进任何一边都会污染统计。
+     */
+    void discardPlayQualityTimer() {
+        playReqStartMs = 0;
+        playReqSourceKey = null;
     }
 
     /**

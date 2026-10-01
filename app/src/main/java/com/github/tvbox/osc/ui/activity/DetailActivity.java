@@ -893,8 +893,20 @@ public class DetailActivity extends BaseActivity {
         sourceViewModel.detailResult.observe(this, new Observer<AbsXml>() {
             @Override
             public void onChanged(AbsXml absXml) {
-                if (detailFallbackActive && !detailFallbackLoadingCandidate) {
+                // ★ 只要这个响应匹配「当前页面正在等的那次详情请求」，就必须放行。
+                // 否则：首次进入详情页时若恰好在切源（detailFallbackActive=true），
+                // 正常返回的详情数据会被下面的守卫拦掉，showSuccess() 永不执行，
+                // 表现为「详情页一直 Loading 十几秒」。
+                boolean matchesCurrentRequest = absXml != null
+                        && !TextUtils.isEmpty(detailRequestKey)
+                        && TextUtils.equals(detailRequestKey, detailRequestKeyOf(absXml.sourceKey));
+                if (detailFallbackActive && !detailFallbackLoadingCandidate && !matchesCurrentRequest) {
                     return;
+                }
+                if (detailFallbackActive && !detailFallbackLoadingCandidate && matchesCurrentRequest) {
+                    // 当前页面要的数据回来了：切源属于后台行为，不该再遮蔽页面。
+                    LOG.i("[FB] detail arrived while fallback active, stop obscuring");
+                    resetDetailFallback();
                 }
                 if (absXml != null && !TextUtils.isEmpty(absXml.sourceKey)
                         && !TextUtils.equals(absXml.sourceKey, sourceKey)
@@ -1175,6 +1187,10 @@ public class DetailActivity extends BaseActivity {
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
             llLayout.postDelayed(detailFallbackDetailTimeout, DETAIL_FALLBACK_DETAIL_TIMEOUT_MS);
         }
+        // ★ 记录本次详情请求的目标，供 detailResult 观察者识别「这响应是不是当前页面要的」。
+        // 用途：首次进入详情页时若恰好在切源（detailFallbackActive=true），
+        // 老逻辑会把正常返回的详情数据一并拦掉，导致 showSuccess() 永不执行 → 一直卡 Loading。
+        detailRequestKey = detailRequestKeyOf(sourceKey);
         sourceViewModel.getDetail(sourceKey, vodId, fallback && detailFallbackActive);
         boolean isVodCollect = RoomDataManger.isVodCollect(sourceKey, vodId);
         if (isVodCollect) {
@@ -1380,6 +1396,18 @@ public class DetailActivity extends BaseActivity {
         return "";
     }
 
+    /**
+     * 生成详情请求标识，用于判断某个 detailResult 响应是否属于当前页面正在等的那次请求。
+     *
+     * <p>注意：{@link AbsXml} 只有 sourceKey 没有 vodId，所以这里以 sourceKey 为准；
+     * 这也与观察者中已有的 sourceKey 校验保持一致。
+     *
+     * @return 请求对应的 sourceKey；为空时返回 ""
+     */
+    private String detailRequestKeyOf(String sourceKey) {
+        return sourceKey == null ? "" : sourceKey;
+    }
+
     private String detailFallbackCacheId(String title, String sourceKey) {
         List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
         if (cachedCandidates == null) {
@@ -1460,7 +1488,28 @@ public class DetailActivity extends BaseActivity {
         // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
         // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
         startDetailFallbackProbe();
-        showLoading();
+        // ★ 切源是「后台行为」，绝不能把用户当前画面整个遮住。
+        // 旧逻辑这里调 showLoading() 盖全屏，导致：切源候选一个个失败时，
+        // 用户只能盯着一个 Loading 十几秒（实测 16 次轮转、44 秒）。
+        // 现在改为只显示轻量提示，页面内容保持可见；真正切成功后由
+        // detailResult 观察者统一隐藏提示。
+        showDetailFallbackTip();
+    }
+
+    /**
+     * 切源期间显示轻量提示，不遮蔽页面内容。
+     *
+     * <p>与 {@code showLoading()} 的区别：后者会用 LoadSir 的全屏 Loading 盖住整个页面
+     * （包括正在播放的播放器），切源候选频繁失败时表现为「一直卡 Loading」。
+     */
+    private void showDetailFallbackTip() {
+        try {
+            if (!isFinishing() && !isDestroyed()) {
+                Toast.makeText(this, "正在切换片源…", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Throwable th) {
+            LOG.e("showDetailFallbackTip fail: " + th);
+        }
     }
 
     /**
@@ -1884,11 +1933,7 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         detailFallbackSearchCollecting = false;
-        if (detailFallbackSearcher != null) {
-            detailFallbackSearcher.shutdown();
-            detailFallbackSearcher = null;
-        }
-        OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+        stopDetailFallbackSearcher(true);
         LOG.i("[FB] searchCollectionDone poolSize=" + detailFallbackUsableCandidateCount() + " loading=" + detailFallbackLoadingCandidate);
         if (detailFallbackLoadingCandidate) {
             return;
@@ -2292,15 +2337,38 @@ public class DetailActivity extends BaseActivity {
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
         }
-        if (!keepCache) {
-            // 只有「彻底复位」才掐断批处理；切源成功后的收尾必须让它继续跑完，
-            // 否则候选池永远只有第一个源 —— 这正是「一直切回同一站点」的根因。
-            OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
-            cancelDetailFallbackProbe();
-            if (detailFallbackSearcher != null) {
-                detailFallbackSearcher.shutdown();
-                detailFallbackSearcher = null;
-            }
+        // ★ 「保留数据」与「保留调度器」必须分开：
+        //   - 数据（detailFallbackCache / CycleKeys / TriedKeys）跨轮复用 → 永远保留；
+        //   - MultiSourceSearcher 是「本轮搜索任务」的执行体，一旦本轮状态机复位，
+        //     它就必须一起停。否则它会继续回调 onSourceFinished → 再次拉起
+        //     loadNextDetailFallbackSource()，形成「切源成功 → 又切下一个 → 又成功」
+        //     的失控轮转（实测点一次连切 16 个源、44 秒卡 Loading）。这就是根因。
+        // 之前把「保留调度器」当作「保留缓存」的手段，是因为担心 cancelTag 会清空候选池；
+        // 实际上候选池存在 detailFallbackCache 里，与 OkGo tag / searcher 生命周期无关。
+        stopDetailFallbackSearcher(keepCache);
+    }
+
+    /**
+     * 停止本轮全网搜索的调度器与在途请求。
+     *
+     * @param keepDispatchMs true = 保留派发耗时表（切源成功收尾，后续统计还要用）
+     *                       false = 一并清空（彻底复位）
+     */
+    private void stopDetailFallbackSearcher(boolean keepDispatchMs) {
+        // ★ 顺序很重要：必须先让调度器"死掉"（清 currentToken + 断回调），再 cancelTag。
+        // cancelTag 是异步取消，取消后会回调 onError → onDetailFallbackSearchResult
+        // → detailFallbackSearcher.finish()；此时若调度器还活着，finish() 会走
+        // callback.onSourceFinished() → onDetailFallbackSourceSettled()
+        // → 拉起 loadNextDetailFallbackSource()，在收尾途中又切一次源。
+        // MultiSourceSearcher.shutdown() 会把 currentToken 置空，
+        // 使之后所有 finish() 在 isCurrentToken 校验处直接返回 false，回调链彻底断开。
+        if (detailFallbackSearcher != null) {
+            detailFallbackSearcher.shutdown();
+            detailFallbackSearcher = null;
+        }
+        OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+        cancelDetailFallbackProbe();
+        if (!keepDispatchMs) {
             detailFallbackDispatchMs.clear();
         }
     }
@@ -2409,6 +2477,13 @@ public class DetailActivity extends BaseActivity {
     private boolean detailFallbackSearchTimeoutScheduled;
     private boolean detailFallbackKeepCurrentDetail;
     private boolean detailFallbackLoadingCandidate;
+    /**
+     * 当前页面正在等待的那次详情请求的源标识。
+     *
+     * <p>用于让 detailResult 观察者分辨「这个响应是不是当前页面要的」：
+     * 若是，则无论切源是否在进行，都必须放行并关闭 Loading。
+     */
+    private String detailRequestKey = "";
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
     private int detailFallbackNextSourceIndex;
