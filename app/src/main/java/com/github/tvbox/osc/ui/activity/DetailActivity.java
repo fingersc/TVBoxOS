@@ -1302,6 +1302,8 @@ public class DetailActivity extends BaseActivity {
 
         // 缓存轮转：直接从缓存里按圈取下一个，零网络开销
         String nextSource = pollNextCycledSource();
+        LOG.i("[FB] pollFromCache picked=" + nextSource + " poolSize=" + detailFallbackUsableCandidateCount()
+                + " cycleKeys=" + detailFallbackCycleKeys.size() + " newCycle=" + detailFallbackNewCycle);
         if (TextUtils.isEmpty(nextSource)) {
             // 一圈内确实没有可切的源了（所有源都试过且都失败），提示并结束
             if (detailFallbackKeepCurrentDetail && mVideo != null && vodInfo != null) {
@@ -1356,7 +1358,7 @@ public class DetailActivity extends BaseActivity {
                 continue;
             }
             SourceBean source = ApiConfig.get().getSource(video.sourceKey);
-            if (source == null || !source.isChangeable()) {
+            if (source == null || !source.isSearchable()) {
                 continue;
             }
             String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
@@ -1421,8 +1423,11 @@ public class DetailActivity extends BaseActivity {
 
         detailFallbackSourceOrder.clear();
         for (SourceBean bean : ApiConfig.get().getSourceBeanList()) {
-            // 一圈 = 包括当前源在内全部轮转：这里不再排除当前源，也不再按「已用」过滤
-            if (bean.isSearchable() && bean.isChangeable()) {
+            // 与搜索页（FastSearchActivity/SearchActivity）保持一致的筛选条件：
+            // 只要求 isSearchable。此前多加了 isChangeable，导致「可搜但不可换」的源
+            // 被排除，切源池比搜索结果的源少。
+            // 一圈 = 包括当前源在内全部轮转：不排除当前源，也不按「已用」过滤。
+            if (bean.isSearchable()) {
                 detailFallbackSourceOrder.add(bean.getKey());
             }
         }
@@ -1445,6 +1450,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackBatchIndex = 0;
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
+        LOG.i("[FB] startSearch title=" + detailFallbackTitle + " sources=" + detailFallbackSourceOrder.size() + " token=" + detailFallbackToken);
         scheduleDetailFallbackSearch();
         // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
         // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
@@ -1755,6 +1761,7 @@ public class DetailActivity extends BaseActivity {
             batchKeys.add(detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++));
         }
         sortSourcesByHitRate(batchKeys);
+        LOG.i("[FB] sendBatch token=" + detailFallbackBatchToken + " keys=" + batchKeys);
         for (final String searchKey : batchKeys) {
             final String searchTitle = detailFallbackTitle;
             final String searchToken = detailFallbackBatchToken;
@@ -1833,6 +1840,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackSearchCollecting = false;
         stopDetailFallbackSearchExecutor();
         OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+        LOG.i("[FB] searchCollectionDone poolSize=" + detailFallbackUsableCandidateCount() + " loading=" + detailFallbackLoadingCandidate);
         if (detailFallbackLoadingCandidate) {
             return;
         }
@@ -1895,6 +1903,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackProbeToken = detailFallbackToken + "_probe_" + System.currentTimeMillis();
         detailFallbackProbeStartMs = System.currentTimeMillis();
         detailFallbackProbePending = true;
+        LOG.i("[FB] probeStart source=" + probeKey + " title=" + detailFallbackTitle + " token=" + detailFallbackProbeToken);
         llLayout.removeCallbacks(detailFallbackProbeTimeout);
         llLayout.postDelayed(detailFallbackProbeTimeout, DETAIL_FALLBACK_PROBE_TIMEOUT_MS);
         final String title = detailFallbackTitle;
@@ -1919,6 +1928,7 @@ public class DetailActivity extends BaseActivity {
             }
         }
         recordFallbackStat(data.sourceKey, hit, System.currentTimeMillis() - detailFallbackProbeStartMs);
+        LOG.i("[FB] probeResult source=" + data.sourceKey + " hit=" + hit + " cost=" + (System.currentTimeMillis() - detailFallbackProbeStartMs) + "ms poolSize=" + detailFallbackUsableCandidateCount());
         if (!hit) {
             return;
         }
@@ -1946,7 +1956,7 @@ public class DetailActivity extends BaseActivity {
                 continue;
             }
             SourceBean source = ApiConfig.get().getSource(video.sourceKey);
-            if (source == null || !source.isChangeable()) {
+            if (source == null || !source.isSearchable()) {
                 continue;
             }
             String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
@@ -2109,22 +2119,101 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
-    /** 挑探路站点：历史分最高者。 */
+    /**
+     * 挑探路站点。
+     *
+     * 两条硬性规则：
+     * 1. **必须排除当前正在播放的源** —— 探路的目的是「找一个不一样的源」，
+     *    打自己等于白费一次请求，而且命中后会把用户「切」回原来那个站。
+     * 2. **无历史统计时轮换取样，不要恒取第一个** —— 所有源同分时若总取第一个，
+     *    探路永远只试同一个站点；若那个站恰好搜不到，探路就永远白打。
+     */
     private String pickBestProbeSource() {
+        // 先收集「有历史分」的候选，按分数取最优
         String best = "";
         double bestScore = -1;
+        boolean allUnknown = true;
         for (String key : detailFallbackSourceOrder) {
+            if (isCurrentPlayingSource(key)) {
+                continue;                       // 规则1：排除当前源
+            }
             SourceBean bean = ApiConfig.get().getSource(key);
-            if (bean == null || !bean.isChangeable()) {
+            if (bean == null || !bean.isSearchable()) {
                 continue;
             }
             double score = detailFallbackSourceScore(key);
+            if (!allUnknown && score <= 0) {
+                continue;
+            }
+            if (detailFallbackProbeCursor(key)) {
+                allUnknown = false;
+            }
             if (score > bestScore) {
                 bestScore = score;
                 best = key;
             }
         }
-        return best;
+        if (!allUnknown && !TextUtils.isEmpty(best)) {
+            return best;
+        }
+        // 规则2：全是未知分 → 按游标轮换，避免次次都打第一个
+        return pickRotatingProbeSource();
+    }
+
+    /** 该源是否已有历史统计（用于判断「全部未知」）。 */
+    private boolean detailFallbackProbeCursor(String sourceKey) {
+        try {
+            String raw = Hawk.get(HAWK_FALLBACK_STAT_PREFIX + sourceKey, "0,0,0");
+            String[] parts = raw.split(",");
+            int hit = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
+            int fail = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
+            return (hit + fail) > 0;
+        } catch (Throwable th) {
+            return false;
+        }
+    }
+
+    /** 无历史时：按内部游标轮换挑一个（排除当前源）。 */
+    private String pickRotatingProbeSource() {
+        List<String> pool = new ArrayList<>();
+        for (String key : detailFallbackSourceOrder) {
+            if (isCurrentPlayingSource(key)) {
+                continue;
+            }
+            SourceBean bean = ApiConfig.get().getSource(key);
+            if (bean != null && bean.isSearchable()) {
+                pool.add(key);
+            }
+        }
+        if (pool.isEmpty()) {
+            return "";
+        }
+        int idx = Math.abs(detailFallbackProbeRotateIndex++) % pool.size();
+        return pool.get(idx);
+    }
+
+    /**
+     * 判定某个源是不是「当前正在播放的源」。
+     * sourceKey 是当前详情源；播放记录里的源也一并比对（从搜索页进入时两者可能不同步）。
+     */
+    private boolean isCurrentPlayingSource(String key) {
+        if (TextUtils.isEmpty(key)) {
+            return false;
+        }
+        if (TextUtils.equals(key, sourceKey)) {
+            return true;
+        }
+        // 兜底：与「实际在播」的对象比对。预览模式下真正在播的是 previewVodInfo，
+        // 而 sourceKey / vodInfo 可能已经指向别的源（从搜索页进入时尤其明显）。
+        if (previewVodInfo != null && !TextUtils.isEmpty(previewVodInfo.sourceKey)
+                && TextUtils.equals(key, previewVodInfo.sourceKey)) {
+            return true;
+        }
+        if (vodInfo != null && !TextUtils.isEmpty(vodInfo.sourceKey)
+                && TextUtils.equals(key, vodInfo.sourceKey)) {
+            return true;
+        }
+        return false;
     }
 
     /** 把一批源按键的分数降序重排（分数高的先发，先回来的概率更大）。 */
@@ -2195,6 +2284,11 @@ public class DetailActivity extends BaseActivity {
         resetDetailFallback(false);
     }
 
+    /**
+     * 切源成功后的收尾：保留 detailFallbackCache 与仍在跑的批处理，
+     * 只把「当前这一轮」的状态机复位。下次点切源可直接续用候选池。
+     * 用 resetDetailFallback() 会 cancelTag 掐死批处理，导致候选池永远补不满。
+     */
     private void resetDetailFallbackKeepCache() {
         resetDetailFallback(true);
     }
@@ -2235,6 +2329,8 @@ public class DetailActivity extends BaseActivity {
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
         }
         if (!keepCache) {
+            // 只有「彻底复位」才掐断批处理；切源成功后的收尾必须让它继续跑完，
+            // 否则候选池永远只有第一个源 —— 这正是「一直切回同一站点」的根因。
             stopDetailFallbackSearchExecutor();
             OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
             cancelDetailFallbackProbe();
@@ -2366,6 +2462,8 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackProbeToken = "";
     private long detailFallbackProbeStartMs;
     private boolean detailFallbackProbePending;
+    /** 无历史统计时的探路轮换游标，避免每次都打同一个站。 */
+    private int detailFallbackProbeRotateIndex;
     /** 本批搜索的发出时刻，用于统计每个源的响应耗时。 */
     private long detailFallbackBatchStartMs;
     private final Runnable detailFallbackProbeTimeout = new Runnable() {
