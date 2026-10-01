@@ -1202,6 +1202,17 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
+    /**
+     * 切源入口（菜单点击 / 播放器线路耗尽）。
+     *
+     * 设计：
+     *   1. 第一次点切源（缓存为空）→ 发起一次全网搜索，结果同时写入 detailFallbackCache；
+     *   2. 之后每次点切源 → 不做任何网络搜索，直接从缓存里按「圈」轮转下一个源；
+     *   3. 「一圈」= 把缓存里的源（含当前正在播放的源）全部轮一遍，走完开新圈；
+     *   4. 只有当缓存为空（首次搜索一个都没命中）时才重新发起全网搜索。
+     *
+     * @return true 表示本次点击已被受理（正在切 / 已切），false 表示完全没得切
+     */
     private boolean startDetailFallback(boolean manual) {
         SourceBean currentSource = ApiConfig.get().getSource(sourceKey);
         if (isFinishing() || currentSource == null || !currentSource.isChangeable()) {
@@ -1227,16 +1238,151 @@ public class DetailActivity extends BaseActivity {
         }
         detailFallbackExcludedSourceKey = sourceKey;
         detailFallbackTitle = vod_name.trim();
-        // 每一轮切源都重新开始“已用源”记录：清掉历史轮次累积的记录，只把当前正在播放的源标记为已用。  
-        // 不清会让 Set 只增不减，最终所有源都被判定“已用”→ 候选为空 → 点击静默无响应。  
-        addDetailFallbackUsedSource(sourceKey);
-        // 预热：把该片名的历史缓存候选先塞进待试队列（加速本轮切源）。  
-        // 注意：不再据此 return —— 必须继续执行 startDetailFallback() 发起全网搜索。  
-        loadDetailFallbackCache();  
-        startDetailFallback();
+        if (TextUtils.isEmpty(detailFallbackTitle)) {
+            return false;
+        }
+
+        // 换片名 = 换了一套缓存/圈记录，重新从「第一圈」开始
+        if (!TextUtils.equals(detailFallbackCycleTitle, detailFallbackTitle)) {
+            detailFallbackCycleTitle = detailFallbackTitle;
+            detailFallbackCycleKeys.clear();
+            detailFallbackNewCycle = true;
+        }
+
+        detailFallbackActive = true;
+        boolean accepted = loadNextDetailFallbackFromCache();
+        // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
+        // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
+        // （detailFallbackLoadingCandidate 为真），就交给异步回调收尾，绝不能在这里复位，
+        // 否则会把刚发起的搜索/加载直接掐掉，表现为「点了没反应」。
+        if (!accepted && !detailFallbackLoadingCandidate
+                && !detailFallbackSearching && !detailFallbackSearchCollecting) {
+            resetDetailFallback();
+        }
         return detailFallbackActive;
     }
 
+    /**
+     * 缓存轮转型切源：不发全网搜索，只从 detailFallbackCache 里按圈取下一个候选。
+     * 缓存为空且从未搜索过 → 退化成一次全网搜索（startDetailFallback()）。
+     *
+     * @return true 表示已经发起 loadDetail（或已转入全网搜索流程）
+     */
+    private boolean loadNextDetailFallbackFromCache() {
+        if (!detailFallbackCacheEntryUsable()) {
+            // 缓存为空 → 只有这种情况才真正发起一次全网搜索
+            if (!detailFallbackSearchCollecting) {
+                detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
+                startDetailFallback();
+            }
+            return detailFallbackActive;
+        }
+
+        // 本轮第一个候选（含当前正在播放的源），用来判定「一圈」是否走完
+        if (!detailFallbackNewCycle) {
+            // 本圈已走完 → 清空圈内记录，开始新的一圈
+            detailFallbackCycleKeys.clear();
+        }
+        detailFallbackNewCycle = false;
+
+        // 缓存轮转：直接从缓存里按圈取下一个，零网络开销
+        String nextSource = pollNextCycledSource();
+        if (TextUtils.isEmpty(nextSource)) {
+            // 一圈内确实没有可切的源了（所有源都试过且都失败），提示并结束
+            if (detailFallbackKeepCurrentDetail && mVideo != null && vodInfo != null) {
+                Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
+            }
+            return false;
+        }
+
+        detailFallbackLoadingCandidate = true;
+        detailFallbackDetailTimedOut = false;
+        addDetailFallbackUsedSource(nextSource);
+        Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource);
+        if (video != null) {
+            vod_name = video.name == null ? "" : video.name;
+            vod_picture = video.pic == null ? "" : video.pic;
+        }
+        loadDetail(detailFallbackCacheId(detailFallbackTitle, nextSource), nextSource, true);
+        return true;
+    }
+
+    /** 缓存里是否还有该片名的可用候选（不含是否已轮转的判断）。 */
+    private boolean detailFallbackCacheEntryUsable() {
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        return cachedCandidates != null && !cachedCandidates.isEmpty();
+    }
+
+    /**
+     * 从缓存里取出「本圈还没轮转到、且全局没试过」的下一个源。
+     * 取不到时先尝试开新圈（清空 CycleKeys），仍然取不到才返回 ""。
+     */
+    private String pollNextCycledSource() {
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        if (cachedCandidates == null || cachedCandidates.isEmpty()) {
+            return "";
+        }
+        String picked = pollNextCycledSourceInternal(cachedCandidates);
+        if (!TextUtils.isEmpty(picked)) {
+            return picked;
+        }
+        // 本圈内都被试过了 → 开新圈（允许重复轮转到同一批源，但按顺序，不随机）
+        detailFallbackCycleKeys.clear();
+        return pollNextCycledSourceInternal(cachedCandidates);
+    }
+
+    private String pollNextCycledSourceInternal(List<Movie.Video> cachedCandidates) {
+        for (Movie.Video video : cachedCandidates) {
+            if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.sourceKey)) {
+                continue;
+            }
+            SourceBean source = ApiConfig.get().getSource(video.sourceKey);
+            if (source == null || !source.isChangeable()) {
+                continue;
+            }
+            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
+            // 圈内已轮转过 → 跳过；全局已试过 → 跳过（避免重复加载同一个详情）
+            if (detailFallbackCycleKeys.contains(candidateKey) || detailFallbackTriedKeys.contains(candidateKey)) {
+                continue;
+            }
+            detailFallbackCycleKeys.add(candidateKey);
+            detailFallbackTriedKeys.add(candidateKey);
+            return video.sourceKey;
+        }
+        return "";
+    }
+
+    private String detailFallbackCacheId(String title, String sourceKey) {
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+        if (cachedCandidates == null) {
+            return "";
+        }
+        for (Movie.Video video : cachedCandidates) {
+            if (video != null && TextUtils.equals(video.sourceKey, sourceKey) && !TextUtils.isEmpty(video.id)) {
+                return video.id;
+            }
+        }
+        return "";
+    }
+
+    private Movie.Video detailFallbackCacheVideo(String title, String sourceKey) {
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+        if (cachedCandidates == null) {
+            return null;
+        }
+        for (Movie.Video video : cachedCandidates) {
+            if (video != null && TextUtils.equals(video.sourceKey, sourceKey) && !TextUtils.isEmpty(video.id)) {
+                return video;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 全网搜索型切源：这次搜索覆盖「全部可搜可换的源」（含当前正在播放的源），
+     * 结果会通过 onDetailFallbackSearchResult 累积进 detailFallbackCache，
+     * 供后续点击切源时零网络地轮转。
+     */
     private void startDetailFallback() {
         detailFallbackTitle = vod_name == null ? "" : vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
@@ -1244,8 +1390,10 @@ public class DetailActivity extends BaseActivity {
             return;
         }
 
+        detailFallbackSourceOrder.clear();
         for (SourceBean bean : ApiConfig.get().getSourceBeanList()) {
-            if (bean.isSearchable() && bean.isChangeable() && !TextUtils.equals(bean.getKey(), detailFallbackExcludedSourceKey) && !isDetailFallbackSourceUsed(bean.getKey())) {
+            // 一圈 = 包括当前源在内全部轮转：这里不再排除当前源，也不再按「已用」过滤
+            if (bean.isSearchable() && bean.isChangeable()) {
                 detailFallbackSourceOrder.add(bean.getKey());
             }
         }
@@ -1268,11 +1416,10 @@ public class DetailActivity extends BaseActivity {
         detailFallbackBatchIndex = 0;
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
-        detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
         scheduleDetailFallbackSearch();
         showLoading();
     }
-    
+
     /**
      * 切源前调用：记录切源前实际正在播放的 源/线路/集。
      * 预览模式下实际播放对象是 previewVodInfo（PlayFragment.mVodInfo 指向它），
@@ -1519,19 +1666,14 @@ public class DetailActivity extends BaseActivity {
         detailFallbackPendingSources.remove(data.sourceKey);
         if (data.movie != null && data.movie.videoList != null) {
             for (Movie.Video video : data.movie.videoList) {
-                if (video == null || TextUtils.isEmpty(video.id) || isDetailFallbackSourceUsed(video.sourceKey) || !detailFallbackTitle.equals(video.name == null ? "" : video.name.trim())) {
+                if (video == null || TextUtils.isEmpty(video.id)
+                        || !detailFallbackTitle.equals(video.name == null ? "" : video.name.trim())) {
                     continue;
                 }
-                String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-                if (!detailFallbackTriedKeys.contains(candidateKey) && detailFallbackCandidateKeys.add(candidateKey)) {
-                    detailFallbackCandidates.add(video);
-                    cacheDetailFallbackCandidate(video);
-                }
+                // 全网搜索的职责是「建立这一圈完整的缓存」，所以这里不再按「已用源」过滤，
+                // 只要片名精确命中就全部纳入（含当前正在播放的源，使一圈能真正闭合）。
+                cacheDetailFallbackCandidate(video);
             }
-        }
-        if (!detailFallbackLoadingCandidate && !detailFallbackCandidates.isEmpty()
-                && (!detailFallbackSearchTimedOut || detailFallbackDetailTimedOut)) {
-            loadNextDetailFallbackSource();
         }
         if (!detailFallbackLoadingCandidate) {
             if (detailFallbackSearching) {
@@ -1577,9 +1719,8 @@ public class DetailActivity extends BaseActivity {
             detailFallbackSearchTimeoutScheduled = true;
             llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);          
         }
-        if (!detailFallbackLoadingCandidate && !detailFallbackCandidates.isEmpty()) {  
-            loadNextDetailFallbackSource();  
-        }
+        // 首次搜索期间不抢跳：本轮搜索的职责是建立完整缓存，
+        // 跳转交给 loadNextDetailFallbackSource() 在收集结束时统一决定。
     }
 
     private void finishDetailFallbackSearchOnTimeout() {
@@ -1587,33 +1728,39 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         detailFallbackSearchTimeoutScheduled = false;
-        // Keep the current 20 searches alive so late results can be used by the next fallback source.
+        // 超时后不再等剩下的批次；但已收集到的结果已经进了 detailFallbackCache，下一圈仍可用。
         detailFallbackSearching = false;
         detailFallbackSearchTimedOut = true;
         detailFallbackNextSourceIndex = detailFallbackSourceOrder.size();
         if (!detailFallbackLoadingCandidate) {
-            if (!detailFallbackCandidates.isEmpty()) {
-                loadNextDetailFallbackSource();
-            } else {
-                showDetailFallbackEmptyIfNeeded();
-            }
+            loadNextDetailFallbackSource();
         }
     }
 
+    /**
+     * 统一取源入口：无论从「首次全网搜索结束」还是「后续缓存轮转」进来，
+     * 都只从 detailFallbackCache 里按圈取下一个候选，保证两条路径行为一致。
+     */
     private void loadNextDetailFallbackSource() {
-        while (!detailFallbackCandidates.isEmpty()) {
-            Movie.Video video = detailFallbackCandidates.remove(0);
-            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            if (isDetailFallbackSourceUsed(video.sourceKey) || !detailFallbackTriedKeys.add(candidateKey)) {
-                continue;
+        if (!detailFallbackLoadingCandidate && detailFallbackCacheEntryUsable()) {
+            String nextSource = pollNextCycledSource();
+            if (!TextUtils.isEmpty(nextSource)) {
+                String videoId = detailFallbackCacheId(detailFallbackTitle, nextSource);
+                if (TextUtils.isEmpty(videoId)) {
+                    finishDetailFallbackWithoutResult();
+                    return;
+                }
+                Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource);
+                detailFallbackLoadingCandidate = true;
+                detailFallbackDetailTimedOut = false;
+                addDetailFallbackUsedSource(nextSource);
+                if (video != null) {
+                    vod_name = video.name == null ? "" : video.name;
+                    vod_picture = video.pic == null ? "" : video.pic;
+                }
+                loadDetail(videoId, nextSource, true);
+                return;
             }
-            detailFallbackLoadingCandidate = true;
-            detailFallbackDetailTimedOut = false;
-            addDetailFallbackUsedSource(video.sourceKey);
-            vod_name = video.name == null ? "" : video.name;
-            vod_picture = video.pic == null ? "" : video.pic;
-            loadDetail(video.id, video.sourceKey, true);
-            return;
         }
         if (detailFallbackSearching || detailFallbackSearchCollecting) {
             if (detailFallbackPendingSources.isEmpty()) {
@@ -1635,9 +1782,12 @@ public class DetailActivity extends BaseActivity {
         detailFallbackSearchCollecting = false;
         stopDetailFallbackSearchExecutor();
         OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
-        if (!detailFallbackLoadingCandidate) {
-            finishDetailFallbackWithoutResult();
+        if (detailFallbackLoadingCandidate) {
+            return;
         }
+        // 收集阶段结束：SourceOrder 里可能还留着「缓存轮转」剩下的候选，
+        // 先把它消费掉；确实一个都没有才收尾。
+        loadNextDetailFallbackSource();
     }
 
     private void showDetailFallbackEmptyIfNeeded() {
@@ -1650,14 +1800,11 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
+    /**
+     * 本轮转没有任何可切的源：保留当前详情页画面（而不是把页面清空），并复位状态。
+     */
     private void finishDetailFallbackWithoutResult() {
-        boolean keepCurrentDetail = detailFallbackKeepCurrentDetail;
-        resetDetailFallback();
-        if (keepCurrentDetail) {
-            showSuccess();
-        } else {
-            showDetailEmpty();
-        }
+        showDetailFallbackEmptyIfNeeded();
     }
 
     private void finishDetailFallbackDetailOnTimeout() {
@@ -1672,25 +1819,6 @@ public class DetailActivity extends BaseActivity {
 
     private String getDetailFallbackKey(String key, String id) {
         return (key == null ? "" : key) + "|" + (id == null ? "" : id);
-    }
-
-    private boolean loadDetailFallbackCache() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
-        if (cachedCandidates == null || cachedCandidates.isEmpty()) {
-            return false;
-        }
-        for (Movie.Video video : cachedCandidates) {
-            SourceBean source = video == null ? null : ApiConfig.get().getSource(video.sourceKey);
-            if (video == null || source == null || !source.isChangeable()
-                    || TextUtils.equals(video.sourceKey, detailFallbackExcludedSourceKey) || isDetailFallbackSourceUsed(video.sourceKey)) {
-                continue;
-            }
-            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            if (detailFallbackCandidateKeys.add(candidateKey)) {
-                detailFallbackCandidates.add(video);
-            }
-        }
-        return false;
     }
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
@@ -1773,13 +1901,12 @@ public class DetailActivity extends BaseActivity {
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "";
         detailFallbackBatchToken = "";
-        detailFallbackTitle = "";
         detailFallbackExcludedSourceKey = "";
         detailFallbackSourceOrder.clear();
-        detailFallbackCandidates.clear();
         detailFallbackPendingSources.clear();
-        detailFallbackCandidateKeys.clear();
-        detailFallbackTriedKeys.clear();
+        // 注意：这里不清 detailFallbackTriedKeys / detailFallbackCycleKeys / detailFallbackTitle，
+        // 因为「一圈」跨越多轮点击；清掉会让候选池每轮重置回起点，导致只有两三个源来回循环。
+        // TriedKeys / CycleKeys 由 startDetailFallback(boolean) 在换片名或开新圈时负责重置。
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
         if (llLayout != null) {
@@ -1864,12 +1991,19 @@ public class DetailActivity extends BaseActivity {
     private ExecutorService searchExecutorService = null;
     private ExecutorService detailFallbackSearchExecutor;
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
-    private final List<Movie.Video> detailFallbackCandidates = new ArrayList<>();
     private final HashMap<String, List<Movie.Video>> detailFallbackCache = new HashMap<>();
     private final HashMap<String, Set<String>> detailFallbackUsedSourceKeys = new HashMap<>();
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
-    private final Set<String> detailFallbackCandidateKeys = new HashSet<>();
     private final Set<String> detailFallbackTriedKeys = new HashSet<>();
+    /**
+     * 本「一圈」内已经轮转到过的候选 key（sourceKey|id）。
+     * 一圈的定义：把缓存里的候选（含当前正在播放的源）全部轮转一遍后重新开始。
+     * 与 TriedKeys 的区别：TriedKeys 是全局去重（整个详情页生命周期内不重复），
+     * CycleKeys 是圈内去重（跨圈会清空，所以下一圈可以重新轮到同一个源）。
+     */
+    private final Set<String> detailFallbackCycleKeys = new HashSet<>();
+    /** 是否为「一圈」的第一次切源（决定要不要发起全网搜索）。 */
+    private boolean detailFallbackNewCycle = true;
     private VodInfo.VodSeries detailFallbackEpisode;
     private int detailFallbackEpisodeIndex = -1;
     
@@ -1895,6 +2029,8 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackToken = "";
     private String detailFallbackBatchToken = "";
     private String detailFallbackTitle = "";
+    /** 当前 CycleKeys / TriedKeys 归属的片名；片名一变说明换剧了，圈记录必须重置。 */
+    private String detailFallbackCycleTitle = "";
     private String detailFallbackExcludedSourceKey = "";
     private final Runnable detailFallbackTimeout = new Runnable() {
         @Override
