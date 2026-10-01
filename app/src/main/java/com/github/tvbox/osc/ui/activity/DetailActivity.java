@@ -1023,7 +1023,10 @@ public class DetailActivity extends BaseActivity {
                             // 否则会把 remap 算对的精确下标覆盖成"就近/裸下标"结果
                             restoreDetailFallbackEpisode();
                         }
-                        resetDetailFallback();
+                        // 切源成功：保留候选池与仍在跑的批处理，只复位本轮状态机。
+                        // 用 resetDetailFallback() 会 cancelTag 把批处理掐死，
+                        // 导致缓存永远只有第一个源 → 下次点击只能切回它。
+                        resetDetailFallbackKeepCache();
 
                         // 线路回退：remapPlayIndexFromNote 可能改写 playFlag、或该线路列表为 null，
                         // 这里兜底回退到第一条有效线路，避免 seriesMap.get() 返回 null 导致 NPE
@@ -1288,12 +1291,14 @@ public class DetailActivity extends BaseActivity {
             return detailFallbackActive;
         }
 
-        // 本轮第一个候选（含当前正在播放的源），用来判定「一圈」是否走完
-        if (!detailFallbackNewCycle) {
-            // 本圈已走完 → 清空圈内记录，开始新的一圈
+        // 「开新圈」只在两处发生：换片名（startDetailFallback(boolean) 里置 NewCycle），
+        // 或 pollNextCycledSource 发现本圈已转完（它自己会清）。
+        // 【绝不能】在这里无条件 clear —— 那会让每次点击都从池子第一个重新开始，
+        // 表现为「点多少次都切回同一个站点」。这正是一直切回同一站点的根因。
+        if (detailFallbackNewCycle) {
             detailFallbackCycleKeys.clear();
+            detailFallbackNewCycle = false;
         }
-        detailFallbackNewCycle = false;
 
         // 缓存轮转：直接从缓存里按圈取下一个，零网络开销
         String nextSource = pollNextCycledSource();
@@ -1335,7 +1340,12 @@ public class DetailActivity extends BaseActivity {
         if (!TextUtils.isEmpty(picked)) {
             return picked;
         }
-        // 本圈内都被试过了 → 开新圈（允许重复轮转到同一批源，但按顺序，不随机）
+        // 本圈内都被试过了。如果可用候选本来就只有 1 个，清空重来只会把用户
+        // 原地锁死在同一个站点上——这种情况直接返回空，让上层提示「没有更多片源」。
+        if (detailFallbackUsableCandidateCount() <= 1) {
+            return "";
+        }
+        // 否则开新圈（允许重复轮转到同一批源，但按顺序，不随机）
         detailFallbackCycleKeys.clear();
         return pollNextCycledSourceInternal(cachedCandidates);
     }
@@ -1400,15 +1410,14 @@ public class DetailActivity extends BaseActivity {
      * 供后续点击切源时零网络地轮转。
      */
     private void startDetailFallback() {
-        // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
-        restoreDetailFallbackCache(detailFallbackTitle);
-        // 方案A：先朝历史命中率最高的站点单独打一枪，命中即刻切，不等整批
-        startDetailFallbackProbe();
+        // 片名必须先解析出来——探路/恢复缓存都依赖它
         detailFallbackTitle = vod_name == null ? "" : vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
             showDetailEmpty();
             return;
         }
+        // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
+        restoreDetailFallbackCache(detailFallbackTitle);
 
         detailFallbackSourceOrder.clear();
         for (SourceBean bean : ApiConfig.get().getSourceBeanList()) {
@@ -1437,6 +1446,9 @@ public class DetailActivity extends BaseActivity {
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
         scheduleDetailFallbackSearch();
+        // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
+        // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
+        startDetailFallbackProbe();
         showLoading();
     }
 
@@ -1910,11 +1922,39 @@ public class DetailActivity extends BaseActivity {
         if (!hit) {
             return;
         }
-        // 探路命中 → 立即从缓存取最优候选切换（此时门槛=1 也安全，
-        // 因为批处理同时在跑，用户第二次点击必有货）
-        if (!detailFallbackLoadingCandidate) {
+        // 探路命中就抢跳——但有个前提：缓存里得有**至少 2 个**可用候选。
+        // 否则池子里只有探路这一颗苗，切过去之后用户再点切源还是它（「一直切回同一站点」）。
+        if (!detailFallbackLoadingCandidate && detailFallbackUsableCandidateCount() >= 2) {
             loadNextDetailFallbackSource();
         }
+        // 池子还不够厚 → 不抢跳，安静地等批处理把候选补齐，由收集结束统一决定跳转。
+    }
+
+    /**
+     * 缓存里当前可用的候选数（去掉不可换源、去重后的真实可选数量）。
+     * 用于「抢跳门槛」判断：池子太薄时抢跳会导致原地打转。
+     */
+    private int detailFallbackUsableCandidateCount() {
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        if (cachedCandidates == null || cachedCandidates.isEmpty()) {
+            return 0;
+        }
+        Set<String> seen = new HashSet<>();
+        int count = 0;
+        for (Movie.Video video : cachedCandidates) {
+            if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.sourceKey)) {
+                continue;
+            }
+            SourceBean source = ApiConfig.get().getSource(video.sourceKey);
+            if (source == null || !source.isChangeable()) {
+                continue;
+            }
+            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
+            if (seen.add(candidateKey)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /** 探路超时：放弃探路，批处理继续走，不打扰用户。 */
@@ -2152,6 +2192,18 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void resetDetailFallback() {
+        resetDetailFallback(false);
+    }
+
+    private void resetDetailFallbackKeepCache() {
+        resetDetailFallback(true);
+    }
+
+    /**
+     * @param keepCache true = 保留缓存与批处理（切源成功路径）
+     *                  false = 彻底复位（退出页面 / 换片 / 出错）
+     */
+    private void resetDetailFallback(boolean keepCache) {
         detailFallbackActive = false;
         detailFallbackSearching = false;
         detailFallbackSearchCollecting = false;
@@ -2182,8 +2234,11 @@ public class DetailActivity extends BaseActivity {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
         }
-        stopDetailFallbackSearchExecutor();
-        OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+        if (!keepCache) {
+            stopDetailFallbackSearchExecutor();
+            OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+            cancelDetailFallbackProbe();
+        }
     }
 
     /** 取消探路请求（tag 与批处理不同，需单独取消）。 */
