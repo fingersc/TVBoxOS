@@ -1208,6 +1208,7 @@ public class DetailActivity extends BaseActivity {
             return false;
         }
         if (detailFallbackActive) {
+            Toast.makeText(this, "正在切换片源，请稍候…", Toast.LENGTH_SHORT).show();
             return true;
         }
         // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
@@ -1226,6 +1227,9 @@ public class DetailActivity extends BaseActivity {
         }
         detailFallbackExcludedSourceKey = sourceKey;
         detailFallbackTitle = vod_name.trim();
+        // 每一轮切源都重新开始“已用源”记录：清掉历史轮次累积的记录，只把当前正在播放的源标记为已用。  
+        // 不清会让 Set 只增不减，最终所有源都被判定“已用”→ 候选为空 → 点击静默无响应。  
+        detailFallbackUsedSourceKeys.remove(detailFallbackTitle);
         addDetailFallbackUsedSource(sourceKey);
         if (loadDetailFallbackCache()) {
             return true;
@@ -1249,6 +1253,8 @@ public class DetailActivity extends BaseActivity {
         if (detailFallbackSourceOrder.isEmpty()) {
             if (!detailFallbackKeepCurrentDetail) {
                 showDetailEmpty();
+            } else {
+                Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
             }
             return;
         }
@@ -1265,6 +1271,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
         detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
         scheduleDetailFallbackSearch();
+        showLoading();
     }
     
     /**
@@ -1634,13 +1641,17 @@ public class DetailActivity extends BaseActivity {
     private void showDetailFallbackEmptyIfNeeded() {
         if (!detailFallbackKeepCurrentDetail) {
             showDetailEmpty();
+        } else {
+            showSuccess();
         }
     }
 
     private void finishDetailFallbackWithoutResult() {
         boolean keepCurrentDetail = detailFallbackKeepCurrentDetail;
         resetDetailFallback();
-        if (!keepCurrentDetail) {
+        if (keepCurrentDetail) {
+            showSuccess();
+        } else {
             showDetailEmpty();
         }
     }
@@ -1681,6 +1692,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackActive = true;
         detailFallbackLoadingCandidate = false;
         detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
+        showLoading();
         loadNextDetailFallbackSource();
         return true;
     }
