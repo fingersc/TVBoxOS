@@ -1231,9 +1231,9 @@ public class DetailActivity extends BaseActivity {
         // 不清会让 Set 只增不减，最终所有源都被判定“已用”→ 候选为空 → 点击静默无响应。  
         detailFallbackUsedSourceKeys.remove(detailFallbackTitle);
         addDetailFallbackUsedSource(sourceKey);
-        if (loadDetailFallbackCache()) {
-            return true;
-        }
+        // 预热：把该片名的历史缓存候选先塞进待试队列（加速本轮切源）。  
+        // 注意：不再据此 return —— 必须继续执行 startDetailFallback() 发起全网搜索。  
+        loadDetailFallbackCache();  
         startDetailFallback();
         return detailFallbackActive;
     }
@@ -1576,7 +1576,10 @@ public class DetailActivity extends BaseActivity {
         }
         if (!detailFallbackSearchTimeoutScheduled) {
             detailFallbackSearchTimeoutScheduled = true;
-            llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
+            llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);          
+        }
+        if (!detailFallbackLoadingCandidate && !detailFallbackCandidates.isEmpty()) {  
+            loadNextDetailFallbackSource();  
         }
     }
 
@@ -1686,15 +1689,7 @@ public class DetailActivity extends BaseActivity {
                 detailFallbackCandidates.add(video);
             }
         }
-        if (detailFallbackCandidates.isEmpty()) {
-            return false;
-        }
-        detailFallbackActive = true;
-        detailFallbackLoadingCandidate = false;
-        detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
-        showLoading();
-        loadNextDetailFallbackSource();
-        return true;
+        return false;
     }
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
