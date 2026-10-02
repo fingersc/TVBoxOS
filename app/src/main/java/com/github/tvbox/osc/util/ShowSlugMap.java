@@ -333,7 +333,16 @@ public final class ShowSlugMap {
 
     // ==================== 直连解析：日期 → 期数 ====================
 
-    /** 多站点配置：主站在前，备用在后，依次尝试。 */
+    /**
+     * 多站点配置：主站在前，备用在后，依次尝试。
+     *
+     * <p><b>关于"更稳定的备用站点"（2026-10 实测结论）</b>：公开互联网上
+     * <b>不存在</b>第二个结构化提供「播出日期 ↔ 第N期」的站点——
+     * {@code zyshow.co / cn.zyshow.co / m.zyshow.co} 全部 301 回主站
+     * （非独立镜像，域名级故障时一并失效）；豆瓣分集接口 404 且综艺日期覆盖不全；
+     * 电视猫只有频道排期、无结构化期号。故冗余策略为：同站双 UA 入口 +
+     * 请求级重试（见 {@link #httpGet}）+ 成功结果磁盘缓存沉淀。</p>
+     */
     private static final List<Site> SITES = new ArrayList<>();
 
     static {
@@ -344,6 +353,15 @@ public final class ShowSlugMap {
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
                         + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"));
     }
+
+    /** 直连探测专用超时（毫秒）：站点偶发 5s+ 慢响应，8s 快速失败以便重试。 */
+    private static final int PROBE_TIMEOUT_MS = 8000;
+
+    /** 探测尝试次数（含首次）：实测约半数首请求失败，两次尝试基本覆盖瞬时故障。 */
+    private static final int PROBE_ATTEMPTS = 2;
+
+    /** 第 N 次重试前的退避（毫秒）。 */
+    private static final long[] PROBE_BACKOFF_MS = {300, 800};
 
     /** 从详情页 title 提取"第N期"的正则。 */
     private static final Pattern RE_TITLE = Pattern.compile("<title>(.*?)</title>", Pattern.DOTALL);
@@ -904,24 +922,51 @@ public final class ShowSlugMap {
     }
 
     /** 使用项目统一的 OkHttp 客户端发起 GET。 */
+    /**
+     * 直连探测专用 HTTP GET（带重试与快速超时）。
+     *
+     * <p><b>为什么要重试</b>：实测 {@code zyshow.net} 波动较大——约半数首请求
+     * 会在连接建立阶段被重置或超时（curl 复测：第 1 次失败、第 2 次即成功），
+     * 且偶发 5s+ 的慢响应。共享 OkHttp 客户端的 30s 超时对探测而言太长：
+     * 失败要等很久才暴露。故此处用 8s 专用超时快速失败 + 短退避重试，
+     * 2 次尝试即可覆盖绝大多数瞬时故障。</p>
+     *
+     * <p><b>与同步预算的关系</b>：调用方（{@code resolveWithin}）的等待预算
+     * 通常只有 1~2s，重试主要惠及异步修正路径与磁盘缓存沉淀——
+     * 本次查不完没关系，后台线程会跑完并把结果写进缓存，下次切源零延迟命中。</p>
+     */
     private static String httpGet(String url, String ua) {
-        okhttp3.Response response = null;
-        try {
-            okhttp3.Request request = new okhttp3.Request.Builder()
-                    .url(url)
-                    .header("User-Agent", ua == null ? "" : ua)
-                    .build();
-            okhttp3.OkHttpClient client = com.github.catvod.net.OkHttp.client();
-            response = client.newCall(request).execute();
-            if (response.body() != null) {
-                return response.body().string();
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (response != null) {
+        for (int attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
                 try {
-                    response.close();
+                    Thread.sleep(PROBE_BACKOFF_MS[Math.min(attempt - 1, PROBE_BACKOFF_MS.length - 1)]);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
                 } catch (Throwable ignored) {
+                }
+            }
+            okhttp3.Response response = null;
+            try {
+                okhttp3.Request request = new okhttp3.Request.Builder()
+                        .url(url)
+                        .header("User-Agent", ua == null ? "" : ua)
+                        .build();
+                okhttp3.OkHttpClient client = com.github.catvod.net.OkHttp.client(PROBE_TIMEOUT_MS);
+                response = client.newCall(request).execute();
+                if (response.body() != null) {
+                    String body = response.body().string();
+                    if (!TextUtils.isEmpty(body)) {
+                        return body;
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (response != null) {
+                    try {
+                        response.close();
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         }

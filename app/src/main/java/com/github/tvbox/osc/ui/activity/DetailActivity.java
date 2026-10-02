@@ -1886,6 +1886,24 @@ public class DetailActivity extends BaseActivity {
         }
         detailFallbackEpisodeIndex = Math.max(0, Math.min(playing.playIndex, seriesList.size() - 1));
         detailFallbackEpisode = seriesList.get(detailFallbackEpisodeIndex);
+        // ★ 同时捕获旧源剧集名列表：切源流程加载新源详情后 vodInfo 会被替换，
+        //   届时 getPlayingSeriesList() 返回的是新源列表，离线秩对齐必须用旧源口径。
+        detailFallbackSourceNames = seriesNames(seriesList);
+    }
+
+    /**
+     * 取"旧源"口径的剧集名列表，供离线秩对齐（{@link #findMatchingEpisodeIndex} 第2-c层）使用。
+     *
+     * <p>切源（detail fallback）流程里 vodInfo 已被替换成新源，此时用
+     * {@link #captureDetailFallbackEpisode()} 捕获的旧源列表；非切源场景
+     * （线路切换等）vodInfo 仍是旧源，直接用当前播放列表。</p>
+     */
+    private List<String> getRankSourceList(String currentName) {
+        if (!TextUtils.isEmpty(currentName) && detailFallbackSourceNames != null
+                && detailFallbackSourceNames.contains(currentName)) {
+            return detailFallbackSourceNames;
+        }
+        return seriesNames(getPlayingSeriesList());
     }
 
     private void restoreDetailFallbackEpisode() {
@@ -1938,7 +1956,12 @@ public class DetailActivity extends BaseActivity {
             // 也不做"就近猜测"把可能错位的下标写成正式结果。
             // 注意这里传入的是"已钳位过的原下标"，属于合法值，safeLand 会正常写入，
             // 但绝不接受 findMatchingEpisodeIndex 返回的 -1。
-            vodInfo.playIndex = nearestEpisodeIndex(fallback, fallbackIndex, preferredList);
+            // ★ 正片保护：原下标若恰好落在特辑/花絮等非正片条目上（实测
+            //   「第5期上」兜底到「20260508泳池特辑」），就近回退到正片条目。
+            vodInfo.playIndex = EpisodeNameMatcher.sanitizeMainFeatureFallback(
+                    fallback == null ? null : fallback.name,
+                    nearestEpisodeIndex(fallback, fallbackIndex, preferredList),
+                    seriesNames(preferredList));
         }
     }
 
@@ -2618,6 +2641,7 @@ public class DetailActivity extends BaseActivity {
         // 新圈由 pollNextCycledSource() 在本圈转尽时统一开启（它会自己清这两个集合）。
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
+        detailFallbackSourceNames = null;
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
@@ -2728,6 +2752,8 @@ public class DetailActivity extends BaseActivity {
     private boolean detailFallbackNewCycle = true;
     private VodInfo.VodSeries detailFallbackEpisode;
     private int detailFallbackEpisodeIndex = -1;
+    /** 切源前捕获的旧源剧集名列表（供离线秩对齐用，见 captureDetailFallbackEpisode）。 */
+    private List<String> detailFallbackSourceNames = null;
     
     // 切源前快照：记录"实际正在播"的源/线路/集，供进度迁移兜底（详见 readOldTimeFromSnapshot）
     private String fallbackFromSourceKey = "";
@@ -3087,7 +3113,14 @@ public class DetailActivity extends BaseActivity {
             return 0;
         }
         int matchedIndex = findMatchingEpisodeIndex(currentSeries, targetList);
-        return matchedIndex >= 0 ? matchedIndex : Math.max(0, Math.min(fallbackIndex, targetList.size() - 1));
+        if (matchedIndex >= 0) {
+            return matchedIndex;
+        }
+        // 裸下标兜底前做正片保护：当前集是正片时，绝不落在特辑/花絮等非正片条目上
+        // （实测曾把「第5期上」兜底到下标恰为「20260508泳池特辑」的位置）
+        return EpisodeNameMatcher.sanitizeMainFeatureFallback(
+                currentSeries == null ? null : currentSeries.name,
+                fallbackIndex, seriesNames(targetList));
     }
 
     /** 一次"选线路 + 定位集"的搜索结果。 */
@@ -3253,7 +3286,22 @@ public class DetailActivity extends BaseActivity {
             if (dictIndex >= 0) {
                 return dictIndex;
             }
-            // 2-b 直连站点：默认权威数据源（缓存命中 0ms，未命中约 800ms）
+            // 2-b 离线正片秩对齐（★ 切到特辑 bug 的主修复，现为首选）：
+            //     用"正片簇序"在本地把期数与日期两种命名域对齐——零延迟、零外部依赖，
+            //     不受直连站点波动影响。此前的顺序是"联网优先、离线兜底"，实测
+            //     直连站点（zyshow.net）波动大（约半数首请求超时/重置），导致每次
+            //     跨域切源都要先白等联网预算才落到离线层；且站点完全不可达时
+            //     裸下标兜底会把「第5期上」静默切到「20260508泳池特辑」这类错位条目。
+            //     簇序对齐自带周更快照校验（±3 天）与伪正片过滤，不确定时返回 -1，
+            //     此时才轮到下面的联网权威换算。
+            List<String> rankSourceNames = getRankSourceList(currentName);
+            int rankSourceIndex = rankSourceNames.indexOf(currentName);
+            int byRank = EpisodeNameMatcher.alignByMainFeatureRank(
+                    currentName, rankSourceIndex, rankSourceNames, targetNames);
+            if (byRank >= 0) {
+                return byRank;
+            }
+            // 2-c 直连站点：离线对齐失败时的权威修正（缓存命中 0ms，未命中约 800ms）
             int online = tryResolveCrossDomainNow(currentName, targetNames);
             if (online >= 0) {
                 return online;

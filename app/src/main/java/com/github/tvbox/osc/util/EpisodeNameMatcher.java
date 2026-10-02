@@ -102,7 +102,7 @@ public final class EpisodeNameMatcher {
      * 非正片词表（用于 {@link #isNonMainFeature} 判定与"同词"前缀提取）。
      */
     private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
-            "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更");
+            "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享");
 
     /** 非正片降权分值：使非正片得分显著低于正片的 80，但又高于 0（保留兜底可匹配性）。 */
     public static final int NON_MAIN_PENALTY = 30;
@@ -858,6 +858,417 @@ public final class EpisodeNameMatcher {
             }
         }
         return fallback;
+    }
+
+    /**
+     * 离线"正片秩对齐"：跨域（期数 ↔ 日期）直连失败时的本地兜底（第2-c层）。
+     *
+     * <p><b>为什么需要它</b>：跨域换算的权威层是直连站点（{@link EpisodeOnlineResolver}），
+     * 但站点可能被墙/超时/节目不在 slug 表内。此前直连失败后只能裸用旧源下标兜底，
+     * 而两源列表构成不同（目标源常混入特辑/花絮），裸下标会静默切到错误条目——
+     * 实测案例：旧源「第5期上」（下标27）切到目标源下标27 的「20260508泳池特辑」，
+     * 而正确答案是「20260502上」（第5期）。</p>
+     *
+     * <p><b>核心观察（真实采集源数据验证）</b>：综艺列表里正片按"期"成簇出现，
+     * 簇与簇之间必然隔着非正片条目（加更/特辑/花絮/回顾/预告），或隔着超过
+     * {@link #CLUSTER_GAP_DAYS} 天的播出间隔（同期的上/下分段通常相邻 0~2 天）：</p>
+     * <pre>
+     *   dytt 源（日期式）                  期簇
+     *   ────────────────────────────────────────
+     *   20260401回顾特辑                  （非正片）
+     *   20260404上 / 20260405下           簇0 = 第1期
+     *   20260406加更 / 特辑…              （非正片，分隔回）
+     *   20260411上 / 20260412下           簇1 = 第2期
+     *   …
+     *   20260502上 / 20260503下           簇4 = 第5期  ←「第5期上」落这里
+     * </pre>
+     *
+     * <p>因此：<b>期数式列表的第 N 期 ↔ 日期式列表的第 N 个正片簇（0 起秩 N-1）</b>。
+     * 簇序是"列表内相对次序"，与日期绝对数值无关——即使源站把年份整体错标
+     * （真实案例：把 20260502 写成 20250502），簇序依然正确，按日期值比对反而必败。</p>
+     *
+     * <p><b>两个方向</b>：</p>
+     * <ul>
+     *   <li>期数式当前集 → 日期式目标：期号即秩，直接取目标第 (N-1) 个正片簇，
+     *       再按分段（上/中/下）选簇内条目；</li>
+     *   <li>日期式当前集 → 期数式目标：用旧源列表自身的正片簇求当前集的簇秩
+     *       （要求当前条目本身是簇内正片），簇秩 + 1 即期号，复用
+     *       {@link #findIndexByEpisode} 落位。</li>
+     * </ul>
+     *
+     * <p><b>宁缺毋滥</b>：当前集是非正片、无法解析、或秩关系建立不起来时一律返回 -1，
+     * 交由调用方原有兜底，绝不无依据猜测。</p>
+     *
+     * @param currentName  当前在播集名（旧源）
+     * @param sourceIndex  当前集在旧源列表中的下标
+     * @param sourceNames  旧源剧集名列表（必须是旧源的列表，不能传新源已加载后的列表）
+     * @param targetNames  新源剧集名列表
+     * @return 新源下标；无法可靠对齐返回 -1
+     */
+    public static int alignByMainFeatureRank(String currentName, int sourceIndex,
+                                             List<String> sourceNames, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || sourceNames == null || targetNames == null
+                || sourceNames.isEmpty() || targetNames.isEmpty()) {
+            return -1;
+        }
+        if (sourceIndex < 0 || sourceIndex >= sourceNames.size()) {
+            return -1;
+        }
+        // 非正片（加更/花絮/特辑…）不参与秩对齐：它们与"期"没有稳定的对应关系
+        if (isNonMainFeature(currentName)) {
+            return -1;
+        }
+        EpisodeKey cur = parse(currentName);
+        if (cur.domain == DOMAIN_ORDINAL && cur.ordinal > 0) {
+            final int rank = cur.ordinal - 1;
+            final int wantPart = normalizePart(extractPart(currentName));
+            // ① 簇法：期号即秩（第N期 = 目标列表第 N-1 个正片簇）
+            List<List<Integer>> clusters = buildMainFeatureClusters(targetNames);
+            if (rank < clusters.size()) {
+                long expectedDay = expectedDayOf(targetNames, clusters, rank);
+                int picked = pickMainFeatureEntry(targetNames, clusters.get(rank), wantPart, expectedDay);
+                // 落点日期应贴近"首簇 + 7×rank 天"的周更快照；偏差过大说明簇序被
+                // 伪正片（特辑写成裸期数等）污染，不可采信
+                boolean trustworthy = picked >= 0;
+                if (trustworthy && expectedDay >= 0) {
+                    int d = dateOf(targetNames.get(picked));
+                    if (d > 0 && Math.abs(dayNumberOf(d) - expectedDay) > CLUSTER_TOLERANCE_DAYS) {
+                        trustworthy = false;
+                    }
+                }
+                if (trustworthy) {
+                    return picked;
+                }
+            }
+            // ② 外推法：首播日 + 7×(N-1) 天 = 期望播出日，按日期直接落位。
+            //    覆盖簇法失效的源（无任何非正片分隔、或簇被污染）。
+            return findIndexByExpectedDay(targetNames, cur.ordinal, wantPart);
+        }
+        if (cur.domain == DOMAIN_DATE && cur.ordinal > 0) {
+            final long curDay = dayNumberOf(cur.ordinal);
+            final int wantPart = normalizePart(extractPart(currentName));
+            // ① 簇法：用旧源列表自身的正片簇求当前集的期簇序。
+            // 注意簇序只依赖列表内的相对次序，与日期数值无关，
+            // 因此源站年份整体错标（2025… vs 实际 2026…）不影响结果。
+            List<List<Integer>> clusters = buildMainFeatureClusters(sourceNames);
+            int rank = mainFeatureClusterRank(sourceNames, sourceIndex);
+            if (rank >= 0) {
+                long expectedDay = expectedDayOf(sourceNames, clusters, rank);
+                boolean trustworthy = true;
+                if (expectedDay >= 0) {
+                    int d = dateOf(sourceNames.get(sourceIndex));
+                    if (d > 0 && Math.abs(dayNumberOf(d) - expectedDay) > CLUSTER_TOLERANCE_DAYS) {
+                        trustworthy = false;
+                    }
+                }
+                if (trustworthy) {
+                    return findIndexByEpisode(currentName, rank + 1, targetNames);
+                }
+            }
+            // ② 外推法：期号 ≈ (当前日期 − 首播日) / 7 周 + 1。
+            //    覆盖旧源列表没有非正片分隔导致簇无法切分的情况。
+            int firstDate = firstMainDate(sourceNames);
+            if (firstDate > 0 && curDay > 0) {
+                long diff = curDay - dayNumberOf(firstDate);
+                if (diff >= 0) {
+                    int episode = (int) Math.round(diff / 7.0) + 1;
+                    // 周更快照校验：当前日期应贴近"首播日 + 7×(期号-1) 天"
+                    if (Math.abs(diff - 7L * (episode - 1)) <= CLUSTER_TOLERANCE_DAYS) {
+                        int byEpisode = findIndexByEpisode(currentName, episode, targetNames);
+                        if (byEpisode >= 0) {
+                            return byEpisode;
+                        }
+                    }
+                }
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    /**
+     * 取列表中第一个"带日期的正片"的日期（YYYYMMDD）。
+     * 用于"首播日 + 7×(N-1)"外推；视为本季第 1 期的播出日。
+     */
+    private static int firstMainDate(List<String> names) {
+        if (names == null) {
+            return -1;
+        }
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d > 0) {
+                return d;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 按"期望播出日"落位：首播日 + 7×(N-1) 天为第 N 期的期望播出日，
+     * 在目标列表里找日期最接近（±{@link #CLUSTER_TOLERANCE_DAYS} 天）、
+     * 同分段、且为正片的条目。
+     *
+     * <p>为什么需要它：目标源把集名写成"第YYYYMMDD期"式或纯日期式时，
+     * 列表内可能没有任何非正片条目可以充当"期"分隔回（如实测 feifan 源，
+     * 全列表连成一片，簇法失效），此时只能靠周更快照外推。</p>
+     */
+    private static int findIndexByExpectedDay(List<String> names, int ordinal, int wantPart) {
+        if (names == null || names.isEmpty() || ordinal <= 0) {
+            return -1;
+        }
+        int firstDate = firstMainDate(names);
+        if (firstDate <= 0) {
+            return -1;
+        }
+        long expected = dayNumberOf(firstDate) + 7L * (ordinal - 1);
+        int best = -1;
+        long bestDist = Long.MAX_VALUE;
+        for (int i = 0; i < names.size(); i++) {
+            String n = names.get(i);
+            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
+                continue;
+            }
+            if (normalizePart(extractPart(n)) != wantPart) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d <= 0) {
+                continue;
+            }
+            long dist = Math.abs(dayNumberOf(d) - expected);
+            if (dist <= CLUSTER_TOLERANCE_DAYS && dist < bestDist) {
+                bestDist = dist;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /** 周更快照校验容差（天）：落点/当前集日期与期望播出日的最大偏差。 */
+    private static final int CLUSTER_TOLERANCE_DAYS = 3;
+
+    /**
+     * 计算第 {@code rank} 个簇的期望播出日（天序数）：首簇日期 + 每周 7 天 × rank。
+     * 首簇没有可解析日期时返回 -1（表示无法建立周更快照，调用方跳过校验）。
+     */
+    private static long expectedDayOf(List<String> names, List<List<Integer>> clusters, int rank) {
+        if (clusters == null || clusters.isEmpty()) {
+            return -1;
+        }
+        int c0 = dateOf(names.get(clusters.get(0).get(0)));
+        if (c0 <= 0) {
+            return -1;
+        }
+        return dayNumberOf(c0) + 7L * rank;
+    }
+
+    /**
+     * 把 YYYYMMDD 转成"天序数"（可做日期加减与比较）。
+     *
+     * <p><b>为什么不能用 YYYYMMDD 整数直接加减</b>：20260404 + 28 = 20260432，
+     * 跨月即失真。日期运算必须走日历。</p>
+     */
+    private static long dayNumberOf(int yyyymmdd) {
+        if (yyyymmdd <= 0) {
+            return -1;
+        }
+        try {
+            java.util.Calendar c = java.util.Calendar.getInstance();
+            c.clear();
+            c.set(yyyymmdd / 10000, (yyyymmdd % 10000) / 100 - 1, yyyymmdd % 100);
+            return c.getTimeInMillis() / 86400000L;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * 簇序校验：第 {@code rank} 个簇的起始日期应接近"首簇日期 + 每周 7 天 × rank"（±3 天）。
+     *
+     * <p><b>为什么需要它</b>：簇切分依赖"非正片条目/日期间隔"这两类分隔回信号。
+     * 有的源会把特辑也写成裸期数（如 {@code 第20260410期}，实为接力合唱特辑），
+     * 这类伪正片会凭空多出簇、把秩整体推后（实测 360zy 源：第5期会被推到
+     * {@code 第20260430期}）。周更综艺的"期起点"几乎严格每周一次，
+     * 用首簇日期外推即可识别这类污染：外推偏差超过 ±3 天说明簇序不可信，
+     * 宁可放弃（返回 -1 交回旧兜底），也不给出错误落点。</p>
+     *
+     * <p>首簇或目标簇没有可解析日期（如期数式列表）时跳过校验（放行）——
+     * 此时没有更可靠的本地依据。</p>
+     */
+    /**
+     * 在指定正片簇内挑出落点条目。
+     *
+     * <p>挑选顺序：先按分段口径（上/中/下）筛选；簇内没有该分段时退回整簇；
+     * 再在候选里选日期最接近期望播出日（首簇日期 + 7×rank 天）的一条——
+     * 这一步能对抗"特辑被写成裸期数"造成的簇污染：污染条目虽混进了簇，
+     * 但它的日期偏离期望播出日，会被同簇里日期正确的真正片压过
+     * （实测 360zy 源：簇内 [0430伪, 0501伪, 0502上, 0503下]，期望 0502，
+     * 正确选中 0502上）。</p>
+     *
+     * @param names       目标源剧集名列表
+     * @param cluster     簇内条目下标（升序）
+     * @param wantPart    归一化后的分段
+     * @param expectedDay 期望播出日的天序数；不可知时传 -1（退回簇内位置选择）
+     * @return 条目下标；簇为空返回 -1
+     */
+    private static int pickMainFeatureEntry(List<String> names, List<Integer> cluster,
+                                            int wantPart, long expectedDay) {
+        if (cluster == null || cluster.isEmpty()) {
+            return -1;
+        }
+        List<Integer> matching = new ArrayList<>();
+        for (int i : cluster) {
+            if (normalizePart(extractPart(names.get(i))) == wantPart) {
+                matching.add(i);
+            }
+        }
+        if (matching.isEmpty()) {
+            matching = cluster;
+        }
+        if (expectedDay < 0 || matching.size() == 1) {
+            // 分段位置选择：上→第一条，下→最后一条，中→三段及以上取第二条
+            if (wantPart == PART_DOWN) {
+                return matching.get(matching.size() - 1);
+            }
+            if (wantPart == PART_MIDDLE && matching.size() >= 3) {
+                return matching.get(1);
+            }
+            return matching.get(0);
+        }
+        int best = matching.get(0);
+        long bestDist = Long.MAX_VALUE;
+        for (int i : matching) {
+            int d = dateOf(names.get(i));
+            long dist = d > 0 ? Math.abs(dayNumberOf(d) - expectedDay) : Long.MAX_VALUE;
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * 正片簇切分阈值（天）：相邻两个正片条目的日期差超过该值即视为新的一期。
+     *
+     * <p>同期的上/下分段一般相邻 0~2 天（同日或次日播出）；
+     * 相邻两期之间至少隔一周（≥5 天）。取 3 天为界，两侧都有足够余量。</p>
+     */
+    private static final int CLUSTER_GAP_DAYS = 3;
+
+    /**
+     * 把剧集列表切分成"正片簇"：每个簇是一段连续同期的正片条目。
+     *
+     * <p>开新簇的两个条件（满足其一）：</p>
+     * <ol>
+     *   <li>与上一个正片之间隔着非正片条目（加更/特辑/花絮…）——这是最主要的分隔回信号；</li>
+     *   <li>与上一个正片的日期差超过 {@link #CLUSTER_GAP_DAYS} 天——兜底覆盖
+     *       "列表里完全没有非正片条目"的源（此时只有日期间隔可用）。</li>
+     * </ol>
+     *
+     * <p>非正片条目与无法解析域名的噪声条目都不进簇。</p>
+     *
+     * @return 簇列表；每个簇是该簇内条目在原列表中的下标（升序）
+     */
+    private static List<List<Integer>> buildMainFeatureClusters(List<String> names) {
+        List<List<Integer>> clusters = new ArrayList<>();
+        if (names == null || names.isEmpty()) {
+            return clusters;
+        }
+        boolean lastWasMain = false;
+        int lastMainDate = -1;
+        for (int i = 0; i < names.size(); i++) {
+            String n = names.get(i);
+            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
+                lastWasMain = false;
+                continue;
+            }
+            int d = dateOf(n);
+            // 日期差必须走日历天序数：YYYYMMDD 整数相减跨月即失真（0429→0502 差 73）
+            boolean gapBoundary = d > 0 && lastMainDate > 0
+                    && Math.abs(dayNumberOf(d) - dayNumberOf(lastMainDate)) > CLUSTER_GAP_DAYS;
+            boolean boundary = !lastWasMain || gapBoundary;
+            if (boundary || clusters.isEmpty()) {
+                clusters.add(new ArrayList<Integer>());
+            }
+            clusters.get(clusters.size() - 1).add(i);
+            lastWasMain = true;
+            if (d > 0) {
+                lastMainDate = d;
+            }
+        }
+        return clusters;
+    }
+
+    /**
+     * 求旧源列表中某条目所属的"正片簇"秩（0 起）。
+     *
+     * @param names 旧源剧集名列表
+     * @param index 目标条目下标（必须是正片，否则返回 -1）
+     * @return 簇秩；条目是非正片/不在任何簇内时返回 -1
+     */
+    private static int mainFeatureClusterRank(List<String> names, int index) {
+        if (names == null || index < 0 || index >= names.size()) {
+            return -1;
+        }
+        if (isNonMainFeature(names.get(index))) {
+            return -1;
+        }
+        List<List<Integer>> clusters = buildMainFeatureClusters(names);
+        for (int c = 0; c < clusters.size(); c++) {
+            if (clusters.get(c).contains(index)) {
+                return c;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 裸下标兜底的"正片保护"：当前集是正片、而兜底下标落在非正片条目
+     * （特辑/花絮/加更/回顾…）上时，就近回退到正片条目。
+     *
+     * <p><b>为什么需要它</b>：所有内容级匹配都失败后，调用方只能用旧源下标兜底。
+     * 两源列表构成不同时该下标会指向任意条目——实测切到了「20260508泳池特辑」。
+     * 正片切到非正片几乎必然是错的（特辑是衍生内容，不是当期正片）；
+     * 而非正片当前集（用户确实在看加更/花絮）落到同性质条目反而合理，故不干预。</p>
+     *
+     * <p><b>就近方向</b>：优先向前（更早的正片）——加更/花絮/特辑在列表里总是
+     * 排在它们所属那期正片的后面，向前找更可能命中同一期的正片。</p>
+     *
+     * @param currentName   当前在播集名
+     * @param fallbackIndex 兜底下标（会被钳位到合法范围）
+     * @param names         目标源剧集名列表
+     * @return 修正后的下标；无法修正时返回钳位后的原值
+     */
+    public static int sanitizeMainFeatureFallback(String currentName, int fallbackIndex, List<String> names) {
+        if (names == null || names.isEmpty()) {
+            return Math.max(0, fallbackIndex);
+        }
+        int clamped = Math.max(0, Math.min(fallbackIndex, names.size() - 1));
+        if (TextUtils.isEmpty(currentName) || isNonMainFeature(currentName)) {
+            return clamped;
+        }
+        String landed = clamped >= 0 && clamped < names.size() ? names.get(clamped) : null;
+        if (TextUtils.isEmpty(landed) || !isNonMainFeature(landed)) {
+            return clamped;
+        }
+        // 落点是非正片：向前找最近的正片，找不到再向后
+        for (int i = clamped; i >= 0; i--) {
+            String n = names.get(i);
+            if (!TextUtils.isEmpty(n) && !isNonMainFeature(n)) {
+                return i;
+            }
+        }
+        for (int i = clamped + 1; i < names.size(); i++) {
+            String n = names.get(i);
+            if (!TextUtils.isEmpty(n) && !isNonMainFeature(n)) {
+                return i;
+            }
+        }
+        return clamped;
     }
 
     /**

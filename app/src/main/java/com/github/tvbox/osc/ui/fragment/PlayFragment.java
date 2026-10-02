@@ -1963,7 +1963,10 @@ public class PlayFragment extends BaseLazyFragment {
         if (matchedIndex >= 0) {
             return matchedIndex;
         }
-        return Math.max(0, Math.min(fallbackIndex, targetList.size() - 1));
+        // 裸下标兜底前做正片保护：当前集是正片时，绝不落在特辑/花絮等非正片条目上
+        // （实测曾把「第5期上」兜底到下标恰为「20260508泳池特辑」的位置）
+        return EpisodeNameMatcher.sanitizeMainFeatureFallback(
+                currentSeries.name, fallbackIndex, seriesNames(targetList));
     }
 
     /**
@@ -2048,7 +2051,21 @@ public class PlayFragment extends BaseLazyFragment {
             if (dictIndex >= 0) {
                 return dictIndex;
             }
-            // 2-b 直连站点：默认权威数据源（缓存命中 0ms，未命中约 800ms）
+            // 2-b 离线正片秩对齐（★ 切到特辑 bug 的主修复，现为首选）：
+            //     用"正片簇序"在本地把期数与日期两种命名域对齐——零延迟、零外部
+            //     依赖，不受直连站点波动影响（实测 zyshow.net 约半数首请求超时/重置，
+            //     旧的"联网优先"顺序会让每次跨域切源先白等联网预算）。簇序对齐
+            //     自带周更快照校验（±3 天）与伪正片过滤，不确定时返回 -1，
+            //     此时才轮到下面的联网权威换算。此前这里落空后由裸下标兜底，
+            //     会把「第5期上」静默切到「20260508泳池特辑」这类错位条目上。
+            if (playIndex >= 0 && !playList.isEmpty()) {
+                int byRank = EpisodeNameMatcher.alignByMainFeatureRank(
+                        currentName, playIndex, seriesNames(playList), targetNames);
+                if (byRank >= 0) {
+                    return byRank;
+                }
+            }
+            // 2-c 直连站点：离线对齐失败时的权威修正（缓存命中 0ms，未命中约 800ms）
             int online = tryResolveCrossDomainNow(currentName, targetNames);
             if (online >= 0) {
                 return online;
