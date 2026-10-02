@@ -3147,6 +3147,24 @@ public class DetailActivity extends BaseActivity {
             return matchedIndex;
         }
 
+        // ---------- 第1.5层：同日期多段的组内位置对齐 ----------
+        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
+        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
+        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
+        // 必须在跨域联网之前做：这是纯本地、零延迟、且确定性的判断。
+        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        int playIndex = indexOfSeries(playList, currentSeries);
+        if (playIndex < 0 && vodInfo != null && vodInfo.playIndex >= 0 && vodInfo.playIndex < playList.size()) {
+            playIndex = vodInfo.playIndex;
+        }
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
+                    currentName, playIndex, seriesNames(playList), targetNames);
+            if (byGroup >= 0) {
+                return byGroup;
+            }
+        }
+
         // ---------- 第2层：跨域 → 权威换算 ----------
         // 严格门控：只有真正跨域（日期 ↔ 期数）才走这一步；同域失败属正常无对应，不联网。
         if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {

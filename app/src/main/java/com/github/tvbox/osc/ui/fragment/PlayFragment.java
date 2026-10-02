@@ -1989,6 +1989,24 @@ public class PlayFragment extends BaseLazyFragment {
             return matchedIndex;
         }
 
+        // ---------- 第1.5层：同日期多段的组内位置对齐 ----------
+        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
+        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
+        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
+        // 必须在跨域联网之前做：这是纯本地、零延迟、且确定性的判断。
+        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        int playIndex = indexOfSeries(playList, currentSeries);
+        if (playIndex < 0 && mVodInfo != null && mVodInfo.playIndex >= 0 && mVodInfo.playIndex < playList.size()) {
+            playIndex = mVodInfo.playIndex;
+        }
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
+                    currentName, playIndex, seriesNames(playList), targetNames);
+            if (byGroup >= 0) {
+                return byGroup;
+            }
+        }
+
         // ---------- 第2层：跨域 → 权威换算 ----------
         if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
             // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
