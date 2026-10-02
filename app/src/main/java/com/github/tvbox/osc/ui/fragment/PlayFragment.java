@@ -75,6 +75,10 @@ import com.github.tvbox.osc.ui.dialog.SelectDialog;
 import com.github.tvbox.osc.ui.dialog.SubtitleDialog;
 import com.github.tvbox.osc.util.AdBlocker;
 import com.github.tvbox.osc.util.DefaultConfig;
+import com.github.tvbox.osc.util.EpisodeDict;
+import com.github.tvbox.osc.util.EpisodeNameMatcher;
+import com.github.tvbox.osc.util.EpisodeOnlineResolver;
+import com.github.tvbox.osc.util.EpisodeResolveInitializer;
 import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.ImgUtil;
@@ -126,8 +130,6 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import me.jessyan.autosize.AutoSize;
 import master.flame.danmaku.ui.widget.DanmakuView;
@@ -1825,6 +1827,9 @@ public class PlayFragment extends BaseLazyFragment {
         // 切换到新线路
         mVodInfo.playFlag = flagToSwitch;
         mVodInfo.playIndex = nextIndex;
+        // 第3层：跨域（日期↔期数）且本地未命中时，异步联网精确重定位（成功后自动重播正确集）
+        tryOnlineCrossDomainResolve(currentSeries == null ? "" : currentSeries.name, flagToSwitch,
+                mVodInfo.seriesMap.get(flagToSwitch), nextIndex);
         autoRetryCount = 0;
         allowSwitchPlayer = true;
         hasAutoSwitchedPlayer = false;
@@ -1910,63 +1915,214 @@ public class PlayFragment extends BaseLazyFragment {
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
             return Math.max(0, Math.min(fallbackIndex, targetList.size() - 1));
         }
-        int currentEpisode = extractEpisodeNumber(currentSeries.name);
-        int matchedIndex = -1;
-        int bestScore = 0;
-        for (int i = 0; i < targetList.size(); i++) {
-            VodInfo.VodSeries targetSeries = targetList.get(i);
-            int score = getEpisodeMatchScore(currentSeries.name, currentEpisode, targetSeries == null ? null : targetSeries.name);
-            if (score > bestScore) {
-                bestScore = score;
-                matchedIndex = i;
-            }
-        }
+        int matchedIndex = findMatchingEpisodeIndex(currentSeries, targetList);
         if (matchedIndex >= 0) {
             return matchedIndex;
         }
         return Math.max(0, Math.min(fallbackIndex, targetList.size() - 1));
     }
 
-    private int getEpisodeMatchScore(String currentName, int currentEpisode, String targetName) {
-        if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(targetName)) {
+    /**
+     * 在 targetList 中定位与 currentSeries 对应的集。
+     * 先同域精确匹配；失败且属"日期 ↔ 第N期"跨域时，用旧源下标按序对齐兜底。
+     */
+    /**
+     * 播放页跨源定位"同一集"的索引。
+     *
+     * <p><b>分层策略（有网优先）</b>：
+     * <ol>
+     *   <li><b>第1层 本地同域匹配</b>：两侧命名方式相同（都是日期或都是"第N期"）时毫秒级命中，
+     *       含前导零（第8集 ↔ 第08集、001集）与多字少字容错；</li>
+     *   <li><b>第2层 跨域直连</b>：一侧日期、一侧期数时本地无法换算，交给
+     *       {@link EpisodeOnlineResolver} 用站点权威数据回答（缓存命中 0ms，未命中约 800ms，
+     *       超预算立即放弃）；</li>
+     *   <li><b>第3层 本地按序兜底</b>：按旧源下标对齐——该猜测仅在两源列表构成一致时成立，
+     *       故仅用于同域，作为最后手段。</li>
+     * </ol>
+     * 全程失败返回 -1，由调用方兜底，<b>绝不阻塞播放</b>。</p>
+     *
+     * @return 目标源下标；无法可靠匹配返回 -1
+     */
+    private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        if (targetList == null || targetList.isEmpty()) {
+            return -1;
+        }
+        if (targetList.size() == 1) {
             return 0;
         }
-        if (targetName.equalsIgnoreCase(currentName)) {
-            return 100;
+        if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
+            return -1;
         }
-        if (currentEpisode >= 0 && extractEpisodeNumber(targetName) == currentEpisode) {
-            return 80;
+        final List<String> targetNames = seriesNames(targetList);
+        final String currentName = currentSeries.name;
+
+        // ---------- 第1层：本地同域精确匹配（含前导零 / 多字少字变体）----------
+        int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
+        if (matchedIndex >= 0) {
+            return matchedIndex;
         }
-        String currentLower = currentName.toLowerCase(Locale.ROOT);
-        String targetLower = targetName.toLowerCase(Locale.ROOT);
-        if (currentEpisode < 0 && currentName.length() >= 2 && targetLower.contains(currentLower)) {
-            return 70;
+
+        // ---------- 第2层：跨域 → 权威换算 ----------
+        if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
+            // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
+            int dictIndex = resolveByOfflineDict(currentName, targetNames);
+            if (dictIndex >= 0) {
+                return dictIndex;
+            }
+            // 2-b 直连站点：默认权威数据源（缓存命中 0ms，未命中约 800ms）
+            int online = tryResolveCrossDomainNow(currentName, targetNames);
+            if (online >= 0) {
+                return online;
+            }
         }
-        if (currentEpisode < 0 && targetName.length() >= 2 && currentLower.contains(targetLower)) {
-            return 60;
+
+        // ---------- 第3层：本地按序兜底（仅同域，跨域不猜）----------
+        List<VodInfo.VodSeries> sourceList = getPlayingSeriesList();
+        int sourceIndex = indexOfSeries(sourceList, currentSeries);
+        if (sourceIndex < 0 && mVodInfo != null && mVodInfo.playIndex >= 0 && mVodInfo.playIndex < sourceList.size()) {
+            sourceIndex = mVodInfo.playIndex;
         }
-        return 0;
+        if (sourceIndex >= 0 && !sourceList.isEmpty()) {
+            int aligned = EpisodeNameMatcher.alignByOrder(
+                    sourceIndex, seriesNames(sourceList), targetNames, false);
+            if (aligned >= 0) {
+                return aligned;
+            }
+        }
+        return matchedIndex;
+    }
+
+    /**
+     * 跨域同步换算：给直连一个有限的等待预算，拿到就用，拿不到立刻放行进兜底。
+     * 缓存命中时开销为 0；无网/慢网超时后立即返回 -1。
+     *
+     * @return 目标源下标；未命中/超时返回 -1
+     */
+    private int tryResolveCrossDomainNow(String currentName, List<String> targetNames) {
+        try {
+            if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return -1;
+            String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            if (TextUtils.isEmpty(showName)) return -1;
+            final String date = EpisodeDict.extractDate(currentName);
+            if (TextUtils.isEmpty(date)) return -1;
+
+            long budget = EpisodeResolveInitializer.getCrossDomainTimeoutMs();
+            if (budget <= 0) return -1;
+
+            int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
+            if (episode <= 0) return -1;
+            return EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    /**
+     * 离线字典换算（<b>默认不参与链路</b>）：把"当前集的播出日期"换算成"期数"，
+     * 再去目标源里找对应的"第N期"。仅跨域（日期→期数）时有意义。
+     *
+     * <p>默认关闭时恒返回 -1，链路顺序不受影响；如需长期无网部署，
+     * 可用 {@link EpisodeResolveInitializer#setOfflineDictEnabled(boolean)} 打开。</p>
+     */
+    private int resolveByOfflineDict(String currentName, List<String> targetNames) {
+        if (!EpisodeResolveInitializer.isOfflineDictEnabled()) return -1;
+        if (!EpisodeDict.isReady() || TextUtils.isEmpty(currentName) || targetNames == null) return -1;
+        String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+        if (TextUtils.isEmpty(showName)) return -1;
+        if (!EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) return -1;
+        String date = EpisodeDict.extractDate(currentName);
+        if (TextUtils.isEmpty(date)) return -1;
+        int episode = EpisodeDict.lookup(showName, date);
+        if (episode <= 0) {
+            episode = EpisodeDict.lookupBySeriesName(showName, currentName);
+        }
+        if (episode <= 0) return -1;
+        return EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+    }
+
+    /**
+     * 跨域直连的<b>异步后置修正</b>入口：同步预算用尽后，仍让正确答案最终生效。
+     *
+     * <p>先按旧源下标落地播出（保证切源不断流），直连结果回来后回主线程静默改写到正确集。
+     * 任何失败静默放弃，不阻塞播放。</p>
+     *
+     * @param currentName 发起查询时"正在播的那一集"的集名（旧源写法）
+     * @param targetFlag  目标线路名
+     * @param landedIndex 本次切源后本地匹配落地的下标；用于回调时确认用户未再操作
+     */
+    private void tryOnlineCrossDomainResolve(final String currentName, final String targetFlag,
+                                             final List<VodInfo.VodSeries> targetList, final int landedIndex) {
+        if (TextUtils.isEmpty(currentName)) return;
+        if (targetList == null || targetList.size() < 2) return;
+        if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return;
+        final List<String> targetNames = seriesNames(targetList);
+        if (!EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) return;
+        final String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+        if (TextUtils.isEmpty(showName)) return;
+        final String date = EpisodeDict.extractDate(currentName);
+        if (TextUtils.isEmpty(date)) return;
+        EpisodeOnlineResolver.resolveAsync(showName, date, parseThreadPool, new EpisodeOnlineResolver.Callback() {
+            @Override
+            public void onResult(final int episode) {
+                if (episode <= 0) return;
+                final int idx = EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+                if (idx < 0) return;
+                applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, idx);
+            }
+        });
+    }
+
+    /**
+     * 在线查询命中后回主线程应用。
+     *
+     * <p>防串台校验：只有仍停留在本次切源落地的位置（线路与下标都未变）时才改写；
+     * 用户已手动切线路或选集则丢弃本次结果。</p>
+     */
+    private void applyOnlineResolvedIndex(final String targetFlag, final List<VodInfo.VodSeries> targetList,
+                                          final int landedIndex, final int index) {
+        if (getActivity() == null) return;
+        getActivity().runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mVodInfo == null || targetList == null || index < 0 || index >= targetList.size()) return;
+                if (!TextUtils.equals(mVodInfo.playFlag, targetFlag)) return;
+                if (mVodInfo.playIndex != landedIndex) return;
+                mVodInfo.playIndex = index;
+                try {
+                    playUrl(targetList.get(index).url, null);
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    private int indexOfSeries(List<VodInfo.VodSeries> list, VodInfo.VodSeries series) {
+        if (list == null || series == null) return -1;
+        for (int i = 0; i < list.size(); i++) {
+            VodInfo.VodSeries s = list.get(i);
+            if (s == series) return i;
+            if (s != null && series.url != null && series.url.equals(s.url)) return i;
+        }
+        return -1;
+    }
+
+    private List<String> seriesNames(List<VodInfo.VodSeries> list) {
+        List<String> names = new ArrayList<>();
+        if (list == null) return names;
+        for (VodInfo.VodSeries s : list) {
+            names.add(s == null || s.name == null ? "" : s.name);
+        }
+        return names;
+    }
+
+    private int getEpisodeMatchScore(String currentName, int currentEpisode, String targetName) {
+        // 统一委托 EpisodeNameMatcher：日期/第N期分域比较，避免 20260809期 与 第8期 无法互认
+        return EpisodeNameMatcher.score(currentName, targetName);
     }
 
     private int extractEpisodeNumber(String name) {
-        if (TextUtils.isEmpty(name)) {
-            return -1;
-        }
-        try {
-            String text = name.replaceAll("\\[.*?\\]|\\(.*?\\)", "");
-            text = text.replaceAll("\\b(19|20)\\d{2}\\b", "");
-            text = text.toLowerCase(Locale.ROOT).replaceAll("2160p|1080p|720p|480p|4k|h26[45]|x26[45]|mp4", "");
-            Matcher matcher = Pattern.compile("(?i)(?:ep|\\u7b2c|e|[\\-\\.\\s])\\s?(\\d{1,4})").matcher(text);
-            if (matcher.find()) {
-                return Integer.parseInt(matcher.group(1));
-            }
-            String number = text.replaceAll("\\D+", "");
-            if (!TextUtils.isEmpty(number)) {
-                return Integer.parseInt(number);
-            }
-        } catch (Exception ignored) {
-        }
-        return -1;
+        // 统一委托 EpisodeNameMatcher：日期优先识别，避免 8 位日期被当成集数号
+        return EpisodeNameMatcher.extractOrdinal(name);
     }
 
     void autoRetryFromLoadFoundVideoUrls() {

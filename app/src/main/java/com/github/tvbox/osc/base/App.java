@@ -10,6 +10,7 @@ import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.util.AppManager;
 import com.github.tvbox.osc.util.EpgUtil;
+import com.github.tvbox.osc.util.EpisodeResolveInitializer;
 import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
@@ -41,6 +42,18 @@ public class App extends MultiDexApplication {
         super.onCreate();
         instance = this;
         initParams();
+        // 综艺跨源集匹配：装配直连查询（含磁盘缓存）与节目名→slug 映射（失败静默，不影响启动）。
+        // 默认链路 = 本地同域匹配 → 跨域直连 → 按序兜底；离线字典默认关闭，
+        // 如需长期无网部署可调用 EpisodeResolveInitializer.setOfflineDictEnabled(true)。
+        EpisodeResolveInitializer.init(this);
+        // 后台补齐"新上线综艺"的节目名→slug 映射（缓存 24h 内不联网；失败静默）
+        try {
+            final java.util.concurrent.ExecutorService pool =
+                    java.util.concurrent.Executors.newSingleThreadExecutor();
+            EpisodeResolveInitializer.refreshSlugMapAsync(pool);
+            pool.shutdown();
+        } catch (Throwable ignored) {
+        }
         // OKGo
         OkGoHelper.init(); //台标获取
         EpgUtil.init();
