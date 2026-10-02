@@ -410,22 +410,84 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * <b>抽取集名中的 8 位播出日期</b>（YYYYMMDD），没有则返回 -1。
+     *
+     * <p><b>为什么需要它（而不是用 {@link #parse} 的 domain）</b>：
+     * 站点存在 {@code 第20260404期上} 这种<b>"期数式里嵌了日期"</b>的写法。
+     * 由于 {@link #parse} 采用<b>日期优先</b>策略，这类条目会被判为
+     * {@link #DOMAIN_DATE}，于是 {@link #findIndexByEpisode} 里
+     * {@code key.domain != DOMAIN_ORDINAL} 的判据会把它<b>整条跳过</b>：
+     * 反向换算好不容易查到日期 {@code D}，却在目标源里<b>永远找不到落点</b>。</p>
+     *
+     * <p>本方法只看"这条名字里有没有合法日期"，与 domain 判定解耦，
+     * 因此 {@code 20260404上}、{@code 第20260404期}、{@code 第20260404期上}
+     * 三种写法都能被统一识别为 {@code 20260404}——
+     * 这正是跨命名风格落位的基础。</p>
+     *
+     * @param name 集名
+     * @return YYYYMMDD 整数；无日期返回 -1
+     */
+    public static int dateOf(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return -1;
+        }
+        Matcher compact = DATE_COMPACT.matcher(name);
+        if (compact.find()) {
+            return buildDateOrdinal(compact.group(1), compact.group(2), compact.group(3));
+        }
+        Matcher separated = DATE_SEPARATED.matcher(name);
+        if (separated.find()) {
+            return buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3));
+        }
+        return -1;
+    }
+
+    /**
      * 按日期定位目标列表下标：找首个日期等于 {@code date} 的条目。
      *
      * <p>用于<b>反向跨域</b>的落位：反查得到日期 {@code D} 后，
      * 目标源本身是日期式（没有期数），因此不能再用
      * {@link #findIndexByEpisode} 匹配，必须按日期找。</p>
      *
-     * <p>多条同日（上/中/下分段）时返回<b>第一条</b>，
-     * 与"无后缀 ≡ 上"的既有归一一致。
-     * 非正片条目（{@code 20260401回顾特辑}）会被跳过，
-     * 避免把正片日期对到回顾内容上。</p>
+     * <p>内部委托 {@link #findIndexByDate(String, List, String)}，
+     * {@code currentName} 传 {@code null} 表示"口径未知"，
+     * 保持旧行为：同日期优先正片，只有非正片时返回该非正片。</p>
      *
      * @param date  YYYYMMDD
      * @param names 目标源集名列表
      * @return 命中下标；未命中返回 -1
      */
     public static int findIndexByDate(String date, List<String> names) {
+        return findIndexByDate(date, names, null);
+    }
+
+    /**
+     * 按日期定位目标列表下标，<b>并保持正片/非正片口径一致</b>。
+     *
+     * <p><b>为什么必须带口径</b>：各源对"哪一天是正片"的判断并不一致。
+     * 例如同一天在 dytt 是 {@code 20260410接力合唱特辑}（非正片），
+     * 在 360zy 却是正片 {@code 第20260410期}。
+     * 若只按日期落位，用户在看<b>正片</b>时会切到<b>特辑</b>，
+     * 表现为"播放记忆丢失"。</p>
+     *
+     * <p><b>落位规则</b>：</p>
+     * <ul>
+     *   <li>{@code currentName} 是<b>正片</b>：只接受非正片以外的条目；
+     *       该日期只有非正片时返回 <b>-1</b>（交由调用方保守落地，保持原集不切换）；</li>
+     *   <li>{@code currentName} 是<b>非正片</b>：优先取<b>同词</b>非正片
+     *       （{@code 加更} ↔ {@code 加更}）；找不到才降级到改日期的任意条目；</li>
+     *   <li>{@code currentName} 为 null/空（口径未知）：同日期优先正片，
+     *       只有非正片时返回首个非正片（兼容旧行为）。</li>
+     * </ul>
+     * <p>同日期多条（上/中/下）时一律返回<b>第一条</b>，
+     * 与"无后缀 ≡ 上"的既有归一一致。</p>
+     *
+     * @param date        YYYYMMDD
+     * @param names       目标源集名列表
+     * @param currentName 当前在播集名（用于确定正片/非正片口径），可为 null
+     * @return 命中下标；未命中或口径不符返回 -1
+     */
+    public static int findIndexByDate(String date, List<String> names, String currentName) {
         if (TextUtils.isEmpty(date) || names == null || names.isEmpty()) {
             return -1;
         }
@@ -435,25 +497,56 @@ public final class EpisodeNameMatcher {
         } catch (Throwable t) {
             return -1;
         }
-        int fallback = -1;
+
+        final boolean curKnown = !TextUtils.isEmpty(currentName);
+        final boolean curIsNonMain = curKnown && isNonMainFeature(currentName);
+        final String curToken = curIsNonMain ? nonMainFeatureToken(currentName) : null;
+
+        int nonMainFallback = -1;      // 口径未知时的兜底
+        int sameTokenFallback = -1;    // 非正片的"同词"命中
         for (int i = 0; i < names.size(); i++) {
             String name = names.get(i);
             if (TextUtils.isEmpty(name)) {
                 continue;
             }
-            EpisodeKey k = parse(name);
-            if (k.domain != DOMAIN_DATE || k.ordinal != target) {
+            // 用 dateOf 而非 parse().domain：兼容「第YYYYMMDD期」这类写法
+            if (dateOf(name) != target) {
                 continue;
             }
-            if (isNonMainFeature(name)) {
-                if (fallback < 0) {
-                    fallback = i;
+            boolean nonMain = isNonMainFeature(name);
+
+            if (!curKnown) {
+                // 口径未知：优先正片，退而取首个非正片
+                if (!nonMain) {
+                    return i;
+                }
+                if (nonMainFallback < 0) {
+                    nonMainFallback = i;
                 }
                 continue;
             }
-            return i;
+
+            if (!curIsNonMain) {
+                // 当前是正片：只认正片
+                if (!nonMain) {
+                    return i;
+                }
+                continue;
+            }
+
+            // 当前是非正片：优先同词
+            if (nonMain && curToken != null && curToken.equals(nonMainFeatureToken(name))) {
+                return i;
+            }
+            if (sameTokenFallback < 0) {
+                sameTokenFallback = i;
+            }
         }
-        return fallback;
+        if (!curKnown) {
+            return nonMainFallback;
+        }
+        // 非正片：同词优先，找不到才降级到该日期的任意条目
+        return curIsNonMain ? sameTokenFallback : -1;
     }
 
     /**

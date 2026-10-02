@@ -3269,11 +3269,12 @@ public class DetailActivity extends BaseActivity {
      * <p><b>两个方向都要处理</b>：</p>
      * <ul>
      *   <li><b>正向</b>（当前名有日期，目标源是期数式）：
-     *       用日期查期数，再在目标源里找 {@code 第N期}。</li>
+     *       先按日期直接落位（覆盖日期式与 {@code 第YYYYMMDD期} 式）；
+     *       不行再用日期查期数找 {@code 第N期}；最后再用日期兜一次。</li>
      *   <li><b>反向</b>（当前名是期数式、无日期，目标源是日期式）：
      *       用期数查日期，再在目标源里按日期定位。</li>
      * </ul>
-     * <p>早期实现只覆盖了正向，反向（{@code 第1期上} → {@code 20260404上}）
+     * <p>早期实现只覆盖了正向的"查期数"一步，反向（{@code 第1期上} → {@code 20260404上}）
      * 会因 {@link #extractDateFromName} 取不到日期而整条链路失效，
      * 只能退到"按位置猜"导致错配。</p>
      *
@@ -3292,9 +3293,22 @@ public class DetailActivity extends BaseActivity {
             // 正向：当前名含日期 → 查期数
             final String date = extractDateFromName(currentName);
             if (!TextUtils.isEmpty(date)) {
+                // ① 优先按日期直接落位：目标源若是日期式（20260404上 / 第20260404期），
+                //    这一步就够了，且能保持正片/非正片口径一致。
+                int byDate = EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
+                if (byDate >= 0) {
+                    return byDate;
+                }
+                // ② 目标源是"第N期"式：先把日期换算成权威期数，再按期数找。
                 int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
                 if (episode <= 0) return -1;
-                return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+                int byEpisode = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+                if (byEpisode >= 0) {
+                    return byEpisode;
+                }
+                // ③ 兜底：目标源写「第YYYYMMDD期」时 parse() 判为日期域，
+                //    findIndexByEpisode 会整条跳过；此处用源名自带日期再落一次。
+                return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
             }
 
             // 反向：当前名是期数式（无日期）→ 查日期
@@ -3347,7 +3361,9 @@ public class DetailActivity extends BaseActivity {
         String date = EpisodeOnlineResolver.resolveDateWithin(
                 showName, cur.ordinal, anchor, reverseBudget);
         if (TextUtils.isEmpty(date)) return -1;
-        return EpisodeNameMatcher.findIndexByDate(date, targetNames);
+        // 带入 currentName 保持正片/非正片口径一致：
+        // 当前是正片时，不会落到同日期但实为特辑/加更的条目上（那属于错配）。
+        return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
     }
 
     /**
@@ -3375,7 +3391,13 @@ public class DetailActivity extends BaseActivity {
             episode = EpisodeDict.lookupBySeriesName(showName, currentName);
         }
         if (episode <= 0) return -1;
-        return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+        int byEpisode = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+        if (byEpisode >= 0) {
+            return byEpisode;
+        }
+        // 目标源若写「第YYYYMMDD期」，findIndexByEpisode 会跳过（判为日期域）；
+        // 这里用当前名自带的日期兜一次，覆盖该写法。
+        return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
     }
 
     /** 从任意集名中提取 8 位播出日期（YYYYMMDD），供跨域换算复用。 */
@@ -3414,12 +3436,18 @@ public class DetailActivity extends BaseActivity {
             @Override
             public void onResult(final int episode) {
                 if (episode <= 0) return; // 静默降级
-                final int idx = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+                // 先按期数找（目标源为 第N期 式）；找不到再用日期兜
+                // （目标源可能是 第YYYYMMDD期 式，findIndexByEpisode 会跳过）
+                int idx = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+                if (idx < 0) {
+                    idx = EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
+                }
                 if (idx < 0) return;
+                final int resolved = idx;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, idx);
+                        applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, resolved);
                     }
                 });
             }
