@@ -1983,18 +1983,9 @@ public class PlayFragment extends BaseLazyFragment {
         final List<String> targetNames = seriesNames(targetList);
         final String currentName = currentSeries.name;
 
-        // ---------- 【诊断日志】切源匹配决策全链路 ----------
-        // 目的：一次性输出每一层的结论，定位"匹配失败后被静默兜成同下标"的具体环节。
-        // 定位完成后可整段删除；不影响任何匹配行为。
-        final long swTraceStart = System.currentTimeMillis();
-        final int swTraceTargetSize = targetNames.size();
-
         // ---------- 第1层：本地同域精确匹配（含前导零 / 多字少字变体）----------
         int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
         if (matchedIndex >= 0) {
-            LOG.i("[SW] Play L1 findIndex '" + currentName + "' → idx" + matchedIndex
-                    + " '" + targetNames.get(matchedIndex) + "' targetN=" + swTraceTargetSize
-                    + " cost=" + (System.currentTimeMillis() - swTraceStart) + "ms");
             return matchedIndex;
         }
 
@@ -2011,34 +2002,20 @@ public class PlayFragment extends BaseLazyFragment {
         if (playIndex >= 0 && !playList.isEmpty()) {
             int byGroup = EpisodeNameMatcher.alignByGroupPosition(
                     currentName, playIndex, seriesNames(playList), targetNames);
-            LOG.i("[SW] Play L1.5 groupAlign '" + currentName + "' srcIdx=" + playIndex
-                    + " srcN=" + playList.size() + " → " + (byGroup >= 0
-                    ? ("idx" + byGroup + " '" + targetNames.get(byGroup) + "'")
-                    : "-1(拒绝)"));
             if (byGroup >= 0) {
                 return byGroup;
             }
-        } else {
-            LOG.i("[SW] Play L1.5 skipped: playIndex=" + playIndex + " playListN=" + playList.size());
         }
 
         // ---------- 第2层：跨域 → 权威换算 ----------
-        boolean crossDomain = EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames);
-        LOG.i("[SW] Play L2 needsCrossDomain=" + crossDomain
-                + " curDomain=" + EpisodeNameMatcher.parse(currentName).domain
-                + " (0=期数 1=日期 -1=未知)");
-        if (crossDomain) {
+        if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
             // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
             int dictIndex = resolveByOfflineDict(currentName, targetNames);
             if (dictIndex >= 0) {
-                LOG.i("[SW] Play L2a dictHit idx" + dictIndex + " '" + targetNames.get(dictIndex) + "'");
                 return dictIndex;
             }
             // 2-b 直连站点：默认权威数据源（缓存命中 0ms，未命中约 800ms）
             int online = tryResolveCrossDomainNow(currentName, targetNames);
-            LOG.i("[SW] Play L2b onlineResolve → " + (online >= 0
-                    ? ("idx" + online + " '" + targetNames.get(online) + "'")
-                    : "-1(无解)"));
             if (online >= 0) {
                 return online;
             }
@@ -2053,18 +2030,10 @@ public class PlayFragment extends BaseLazyFragment {
         if (sourceIndex >= 0 && !sourceList.isEmpty()) {
             int aligned = EpisodeNameMatcher.alignByOrder(
                     sourceIndex, seriesNames(sourceList), targetNames, false);
-            LOG.i("[SW] Play L3 orderFallback srcIdx=" + sourceIndex
-                    + " srcN=" + sourceList.size() + " → " + (aligned >= 0
-                    ? ("idx" + aligned + " '" + targetNames.get(aligned) + "'")
-                    : "-1(拒绝)"));
             if (aligned >= 0) {
                 return aligned;
             }
         }
-        // 【关键】所有本地/联网层均未命中 → 返回 -1，由调用方决定是否按下标兜底。
-        // 若调用方最终仍切到了某集，说明存在"猜"的兜底逻辑（本次要定位的目标）。
-        LOG.i("[SW] Play ALL_FAIL '" + currentName + "' targetN=" + swTraceTargetSize
-                + " → -1 (调用方将决定兜底) cost=" + (System.currentTimeMillis() - swTraceStart) + "ms");
         return matchedIndex;
     }
 
@@ -2087,7 +2056,7 @@ public class PlayFragment extends BaseLazyFragment {
 
             int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
             if (episode <= 0) return -1;
-            return EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+            return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
         } catch (Throwable ignored) {
             return -1;
         }
@@ -2113,7 +2082,7 @@ public class PlayFragment extends BaseLazyFragment {
             episode = EpisodeDict.lookupBySeriesName(showName, currentName);
         }
         if (episode <= 0) return -1;
-        return EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+        return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
     }
 
     /**
@@ -2141,7 +2110,7 @@ public class PlayFragment extends BaseLazyFragment {
             @Override
             public void onResult(final int episode) {
                 if (episode <= 0) return;
-                final int idx = EpisodeNameMatcher.findIndex("第" + episode + "期", targetNames);
+                final int idx = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
                 if (idx < 0) return;
                 applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, idx);
             }

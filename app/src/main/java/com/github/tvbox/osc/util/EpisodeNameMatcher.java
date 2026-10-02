@@ -63,6 +63,27 @@ public final class EpisodeNameMatcher {
     private static final Pattern PART_TAIL = Pattern.compile(
             "(?:第\\s*)?[（(]?\\s*(上集|中集|下集|上部|中部|下部|上|中|下|一|二|三)\\s*[）)]?\\s*$");
 
+    /**
+     * 非正片标记词：这些词说明该条目是"花絮/回顾"类衍生内容，
+     * <b>不是当期正片</b>。用于避免"重温经典2"这类伪期数与"第2期"撞分。
+     *
+     * <p><b>为什么需要它</b>：{@code 重温经典2} 结尾的 {@code 2} 会被
+     * {@link #ORDINAL_ARABIC} 解析成序数 2，于是
+     * {@code score("第2期", "重温经典2")} 与 {@code score("第2期", "第2期上")}
+     * 同为 80 分，{@link #findIndex} 取先出现的下标 → 错配到"重温经典2"。</p>
+     *
+     * <p>识别到的条目统一降权 {@link #NON_MAIN_PENALTY}，保证正片（80/100）
+     * 永远压过非正片。</p>
+     */
+    /**
+     * 非正片词表（用于 {@link #isNonMainFeature} 判定与"同词"前缀提取）。
+     */
+    private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
+            "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更");
+
+    /** 非正片降权分值：使非正片得分显著低于正片的 80，但又高于 0（保留兜底可匹配性）。 */
+    public static final int NON_MAIN_PENALTY = 30;
+
     /** 分集语义值：无分集（等价于"上"）。 */
     public static final int PART_NONE = 0;
     /** 分集语义值：上（含"一"/"上集"/"上部"）。 */
@@ -267,7 +288,15 @@ public final class EpisodeNameMatcher {
                 return 0;
             }
             // 序号相同：再比"分集语义"（无分集 ≡ 上）。语义不同即不同集，直接判 0。
-            return normalizePart(cur.part) == normalizePart(tgt.part) ? 80 : 0;
+            if (normalizePart(cur.part) != normalizePart(tgt.part)) {
+                return 0;
+            }
+            // 非正片（重温/花絮/预告…）不是当期正片：即使序号撞上也要降权，
+            // 避免"重温经典2"与"第2期"同分后由 findIndex 的先到先得规则取错。
+            if (isNonMainFeature(currentName) || isNonMainFeature(targetName)) {
+                return NON_MAIN_PENALTY;
+            }
+            return 80;
         }
         // 两侧都无法识别序号时，退回包含式模糊匹配（与旧行为一致）
         if (cur.domain == DOMAIN_UNKNOWN && tgt.domain == DOMAIN_UNKNOWN) {
@@ -282,6 +311,54 @@ public final class EpisodeNameMatcher {
         }
         // 跨域或一侧可识别一侧不可识别：单条不判定，交由列表级对齐处理
         return 0;
+    }
+
+    /**
+     * 判断名称是否属于"非正片"衍生内容（花絮/回顾/预告等）。
+     *
+     * <p>口径来自实际源站命名：{@code 重温经典N}、{@code 精彩回顾3}、
+     * {@code 第2期加更}、{@code 幕后花絮} 等。这类条目虽然可能带数字后缀，
+     * 但语义上不等于当期正片，故不参与正片定位。</p>
+     *
+     * <p><b>注意</b>：本方法只判"是否含标记词"，不判它在名字里的位置。
+     * 因为源站写法不统一（{@code 重温经典2} / {@code 精彩回顾} / {@code 加更}），
+     * 位置判断会漏。</p>
+     *
+     * @param name 待判定的条目名
+     * @return true 表示该条目是非正片衍生内容
+     */
+    public static boolean isNonMainFeature(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        return NON_MAIN_FEATURE.matcher(name).find();
+    }
+
+    /**
+     * 提取非正片条目的"系列词"，用于判断两条非正片是否属于同一系列。
+     *
+     * <p><b>为什么需要它</b>：用户正在看「重温经典2」时切源，新源若写
+     * 「回顾往期2」，两者期数相同但<b>节目板块可能完全不同</b>——
+     * 把前者对到后者是危险的猜测。只有当两者共享同一个标记词
+     * （都是"重温"或都是"回顾"）才认为是同一系列，可以互配。</p>
+     *
+     * <p>实现：按词表顺序，取<b>第一个</b>命中的标记词作为系列词。
+     * 「重温经典2」→「重温」；「精彩回顾3」→「回顾」；
+     * 「第2期加更」→「加更」。返回 null 表示不是非正片。</p>
+     *
+     * <p><b>为什么取第一个而不是全部</b>：「重温经典」同时含"重温"和"经典"，
+     * 视为"重温"系列即可——只要能区分「重温经典N」与「回顾往期N」就够，
+     * 再细分没有实际收益。</p>
+     *
+     * @param name 条目名
+     * @return 系列词；不是非正片时返回 null
+     */
+    public static String nonMainFeatureToken(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return null;
+        }
+        Matcher m = NON_MAIN_FEATURE.matcher(name);
+        return m.find() ? m.group() : null;
     }
 
     /**
@@ -313,6 +390,130 @@ public final class EpisodeNameMatcher {
             }
         }
         return matched;
+    }
+
+    /**
+     * 把「期数」映射到目标列表的下标。
+     *
+     * <p><b>为什么不能用 {@link #findIndex} 代替</b>：综艺列表里常有
+     * 「重温经典1」「回顾往期2」这类非正片条目，它们的尾部数字会被
+     * {@link #parse} 当成期数，于是 {@code score("第2期", "重温经典2")}
+     * 与 {@code score("第2期", "第2期上")} <b>同为 80 分</b>，
+     * {@code findIndex} 取靠前者，就把「第2期」错配到「重温经典2」。</p>
+     *
+     * <p>实测（线上日志）：跨域联网拿到权威期数 2 后，本该落到 {@code 第2期上}，
+     * 却因上述平局落到 {@code 重温经典2}，用户看到"切源后集数完全不相干"。</p>
+     *
+     * <h3>匹配口径：解析式，而非字符串前缀</h3>
+     *
+     * <p><b>为什么不能用 {@code startsWith("第N期")}</b>：那是字面量口径，会把
+     * 同义不同写法的正片全部漏掉。源站对同一期有多种写法，字面量匹配只认第一种：</p>
+     * <pre>
+     *   权威期数=2   目标列表              startsWith("第2期")    解析式(本方法)
+     *   ────────────────────────────────────────────────────────────────────
+     *   第2期上                           命中                  命中
+     *   第02期上    （前导零，老站常见）    漏                    命中
+     *   第002期上   （3 位零填充）          漏                    命中
+     *   02期上      （无"第"字）           漏                    命中
+     *   第2集       （用"集"字）           漏                    命中
+     *   第二期上    （中文数字）           漏                    命中
+     * </pre>
+     *
+     * <p>漏判的后果不是错配而是返回 <b>-1</b>：调用方会降级到 L3 {@code alignByOrder}
+     * 兜底，等于绕过了联网权威数据，退化成旧行为——用户看到的错配可能因此复现。</p>
+     *
+     * <p>因此本方法复用 {@link #parse}，与 {@link #score} 用<b>同一套</b>解析逻辑：
+     * 只要该条目属于序号域（{@link #DOMAIN_ORDINAL}）且 ordinal 等于权威期数，即为候选。
+     * 写法差异（前导零 / 中文数字 / 期与集）由 {@code parse} 统一归一。</p>
+     *
+     * <h3>为什么不会重新踩「重温经典2」的坑（当前是正片时）</h3>
+     *
+     * <p>关键在于额外要求该条目是<b>正片</b>：用 {@link #isNonMainFeature} 排除
+     * 非正片标记词。{@code 重温经典2} 的 ordinal 确实也是 2，会被解析命中，
+     * 但它含"重温 / 经典"标记词，在此被过滤掉。
+     * 这正是本方法与 {@code score} 的分工：{@code score} 只比数值，
+     * 本方法额外加"必须是正片"这道语义约束。</p>
+     *
+     * <h3>当前正在看的本身就是非正片时</h3>
+     *
+     * <p>用户可能正在看「重温经典2」这类非正片。此时若仍按"只找正片"的口径，
+     * 就会一头扎进正片区，把回顾内容对到当期正片上——同样是错。</p>
+     *
+     * <p>因此本方法<b>按当前条目的性质分流</b>：</p>
+     * <table border="1">
+     *   <tr><th>当前名</th><th>匹配口径</th><th>例子</th></tr>
+     *   <tr><td>正片（不含标记词）</td><td>只在<b>正片</b>里找同序号</td>
+     *       <td>{@code 第2期} → {@code 第02期上}</td></tr>
+     *   <tr><td>非正片（含标记词）</td><td>只在<b>同一系列词</b>的非正片里找同序号</td>
+     *       <td>{@code 重温经典2} → {@code 重温经典2}；
+     *           不会对到 {@code 回顾往期2}（不同系列）</td></tr>
+     * </table>
+     *
+     * <p>"同一系列"由 {@link #nonMainFeatureToken} 判断：共享同一个标记词
+     * （都是"重温"或都是"回顾"）才互配。</p>
+     *
+     * <p><b>为什么不同系列不互配</b>：{@code 重温经典2} 与 {@code 回顾往期2}
+     * 期数都是 2 纯属巧合，它们可能是完全不同的节目板块。宁可返回 -1
+     * 交给 L3 按位置兜底，也不做这种没有依据的跨板块猜测。</p>
+     *
+     * <p><b>日期域条目直接跳过</b>：权威期数是序数（第N期），若目标条目是日期名
+     * （{@code 20260412下}），其 ordinal 是 YYYYMMDD 这样的一大串数字，两者量纲不同，
+     * 数值比较没有意义，必须排除。</p>
+     *
+     * <p>同一期数有多条（如"第2期上 / 下 / 加更"）时，返回<b>第一条</b>符合口径的条目——
+     * 与"无后缀 ≡ 上"的既有归一一致（上段是当天首段）。</p>
+     *
+     * @param currentName 当前正在播放的集名（旧源）；用于判断走正片还是非正片口径
+     * @param episode     期数（1 起）
+     * @param targetNames 目标源集名列表
+     * @return 命中的下标；目标列表里没有该期数时返回 -1
+     */
+    public static int findIndexByEpisode(String currentName, int episode, List<String> targetNames) {
+        if (episode <= 0 || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        // 当前条目是否非正片，决定本次走哪套口径
+        final boolean curIsNonMain = isNonMainFeature(currentName);
+        final String curToken = nonMainFeatureToken(currentName);
+        for (int i = 0; i < targetNames.size(); i++) {
+            String name = targetNames.get(i);
+            if (TextUtils.isEmpty(name)) {
+                continue;
+            }
+            EpisodeKey key = parse(name);
+            // 必须是序号域，且序号等于权威期数（日期域量纲不同，排除）
+            if (key.domain != DOMAIN_ORDINAL || key.ordinal != episode) {
+                continue;
+            }
+            if (curIsNonMain) {
+                // 当前是非正片：只在同一系列词的非正片里找
+                // （'重温经典2' 找 '重温经典2' ✅；不找 '回顾往期2' ❌）
+                if (curToken != null && curToken.equals(nonMainFeatureToken(name))) {
+                    return i;
+                }
+            } else {
+                // 当前是正片：只在正片里找，跳过一切非正片条目
+                if (!isNonMainFeature(name)) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 兼容重载：不知道当前集名时退化为"只在正片里找"。
+     *
+     * <p>保留此重载是为了不破坏既有调用方与测试。
+     * 新代码应优先使用带 {@code currentName} 的三参版本，
+     * 这样用户在看非正片时也能正确匹配。</p>
+     *
+     * @param episode     期数（1 起）
+     * @param targetNames 目标源集名列表
+     * @return 命中的下标；未命中返回 -1
+     */
+    public static int findIndexByEpisode(int episode, List<String> targetNames) {
+        return findIndexByEpisode(null, episode, targetNames);
     }
 
     /**
