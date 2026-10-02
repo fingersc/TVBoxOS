@@ -1244,12 +1244,40 @@ public class DetailActivity extends BaseActivity {
      * @return true 表示本次点击已被受理（正在切 / 已切），false 表示完全没得切
      */
     private boolean startDetailFallback(boolean manual) {
+        // 诊断：记录切源入口来源（manual=true 为用户点击/MENU 键，false 为播放器自动触发）。
+        // 保留精简调用栈（最近 3 层），用于区分「用户连点」与「播放器自动换源」；
+        // 排查完毕后可整体删除本段。
+        try {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            StringBuilder sb = new StringBuilder("[FB] entry manual=").append(manual).append(" from=");
+            for (int i = 2; i < st.length && i < 5; i++) {
+                sb.append(st[i].getMethodName()).append("<").append(st[i].getLineNumber()).append(") ");
+            }
+            LOG.i(sb.toString());
+        } catch (Throwable ignore) {
+        }
         SourceBean currentSource = ApiConfig.get().getSource(sourceKey);
         if (isFinishing() || currentSource == null || !currentSource.isChangeable()) {
             return false;
         }
         if (detailFallbackActive) {
             Toast.makeText(this, "正在切换片源，请稍候…", Toast.LENGTH_SHORT).show();
+            return true;
+        }
+        // ★ 冷却期：刚切完一个源、新源还在起播中时，忽略再次切源。
+        //
+        // 为什么需要：切源成功（详情返回）后 resetDetailFallbackKeepCache() 会把
+        // detailFallbackActive 复位成 false，于是「切源会话进行中」这个状态丢失。
+        // 用户此时如果以为还卡着、又点了切源，就会被当成一次全新请求 → 立刻切走
+        // 刚起播的源，表现为「一直切、看不到画面」。
+        //
+        // 日志依据：tvbox.log 中 4 次 [FB] pollFromCache 间隔 15s/5s/7s，
+        // 且 [PQ] ok wujin 与下一次 pollFromCache 只差 0.26 秒（人手不可能这么快），
+        // 说明是等待期间反复点击造成的被动连续切源。
+        if (manual && System.currentTimeMillis() - detailFallbackSettledMs < DETAIL_FALLBACK_CLICK_COOLDOWN_MS) {
+            LOG.i("[FB] click ignored, cooldown remain="
+                    + (DETAIL_FALLBACK_CLICK_COOLDOWN_MS - (System.currentTimeMillis() - detailFallbackSettledMs)) + "ms");
+            Toast.makeText(this, "已切换，正在起播…", Toast.LENGTH_SHORT).show();
             return true;
         }
         // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
@@ -1271,9 +1299,19 @@ public class DetailActivity extends BaseActivity {
             return false;
         }
 
-        // 换片名 = 换了一套缓存/圈记录，重新从「第一圈」开始
-        if (!TextUtils.equals(detailFallbackCycleTitle, detailFallbackTitle)) {
-            detailFallbackCycleTitle = detailFallbackTitle;
+        // 换片名 = 换了一套缓存/圈记录，重新从「第一圈」开始。
+        //
+        // ★ 必须用「归一化片名」比较，不能用原始串：
+        // 各资源站返回的 vod_name 常有细微差异（多余空格、全角/半角、别名后缀、
+        // 中英文分隔符等），而切源过程中 vod_name 会被替换成新源的写法。
+        // 若直接比原始串，切一次源就会判定为"换片"→ clear(CycleKeys) + NewCycle=true
+        // → 候选池从头轮转 → 表现为「再点切源又切回同一个站点」。
+        // 归一化后只保留汉字/字母/数字，抹平这些差异。
+        String normalizedTitle = normalizeFallbackTitle(detailFallbackTitle);
+        if (!TextUtils.equals(detailFallbackCycleTitle, normalizedTitle)) {
+            LOG.i("[FB] title changed, new cycle. old=[" + detailFallbackCycleTitle
+                    + "] new=[" + normalizedTitle + "] raw=[" + detailFallbackTitle + "]");
+            detailFallbackCycleTitle = normalizedTitle;
             detailFallbackCycleKeys.clear();
             detailFallbackNewCycle = true;
         }
@@ -1406,6 +1444,37 @@ public class DetailActivity extends BaseActivity {
      */
     private String detailRequestKeyOf(String sourceKey) {
         return sourceKey == null ? "" : sourceKey;
+    }
+
+    /**
+     * 归一化片名，用于判断「是否换了一部片子」。
+     *
+     * <p>各资源站返回的 {@code vod_name} 常有细微差异：多余空格、全角/半角、
+     * 别名后缀（如"（国语版）"）、中英文分隔符等。切源过程中 {@code vod_name}
+     * 会被替换成新源的写法，若用原始串比较，就会把"换了写法"误判成"换了片子"，
+     * 从而清空 CycleKeys 让候选池从头轮转 —— 表现为「再点切源又切回同一个站点」。
+     *
+     * <p>归一化规则：只保留汉字、字母、数字；其余（空格、标点、括号、符号）全部丢弃，
+     * 并统一转小写。这样"花开锦绣"、"花开锦绣 "、"花开锦绣（国语）"会归一到同一串。
+     *
+     * @return 归一化后的片名；入参为空时返回 ""
+     */
+    private String normalizeFallbackTitle(String title) {
+        if (TextUtils.isEmpty(title)) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(title.length());
+        for (int i = 0; i < title.length(); i++) {
+            char c = title.charAt(i);
+            // 只保留汉字（含扩展区）、字母、数字
+            if (Character.isLetterOrDigit(c) || Character.isIdeographic(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        String result = sb.toString();
+        // 极端情况：片名全是符号/emoji → 归一化后为空，退回原始 trim 串，
+        // 避免所有此类片子都归一到 "" 而互相串味。
+        return TextUtils.isEmpty(result) ? title.trim() : result;
     }
 
     private String detailFallbackCacheId(String title, String sourceKey) {
@@ -2337,6 +2406,8 @@ public class DetailActivity extends BaseActivity {
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
         }
+        // 记录"本轮切源已落定"的时刻，供冷却期判断（见 startDetailFallback 里的守卫）。
+        detailFallbackSettledMs = System.currentTimeMillis();
         // ★ 「保留数据」与「保留调度器」必须分开：
         //   - 数据（detailFallbackCache / CycleKeys / TriedKeys）跨轮复用 → 永远保留；
         //   - MultiSourceSearcher 是「本轮搜索任务」的执行体，一旦本轮状态机复位，
@@ -2477,6 +2548,15 @@ public class DetailActivity extends BaseActivity {
     private boolean detailFallbackSearchTimeoutScheduled;
     private boolean detailFallbackKeepCurrentDetail;
     private boolean detailFallbackLoadingCandidate;
+    /**
+     * 上一次切源"落定"（详情成功返回 / 明确失败）的时刻。
+     *
+     * <p>用于实现切源按钮的冷却期：刚切完的这几秒内，用户再点按钮多半是
+     * "以为还卡着"的误操作，此时若放行就会立刻把正在起播的新源切走。
+     */
+    private long detailFallbackSettledMs;
+    /** 切源按钮冷却时长。 */
+    private static final long DETAIL_FALLBACK_CLICK_COOLDOWN_MS = 5000L;
     /**
      * 当前页面正在等待的那次详情请求的源标识。
      *

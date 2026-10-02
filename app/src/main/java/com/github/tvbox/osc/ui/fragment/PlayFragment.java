@@ -143,8 +143,18 @@ public class PlayFragment extends BaseLazyFragment {
     private static final int MSG_PARSE_TIMEOUT = 100;
     private static final int MSG_RESOLVE_PLAY_URL_TIMEOUT = 101;
     private static final int MSG_SWITCH_LINE_PLAY_TIMEOUT = 102;
+    /** 解析停滞检查：页面加载完仍探不到视频地址时，提前兜底换线路/换源。 */
+    private static final int MSG_PARSE_STALL_CHECK = 103;
     private static final long RESOLVE_PLAY_URL_TIMEOUT_MS = 15 * 1000L;
     private static final long SWITCH_LINE_PLAY_TIMEOUT_MS = 20 * 1000L;
+    /**
+     * 解析停滞宽限：页面 onPageFinished 之后再等这么久，仍无视频地址就判停滞。
+     *
+     * <p>取值考虑：正常站点在页面加载完后 1~3 秒内即可探到 m3u8
+     * （实测 sanliuling/wujin/xinlang 均是 1 秒左右），5 秒足够宽松，
+     * 又能把原 20 秒的干等压缩到 5 秒左右。
+     */
+    private static final long PARSE_STALL_TIMEOUT_MS = 5 * 1000L;
     private MyVideoView mVideoView;
     private TextView mPlayLoadTip;
     private ImageView mPlayLoadErr;
@@ -286,6 +296,9 @@ public class PlayFragment extends BaseLazyFragment {
                         break;
                     case MSG_SWITCH_LINE_PLAY_TIMEOUT:
                         handleSwitchLinePlayTimeout();
+                        break;
+                    case MSG_PARSE_STALL_CHECK:
+                        handleParseStallCheck();
                         break;
                 }
                 return false;
@@ -1739,6 +1752,17 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     boolean tryNextLineIfEnabled() {
+        // 诊断：记录换线路/换源入口来源，保留精简调用栈（最近 3 层）。
+        // 用于区分「播放失败自动换源」与「详情页主动切源」；排查完毕可整体删除本段。
+        try {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            StringBuilder sb = new StringBuilder("[FB] tryNextLineIfEnabled from=");
+            for (int i = 2; i < st.length && i < 5; i++) {
+                sb.append(st[i].getMethodName()).append("<").append(st[i].getLineNumber()).append(") ");
+            }
+            LOG.i(sb.toString());
+        } catch (Throwable ignore) {
+        }
         restoreAutoSwitchedPlayer();
         if (allowAutoSwitchLine && Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true)) return tryNextLine();
         LOG.i("echo-autoRetry line switching disabled");
@@ -2461,6 +2485,41 @@ public class PlayFragment extends BaseLazyFragment {
         }
     }
 
+    /**
+     * 解析停滞兜底：页面加载完仍未探到视频地址时，不再干等 20 秒。
+     *
+     * <p>触发场景（实测日志）：切到某源后 {@code onPageFinished} 之后再无任何进展，
+     * 既没有 m3u8 也没有错误回调，静默卡住 14 秒以上，用户只能手动切走。
+     *
+     * <p>本方法在宽限期到时做一次确认，只有「确实没探到地址、且还没起播」才判失败，
+     * 因此不会误伤慢站点（慢站点在这段时间里通常会先探到地址）。
+     */
+    void handleParseStallCheck() {
+        // 已经探到可播地址 → 解析成功，本次检查作废
+        if (loadFoundCount.get() > 0) {
+            return;
+        }
+        // 已经起播 → 正常播放中，绝不能打断
+        if (isPlaybackStarted()) {
+            return;
+        }
+        // 播放器已在加载/播放（webPlayUrl 已被本次解析写入且播放器就绪）→ 不打断
+        // 注意：不能用 webPlayUrl != null 判断 —— 它可能残留上一个源的地址，
+        // 会导致本检查被无脑跳过（这正是「解析停滞无人兜底」的坑）。
+        if (mVideoView != null && mVideoView.getCurrentPlayState() != VideoView.STATE_IDLE
+                && mVideoView.getCurrentPlayState() != VideoView.STATE_ERROR) {
+            return;
+        }
+        LOG.i("echo-parseStall no video url after " + PARSE_STALL_TIMEOUT_MS
+                + "ms, try next line");
+        recordPlaybackFailure("parseStall");
+        stopParse();
+        if (!tryNextLineIfEnabled()) {
+            stopMusicSessionForFailedPlayback();
+            setTip("解析超时", false, true);
+        }
+    }
+
     void stopParse() {
         mHandler.removeMessages(MSG_PARSE_TIMEOUT);
         stopLoadWebView(false);
@@ -2478,9 +2537,30 @@ public class PlayFragment extends BaseLazyFragment {
 
     ExecutorService parseThreadPool;
 
+    /**
+     * 安排一次「解析停滞」检查。
+     *
+     * <p>仅在「尚未探到可播地址」时生效；一旦解析成功、已经起播，或已进入播放，
+     * 本次检查会自行作废（见 {@link #handleParseStallCheck()}），不会误伤正常播放。
+     */
+    private void scheduleParseStallCheck() {
+        mHandler.removeMessages(MSG_PARSE_STALL_CHECK);
+        mHandler.sendEmptyMessageDelayed(MSG_PARSE_STALL_CHECK, PARSE_STALL_TIMEOUT_MS);
+    }
+
     private void doParse(ParseBean pb) {
         stopParse();
         initParseLoadFound();
+        // ★ 解析停滞探测：从这里起算，PARSE_STALL_TIMEOUT_MS 内没探到可播地址就判停滞。
+        //
+        // 为什么挂这里而不是 onPageFinished：实测多数站点最终停在 about:blank，
+        // 而 onPageFinished 里有 if(!url.equals("about:blank")) 的排除，检查压根不会被安排。
+        //
+        // 背景：某些站点解析页加载成功却始终找不到 m3u8，既没有成功回调、
+        // 也不触发错误，只能干等 MSG_PARSE_TIMEOUT（20 秒）。
+        // 实测日志：切到 zuida 后 onPageFinished 之后再无任何进展，静默卡 14 秒以上
+        // （用户等不及手动切走），表现为「切源不立即成功」。
+        scheduleParseStallCheck();
         if (pb.getType() == 4) {
             parseMix(pb,true);
         }
@@ -3068,6 +3148,8 @@ public class PlayFragment extends BaseLazyFragment {
                         SuperParse.stopJsonJx();
                         url = loadFoundVideoUrls.poll();
                         mHandler.removeMessages(MSG_PARSE_TIMEOUT);
+                        // 已探到地址 → 撤掉解析停滞检查，避免宽限期到点误判
+                        mHandler.removeMessages(MSG_PARSE_STALL_CHECK);
                         String cookie = CookieManager.getInstance().getCookie(url);
                         if(!TextUtils.isEmpty(cookie))headers.put("Cookie", " " + cookie);//携带cookie
                         playUrl(url, headers);
@@ -3257,6 +3339,8 @@ public class PlayFragment extends BaseLazyFragment {
                         stopLoadWebView(false);
                         SuperParse.stopJsonJx();
                         mHandler.removeMessages(MSG_PARSE_TIMEOUT);
+                        // 已探到地址 → 撤掉解析停滞检查，避免宽限期到点误判
+                        mHandler.removeMessages(MSG_PARSE_STALL_CHECK);
                         url = loadFoundVideoUrls.poll();
                         String cookie = CookieManager.getInstance().getCookie(url);
                         if(!TextUtils.isEmpty(cookie))webHeaders.put("Cookie", " " + cookie);//携带cookie
