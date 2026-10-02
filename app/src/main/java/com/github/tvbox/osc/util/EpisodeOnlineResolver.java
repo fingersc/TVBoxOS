@@ -113,6 +113,111 @@ public final class EpisodeOnlineResolver {
         });
     }
 
+    /** 反向查询回调：返回期数对应的播出日期（YYYYMMDD）。 */
+    public interface DateCallback {
+        void onResult(String date);
+    }
+
+    /**
+     * 反向查询：给定节目名与期数，返回对应的播出日期（含缓存）。
+     *
+     * <p><b>为什么需要它</b>：{@link #resolve} 覆盖"日期 → 期数"。
+     * 反方向（期数 → 日期）用于：当前正在看的集名是<b>期数式</b>
+     * （{@code 第1期上}，不含日期），而目标源用<b>日期式</b>
+     * （{@code 20260404上}）。此时正向查询无日期可用，链路失手。</p>
+     *
+     * <p><b>缓存</b>：结果写入同一份 {@code date→episode} 缓存
+     * （反向也存进去，双向查询互相受益）。缓存命中时零延迟、不联网。</p>
+     *
+     * @param showName      节目名
+     * @param targetEpisode 目标期数
+     * @param anchorDate    起点日期（YYYYMMDD），用于限定扫描窗口
+     * @return 播出日期（YYYYMMDD）；未命中/失败返回空串
+     */
+    public static String resolveDate(String showName, int targetEpisode, String anchorDate) {
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return "";
+        }
+        // 1. 查缓存（反向遍历已有映射）
+        Map<String, Integer> cached = getCached(showName);
+        if (cached != null) {
+            for (Map.Entry<String, Integer> e : cached.entrySet()) {
+                if (e.getValue() != null && e.getValue() == targetEpisode) {
+                    return e.getKey();
+                }
+            }
+        }
+        // 2. 反向直连
+        if (!OnlineResolveConfig.isDirectConnectEnabled()) {
+            return "";
+        }
+        ShowSlugMap.DateResult r;
+        try {
+            r = ShowSlugMap.resolveEpisodeToDate(showName, targetEpisode, anchorDate);
+        } catch (Throwable ignored) {
+            return "";
+        }
+        if (r == null || !r.found()) {
+            return "";
+        }
+        // 3. 写缓存（反向结果并入，供正向查询复用）
+        Map<String, Integer> merged = new HashMap<>();
+        if (cached != null) {
+            merged.putAll(cached);
+        }
+        merged.put(r.date, targetEpisode);
+        putCache(showName, merged);
+        return r.date;
+    }
+
+    /**
+     * 反向查询的有限等待版本：在 {@code timeoutMs} 内拿到日期就返回，超时返回空串。
+     *
+     * <p>反向查询需要逐天探测站点页面，比正向慢，预算应给得更大些。
+     * 超时/失败一律返回空串，调用方静默回退本地兜底。</p>
+     *
+     * <p>本方法会阻塞调用线程，<b>禁止在主线程调用</b>。</p>
+     *
+     * @param timeoutMs 最长等待毫秒数，建议 1500~2500
+     * @return 播出日期（YYYYMMDD）；未命中/超时/失败返回空串
+     */
+    public static String resolveDateWithin(final String showName, final int targetEpisode,
+                                           final String anchorDate, long timeoutMs) {
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return "";
+        }
+        Map<String, Integer> cached = getCached(showName);
+        if (cached != null) {
+            for (Map.Entry<String, Integer> e : cached.entrySet()) {
+                if (e.getValue() != null && e.getValue() == targetEpisode) {
+                    return e.getKey();
+                }
+            }
+        }
+        java.util.concurrent.ExecutorService pool = null;
+        try {
+            pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+            java.util.concurrent.Future<String> future =
+                    pool.submit(new java.util.concurrent.Callable<String>() {
+                        @Override
+                        public String call() {
+                            return resolveDate(showName, targetEpisode, anchorDate);
+                        }
+                    });
+            String r = future.get(Math.max(1, timeoutMs), java.util.concurrent.TimeUnit.MILLISECONDS);
+            return r == null ? "" : r;
+        } catch (Throwable t) {
+            return "";
+        } finally {
+            if (pool != null) {
+                try {
+                    pool.shutdownNow();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     /**
      * 有限等待的查询：在 {@code timeoutMs} 内拿到结果就返回期数，超时返回 -1。
      *

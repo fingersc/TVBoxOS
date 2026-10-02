@@ -362,6 +362,101 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 判断列表是否由<b>日期域</b>主导（日期条目占比 ≥ 序号条目）。
+     *
+     * <p>用于反向跨域的前置检查：只有目标源主要是日期式写法时，
+     * "期数 → 日期"的反查才有意义。</p>
+     *
+     * @param names 集名列表
+     * @return true 表示日期域主导
+     */
+    public static boolean isDateDominated(List<String> names) {
+        if (names == null || names.isEmpty()) {
+            return false;
+        }
+        int dateCount = 0;
+        int ordinalCount = 0;
+        for (String name : names) {
+            EpisodeKey k = parse(name);
+            if (k.domain == DOMAIN_DATE) {
+                dateCount++;
+            } else if (k.domain == DOMAIN_ORDINAL) {
+                ordinalCount++;
+            }
+        }
+        return dateCount > 0 && dateCount >= ordinalCount;
+    }
+
+    /**
+     * 取列表中<b>第一个</b>日期域条目的日期串（YYYYMMDD）。
+     *
+     * <p>用途：反向跨域扫描需要一个锚点日期。列表首个日期必然属于本季节目，
+     * 从它出发前后扫描最容易命中目标期数。</p>
+     *
+     * @param names 集名列表
+     * @return 日期串；没有日期域条目时返回空串
+     */
+    public static String firstDate(List<String> names) {
+        if (names == null) {
+            return "";
+        }
+        for (String name : names) {
+            EpisodeKey k = parse(name);
+            if (k.domain == DOMAIN_DATE && k.ordinal > 0) {
+                return String.valueOf(k.ordinal);
+            }
+        }
+        return "";
+    }
+
+    /**
+     * 按日期定位目标列表下标：找首个日期等于 {@code date} 的条目。
+     *
+     * <p>用于<b>反向跨域</b>的落位：反查得到日期 {@code D} 后，
+     * 目标源本身是日期式（没有期数），因此不能再用
+     * {@link #findIndexByEpisode} 匹配，必须按日期找。</p>
+     *
+     * <p>多条同日（上/中/下分段）时返回<b>第一条</b>，
+     * 与"无后缀 ≡ 上"的既有归一一致。
+     * 非正片条目（{@code 20260401回顾特辑}）会被跳过，
+     * 避免把正片日期对到回顾内容上。</p>
+     *
+     * @param date  YYYYMMDD
+     * @param names 目标源集名列表
+     * @return 命中下标；未命中返回 -1
+     */
+    public static int findIndexByDate(String date, List<String> names) {
+        if (TextUtils.isEmpty(date) || names == null || names.isEmpty()) {
+            return -1;
+        }
+        int target;
+        try {
+            target = Integer.parseInt(date.trim());
+        } catch (Throwable t) {
+            return -1;
+        }
+        int fallback = -1;
+        for (int i = 0; i < names.size(); i++) {
+            String name = names.get(i);
+            if (TextUtils.isEmpty(name)) {
+                continue;
+            }
+            EpisodeKey k = parse(name);
+            if (k.domain != DOMAIN_DATE || k.ordinal != target) {
+                continue;
+            }
+            if (isNonMainFeature(name)) {
+                if (fallback < 0) {
+                    fallback = i;
+                }
+                continue;
+            }
+            return i;
+        }
+        return fallback;
+    }
+
+    /**
      * 列表级查找：在当前集与新源列表中定位匹配项。
      *
      * @param currentName 当前正在播放的集名（旧源）

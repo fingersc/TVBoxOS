@@ -1836,7 +1836,14 @@ public class PlayFragment extends BaseLazyFragment {
         }
         // 切换到新线路
         mVodInfo.playFlag = flagToSwitch;
-        mVodInfo.playIndex = nextIndex;
+        // 保守落地：nextIndex 来自 locateEpisodeOnFlag，只在命中（>=0）时才会被选中，
+        // 这里仍走统一入口，语义与"匹配失败不落地"保持一致。
+        if (!safeLandPlayIndex(nextIndex, mVodInfo.seriesMap.get(flagToSwitch))) {
+            // 理论上不可达：命中的线路必然带合法下标。真发生则放弃本次切换。
+            triedLineFlags.add(flagToSwitch);
+            autoRetryCount = 0;
+            return false;
+        }
         // 第3层：跨域（日期↔期数）且本地未命中时，异步联网精确重定位（成功后自动重播正确集）
         tryOnlineCrossDomainResolve(currentSeries == null ? "" : currentSeries.name, flagToSwitch,
                 mVodInfo.seriesMap.get(flagToSwitch), nextIndex);
@@ -1910,9 +1917,36 @@ public class PlayFragment extends BaseLazyFragment {
         return list == null ? Collections.emptyList() : list;
     }
 
+    /**
+     * 把索引钳位到列表合法范围内，越界返回 0。
+     *
+     * <p><b>本方法只做范围收敛，不做语义转换</b>：传入 -1 会返回 0。
+     * 因此<b>绝不能用它来消化"匹配失败"</b>——那会把 -1 静默变成第 0 集。
+     * 匹配失败请用 {@link #safeLandPlayIndex}。</p>
+     */
     private int clampIndex(int index, List<?> list) {
         if (list == null || list.isEmpty()) return 0;
         return Math.max(0, Math.min(index, list.size() - 1));
+    }
+
+    /**
+     * <b>保守落地</b>（播放页版）：切线路时把"内容匹配得到的新下标"安全地写回 {@code playIndex}。
+     *
+     * <p>语义与 {@code DetailActivity#safeLandPlayIndex} 完全一致：
+     * {@code newIndex >= 0} 正常写入；{@code newIndex < 0} 时<b>保持原下标不动</b>，
+     * 绝不交给 {@link #clampIndex} 把 -1 伪造成第 0 集。</p>
+     *
+     * @param newIndex 内容匹配得到的下标，-1 表示匹配失败
+     * @param list     目标列表（用于边界校验）
+     * @return true 表示已写入合法下标；false 表示匹配失败、未做任何改动
+     */
+    private boolean safeLandPlayIndex(int newIndex, List<?> list) {
+        if (mVodInfo == null) return false;
+        if (newIndex >= 0 && list != null && !list.isEmpty() && newIndex < list.size()) {
+            mVodInfo.playIndex = newIndex;
+            return true;
+        }
+        return false;
     }
 
     private int findSameEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList, int fallbackIndex) {
@@ -2041,6 +2075,14 @@ public class PlayFragment extends BaseLazyFragment {
      * 跨域同步换算：给直连一个有限的等待预算，拿到就用，拿不到立刻放行进兜底。
      * 缓存命中时开销为 0；无网/慢网超时后立即返回 -1。
      *
+     * <p><b>两个方向都要处理</b>：</p>
+     * <ul>
+     *   <li><b>正向</b>（当前名有日期，目标源是期数式）：用日期查期数，再找 {@code 第N期}。</li>
+     *   <li><b>反向</b>（当前名是期数式、无日期，目标源是日期式）：用期数查日期，再按日期定位。</li>
+     * </ul>
+     * <p>早期实现只有正向，反向（{@code 第1期上} → {@code 20260404上}）因取不到日期而
+     * 整条链路失效，只能退到"按位置猜"导致错配。</p>
+     *
      * @return 目标源下标；未命中/超时返回 -1
      */
     private int tryResolveCrossDomainNow(String currentName, List<String> targetNames) {
@@ -2048,18 +2090,50 @@ public class PlayFragment extends BaseLazyFragment {
             if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return -1;
             String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
             if (TextUtils.isEmpty(showName)) return -1;
-            final String date = EpisodeDict.extractDate(currentName);
-            if (TextUtils.isEmpty(date)) return -1;
 
             long budget = EpisodeResolveInitializer.getCrossDomainTimeoutMs();
             if (budget <= 0) return -1;
 
-            int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
-            if (episode <= 0) return -1;
-            return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+            // 正向：当前名含日期 → 查期数
+            final String date = EpisodeDict.extractDate(currentName);
+            if (!TextUtils.isEmpty(date)) {
+                int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
+                if (episode <= 0) return -1;
+                return EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
+            }
+
+            // 反向：当前名是期数式（无日期）→ 查日期
+            return resolveBackwardCrossDomain(showName, currentName, targetNames, budget);
         } catch (Throwable ignored) {
             return -1;
         }
+    }
+
+    /**
+     * 反向跨域换算：当前名是<b>期数式</b>（如 {@code 第1期上}，不含日期），
+     * 而目标源是<b>日期式</b>（如 {@code 20260404上}）时，
+     * 用"期数 → 播出日期"反查，再在目标源里按日期定位。
+     *
+     * <p>锚点日期取目标列表里第一条可识别日期——它必然属于本季节目，
+     * 从它出发前后扫描最容易命中。</p>
+     *
+     * @return 目标源下标；未命中/超时返回 -1
+     */
+    private int resolveBackwardCrossDomain(String showName, String currentName,
+                                           List<String> targetNames, long budget) {
+        if (targetNames == null || targetNames.isEmpty()) return -1;
+        EpisodeNameMatcher.EpisodeKey cur = EpisodeNameMatcher.parse(currentName);
+        if (cur.domain != EpisodeNameMatcher.DOMAIN_ORDINAL || cur.ordinal <= 0) return -1;
+        if (!EpisodeNameMatcher.isDateDominated(targetNames)) return -1;
+
+        String anchor = EpisodeNameMatcher.firstDate(targetNames);
+        if (TextUtils.isEmpty(anchor)) return -1;
+
+        long reverseBudget = Math.max(budget, 1800L);
+        String date = EpisodeOnlineResolver.resolveDateWithin(
+                showName, cur.ordinal, anchor, reverseBudget);
+        if (TextUtils.isEmpty(date)) return -1;
+        return EpisodeNameMatcher.findIndexByDate(date, targetNames);
     }
 
     /**

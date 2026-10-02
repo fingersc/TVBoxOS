@@ -381,6 +381,155 @@ public final class ShowSlugMap {
         }
     }
 
+    /** 反向直连查询结果（期数 → 播出日期）。 */
+    public static final class DateResult {
+        public final String date;
+        public final String site;
+
+        DateResult(String date, String site) {
+            this.date = date;
+            this.site = site;
+        }
+
+        public boolean found() {
+            return !TextUtils.isEmpty(date);
+        }
+    }
+
+    /**
+     * 探测某个日期是不是目标期数（反向查询的单点验证）。
+     *
+     * <p>与 {@link #resolveDirect} 不同：这里<b>已知日期</b>，
+     * 直接抓该日期的页面并返回期数，或返回 -1 表示该日期不是这一期。</p>
+     *
+     * @param showName 节目中文名
+     * @param date     待验证的日期（YYYYMMDD）
+     * @return 该日期对应的期数；不是该节目/无期数返回 -1
+     */
+    static int probeEpisodeAtDate(String showName, String date) {
+        if (TextUtils.isEmpty(showName) || TextUtils.isEmpty(date)) {
+            return -1;
+        }
+        String trimmed = showName.trim();
+        String slug = lookupStrict(trimmed);
+        boolean strict = true;
+        if (TextUtils.isEmpty(slug)) {
+            slug = lookupByYearStrip(trimmed);
+            strict = TextUtils.isEmpty(slug);
+        }
+        if (TextUtils.isEmpty(slug)) {
+            slug = lookupFuzzy(trimmed);
+            strict = TextUtils.isEmpty(slug);
+        }
+        if (TextUtils.isEmpty(slug)) {
+            return -1;
+        }
+        for (Site site : SITES) {
+            try {
+                String html = httpGet(site.episodeUrl(slug, date), site.ua);
+                int ep = parseEpisodeFromTitle(html);
+                if (ep <= 0) {
+                    continue;
+                }
+                if (!strict && !titleMatches(extractTitle(html), trimmed)) {
+                    continue;
+                }
+                return ep;
+            } catch (Throwable ignored) {
+            }
+        }
+        return -1;
+    }
+
+    /** 反向扫描窗口：最多前后各 {@code MAX_WEEKS} 周。 */
+    private static final int MAX_WEEKS = 26;
+
+    /**
+     * 反向直连解析：给定节目名与期数，找出对应的播出日期。
+     *
+     * <p><b>为什么需要它</b>：正向 {@link #resolveDirect} 只覆盖"日期 → 期数"。
+     * 但切源场景也存在反方向——当前正在看的集名是<b>期数式</b>
+     * （如 {@code 第1期上}，本身不含日期），而目标源用<b>日期式</b>
+     * （如 {@code 20260404上}）。此时正向查询没有日期可用，整条链路失手，
+     * 只能退到"按位置猜"，必然错位。</p>
+     *
+     * <p><b>算法</b>：从 {@code anchorDate} 起按周向两侧扫描
+     * （综艺多为周更，周步进最快逼近），命中后再在 ±7 天邻域精调。
+     * 扫描窗口限制在前后各 {@link #MAX_WEEKS} 周内，避免无意义的长时间遍历。</p>
+     *
+     * <p><b>性能</b>：单次探测约 300~800ms，逐天遍历代价高，
+     * 因此先用周步进把最坏情况的探测次数压到个位数。</p>
+     *
+     * <p>必须在后台线程调用；任何失败返回未命中的空结果。</p>
+     *
+     * @param showName      节目中文名
+     * @param targetEpisode 目标期数（如 1）
+     * @param anchorDate    起点日期（YYYYMMDD）
+     * @return 结果对象；{@link DateResult#found()} 为 false 表示未命中
+     */
+    public static DateResult resolveEpisodeToDate(String showName, int targetEpisode, String anchorDate) {
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return new DateResult(null, null);
+        }
+        java.util.Calendar cal = parseCalendar(anchorDate);
+        if (cal == null) {
+            return new DateResult(null, null);
+        }
+        // 第一轮：按周步进快速逼近（综艺多为周更）
+        for (int step = 0; step <= MAX_WEEKS; step++) {
+            for (int sign : new int[]{1, -1}) {
+                if (step == 0 && sign < 0) {
+                    continue;
+                }
+                java.util.Calendar c = (java.util.Calendar) cal.clone();
+                c.add(java.util.Calendar.DAY_OF_YEAR, sign * step * 7);
+                String d = formatDate(c);
+                if (probeEpisodeAtDate(showName, d) == targetEpisode) {
+                    return new DateResult(d, null);
+                }
+            }
+        }
+        // 第二轮：邻域精扫（覆盖一周内的全部日期）
+        for (int week = -6; week <= 6; week++) {
+            java.util.Calendar base = (java.util.Calendar) cal.clone();
+            base.add(java.util.Calendar.DAY_OF_YEAR, week * 7);
+            for (int inner = -1; inner <= 1; inner++) {
+                java.util.Calendar c = (java.util.Calendar) base.clone();
+                c.add(java.util.Calendar.DAY_OF_YEAR, inner);
+                String d = formatDate(c);
+                if (probeEpisodeAtDate(showName, d) == targetEpisode) {
+                    return new DateResult(d, null);
+                }
+            }
+        }
+        return new DateResult(null, null);
+    }
+
+    /** 解析 YYYYMMDD 为 Calendar；不合法返回 null。 */
+    private static java.util.Calendar parseCalendar(String date) {
+        if (TextUtils.isEmpty(date) || date.length() != 8) {
+            return null;
+        }
+        try {
+            java.util.Calendar c = java.util.Calendar.getInstance();
+            c.clear();
+            c.set(Integer.parseInt(date.substring(0, 4)),
+                    Integer.parseInt(date.substring(4, 6)) - 1,
+                    Integer.parseInt(date.substring(6, 8)));
+            return c;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 格式化为 YYYYMMDD。 */
+    static String formatDate(java.util.Calendar c) {
+        return String.format(java.util.Locale.ROOT, "%04d%02d%02d",
+                c.get(java.util.Calendar.YEAR),
+                c.get(java.util.Calendar.MONTH) + 1,
+                c.get(java.util.Calendar.DAY_OF_MONTH));
+    }
+
     /**
      * 直连解析：给定节目名与播出日期，直接从站点抓取对应期数。
      *
