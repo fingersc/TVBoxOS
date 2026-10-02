@@ -54,6 +54,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.SearchHelper;
+import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
@@ -111,7 +112,8 @@ public class DetailActivity extends BaseActivity {
     private static final String HAWK_FALLBACK_CACHE_PREFIX = "fb_cache_";
     private static final long FALLBACK_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
     // ===== 方案E：站点命中率统计 =====
-    private static final String HAWK_FALLBACK_STAT_PREFIX = "fb_stat_";
+    // 已统一到 SourceQualityStore（key 前缀 fb_stat_，6 字段格式），与搜索页/播放页共用。
+    // 不再在本类里维护自有前缀，避免两套格式互相覆盖。
     private LinearLayout llLayout;
     private FragmentContainerView llPlayerFragmentContainer;
     private View llPlayerFragmentContainerBlock;
@@ -1107,10 +1109,33 @@ public class DetailActivity extends BaseActivity {
                         tvSeriesGroup.setVisibility(View.GONE);
                         tvPlay.setVisibility(View.GONE);
                         mEmptyPlayList.setVisibility(View.VISIBLE);
+                        // ★ 详情判空（movie 有值但 seriesMap 为空）也要先把站点指示刷出来。
+                        // 切源时这是常见情况：某些源的详情接口返回结构不符合预期，
+                        // 但它的播放线路其实是好的。老逻辑直接走 handleNoPlayableDetail()
+                        // 自动续切下一个源，页面一个字节都不更新 —— 用户看到画面在变、
+                        // 文字却纹丝不动，必然以为"没切成功"而反复点击。
+                        //
+                        // 此刻剧集区已被 mEmptyPlayList 占位（点不到集数/线路），
+                        // 所以只改「来源」不会造成"来源与剧集不一致"的误导。
+                        if (detailFallbackActive || detailFallbackLoadingCandidate) {
+                            showDetailFallbackIndicators(sourceKey,
+                                    detailFallbackCacheVideo(detailFallbackTitle, sourceKey));
+                            // 详情**已成功返回**、但该源没有可播剧集 → 这是「确认不可用」，
+                            // 不是网络抖动。记入 DeadKeys，本圈与后续各圈都跳过它，
+                            // 免得一圈又一圈地反复试同一个空站（这正是轮转"停不下来"的原因之一）。
+                            // 注意判定条件：必须是 detailFallbackActive（切源会话内），
+                            // 避免把正常进详情页的空结果也记成拉黑。
+                            detailFallbackDeadKeys.add(sourceKey);
+                        }
                         handleNoPlayableDetail();
                     }
                 } else {
                     if (detailFallbackLoadingCandidate) {
+                        // ★ 先刷站点指示，再复位 ← 顺序不能反：
+                        // detailFallbackLoadingCandidate 是「本次响应属于切源请求」的唯一凭据，
+                        // 必须先据它把页面画出来，复位后再判断就晚了。
+                        showDetailFallbackIndicators(sourceKey,
+                                detailFallbackCacheVideo(detailFallbackTitle, sourceKey));
                         detailFallbackLoadingCandidate = false;
                         detailFallbackDetailTimedOut = true;
                         llLayout.removeCallbacks(detailFallbackDetailTimeout);
@@ -1255,11 +1280,23 @@ public class DetailActivity extends BaseActivity {
             return false;
         }
 
-        // 换片名 = 换了一套缓存/圈记录，重新从「第一圈」开始
-        if (!TextUtils.equals(detailFallbackCycleTitle, detailFallbackTitle)) {
-            detailFallbackCycleTitle = detailFallbackTitle;
+        // 换片名 = 换了一套缓存/圈记录，重新从「第一圈」开始。
+        //
+        // ★ 必须用「归一化片名」比较，不能用原始串：
+        // 各资源站返回的 vod_name 常有细微差异（多余空格、全角/半角、别名后缀），
+        // 而切源过程中 vod_name 会被替换成新源的写法。若直接比原始串，
+        // 切一次源就会被判定为"换片" → 清空 CycleKeys + DeadKeys + 重置为第一圈
+        // → 表现为「再点切源又切回同一个站点」。
+        String normalizedTitle = normalizeFallbackTitle(detailFallbackTitle);
+        if (!TextUtils.equals(detailFallbackCycleTitle, normalizedTitle)) {
+            detailFallbackCycleTitle = normalizedTitle;
             detailFallbackCycleKeys.clear();
             detailFallbackNewCycle = true;
+            // ★ 换片必须清 DeadKeys / SoftTriedKeys：
+            // 「某站没有 A 片」不代表「没有 B 片」，跨片沿用拉黑列表会让新片的
+            // 可切站点凭空变少（表现为「这部片只有两三个源能切」）。
+            detailFallbackDeadKeys.clear();
+            detailFallbackSoftTriedKeys.clear();
         }
 
         detailFallbackActive = true;
@@ -1285,7 +1322,6 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackCacheEntryUsable()) {
             // 缓存为空 → 只有这种情况才真正发起一次全网搜索
             if (!detailFallbackSearchCollecting) {
-                detailFallbackTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
                 startDetailFallback();
             }
             return detailFallbackActive;
@@ -1319,8 +1355,52 @@ public class DetailActivity extends BaseActivity {
             vod_name = video.name == null ? "" : video.name;
             vod_picture = video.pic == null ? "" : video.pic;
         }
+        // ★ 先刷页面，再发请求。站点的信息在点下切源这一刻就已从本地缓存选定，
+        // 没有任何理由等详情报文回来才显示。不先刷的话，用户点完只能对着旧源发呆
+        // 7~8 秒（详情 RTT + 解析 + 起播），以为没生效而反复点击。
+        showDetailFallbackIndicators(nextSource, video);
         loadDetail(detailFallbackCacheId(detailFallbackTitle, nextSource), nextSource, true);
         return true;
+    }
+
+    /**
+     * 切源过程中刷新「站点指示」：来源名 / 海报 / 解析标记 / 播放地址占位。
+     *
+     * <p>只碰「仅凭候选信息即可确定」的四项，<b>刻意不动</b>线路列表
+     * （{@code seriesFlagAdapter}）、剧集列表（{@code refreshList()}）、起播
+     * （{@code jumpToPlay()}）—— 那三样强依赖详情报文里的 {@code seriesMap}，
+     * 详情没回来时是空数据，提前刷只会把页面清空。
+     *
+     * <p><b>不会造成「来源与线路/剧集不一致」的误导</b>：切源期间剧集区会被
+     * {@code mEmptyPlayList} 占位或保持隐藏，用户点不到集数与线路；等详情真正
+     * 成功返回时，{@code refreshList()} / {@code seriesFlagAdapter.setNewData()}
+     * 会把线路与剧集一并刷成新源的，三者重新一致。
+     *
+     * @param sourceKey 命中的站点 key
+     * @param video     候选（可为 null，此时只更新站点名与地址占位）
+     */
+    private void showDetailFallbackIndicators(String sourceKey, Movie.Video video) {
+        if (TextUtils.isEmpty(sourceKey) || isFinishing() || isDestroyed()) {
+            return;
+        }
+        try {
+            SourceBean indicatorSource = ApiConfig.get().getSource(sourceKey);
+            String indicatorName = indicatorSource == null ? sourceKey : indicatorSource.getName();
+            setTextShow(tvSite, "来源：", indicatorName);
+            setTextShow(tvType, "类型：", "[" + indicatorName + "] 解析");
+            // 地址先置「获取中」：旧源地址留在那里会让人误以为没切
+            setTextShow(tvPlayUrl, "播放地址：", "获取中…");
+            if (video != null && !TextUtils.isEmpty(video.pic)) {
+                com.github.tvbox.osc.util.ImgUtil.load(
+                        DefaultConfig.checkReplaceProxy(video.pic), ivThumb,
+                        AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 300),
+                        AutoSizeUtils.mm2px(mContext, 400), video.name);
+            }
+            LOG.i("[FB] indicators source=" + indicatorName
+                    + " hasPic=" + (video != null && !TextUtils.isEmpty(video.pic)));
+        } catch (Throwable th) {
+            LOG.e("showDetailFallbackIndicators fail: " + th);
+        }
     }
 
     /** 缓存里是否还有该片名的可用候选（不含是否已轮转的判断）。 */
@@ -1361,20 +1441,31 @@ public class DetailActivity extends BaseActivity {
             if (source == null || !source.isSearchable()) {
                 continue;
             }
-            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            // 圈内已轮转过 → 跳过（本圈不重复）
-            if (detailFallbackCycleKeys.contains(candidateKey)) {
+            // ★ 去重粒度 = 「站点」，不是「站点|影片id」。
+            //
+            // 缓存里同一个站点可能有多条匹配（该源搜到多个不同 vod_id 的条目），
+            // 若用「站点|影片id」当圈内标记，这些条目会被当成不同候选，
+            // 一圈内就会**重复切到同一个站点** —— 正是「切源切来切去还是那个站」。
+            // 真正取源时 detailFallbackCacheVideo/CacheId 都只认 sourceKey（取第一条），
+            // 所以去重也必须以 sourceKey 为准，两者粒度才对得上。
+            String cycleKey = video.sourceKey;
+            // 圈内已轮转过 → 跳过（本圈不重复站点）
+            if (detailFallbackCycleKeys.contains(cycleKey)) {
                 continue;
             }
-            // 确认不可用 → 永久跳过
-            if (detailFallbackDeadKeys.contains(candidateKey)) {
+            // 确认该源不可用 → 本圈也跳过（Dead 按「源|影片id」记，判定时两者都认）
+            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
+            if (detailFallbackDeadKeys.contains(candidateKey)
+                    || detailFallbackDeadKeys.contains(cycleKey)) {
                 continue;
             }
             // 软失败（超时/网络错误）：本圈内跳过，但开新圈时允许重试
-            if (detailFallbackSoftTriedKeys.contains(candidateKey) && !detailFallbackNewCycle) {
+            boolean softFailed = detailFallbackSoftTriedKeys.contains(candidateKey)
+                    || detailFallbackSoftTriedKeys.contains(cycleKey);
+            if (softFailed && !detailFallbackNewCycle) {
                 continue;
             }
-            detailFallbackCycleKeys.add(candidateKey);
+            detailFallbackCycleKeys.add(cycleKey);
             return video.sourceKey;
         }
         return "";
@@ -1439,6 +1530,12 @@ public class DetailActivity extends BaseActivity {
             }
             return;
         }
+        // ★ 按站点质量排序：让「响应快、起播稳」的站点排在前面，切源与搜索用同一套分数
+        // （数据来自 SourceQualityStore，与搜索页/播放页共用）。
+        //
+        // 排序必须稳定：同分（含全部无历史的中性分 0.5）保持 ApiConfig 原序不变，
+        // 否则每次排序结果都可能不同，「一圈」的轮转顺序就失去可预测性。
+        sortDetailFallbackSourceOrderByQuality();
 
         detailFallbackActive = true;
         detailFallbackSearching = true;
@@ -1455,7 +1552,27 @@ public class DetailActivity extends BaseActivity {
         // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
         // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
         startDetailFallbackProbe();
-        showLoading();
+        // ★ 切源不盖全屏 Loading。
+        // showLoading() 会用 LoadSir 的全屏遮罩盖住整个页面（含正在播放的播放器），
+        // 在候选频繁失败时表现为「一直卡在 Loading」——这正是「点了像卡死」的根源。
+        // 改为页面内轻量提示：内容与播放器保持可见，用户能立刻看到反馈。
+        showDetailFallbackTip();
+    }
+
+    /**
+     * 切源期间的状态提示：写在页面内的「播放地址」行上，不弹 Toast、不盖 Loading。
+     *
+     * <p>为什么不用 Toast：切源是连续动作（用户可能连点），Toast 会排队堆叠，
+     * 后一条盖住前一条，体感像是"卡住了"。写进页面则始终只有一条，且位置固定。
+     */
+    private void showDetailFallbackTip() {
+        try {
+            if (!isFinishing() && !isDestroyed()) {
+                setTextShow(tvPlayUrl, "播放地址：", "正在切换片源…");
+            }
+        } catch (Throwable th) {
+            LOG.e("showDetailFallbackTip fail: " + th);
+        }
     }
 
     /**
@@ -1816,6 +1933,8 @@ public class DetailActivity extends BaseActivity {
                     vod_name = video.name == null ? "" : video.name;
                     vod_picture = video.pic == null ? "" : video.pic;
                 }
+                // 同 loadNextDetailFallbackFromCache：站点信息已定，先行刷新页面
+                showDetailFallbackIndicators(nextSource, video);
                 loadDetail(videoId, nextSource, true);
                 return;
             }
@@ -1874,13 +1993,43 @@ public class DetailActivity extends BaseActivity {
         detailFallbackDetailTimedOut = true;
         // 方案C：详情超时只是网络抖动，记为「软失败」——本圈跳过，下圈可重试，
         // 绝不写进 deadKeys 永久拉黑（这是「越切越少」的根因之一）。
-        detailFallbackSoftTriedKeys.add(getDetailFallbackKey(sourceKey, vodId));
+        // ★ 记 sourceKey（与轮转去重粒度一致），不要用「源|影片id」——
+        // 同一站点的多条候选会各记一次，反而让去重失效。
+        detailFallbackSoftTriedKeys.add(sourceKey);
         OkGo.getInstance().cancelTag("detail");
         loadNextDetailFallbackSource();
     }
 
     private String getDetailFallbackKey(String key, String id) {
         return (key == null ? "" : key) + "|" + (id == null ? "" : id);
+    }
+
+    /**
+     * 归一化片名，用于判断「是否换了一部片子」。
+     *
+     * <p>各资源站返回的 {@code vod_name} 常有细微差异：多余空格、全角/半角、
+     * 分隔符（{@code / · -}）、别名后缀等，而切源过程中 {@code vod_name} 会被
+     * 替换成新源的写法。若直接比原始串，切一次源就会被误判为"换片"，
+     * 进而清空轮转记录、重置回第一圈 —— 表现为「再点切源又切回同一个站点」。
+     *
+     * <p>做法：只保留汉字/字母/数字，统一转小写，抹平上述差异。
+     *
+     * @return 归一化结果；若全是符号/emoji 导致结果为空，退回原始 trim 串，
+     *         避免所有此类片子都归一到 "" 而互相串味
+     */
+    private String normalizeFallbackTitle(String title) {
+        if (TextUtils.isEmpty(title)) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < title.length(); i++) {
+            char c = title.charAt(i);
+            if (Character.isLetterOrDigit(c) || Character.isIdeographic(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        String result = sb.toString();
+        return TextUtils.isEmpty(result) ? title.trim() : result;
     }
 
 
@@ -1949,8 +2098,10 @@ public class DetailActivity extends BaseActivity {
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return 0;
         }
+        // ★ 与 pollNextCycledSourceInternal 保持同一粒度：按「站点」计数。
+        // 两者必须一致，否则这里会算出比实际可轮转站点更多的数字，
+        // 导致「本圈已转完」被误判为「还有候选」，反之亦然。
         Set<String> seen = new HashSet<>();
-        int count = 0;
         for (Movie.Video video : cachedCandidates) {
             if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.sourceKey)) {
                 continue;
@@ -1959,12 +2110,9 @@ public class DetailActivity extends BaseActivity {
             if (source == null || !source.isSearchable()) {
                 continue;
             }
-            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            if (seen.add(candidateKey)) {
-                count++;
-            }
+            seen.add(video.sourceKey);
         }
-        return count;
+        return seen.size();
     }
 
     /** 探路超时：放弃探路，批处理继续走，不打扰用户。 */
@@ -2074,46 +2222,38 @@ public class DetailActivity extends BaseActivity {
     }
 
     // ==================== 方案E：站点命中率统计 ====================
+    //
+    // ★ 已统一到 SourceQualityStore（与搜索页 FastSearchActivity/SearchActivity、
+    //   播放页 PlayFragment 共用同一份数据，key 前缀都是 fb_stat_，6 字段格式）。
+    //
+    // 此前这里有一套自有的 recordFallbackStat/detailFallbackSourceScore，用**同一个
+    // fb_stat_ 前缀**却只写 3 个字段（hitCnt,failCnt,totalMs），而 SourceQualityStore
+    // 写 6 个字段（...,playOkCnt,playFailCnt,firstFrameMsSum）。两边互相覆盖：
+    //   - 搜索页写 6 字段 → 切源只读前 3 个，歪打正着读到部分数据；
+    //   - 切源写 3 字段 → 搜索页读后 3 个全为 0，播放质量历史被抹掉。
+    // 结果就是「质量排序」形同虚设。现统一走 SourceQualityStore，一套读写、一处格式。
 
-    /** 记录某站点的命中/失败与耗时（Hawk，key = fb_stat_<sourceKey>）。 */
+    /** 记录某站点的一次搜索命中/失败与耗时（写入 SourceQualityStore）。 */
     private void recordFallbackStat(String sourceKey, boolean hit, long elapsedMs) {
         if (TextUtils.isEmpty(sourceKey)) {
             return;
         }
         try {
-            String raw = Hawk.get(HAWK_FALLBACK_STAT_PREFIX + sourceKey, "0,0,0");
-            String[] parts = raw.split(",");
-            int hitCnt = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
-            int failCnt = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
-            long totalMs = parts.length > 2 ? Long.parseLong(parts[2]) : 0L;
-            if (hit) {
-                hitCnt++;
-            } else {
-                failCnt++;
-            }
-            totalMs += Math.max(0L, elapsedMs);
-            Hawk.put(HAWK_FALLBACK_STAT_PREFIX + sourceKey, hitCnt + "," + failCnt + "," + totalMs);
+            SourceQualityStore.recordSearch(sourceKey, hit, Math.max(0L, elapsedMs));
         } catch (Throwable th) {
             LOG.e("recordFallbackStat fail: " + th);
         }
     }
 
-    /** 站点评分：命中率（0~1）+ 速度奖励（越快越高）；无历史给中性分 0.5。 */
+    /**
+     * 站点质量分（切源选站用），委托给 {@link SourceQualityStore}。
+     *
+     * <p>与搜索页用的是同一套数据与同一套打分，保证「切源时优先挑的站点」
+     * 就是「搜索结果里排在前面、且实测起播快的站点」。
+     */
     private double detailFallbackSourceScore(String sourceKey) {
         try {
-            String raw = Hawk.get(HAWK_FALLBACK_STAT_PREFIX + sourceKey, "0,0,0");
-            String[] parts = raw.split(",");
-            int hitCnt = parts.length > 0 ? Integer.parseInt(parts[0]) : 0;
-            int failCnt = parts.length > 1 ? Integer.parseInt(parts[1]) : 0;
-            long totalMs = parts.length > 2 ? Long.parseLong(parts[2]) : 0L;
-            int total = hitCnt + failCnt;
-            if (total == 0) {
-                return 0.5;
-            }
-            double hitRate = (double) hitCnt / total;
-            double avgMs = totalMs > 0 ? (double) totalMs / total : 0;
-            double speedBonus = avgMs > 0 ? Math.min(0.3, 300.0 / avgMs) : 0;
-            return hitRate + speedBonus;
+            return SourceQualityStore.score(sourceKey);
         } catch (Throwable th) {
             return 0.5;
         }
@@ -2147,6 +2287,47 @@ public class DetailActivity extends BaseActivity {
             }
         }
         return TextUtils.isEmpty(best) ? "" : best;
+    }
+
+    /**
+     * 把 {@link #detailFallbackSourceOrder} 按站点质量分从高到低重排。
+     *
+     * <p><b>为什么需要</b>：这个列表决定了「一圈」的轮转顺序，也就是用户按切源时
+     * 依次试到哪些站。原先是 ApiConfig 的配置顺序，与站点实际快慢完全无关；
+     * 排在后面的好站点要等前面一堆慢站超时才会被轮到。
+     *
+     * <p><b>与搜索的一致性</b>：分数取自 {@link SourceQualityStore#snapshot}，
+     * 与搜索页（FastActivity/SearchActivity）和播放页（PlayFragment 的起播打点）
+     * 用的是同一份数据、同一套权重，因此「切源优先试的站」就是「搜索排前面的站」。
+     *
+     * <p><b>稳定性</b>：用 {@code List.sort}（TimSort，稳定排序）。所有站点在
+     * 冷启动时都是中性分 0.5，此时排序结果 == 原始顺序，不会打乱既有行为。
+     *
+     * <p><b>性能</b>：一次性批量取分（{@code snapshot}），比较器内不再逐次读 Hawk。
+     * 源数量在百级，排序开销可忽略。
+     */
+    private void sortDetailFallbackSourceOrderByQuality() {
+        if (detailFallbackSourceOrder.size() <= 1) {
+            return;
+        }
+        try {
+            final SourceQualityStore.Snapshot snapshot =
+                    SourceQualityStore.snapshot(detailFallbackSourceOrder);
+            java.util.Collections.sort(detailFallbackSourceOrder,
+                    new Comparator<String>() {
+                        @Override
+                        public int compare(String a, String b) {
+                            // 降序：分数高的排前面。
+                            // 用 Double.compare 保证同分返回 0 → TimSort 保持原相对顺序。
+                            return Double.compare(snapshot.get(b), snapshot.get(a));
+                        }
+                    });
+            LOG.i("[FB] sourceOrder sorted by quality, n=" + detailFallbackSourceOrder.size()
+                    + " head=" + detailFallbackSourceOrder.subList(0, Math.min(3, detailFallbackSourceOrder.size())));
+        } catch (Throwable th) {
+            // 排序失败不影响主流程：保持原序（等价于「无质量数据」的冷启动行为）
+            LOG.e("sortDetailFallbackSourceOrderByQuality fail: " + th);
+        }
     }
 
     /**
@@ -2276,9 +2457,9 @@ public class DetailActivity extends BaseActivity {
         detailFallbackProbeSourceKey = "";
         detailFallbackProbeToken = "";
         llLayout.removeCallbacks(detailFallbackProbeTimeout);
-        // 注意：这里不清 detailFallbackTriedKeys / detailFallbackCycleKeys / detailFallbackTitle，
+        // 注意：这里不清 detailFallbackCycleKeys / detailFallbackTitle，
         // 因为「一圈」跨越多轮点击；清掉会让候选池每轮重置回起点，导致只有两三个源来回循环。
-        // TriedKeys / CycleKeys 由 startDetailFallback(boolean) 在换片名或开新圈时负责重置。
+        // CycleKeys 由 startDetailFallback(boolean) 在换片名或开新圈时负责重置。
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
         if (llLayout != null) {
@@ -2377,12 +2558,14 @@ public class DetailActivity extends BaseActivity {
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     private final HashMap<String, List<Movie.Video>> detailFallbackCache = new HashMap<>();
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
-    private final Set<String> detailFallbackTriedKeys = new HashSet<>();
     /**
-     * 本「一圈」内已经轮转到过的候选 key（sourceKey|id）。
-     * 一圈的定义：把缓存里的候选（含当前正在播放的源）全部轮转一遍后重新开始。
-     * 与 TriedKeys 的区别：TriedKeys 是全局去重（整个详情页生命周期内不重复），
-     * CycleKeys 是圈内去重（跨圈会清空，所以下一圈可以重新轮到同一个源）。
+     * 本「一圈」内已经轮转到过的**站点 key**。
+     *
+     * <p>一圈的定义：把缓存里的站点全部轮转一遍后重新开始。
+     * 跨圈会清空，所以下一圈可以重新轮到同一个站点（允许全站循环，但不允许同圈重复）。
+     *
+     * <p>注意粒度是 **sourceKey**，不是「sourceKey|影片id」：同一个站点在缓存里
+     * 可能有多条匹配，用后者当标记会让它们被当成不同候选，一圈内重复切到同一个站。
      */
     private final Set<String> detailFallbackCycleKeys = new HashSet<>();
     /** 是否为「一圈」的第一次切源（决定要不要发起全网搜索）。 */
