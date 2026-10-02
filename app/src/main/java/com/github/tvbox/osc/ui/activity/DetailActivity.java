@@ -490,7 +490,7 @@ public class DetailActivity extends BaseActivity {
                     if (hit == null) {
                         // 所有线路都没有这一集：放弃切源，还原选中态，明确告知用户
                         updateFlagSelectionUi(oldFlag);
-                        android.widget.Toast.makeText(this,
+                        android.widget.Toast.makeText(DetailActivity.this,
                                 "该剧集在所切换的源中未找到，已保持当前播放",
                                 android.widget.Toast.LENGTH_SHORT).show();
                         seriesFlagFocus = itemView;
