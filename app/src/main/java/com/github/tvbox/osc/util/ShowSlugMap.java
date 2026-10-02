@@ -579,12 +579,95 @@ public final class ShowSlugMap {
                 if (!strict && !titleMatches(extractTitle(html), trimmed)) {
                     continue;
                 }
-                return new DirectResult(ep, site.name);
+                // ★ 归一：站点按自然周编号，源侧按播出次数编号，量纲不同。
+                //   把周序号换算成播出序号，否则 20260411 会被当成"第2期"。
+                int normalized = normalizeToBroadcastOrdinal(slug, date, ep);
+                return new DirectResult(normalized, site.name);
             } catch (Throwable ignored) {
                 // 单站点失败，继续尝试下一个（备用的意义所在）
             }
         }
         return new DirectResult(-1, null);
+    }
+
+    /**
+     * 把站点的「第N期」归一成<b>播出序号</b>（而非自然周序号）。
+     *
+     * <p><b>为什么必须归一（关键修复）</b>：站点详情页标题里的「第N期」是
+     * 该站自己的编号口径。实测 {@code zyshow.net} 的综艺按<b>自然周</b>编号：
+     * 同一自然周内播出的多天共用同一个期号，下一周才 +1。
+     * 而各视频源（jisu / 360zy 等）的「第N期」按<b>播出次数</b>编号，每播一次 +1。
+     * 两者量纲不同，直接套用会让用户切到完全不相干的集。</p>
+     *
+     * <pre>
+     *   实测（哈哈哈哈哈第六季，2026 年）：
+     *   播出日期     播出序号   站点周序号
+     *   ───────────────────────────────────
+     *   20260404       1           1
+     *   20260405       2           1     ← 同周共用
+     *   20260406       3           2
+     *   20260409       4           2     ← 同周共用
+     *   20260411       5           2     ★ 用户在此切源，站点说"第2期"
+     * </pre>
+     * <p>于是 {@code 第20260411期} 被错配到源里的 {@code 第2期上}。</p>
+     *
+     * <p><b>归一算法</b>：以本季首个播出日为原点，按<b>天</b>步进扫描早期日期，
+     * 统计"该节目确实有页面（即当天有播出）"的天数，即为播出序号。
+     * 为了避免逐天扫描代价过高，只在<b>起始若干天</b>内扫描（覆盖本季开头），
+     * 一旦累计天数达到站点给的周序号就停止——因为我们只需要知道
+     * "站点周序号 N 对应真实播出序号 M"，且 M ≥ N（周序号只会少不会多）。</p>
+     *
+     * <p>扫描失败（超时/无网）时<b>原样返回站点期数</b>：宁可维持现状，
+     * 也不引入新的错配。</p>
+     *
+     * @param slug       站点 slug
+     * @param date       目标播出日期（YYYYMMDD）
+     * @param siteEpisode 站点标题里解析出的期数（周序号口径）
+     * @return 归一后的播出序号；无法归一/失败时返回 {@code siteEpisode}
+     */
+    static int normalizeToBroadcastOrdinal(String slug, String date, int siteEpisode) {
+        if (TextUtils.isEmpty(slug) || TextUtils.isEmpty(date) || siteEpisode <= 0) {
+            return siteEpisode;
+        }
+        java.util.Calendar target = parseCalendar(date);
+        if (target == null) {
+            return siteEpisode;
+        }
+        // 从目标日期回溯最多 60 天，覆盖本季开头
+        java.util.Calendar cursor = (java.util.Calendar) target.clone();
+        cursor.add(java.util.Calendar.DAY_OF_YEAR, -60);
+        // 逐天统计：从起点开始，数到目标日期为止，有多少天"该节目确实有页面"
+        int broadcastCount = 0;
+        java.util.Calendar probe = (java.util.Calendar) cursor.clone();
+        // 限制总探测次数，避免慢网下卡顿（最多 62 次 ≈ 2 个月）
+        for (int i = 0; i <= 62; i++) {
+            String d = formatDate(probe);
+            int ep = -1;
+            for (Site site : SITES) {
+                try {
+                    String html = httpGet(site.episodeUrl(slug, d), site.ua);
+                    int got = parseEpisodeFromTitle(html);
+                    if (got > 0) {
+                        ep = got;
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (ep > 0) {
+                broadcastCount++;
+            }
+            if (d.equals(date)) {
+                // 已数到目标日期
+                break;
+            }
+            probe.add(java.util.Calendar.DAY_OF_YEAR, 1);
+        }
+        // 统计数必然 ≥ 站点周序号；只有统计数不小于站点期数时才采用（防护异常数据）
+        if (broadcastCount >= siteEpisode) {
+            return broadcastCount;
+        }
+        return siteEpisode;
     }
 
     /** 取出 {@code <title>} 内容；取不到返回空串。 */

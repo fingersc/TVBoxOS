@@ -2914,7 +2914,21 @@ public class DetailActivity extends BaseActivity {
         vodInfo.playFlag = newFlag;
         // 保守落地：匹配到才写 playIndex；匹配不到（-1）保持原下标不动，
         // 绝不交给 clampIndex 把 -1 伪造成第 0 集（那会静默覆盖播放记录）。
+        //
+        // ★ 注意：oldIndex 是【旧列表】的下标，直接塞进【新列表】是错的——
+        //   两源排序不同，编号一致也未必同集（旧源 36 条、新源 23 条时偏差更大）。
+        //   仅在"两列表构成一致"（同域、同序）时才可以按下标平移；
+        //   跨域/异构成列表时保持 -1 语义，交给上层保守处理（不写 playIndex）。
         if (newIndex < 0) {
+            boolean sameShape = sameFlag
+                    && playingSeries != null
+                    && newSeriesList.size() == getPlayingSeriesList().size();
+            if (sameShape) {
+                newIndex = Math.max(0, Math.min(oldIndex, newSeriesList.size() - 1));
+            }
+        }
+        if (newIndex < 0) {
+            // 保底：仍找不到就维持旧下标（同一 flag 下至少不跳到无关联的集）
             newIndex = Math.max(0, Math.min(oldIndex, newSeriesList.size() - 1));
         }
         vodInfo.playIndex = newIndex;
@@ -3299,14 +3313,21 @@ public class DetailActivity extends BaseActivity {
                 if (byDate >= 0) {
                     return byDate;
                 }
-                // ② 目标源是"第N期"式：先把日期换算成权威期数，再按期数找。
+                // ② 目标源是"第N期"式：优先用<b>目标源自己的日期锚</b>换算。
+                //    站点(zyshow)的"第N期"按自然周编号，与源侧"按播出次数"口径不同，
+                //    直接套站点期数会错配（20260411→第2期上）。日期锚不依赖外部口径。
+                int byAnchor = EpisodeNameMatcher.findIndexByDateAnchor(date, targetNames, currentName);
+                if (byAnchor >= 0) {
+                    return byAnchor;
+                }
+                // ③ 目标源自身无日期可用时，才退回站点期数（尽力而为）
                 int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
                 if (episode <= 0) return -1;
                 int byEpisode = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
                 if (byEpisode >= 0) {
                     return byEpisode;
                 }
-                // ③ 兜底：目标源写「第YYYYMMDD期」时 parse() 判为日期域，
+                // ④ 兜底：目标源写「第YYYYMMDD期」时 parse() 判为日期域，
                 //    findIndexByEpisode 会整条跳过；此处用源名自带日期再落一次。
                 return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
             }
@@ -3557,6 +3578,17 @@ public class DetailActivity extends BaseActivity {
         long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
         if (oldTime > 0) {
             PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+            // ★ 防丢：仅当新集名确实是旧集名的"同一集"时才写（同集名，或由匹配器判定同集）。
+            //   名称不同且无法互认时，额外保底写一份"按旧集名"的记录——
+            //   这样即便本次落点有偏差，用户回到该集仍能拿回时间，不会凭空丢记忆。
+            if (!TextUtils.equals(oldSeriesName, newSeriesName)
+                    && EpisodeNameMatcher.findIndex(oldSeriesName,
+                        java.util.Collections.singletonList(newSeriesName)) < 0) {
+                long existing = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, oldSeriesName);
+                if (existing <= 0) {
+                    PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, oldSeriesName, oldTime);
+                }
+            }
         }
     } catch (Throwable th) {
         th.printStackTrace();

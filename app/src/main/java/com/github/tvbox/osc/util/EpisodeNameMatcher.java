@@ -51,6 +51,29 @@ public final class EpisodeNameMatcher {
             Pattern.compile("(?:第\\s*)?([零一二三四五六七八九十百]{1,4})\\s*(?:期|集|话|話)");
 
     /**
+     * 8 位纯数字（日期语义守卫）：形如 {@code 20260411}，无论有无"第"/"期"包裹。
+     *
+     * <p><b>为什么需要它</b>：综艺/日更节目普遍用播出日期当集名，写法多达三种——
+     * {@code 第20260411期}、{@code 第20260411}、{@code 20260411期}。
+     * 它们的数字部分都是 <b>8 位</b>，语义是<b>日期</b>而非期数：</p>
+     * <ul>
+     *   <li>当真·期数处理会撞上 {@link ORDINAL_ARABIC} 的 {@code \d{1,4}}，
+     *       被截成 {@code 0404}/{@code 0411} 这类伪期数，与真实"第4期""第11期"错配；</li>
+     *   <li>即便侥幸没截断，8 位数值（约两千万）与真实期数（1~几百）量纲完全不同，
+     *       {@code score} 永远比不中，导致切源时匹配失败。</li>
+     * </ul>
+     *
+     * <p><b>与 {@link #DATE_COMPACT} 的分工</b>：{@code DATE_COMPACT} 只认<b>合法</b>日期
+     * （月份 01-12、日 01-31）。但站点偶有脏数据（如 {@code 第20261399期}，月份 13 非法），
+     * 这种 8 位数<b>仍然不该当期数</b>——把它当"第1399期"同样会错配。
+     * 因此本守卫只要"8 位连续数字"，不校验日期合法性，作为兜底拦在期数解析之前。</p>
+     *
+     * <p>注意：必须带 {@code (?<!\d)…(?!\d)} 边界，避免从更长的数字串中截取。</p>
+     */
+    private static final Pattern EIGHT_DIGITS =
+            Pattern.compile("(?<!\\d)(\\d{8})(?!\\d)");
+
+    /**
      * 分集段（上/中/下），出现在名称<b>末尾</b>。
      *
      * <p>为什么必须在"去括号"之前提取：站点会把分集写在括号里
@@ -218,6 +241,17 @@ public final class EpisodeNameMatcher {
         if (separated.find()) {
             return new EpisodeKey(buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3)),
                     DOMAIN_DATE, part, raw);
+        }
+
+        // 2.5 8 位纯数字守卫：{@code 第20260411期 / 第20260411 / 20260411期} 一律按日期语义。
+        //     即使日期非法（月份/日越界）也不能跌进期数分支——8 位数字当期数必然错配。
+        //     ordinal 原样返回该 8 位数，保持"日期域"的数值语义，供跨域换算使用。
+        Matcher eight = EIGHT_DIGITS.matcher(work);
+        if (eight.find()) {
+            int v = parseIntSafe(eight.group(1));
+            if (v > 0) {
+                return new EpisodeKey(v, DOMAIN_DATE, part, raw);
+            }
         }
 
         // 3. 期数/集数（阿拉伯数字），优先于纯序号兜底
@@ -438,6 +472,120 @@ public final class EpisodeNameMatcher {
         Matcher separated = DATE_SEPARATED.matcher(name);
         if (separated.find()) {
             return buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3));
+        }
+        return -1;
+    }
+
+    /**
+     * 用「目标源自己的日期序列」把日期换算成本源口径的序号，再落位。
+     *
+     * <p><b>为什么需要它（关键修复）</b>：联网查到的期数来自第三站点
+     * （{@code zyshow.net} 的 {@code /dl/{slug}/v/{date}.html} 页面标题），
+     * 该站点的「第N期」按<b>自然周</b>编号；而 app 侧源（jisu / 360zy 等）
+     * 的「第N期」按<b>播出次数</b>编号。两者量纲不同，直接套用必然错配。</p>
+     *
+     * <pre>
+     *   实测（哈哈哈哈哈第六季）：
+     *   日期        播出序号   站点周序号   源内落点
+     *   ─────────────────────────────────────────────
+     *   20260404       1          1       第1期上
+     *   20260405       2          1       第1期下
+     *   20260406       3          2       第2期上
+     *   20260409       4          2       第3期上
+     *   20260411       5          2       第5期上   ← 站点说"第2期"，实为第5期
+     * </pre>
+     *
+     * <p>用户观测到的现象正是这个错配：在 {@code 第20260411期} 切源，
+     * 落到 {@code 第2期上}——因为站点把 20260411 归入第 2 个自然周。</p>
+     *
+     * <p><b>本方法的做法</b>：不理会站点的绝对期数，改为<b>用目标源自身的
+     * 日期序列做锚</b>——列出目标源里所有<i>带日期的条目</i>，按日期升序排，
+     * 求出 {@code date} 在这条序列里的秩（0 起），再取目标源里第
+     * {@code rank} 个<b>序号域</b>条目。这样一来：
+     * <ul>
+     *   <li>不依赖任何外部服务；</li>
+     *   <li>口径由目标源自己定义，天然一致；</li>
+     *   <li>目标源混入特辑/回顾时，只有"带日期的正片"参与排名，
+     *       非正片不会挤占名次。</li>
+     * </ul>
+     *
+     * @param date        已知播出日期（YYYYMMDD）
+     * @param names       目标源集名列表
+     * @param currentName 当前在播集名（保持正片/非正片口径），可为 null
+     * @return 命中下标；无法建立锚定关系时返回 -1
+     */
+    public static int findIndexByDateAnchor(String date, List<String> names, String currentName) {
+        if (TextUtils.isEmpty(date) || names == null || names.isEmpty()) {
+            return -1;
+        }
+        int target;
+        try {
+            target = Integer.parseInt(date.trim());
+        } catch (Throwable t) {
+            return -1;
+        }
+        // 第一优先：目标源里直接存在该日期的条目 → 直接落位（最可靠）
+        int exact = findIndexByDate(date, names, currentName);
+        if (exact >= 0) {
+            return exact;
+        }
+        // 否则：按"目标源自己带日期的正片序列"求秩，映射到期数序号
+        final boolean curIsNonMain = isNonMainFeature(currentName);
+        final String curToken = curIsNonMain ? nonMainFeatureToken(currentName) : null;
+
+        // 收集目标源中所有"带日期的正片"的日期，升序
+        List<Integer> dated = new ArrayList<>();
+        for (String n : names) {
+            if (TextUtils.isEmpty(n)) continue;
+            int d = dateOf(n);
+            if (d <= 0) continue;
+            if (isNonMainFeature(n)) continue;   // 非正片不参与排名
+            dated.add(d);
+        }
+        if (dated.size() < 2) {
+            return -1;   // 锚点太少，无法建立可信映射
+        }
+        java.util.Collections.sort(dated);
+        // 去重后求秩
+        List<Integer> uniq = new ArrayList<>();
+        for (int d : dated) {
+            if (uniq.isEmpty() || uniq.get(uniq.size() - 1) != d) uniq.add(d);
+        }
+        int rank = uniq.indexOf(target);
+        if (rank < 0) {
+            // date 不在目标源的日期序列里：用"≤date 的条数"近似秩，避免越界
+            rank = 0;
+            for (int d : uniq) {
+                if (d <= target) rank++;
+            }
+            if (rank <= 0) return -1;
+            rank -= 1;
+        }
+        // 在目标源里取第 rank 个"序号域且为正片"的条目
+        int seen = 0;
+        for (int i = 0; i < names.size(); i++) {
+            String n = names.get(i);
+            if (TextUtils.isEmpty(n)) continue;
+            EpisodeKey key = parse(n);
+            if (key.domain != DOMAIN_ORDINAL || key.ordinal <= 0) continue;
+            if (isNonMainFeature(n)) continue;    // 正片口径：跳过特辑/回顾
+            if (seen == rank) {
+                // 口径一致性：当前是非正片时，此处按位置映射到正片是合理的
+                // （目标源没有对应非正片时的最佳近似），因此不做额外限制。
+                return i;
+            }
+            seen++;
+        }
+        // 序号域条目不足 rank+1 条 → 越界，返回最后一条
+        if (seen > 0) {
+            for (int i = names.size() - 1; i >= 0; i--) {
+                String n = names.get(i);
+                if (TextUtils.isEmpty(n)) continue;
+                EpisodeKey key = parse(n);
+                if (key.domain == DOMAIN_ORDINAL && key.ordinal > 0 && !isNonMainFeature(n)) {
+                    return i;
+                }
+            }
         }
         return -1;
     }

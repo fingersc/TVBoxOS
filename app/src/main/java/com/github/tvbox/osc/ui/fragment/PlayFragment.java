@@ -2102,14 +2102,21 @@ public class PlayFragment extends BaseLazyFragment {
                 if (byDate >= 0) {
                     return byDate;
                 }
-                // ② 目标源是"第N期"式：日期换算成权威期数再找
+                // ② 目标源是"第N期"式：优先用<b>目标源自己的日期锚</b>换算。
+                //    站点(zyshow)的"第N期"按自然周编号，与源侧"按播出次数"口径不同，
+                //    直接套站点期数会错配（20260411→第2期上）。日期锚不依赖外部口径。
+                int byAnchor = EpisodeNameMatcher.findIndexByDateAnchor(date, targetNames, currentName);
+                if (byAnchor >= 0) {
+                    return byAnchor;
+                }
+                // ③ 目标源自身无日期可用时，才退回站点期数（尽力而为）
                 int episode = EpisodeOnlineResolver.resolveWithin(showName, date, budget);
                 if (episode <= 0) return -1;
                 int byEpisode = EpisodeNameMatcher.findIndexByEpisode(currentName, episode, targetNames);
                 if (byEpisode >= 0) {
                     return byEpisode;
                 }
-                // ③ 兜底：目标源写「第YYYYMMDD期」时 findIndexByEpisode 会跳过
+                // ④ 兜底：目标源写「第YYYYMMDD期」时 findIndexByEpisode 会跳过
                 return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
             }
 
