@@ -329,6 +329,13 @@ public final class EpisodeNameMatcher {
      *
      * <p><b>对齐算法</b>（前提：两侧同日总集数相等，否则直接放弃）：</p>
      * <ol>
+     *   <li><b>两侧当天各只有一条</b> → 直接判定为同一集（当天不可能有第二种可能）。
+     *       这一步专治 {@code 第20260405期} ↔ {@code 20260405下} 这类
+     *       "无后缀单条" vs "带后缀单条" —— 纯名字匹配会因"无后缀≡上"的归一化误判为不等；</li>
+     *   <li><b>旧源单条 → 新源多段</b> → 取新源的<b>"上"段</b>。
+     *       旧源一天只出一条，说明它没把这一天拆开，那一条即当天的首段（上）；</li>
+     *   <li><b>旧源多段 → 新源单条</b> → 仅当旧源当前段是<b>"上"</b>时命中那一条，
+     *       否则放弃（"中/下"在新源里没有落点）；</li>
      *   <li><b>求旧源当前集的"实际后缀"</b>（{@link #resolvePart}）：
      *       有后缀就用它本身；<b>无后缀</b>时用同日其它条目已用的后缀反推；</li>
      *   <li><b>在新源同日组内按序查找</b>：
@@ -336,6 +343,17 @@ public final class EpisodeNameMatcher {
      *       找不到 → 退而选择<b>无后缀</b>条目 → 命中即用；
      *       都没有 → 放弃（返回 -1，由上层跳过该源）。</li>
      * </ol>
+     *
+     * <p><b>关于"无后缀 ≡ 上"这条归一</b>：它的适用范围是<b>"该源当天只有一条"</b>。
+     * 若一条源确实把某天切成多段，其"无后缀"条目才需要用 {@link #resolvePart}
+     * 结合同日其它后缀反推（见规则2反推表）。两种情形互不冲突：</p>
+     * <ul>
+     *   <li>该源当天 <b>=1 条</b> → 无后缀就是"上"（该源没切分，那一条即首段）；</li>
+     *   <li>该源当天 <b>≥2 条</b> → 无后缀按同日已用后缀反推（可能是上/中/下）。</li>
+     * </ul>
+     *
+     * <p><b>仅剩一种拒绝情形</b>：两侧段数不等且都 ≥2（如 3 段 vs 2 段）——
+     * 后缀身份对不上，拒绝猜测。</p>
      *
      * <p><b>为什么用"后缀身份"而不是"组内位置"</b>：位置对齐需要组内顺序稳定，
      * 但同日可能出现多条语义相同的条目（如新源 {@code [20260910, 20260910上]} ——
@@ -368,8 +386,7 @@ public final class EpisodeNameMatcher {
 
         // --- 旧源：与当前集同日的分组 ---
         List<Integer> sourceGroup = sameDayGroup(sourceNames, current.ordinal);
-        if (sourceGroup.size() < 2) {
-            // 当天只有一条：不存在"多段"场景，交由 findIndex 处理
+        if (sourceGroup.isEmpty()) {
             return -1;
         }
 
@@ -378,6 +395,35 @@ public final class EpisodeNameMatcher {
         if (targetGroup.isEmpty()) {
             // 新源没有当天的条目 —— 是真的缺集，交给上层跳过
             return -1;
+        }
+
+        // 两侧都只有一条：同一天各一条，不存在第二种可能，必为同一集。
+        // 这一步必须显式处理，因为纯名字匹配会被"无后缀≡上"的归一化挡住：
+        //   旧源 第20260405期（无后缀） vs 新源 20260405下 → score 得 0 → findIndex 返回 -1
+        // 但两侧当天都只有一条，语义上就是同一集。
+        if (sourceGroup.size() == 1 && targetGroup.size() == 1) {
+            return targetGroup.get(0);
+        }
+
+        // 旧源当天只有一条（且无后缀，否则上面 1v1 已处理）、新源当天切成多段：
+        // 旧源那条覆盖了当天的全部内容，其语义位置就是"上"—— 取新源的"上"段。
+        // 依据："无后缀 ≡ 上" 这一归一在"该源当天只有一条"时仍然成立：
+        // 一天只出一条，说明该源没有把这一天拆开，那一条即当天的首段（上）。
+        if (sourceGroup.size() == 1) {
+            for (int i : targetGroup) {
+                if (extractPart(targetNames.get(i)) == PART_UP) {
+                    return i;
+                }
+            }
+            // 新源多段但没写"上"（如只有 中+下）：无从安放，放弃
+            return -1;
+        }
+        // 旧源多段、新源单条：只有"上"能落到新源那一条上。
+        // 旧源"上" 与 新源无后缀 语义相同（无后缀 ≡ 上）；
+        // 而"中/下"在新源里没有对应落点（新源没把那天拆开）—— 放弃，交给上层。
+        if (targetGroup.size() < 2) {
+            int want0 = resolvePart(sourceNames, sourceIndex);
+            return want0 == PART_UP ? targetGroup.get(0) : -1;
         }
         if (targetGroup.size() != sourceGroup.size()) {
             // 切分粒度不同（如旧源 3 段、新源 2 段）：后缀身份对不上，拒绝猜测
@@ -507,6 +553,20 @@ public final class EpisodeNameMatcher {
      * 而是交给 {@link EpisodeOnlineResolver} 用站点权威数据换算；按序对齐仅保留
      * 作为同域场景（两源命名方式相同）的兜底。</p>
      *
+     * <p><b>同域也要做规模校验</b>：即使两侧命名方式相同，"同下标即同一集"仍要求
+     * 两源列表<b>可识别的集条目数一致</b>。反例（真实采集源）：</p>
+     * <pre>
+     *   旧源 feifan 23 条: [第20260404期 … 第20260508期]
+     *   新源 dytt   24 条: [20260401回顾特辑, 20260404上 … 20260503下]
+     * </pre>
+     * <p>新源在<b>开头混入了一条"回顾特辑"</b>，此后每条都比旧源多偏移一格。
+     * 此时按序对齐对下标 12 会给出 {@code 20260419下}，而正确答案是
+     * {@code 20260418上} —— 静默错一集。因此条目数不等时直接放弃，
+     * 让上层走权威解析，而不是给出一个"看起来很合理"的错答案。</p>
+     *
+     * <p>比的是"可识别条目数"而非列表长度：新源常混入 {@code 下期预告} 这类
+     * 无法识别域名的噪声条目，它们本就不参与集数对应，计入长度会造成无谓误判。</p>
+     *
      * @param allowCrossDomain false 表示只允许同域对齐（跨域直接返回 -1）
      */
     public static int alignByOrder(int sourceIndex, List<String> sourceNames, List<String> targetNames,
@@ -529,12 +589,42 @@ public final class EpisodeNameMatcher {
                 return -1;
             }
         }
+        // 规模校验：两侧"可识别的集条目数"必须一致，否则"同下标即同一集"的前提不成立。
+        // 反例（真实采集源）：旧源 feifan 23 条、新源 dytt 24 条，新源开头多一条
+        // "回顾特辑"，此后每条都比旧源偏移一格 —— 按下标对齐会静默错一集。
+        //
+        // 之所以比"可识别条目数"而不是"列表长度"：新源常混入预告/花絮这类
+        // 无法识别域名的噪声条目（"下期预告"→DOMAIN_UNKNOWN），它们本就不参与
+        // 集数对应关系，计入长度会造成无谓的误判。
+        //
+        // 旧源可识别条目为 0（整个列表都无法解析）时不拦——此时没有基准可比，
+        // 按下标是唯一可用依据。
+        int srcCount = recognizableCount(sourceNames);
+        int tgtCount = recognizableCount(targetNames);
+        if (srcCount > 0 && srcCount != tgtCount) {
+            return -1;
+        }
         if (!isMonotonicAscending(targetNames)) {
             // 新源顺序无法确认单调递增，按序对齐不可信
             return -1;
         }
         // 两源期数排列顺序一致时，同下标即为同一期
         return sourceIndex < targetNames.size() ? sourceIndex : -1;
+    }
+
+    /** 统计列表中域名可识别（日期域或序号域）的条目数。 */
+    private static int recognizableCount(List<String> names) {
+        if (names == null) {
+            return 0;
+        }
+        int count = 0;
+        for (String name : names) {
+            EpisodeKey k = parse(name);
+            if (k.domain == DOMAIN_DATE || k.domain == DOMAIN_ORDINAL) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
