@@ -102,12 +102,37 @@ public final class ShowSlugMap {
     }
 
     /**
-     * 按节目名查 slug。会依次尝试精确、去空格、去后缀括号等常见变体。
+     * 按节目名查 slug。**只做可信匹配**：精确、去空格、去尾部括号。
+     *
+     * <p><b>为什么不做包含式模糊匹配</b>：曾出过真实的错配事故——
+     * 「披荆斩棘2026」不在表里，却被「披荆斩棘」包含命中，于是直连去抓了
+     * <b>另一个节目</b>的页面，拿到完全无关的期数，最终把用户切到了不相干的集上。
+     * 这类"张冠李戴"比"查不到"危害大得多（查不到只是退回本地兜底，错配会污染播放记录）。</p>
+     *
+     * <p>需要宽松匹配的旁路请用 {@link #lookupFuzzy}，它要求调用方做二次校验。</p>
      *
      * @param showName 节目中文名（如"忙忙碌碌寻宝藏"）
      * @return slug（如"mangmangluluxunbaozang"）；查不到返回空串
      */
     public static String lookup(String showName) {
+        String hit = lookupStrict(showName);
+        if (!TextUtils.isEmpty(hit)) {
+            return hit;
+        }
+        // 变体3：去掉尾部"年份/季"数字后缀，如 "披荆斩棘2026" -> "披荆斩棘"
+        // 仅当去掉后能在表里精确命中才采纳，且**必须**由调用方二次校验页面标题
+        return lookupByYearStrip(showName);
+    }
+
+    /**
+     * 可信匹配（子集）：精确 → 去空格 → 去尾部括号后缀。
+     *
+     * <p>这三类命中都直接命中表中的完整节目名，不存在"截断成另一个节目"的风险，
+     * 因此调用方可以直接采信，无需页面标题二次校验。</p>
+     *
+     * @return slug；无可信命中返回空串
+     */
+    static String lookupStrict(String showName) {
         if (TextUtils.isEmpty(showName)) {
             return "";
         }
@@ -134,10 +159,67 @@ public final class ShowSlugMap {
                 return hit;
             }
         }
-        // 变体3：遍历找"包含"关系（节目名带"第N季"等后缀时的宽松匹配）
+        return "";
+    }
+
+    /**
+     * 去年份后缀匹配（**不可信**）：如「披荆斩棘2026」→「披荆斩棘」。
+     *
+     * <p>剥离后命中的很可能是<b>同名的另一季节目</b>，直连抓到的页面未必对应当前节目，
+     * 调用方<b>必须</b>用页面标题做二次校验后方可采信。</p>
+     *
+     * @return slug；未命中返回空串
+     */
+    static String lookupByYearStrip(String showName) {
+        if (TextUtils.isEmpty(showName)) {
+            return "";
+        }
+        Map<String, String> map = name2slug;
+        if (map == null || map.isEmpty()) {
+            return "";
+        }
+        String noSpace = showName.trim().replaceAll("\\s+", "");
+        String noYear = stripYearSuffix(noSpace);
+        if (noYear.equals(noSpace)) {
+            return "";
+        }
+        String hit = map.get(noYear);
+        return hit == null ? "" : hit;
+    }
+
+    /**
+     * 宽松匹配（**含包含式，不可信**）：仅供需要额外校验的调用方使用。
+     *
+     * <p>返回值可能来自"另一个节目"，调用方<b>必须</b>用站点页面标题等权威信息
+     * 做二次校验后才能采信，否则会重演「披荆斩棘2026」错配事故。</p>
+     *
+     * @return slug；无可信匹配时返回空串
+     */
+    public static String lookupFuzzy(String showName) {
+        String exact = lookup(showName);
+        if (!TextUtils.isEmpty(exact)) {
+            return exact;
+        }
+        if (TextUtils.isEmpty(showName)) {
+            return "";
+        }
+        Map<String, String> map = name2slug;
+        if (map == null || map.isEmpty()) {
+            return "";
+        }
+        String noSpace = showName.trim().replaceAll("\\s+", "");
+        String noYear = stripYearSuffix(noSpace);
         for (Map.Entry<String, String> e : map.entrySet()) {
             String key = e.getKey();
-            if (key.length() >= 3 && (noSpace.contains(key) || key.contains(noSpace))) {
+            if (key.length() < 3) {
+                continue;
+            }
+            if (noSpace.contains(key) || key.contains(noSpace)) {
+                return e.getValue();
+            }
+            // 剥掉年份后缀后再比一次：「披荆斩棘2026」vs 表里的「披荆斩棘」
+            if (!noYear.equals(noSpace)
+                    && (noYear.contains(key) || key.contains(noYear))) {
                 return e.getValue();
             }
         }
@@ -149,6 +231,30 @@ public final class ShowSlugMap {
         String r = s.replaceAll("[（(][^）)]*[）)]\\s*$", "");
         r = r.replaceAll("[_\\-·].*$", "");
         return r.trim();
+    }
+
+    /**
+     * 去掉尾部的"年份 / 第N季 / 季数"后缀，用于「披荆斩棘2026」→「披荆斩棘」这类变体。
+     *
+     * <p>只剥离<b>尾部</b>的纯数字年份、或「第N季」结构，不做任何中间截断，
+     * 避免把正常的节目名截成另一个节目。</p>
+     * <p>例：{@code 披荆斩棘2026 → 披荆斩棘}、{@code 再见爱人第4季 → 再见爱人}、
+     * {@code 某某节目2026 → 某某节目}。</p>
+     */
+    static String stripYearSuffix(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return "";
+        }
+        String r = s;
+        // "第4季" / "第4期" 结尾
+        r = r.replaceAll("第\\s*[0-9一二三四五六七八九十]{1,3}\\s*季\\s*$", "");
+        // 尾部 4 位年份（20xx），且前面还有内容
+        r = r.replaceAll("(20\\d{2})\\s*$", "");
+        // 尾部 "季" 单字
+        r = r.replaceAll("季\\s*$", "");
+        r = r.trim();
+        // 剥离后太短则视为不可信（避免截成单字节目名）
+        return r.length() >= 2 ? r : s;
     }
 
     /** 清空（用于映射更新后重载）。 */
@@ -281,6 +387,11 @@ public final class ShowSlugMap {
      * <p>多站点依次尝试（主站失败自动切备用），全部失败返回 {@code episode=-1}。
      * 必须在后台线程调用。</p>
      *
+     * <p><b>二次校验（防张冠李戴）</b>：slug 一旦来自"去年份后缀"或包含式这类宽松匹配，
+     * 抓到的可能是<b>另一个节目</b>的页面。因此拿到 HTML 后必须确认
+     * 页面标题里确实出现了当前节目名（或其去年份后缀的形式），否则一律弃用。
+     * 宁可返回 -1 退回本地兜底，也不能把用户切到无关的集上。</p>
+     *
      * @param showName 节目中文名
      * @param date     播出日期（YYYYMMDD）
      * @return 结果对象；{@link DirectResult#found()} 为 false 表示未命中
@@ -289,7 +400,21 @@ public final class ShowSlugMap {
         if (TextUtils.isEmpty(showName) || TextUtils.isEmpty(date)) {
             return new DirectResult(-1, null);
         }
-        String slug = lookup(showName);
+        String trimmed = showName.trim();
+        // 先试可信匹配（精确/去空格/去括号）；没有再试"去年份后缀"，最后才是包含式。
+        // 可信来源（精确命中）无需标题校验；其余两类都可能命中"另一个节目"，必须校验。
+        String slug = lookupStrict(trimmed);
+        boolean strict = true;
+        if (TextUtils.isEmpty(slug)) {
+            // 去年份后缀，如「披荆斩棘2026」→「披荆斩棘」。
+            // 命中后抓到的极可能是同名前作的页面，属于不可信来源，必须二次校验标题。
+            slug = lookupByYearStrip(trimmed);
+            strict = TextUtils.isEmpty(slug);
+        }
+        if (TextUtils.isEmpty(slug)) {
+            slug = lookupFuzzy(trimmed);
+            strict = TextUtils.isEmpty(slug);
+        }
         if (TextUtils.isEmpty(slug)) {
             // 节目不在映射表内，无法直连
             return new DirectResult(-1, null);
@@ -298,14 +423,75 @@ public final class ShowSlugMap {
             try {
                 String html = httpGet(site.episodeUrl(slug, date), site.ua);
                 int ep = parseEpisodeFromTitle(html);
-                if (ep > 0) {
-                    return new DirectResult(ep, site.name);
+                if (ep <= 0) {
+                    continue;
                 }
+                // 宽松来源（可能命中"另一个节目"）必须做标题二次校验
+                if (!strict && !titleMatches(extractTitle(html), trimmed)) {
+                    continue;
+                }
+                return new DirectResult(ep, site.name);
             } catch (Throwable ignored) {
                 // 单站点失败，继续尝试下一个（备用的意义所在）
             }
         }
         return new DirectResult(-1, null);
+    }
+
+    /** 取出 {@code <title>} 内容；取不到返回空串。 */
+    static String extractTitle(String html) {
+        if (TextUtils.isEmpty(html)) {
+            return "";
+        }
+        Matcher tm = RE_TITLE.matcher(html);
+        if (!tm.find()) {
+            return "";
+        }
+        String t = tm.group(1);
+        return t == null ? "" : t;
+    }
+
+    /**
+     * 校验站点页面标题是否确实属于当前节目。
+     *
+     * <p>判定：把标题与节目名都归一化（去空格、去标点）后，检查标题中是否包含
+     * 节目名主体。考虑到站点标题常形如
+     * {@code 【披荆斩棘2026】_第8期：...} 或 {@code 披荆斩棘20260816_第8期_...}，
+     * 这里同时接受"节目名"与"去掉年份后缀的节目名"两种形式。</p>
+     *
+     * @param title    站点页面 title 原文
+     * @param showName 当前节目名
+     * @return true 表示标题确实属于该节目
+     */
+    static boolean titleMatches(String title, String showName) {
+        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(showName)) {
+            return false;
+        }
+        String t = normalizeForCompare(title);
+        String n = normalizeForCompare(showName);
+        if (n.length() < 2 || t.isEmpty()) {
+            return false;
+        }
+        // 直接包含
+        if (t.contains(n)) {
+            return true;
+        }
+        // 去掉年份后缀后再比一次（站点常把年份放在节目名里，也可能不放）
+        String nNoYear = normalizeForCompare(stripYearSuffix(showName));
+        if (nNoYear.length() >= 2 && t.contains(nNoYear)) {
+            return true;
+        }
+        // 反过来：站点标题里可能带了额外后缀，节目名去掉尾部数字后再比
+        String nBase = normalizeForCompare(showName.replaceAll("\\d+\\s*$", ""));
+        return nBase.length() >= 3 && t.contains(nBase);
+    }
+
+    /** 归一化：去空白与常见标点，便于标题比对。 */
+    private static String normalizeForCompare(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return "";
+        }
+        return s.replaceAll("[\\s\\[\\]【】()（）_\\-—·、,，.。:：!！?？\"'“”‘’]+", "");
     }
 
     /** 从 HTML 的 {@code <title>} 中解析"第N期"。返回 -1 表示无期数。 */

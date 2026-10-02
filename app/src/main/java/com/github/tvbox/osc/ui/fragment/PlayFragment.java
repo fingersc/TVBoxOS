@@ -1791,17 +1791,27 @@ public class PlayFragment extends BaseLazyFragment {
         List<String> lineFlags = getLineFlagsInDisplayOrder();
         int currentLineIndex = findLineFlagIndex(lineFlags, currentFlag);
         int startLineIndex = currentLineIndex >= 0 ? currentLineIndex + 1 : 0;
-        // 查找下一条未尝试过的线路
+        // 查找下一条未尝试过、且**确实含有当前集**的线路。
+        // 关键：匹配不上（返回 -1）时跳过该线路，继续往后找，
+        // 绝不退回 findSameEpisodeIndex 的"按下标兜底"——那会静默切到不相干的集。
         String nextFlag = null;
         int nextIndex = 0;
         for (int i = startLineIndex; i < lineFlags.size(); i++) {
             String flag = lineFlags.get(i);
             List<VodInfo.VodSeries> seriesList = mVodInfo.seriesMap.get(flag);
-            if (!triedLineFlags.contains(flag) && seriesList != null && !seriesList.isEmpty()) {
-                nextFlag = flag;
-                nextIndex = findSameEpisodeIndex(currentSeries, seriesList, currentIndex);
-                break;
+            if (triedLineFlags.contains(flag) || seriesList == null || seriesList.isEmpty()) {
+                continue;
             }
+            int located = locateEpisodeOnFlag(currentSeries, seriesList);
+            if (located < 0) {
+                // 该线路没有这一集：标记为已尝试并跳过
+                triedLineFlags.add(flag);
+                LOG.i("echo-autoRetry skip line(no such episode): " + flag);
+                continue;
+            }
+            nextFlag = flag;
+            nextIndex = located;
+            break;
         }
         if (nextFlag == null) {
             // 所有线路都已尝试过
@@ -1923,9 +1933,26 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     /**
-     * 在 targetList 中定位与 currentSeries 对应的集。
-     * 先同域精确匹配；失败且属"日期 ↔ 第N期"跨域时，用旧源下标按序对齐兜底。
+     * 在指定线路的列表里定位与 {@code currentSeries} 对应的集。
+     *
+     * <p>与 {@link #findSameEpisodeIndex} 的关键区别：<b>匹配不上时返回 -1，不按下标兜底</b>。
+     * 用于"跳过没有这一集的线路"——回到错误的集上比不切线路糟糕得多。</p>
+     *
+     * @return 命中索引；该线路确实没有这一集时返回 -1
      */
+    private int locateEpisodeOnFlag(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> list) {
+        if (list == null || list.isEmpty()) {
+            return -1;
+        }
+        if (list.size() == 1) {
+            return 0;
+        }
+        if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
+            return -1;
+        }
+        return findMatchingEpisodeIndex(currentSeries, list);
+    }
+
     /**
      * 播放页跨源定位"同一集"的索引。
      *

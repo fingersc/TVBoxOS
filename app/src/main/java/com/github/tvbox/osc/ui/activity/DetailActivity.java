@@ -461,8 +461,8 @@ public class DetailActivity extends BaseActivity {
         });
         mGridViewFlag.setOnItemListener(new TvRecyclerView.OnItemListener() {
             private void refresh(View itemView, int position) {
-                String newFlag = seriesFlagAdapter.getData().get(position).name;
-                if (vodInfo != null && !vodInfo.playFlag.equals(newFlag)) {
+                String clickedFlag = seriesFlagAdapter.getData().get(position).name;
+                if (vodInfo != null && !vodInfo.playFlag.equals(clickedFlag)) {
                     String oldFlag = vodInfo.playFlag;
                     int oldIndex = vodInfo.playIndex;
                     // 预览模式下实际在播对象是 previewVodInfo，旧进度 key 要按它拼
@@ -477,27 +477,35 @@ public class DetailActivity extends BaseActivity {
                     if (currentSeries == null) {
                         currentSeries = routeSwitchSeries;
                     }
-                    for (int i = 0; i < vodInfo.seriesFlags.size(); i++) {
-                        VodInfo.VodSeriesFlag flag = vodInfo.seriesFlags.get(i);
-                        if (flag.name.equals(oldFlag)) {
-                            flag.selected = false;
-                            View oldItemView = mGridViewFlag.getLayoutManager().findViewByPosition(i);
-                            if (oldItemView != null) oldItemView.findViewById(R.id.tvSeriesFlagSelect).setVisibility(View.GONE);
-                            break;
-                        }
-                    }
-                    VodInfo.VodSeriesFlag flag = vodInfo.seriesFlags.get(position);
-                    flag.selected = true;
-                    itemView.findViewById(R.id.tvSeriesFlagSelect).setVisibility(View.VISIBLE);
-                    // clean pre flag select status
+                    // 清理旧线路的集选中态
                     if (oldSeriesList != null && oldIndex >= 0 && oldSeriesList.size() > oldIndex) {
                         oldSeriesList.get(oldIndex).selected = false;
                     }
+
+                    // ---------------- 选源：跳过"没有这一集"的站点 ----------------
+                    // 需求：点击的目标源若不含当前集，不应静默切到第0集（会覆盖播放记录），
+                    // 而应从点击位置开始沿线路轮询，找到第一条真正含有该集的源；
+                    // 全部都没有才放弃切源，保持原线路与进度不变。
+                    FlagMatch hit = findFirstFlagWithEpisode(currentSeries, position);
+                    if (hit == null) {
+                        // 所有线路都没有这一集：放弃切源，还原选中态，明确告知用户
+                        updateFlagSelectionUi(oldFlag);
+                        android.widget.Toast.makeText(this,
+                                "该剧集在所切换的源中未找到，已保持当前播放",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        seriesFlagFocus = itemView;
+                        return;
+                    }
+                    final String newFlag = hit.flag;
+                    final int matchedIndex = hit.index;
+
+                    updateFlagSelectionUi(newFlag);
                     vodInfo.playFlag = newFlag;
                     List<VodInfo.VodSeries> newSeriesList = vodInfo.seriesMap.get(newFlag);
-                    if (newSeriesList != null && !newSeriesList.isEmpty()) {
-                        vodInfo.playIndex = clampIndex(findMatchingEpisodeIndex(currentSeries, newSeriesList), newSeriesList);
-                        // 第3层：跨域（日期↔期数）且本地未命中时，异步联网精确重定位（成功后自动刷新播放地址）
+                    if (newSeriesList != null && !newSeriesList.isEmpty()
+                            && matchedIndex >= 0 && matchedIndex < newSeriesList.size()) {
+                        vodInfo.playIndex = matchedIndex;
+                        // 跨域（日期↔期数）且本地未命中时，异步联网精确重定位（成功后自动刷新播放地址）
                         tryOnlineCrossDomainResolve(currentSeries == null ? "" : currentSeries.name, newFlag,
                                 newSeriesList, vodInfo.playIndex);
                         for (VodInfo.VodSeries series : newSeriesList) {
@@ -3000,6 +3008,106 @@ public class DetailActivity extends BaseActivity {
         }
         int matchedIndex = findMatchingEpisodeIndex(currentSeries, targetList);
         return matchedIndex >= 0 ? matchedIndex : Math.max(0, Math.min(fallbackIndex, targetList.size() - 1));
+    }
+
+    /** 一次"选线路 + 定位集"的搜索结果。 */
+    private static final class FlagMatch {
+        final String flag;
+        final int index;
+
+        FlagMatch(String flag, int index) {
+            this.flag = flag;
+            this.index = index;
+        }
+    }
+
+    /**
+     * 在某条线路上定位与 {@code currentSeries} 对应的集。
+     *
+     * <p>返回值语义：
+     * <ul>
+     *   <li>{@code >= 0} —— 找到了，索引可用；</li>
+     *   <li>{@code -1}   —— 该线路确实<b>没有</b>这一集（不是"不知道"，
+     *       而是所有本地/在线手段都查过了，且明确判定不存在）。</li>
+     * </ul>
+     * 关键区别：单集列表直接返回 0（只有一集时只能是它），
+     * 而<b>多集列表匹配不上时返回 -1，绝不 clamp 成 0</b>——
+     * 这正是之前"匹配失败被静默伪装成第0集"的根源。</p>
+     */
+    private int locateEpisodeOnFlag(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> list) {
+        if (list == null || list.isEmpty()) {
+            return -1;
+        }
+        if (list.size() == 1) {
+            return 0;
+        }
+        if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
+            return -1;
+        }
+        return findMatchingEpisodeIndex(currentSeries, list);
+    }
+
+    /**
+     * 从用户点击的线路开始，沿线路列表轮询，找到第一条<b>确实含有当前集</b>的线路。
+     *
+     * <p>需求来源：当目标源没有这一集时，不应静默切到"第 0 集"并覆盖播放记录，
+     * 而应当<b>跳过该站点、继续尝试下一个站点</b>，直到找到真正含有该集的源；
+     * 全都找不到才放弃切源（保持原线路与进度不变）。</p>
+     *
+     * <p>轮询顺序：先 {@code startPos}（用户点的那个），再 {@code startPos+1 …} 绕回开头，
+     * 保证"用户点的线路"优先级最高，符合直觉。</p>
+     *
+     * @param currentSeries 当前在播的集（旧源写法）
+     * @param startPos      用户点击的线路下标
+     * @return 命中的线路与集索引；全部线路都没有该集时返回 null
+     */
+    private FlagMatch findFirstFlagWithEpisode(VodInfo.VodSeries currentSeries, int startPos) {
+        if (vodInfo == null || vodInfo.seriesFlags == null
+                || vodInfo.seriesFlags.isEmpty() || currentSeries == null
+                || TextUtils.isEmpty(currentSeries.name)) {
+            return null;
+        }
+        int n = vodInfo.seriesFlags.size();
+        if (n <= 0) {
+            return null;
+        }
+        int start = Math.max(0, Math.min(startPos, n - 1));
+        for (int k = 0; k < n; k++) {
+            int pos = (start + k) % n;               // 从点击位置开始绕圈
+            VodInfo.VodSeriesFlag f = vodInfo.seriesFlags.get(pos);
+            if (f == null || TextUtils.isEmpty(f.name)) {
+                continue;
+            }
+            List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(f.name);
+            int idx = locateEpisodeOnFlag(currentSeries, list);
+            if (idx >= 0) {
+                return new FlagMatch(f.name, idx);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 更新线路按钮的选中态（切换线路时视觉同步）。
+     *
+     * @param selectFlag 新的选中线路名
+     */
+    private void updateFlagSelectionUi(String selectFlag) {
+        if (vodInfo == null || vodInfo.seriesFlags == null || seriesFlagAdapter == null) {
+            return;
+        }
+        for (int i = 0; i < vodInfo.seriesFlags.size(); i++) {
+            VodInfo.VodSeriesFlag f = vodInfo.seriesFlags.get(i);
+            if (f == null) continue;
+            boolean sel = TextUtils.equals(f.name, selectFlag);
+            f.selected = sel;
+            View v = mGridViewFlag == null || mGridViewFlag.getLayoutManager() == null
+                    ? null : mGridViewFlag.getLayoutManager().findViewByPosition(i);
+            if (v != null) {
+                int vis = sel ? View.VISIBLE : View.GONE;
+                v.findViewById(R.id.tvSeriesFlagSelect).setVisibility(vis);
+            }
+        }
     }
 
     /**
