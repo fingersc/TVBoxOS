@@ -505,6 +505,102 @@ public final class ShowSlugMap {
         return new DateResult(null, null);
     }
 
+    /**
+     * 反向解析（<b>多日期版</b>）：给定期数，返回<b>所有</b>属于该期的播出日期。
+     *
+     * <p><b>为什么需要多日期</b>：一个「期」在日期式源里常常<b>跨越两天</b>——
+     * 综艺普遍把一期的"上/下"两段分两天播出：</p>
+     * <pre>
+     *   jisu 源（期数式）        dytt 源（日期式）
+     *   ────────────────────────────────────────────
+     *   第2期上          ←→      20260411上
+     *   第2期下          ←→      20260412下
+     * </pre>
+     * <p>此时 {@code 20260411} 与 {@code 20260412} <b>都属于第2期</b>。
+     * 单日期版 {@link #resolveEpisodeToDate} 只返回先扫到的那个，
+     * 于是"第2期上"可能被对到 {@code 20260412上}（错）而非 {@code 20260411上}（对）。</p>
+     *
+     * <p><b>算法</b>：与单日期版相同的双轮扫描（周步进 + 邻域精扫），
+     * 但命中后<b>不立即返回</b>，而是把日期收进结果集；
+     * 同时对该日期前后各若干天做一次短程延伸探测，把"同期的相邻天"一并收齐。</p>
+     *
+     * <p>调用方随后可用日期顺序 + 分集后缀，把"第N期上/下"精确对到对应日期。</p>
+     *
+     * <p>必须在后台线程调用；任何失败返回空列表。</p>
+     *
+     * @param showName      节目中文名
+     * @param targetEpisode 目标期数（如 2）
+     * @param anchorDate    起点日期（YYYYMMDD）
+     * @param spanDays      命中后向两侧延伸探测的天数（建议 1~3）
+     * @return 属于该期的日期列表（升序，可能为空）
+     */
+    public static java.util.List<String> resolveEpisodeToDates(String showName, int targetEpisode,
+                                                              String anchorDate, int spanDays) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return out;
+        }
+        java.util.Calendar cal = parseCalendar(anchorDate);
+        if (cal == null) {
+            return out;
+        }
+        java.util.Set<String> seenHit = new java.util.LinkedHashSet<>();
+        // 第一轮：按周步进快速逼近
+        for (int step = 0; step <= MAX_WEEKS && out.isEmpty(); step++) {
+            for (int sign : new int[]{1, -1}) {
+                if (step == 0 && sign < 0) {
+                    continue;
+                }
+                java.util.Calendar c = (java.util.Calendar) cal.clone();
+                c.add(java.util.Calendar.DAY_OF_YEAR, sign * step * 7);
+                String d = formatDate(c);
+                if (probeEpisodeAtDate(showName, d) == targetEpisode) {
+                    seenHit.add(d);
+                }
+            }
+        }
+        // 第二轮：邻域精扫（仅在第一轮无果时进行，保持与单日期版一致的探测预算）
+        if (out.isEmpty() && seenHit.isEmpty()) {
+            for (int week = -6; week <= 6; week++) {
+                java.util.Calendar base = (java.util.Calendar) cal.clone();
+                base.add(java.util.Calendar.DAY_OF_YEAR, week * 7);
+                for (int inner = -1; inner <= 1; inner++) {
+                    java.util.Calendar c = (java.util.Calendar) base.clone();
+                    c.add(java.util.Calendar.DAY_OF_YEAR, inner);
+                    String d = formatDate(c);
+                    if (probeEpisodeAtDate(showName, d) == targetEpisode) {
+                        seenHit.add(d);
+                    }
+                }
+            }
+        }
+        if (seenHit.isEmpty()) {
+            return out;
+        }
+        // 延伸：对每个命中日，向两侧各 spanDays 天探测，收齐"同期的相邻天"
+        int span = Math.max(0, Math.min(spanDays, 5));
+        java.util.Set<String> all = new java.util.TreeSet<>(seenHit);
+        for (String hit : seenHit) {
+            java.util.Calendar hc = parseCalendar(hit);
+            if (hc == null) {
+                continue;
+            }
+            for (int off = -span; off <= span; off++) {
+                if (off == 0) {
+                    continue;
+                }
+                java.util.Calendar c = (java.util.Calendar) hc.clone();
+                c.add(java.util.Calendar.DAY_OF_YEAR, off);
+                String d = formatDate(c);
+                if (probeEpisodeAtDate(showName, d) == targetEpisode) {
+                    all.add(d);
+                }
+            }
+        }
+        out.addAll(all);
+        return out;
+    }
+
     /** 解析 YYYYMMDD 为 Calendar；不合法返回 null。 */
     private static java.util.Calendar parseCalendar(String date) {
         if (TextUtils.isEmpty(date) || date.length() != 8) {

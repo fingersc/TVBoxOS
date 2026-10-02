@@ -3379,6 +3379,27 @@ public class DetailActivity extends BaseActivity {
 
         // 反向查询比正向慢（需逐天探测），给预算留出更宽裕的余量
         long reverseBudget = Math.max(budget, 1800L);
+        // ★ 多日期查询：一个「期」可能跨越两天（上/下分段分两天播，如
+        //   第2期上=20260411、第2期下=20260412）。只取单个日期会丢掉分段归属，
+        //   于是"第2期上"可能被对到 20260412上。
+        java.util.List<String> dates = EpisodeOnlineResolver.resolveDatesWithin(
+                showName, cur.ordinal, anchor, reverseBudget);
+        if (dates != null && !dates.isEmpty()) {
+            // 按「日期顺序 + 分集后缀」精确落位（第N期上→第1天、第N期下→第2天…）
+            int byDates = EpisodeNameMatcher.findIndexByDates(dates, targetNames, currentName);
+            if (byDates >= 0) {
+                return byDates;
+            }
+            // 分段无法区分时，退回单日期（保持旧行为：优先正片口径）
+            for (String d : dates) {
+                int byDate = EpisodeNameMatcher.findIndexByDate(d, targetNames, currentName);
+                if (byDate >= 0) {
+                    return byDate;
+                }
+            }
+            return -1;
+        }
+        // 兼容回退：多日期查询不可用时，仍走原来的单日期路径
         String date = EpisodeOnlineResolver.resolveDateWithin(
                 showName, cur.ordinal, anchor, reverseBudget);
         if (TextUtils.isEmpty(date)) return -1;

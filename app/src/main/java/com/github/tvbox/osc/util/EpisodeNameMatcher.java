@@ -591,12 +591,151 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 同日多段对齐：跨天分段的期，按「日期顺序 + 分集后缀」精确落位。
+     *
+     * <p><b>场景（实测）</b>：一个「期」在日期式源里可能<b>跨越两天</b>——
+     * 综艺把一期的上/下两段分两天播出：</p>
+     * <pre>
+     *   当前源（期数式）        目标源（日期式）
+     *   ──────────────────────────────────────────
+     *   第2期上          ←→      20260411上
+     *   第2期下          ←→      20260412下
+     * </pre>
+     *
+     * <p><b>为什么原有的 {@link #findIndexByDate} 不够</b>：它只接受<b>单个</b>日期，
+     * 且分集口径只在该日期内部比较。反查若先扫到 {@code 20260412}，
+     * 就只能在 {@code 20260412} 内挑分段，于是"第2期上"落到 {@code 20260412上}（错），
+     * 而正确答案是 {@code 20260411上}。</p>
+     *
+     * <p><b>本方法的做法</b>：接收<b>属于同一期的全部日期</b>（升序），
+     * 再按以下优先级落位：</p>
+     * <ol>
+     *   <li><b>按分段对齐</b>：把当前名的分段（上/中/下）映射到日期序列的对应位置。
+     *       一段分两天时 上→第1天、下→第2天；三段时 上→第1天、中→第2天、下→第3天。</li>
+     *   <li>若该日期在目标源里没有匹配分段的条目，退而求其次取该日期任意正片条目。</li>
+     *   <li>仍无果则按日期顺序返回第一个能在目标源中找到的日期。</li>
+     * </ol>
+     *
+     * @param dates       属于同一期的日期列表（升序，YYYYMMDD）
+     * @param names       目标源集名列表
+     * @param currentName 当前在播集名（提供分段信息），可为 null
+     * @return 命中下标；未命中返回 -1
+     */
+    public static int findIndexByDates(java.util.List<String> dates, List<String> names, String currentName) {
+        if (dates == null || dates.isEmpty() || names == null || names.isEmpty()) {
+            return -1;
+        }
+        // 日期去重升序，保证下标稳定
+        java.util.List<String> sorted = new java.util.ArrayList<>();
+        for (String d : dates) {
+            if (!TextUtils.isEmpty(d) && !sorted.contains(d)) {
+                sorted.add(d);
+            }
+        }
+        if (sorted.isEmpty()) {
+            return -1;
+        }
+        java.util.Collections.sort(sorted);
+
+        final int wantPart = normalizePart(extractPart(currentName));
+        final boolean curKnown = !TextUtils.isEmpty(currentName);
+        final boolean curIsNonMain = curKnown && isNonMainFeature(currentName);
+        final String curToken = curIsNonMain ? nonMainFeatureToken(currentName) : null;
+
+        // ① 分段对齐：把分段映射到日期序号
+        //    一段(上)→第1天；两段(上/下)→上=第1天、下=第2天；
+        //    三段(上/中/下)→依次对应第1/2/3天。
+        int daySlot = -1;
+        if (curKnown) {
+            if (wantPart == PART_UP) {
+                daySlot = 0;
+            } else if (wantPart == PART_MIDDLE) {
+                daySlot = 1;
+            } else if (wantPart == PART_DOWN) {
+                // 下段：若只有 2 天 → 第2天；若有 3 天及以上 → 最后一天
+                daySlot = sorted.size() >= 3 ? sorted.size() - 1 : Math.min(1, sorted.size() - 1);
+            }
+        }
+        if (daySlot >= 0 && daySlot < sorted.size()) {
+            int hit = pickInDate(sorted.get(daySlot), names, currentName, wantPart,
+                    curKnown, curIsNonMain, curToken);
+            if (hit >= 0) {
+                return hit;
+            }
+        }
+        // ② 按日期顺序，逐个日期尝试（口径放宽：接受该日期的任意正片）
+        for (String d : sorted) {
+            int hit = findIndexByDate(d, names, currentName);
+            if (hit >= 0) {
+                return hit;
+            }
+        }
+        // ③ 最后：忽略口径，只按日期取首个匹配
+        for (String d : sorted) {
+            int hit = findIndexByDate(d, names, null);
+            if (hit >= 0) {
+                return hit;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 在<b>指定日期</b>的条目里，按分段口径挑一个下标。
+     *
+     * @return 下标；无匹配返回 -1
+     */
+    private static int pickInDate(String date, List<String> names, String currentName, int wantPart,
+                                  boolean curKnown, boolean curIsNonMain, String curToken) {
+        int target;
+        try {
+            target = Integer.parseInt(date.trim());
+        } catch (Throwable t) {
+            return -1;
+        }
+        int fallback = -1;
+        for (int i = 0; i < names.size(); i++) {
+            String n = names.get(i);
+            if (TextUtils.isEmpty(n) || dateOf(n) != target) {
+                continue;
+            }
+            boolean nonMain = isNonMainFeature(n);
+            if (curKnown) {
+                if (curIsNonMain) {
+                    // 当前是非正片：优先同词非正片
+                    if (nonMain && curToken != null && curToken.equals(nonMainFeatureToken(n))) {
+                        return i;
+                    }
+                } else {
+                    // 当前是正片：跳过一切非正片
+                    if (nonMain) {
+                        continue;
+                    }
+                }
+            } else if (nonMain) {
+                // 口径未知：优先正片
+                if (fallback < 0) {
+                    fallback = i;
+                }
+                continue;
+            }
+            // 分段一致性：无后缀 ≡ 上
+            if (normalizePart(extractPart(n)) == wantPart) {
+                return i;
+            }
+            if (fallback < 0) {
+                fallback = i;
+            }
+        }
+        return fallback;
+    }
+
+    /**
      * 按日期定位目标列表下标：找首个日期等于 {@code date} 的条目。
      *
      * <p>用于<b>反向跨域</b>的落位：反查得到日期 {@code D} 后，
      * 目标源本身是日期式（没有期数），因此不能再用
      * {@link #findIndexByEpisode} 匹配，必须按日期找。</p>
-     *
      * <p>内部委托 {@link #findIndexByDate(String, List, String)}，
      * {@code currentName} 传 {@code null} 表示"口径未知"，
      * 保持旧行为：同日期优先正片，只有非正片时返回该非正片。</p>
@@ -811,6 +950,12 @@ public final class EpisodeNameMatcher {
         // 当前条目是否非正片，决定本次走哪套口径
         final boolean curIsNonMain = isNonMainFeature(currentName);
         final String curToken = nonMainFeatureToken(currentName);
+        // ★ 分段口径：当前名带 上/中/下 时，必须挑到同分段的条目。
+        //   否则「第2期下」会落到「第2期上」（findIndexByEpisode 早期只取第一条）。
+        final boolean curHasPart = extractPart(currentName) != PART_NONE;
+        final int wantPart = normalizePart(extractPart(currentName));
+        // 分段不一致时的候选（用于兜底：目标源确实没有该分段时，仍给一个近似落点）
+        int partMismatchFallback = -1;
         for (int i = 0; i < targetNames.size(); i++) {
             String name = targetNames.get(i);
             if (TextUtils.isEmpty(name)) {
@@ -824,17 +969,26 @@ public final class EpisodeNameMatcher {
             if (curIsNonMain) {
                 // 当前是非正片：只在同一系列词的非正片里找
                 // （'重温经典2' 找 '重温经典2' ✅；不找 '回顾往期2' ❌）
-                if (curToken != null && curToken.equals(nonMainFeatureToken(name))) {
-                    return i;
+                if (curToken == null || !curToken.equals(nonMainFeatureToken(name))) {
+                    continue;
                 }
             } else {
                 // 当前是正片：只在正片里找，跳过一切非正片条目
-                if (!isNonMainFeature(name)) {
-                    return i;
+                if (isNonMainFeature(name)) {
+                    continue;
                 }
             }
+            // 分段一致 → 直接命中
+            if (!curHasPart || normalizePart(key.part) == wantPart) {
+                return i;
+            }
+            // 分段不一致 → 记下首个候选作为兜底
+            if (partMismatchFallback < 0) {
+                partMismatchFallback = i;
+            }
         }
-        return -1;
+        // 目标源没有同分段的条目时，退回首个候选（保持旧行为，避免整体失配）
+        return partMismatchFallback;
     }
 
     /**

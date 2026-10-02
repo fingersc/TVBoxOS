@@ -272,6 +272,104 @@ public final class EpisodeOnlineResolver {
         }
     }
 
+    /**
+     * 反向查询的<b>多日期</b>版本：给定期数，返回属于该期的<b>全部</b>播出日期。
+     *
+     * <p><b>为什么需要它</b>：一个「期」在日期式源里常跨两天（上/下分段分两天播）。
+     * 只取单个日期会让"第N期上/下"无法区分，落点随机。
+     * 拿到全部日期后，调用方可用 {@code EpisodeNameMatcher.findIndexByDates}
+     * 按分段精确落位。</p>
+     *
+     * <p>本方法会阻塞调用线程，<b>禁止在主线程调用</b>。</p>
+     *
+     * @param showName      节目名
+     * @param targetEpisode 目标期数
+     * @param anchorDate    起点日期（YYYYMMDD）
+     * @param timeoutMs     超时预算
+     * @return 日期列表（升序）；未命中/超时/失败返回空列表
+     */
+    public static java.util.List<String> resolveDatesWithin(final String showName, final int targetEpisode,
+                                                            final String anchorDate, long timeoutMs) {
+        final java.util.List<String> empty = new java.util.ArrayList<>();
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return empty;
+        }
+        java.util.concurrent.ExecutorService pool = null;
+        try {
+            pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+            java.util.concurrent.Future<java.util.List<String>> future =
+                    pool.submit(new java.util.concurrent.Callable<java.util.List<String>>() {
+                        @Override
+                        public java.util.List<String> call() {
+                            return resolveDates(showName, targetEpisode, anchorDate);
+                        }
+                    });
+            java.util.List<String> r = future.get(Math.max(1, timeoutMs),
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+            return r == null ? empty : r;
+        } catch (Throwable t) {
+            // 超时/中断/异常：一律视为"查不到"，交由调用方兜底
+            return empty;
+        } finally {
+            if (pool != null) {
+                try {
+                    pool.shutdownNow();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * 反向查询（多日期）的实现：先查缓存，再直连站点做多日期扫描。
+     *
+     * <p>命中后把全部 日期→期数 映射并入缓存，供后续正向查询复用。</p>
+     */
+    static java.util.List<String> resolveDates(String showName, int targetEpisode, String anchorDate) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
+            return out;
+        }
+        // 1. 缓存里已有的同期限日期
+        Map<String, Integer> cached = getCached(showName);
+        if (cached != null) {
+            for (Map.Entry<String, Integer> e : cached.entrySet()) {
+                if (e.getValue() != null && e.getValue() == targetEpisode && !TextUtils.isEmpty(e.getKey())) {
+                    out.add(e.getKey());
+                }
+            }
+        }
+        // 2. 直连站点多日期扫描
+        if (OnlineResolveConfig.isDirectConnectEnabled()) {
+            try {
+                java.util.List<String> scanned =
+                        ShowSlugMap.resolveEpisodeToDates(showName, targetEpisode, anchorDate, 2);
+                if (scanned != null) {
+                    for (String d : scanned) {
+                        if (!TextUtils.isEmpty(d) && !out.contains(d)) {
+                            out.add(d);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (out.isEmpty()) {
+            return out;
+        }
+        java.util.Collections.sort(out);
+        // 3. 写缓存（并入，供正向查询复用）
+        Map<String, Integer> merged = new HashMap<>();
+        if (cached != null) {
+            merged.putAll(cached);
+        }
+        for (String d : out) {
+            merged.put(d, targetEpisode);
+        }
+        putCache(showName, merged);
+        return out;
+    }
+
     // ---------------- 网络层 ----------------
 
     /**
