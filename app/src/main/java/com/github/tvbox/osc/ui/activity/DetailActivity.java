@@ -488,6 +488,8 @@ public class DetailActivity extends BaseActivity {
                     // 全部都没有才放弃切源，保持原线路与进度不变。
                     FlagMatch hit = findFirstFlagWithEpisode(currentSeries, position);
                     if (hit == null) {
+                        LOG.i("[SW] Detail.switchHit NO_SOURCE_HAS_EPISODE '" + (currentSeries == null ? "?" : currentSeries.name)
+                                + "' from=" + oldFlag + " clickedPos=" + position);
                         // 所有线路都没有这一集：放弃切源，还原选中态，明确告知用户
                         updateFlagSelectionUi(oldFlag);
                         android.widget.Toast.makeText(DetailActivity.this,
@@ -498,6 +500,9 @@ public class DetailActivity extends BaseActivity {
                     }
                     final String newFlag = hit.flag;
                     final int matchedIndex = hit.index;
+                    LOG.i("[SW] Detail.switchHit '" + (currentSeries == null ? "?" : currentSeries.name)
+                            + "' from=" + oldFlag + " clickedPos=" + position
+                            + " → flag=" + newFlag + " idx=" + matchedIndex);
 
                     updateFlagSelectionUi(newFlag);
                     vodInfo.playFlag = newFlag;
@@ -1889,9 +1894,13 @@ public class DetailActivity extends BaseActivity {
         }
         String preferredFlag = vodInfo.playFlag;
         List<VodInfo.VodSeries> preferredList = vodInfo.seriesMap.get(preferredFlag);
+        LOG.i("[SW] Detail.restoreFallback START '" + fallback.name + "' fbIdx=" + fallbackIndex
+                + " preferredFlag=" + preferredFlag
+                + " preferredN=" + (preferredList == null ? -1 : preferredList.size()));
         int matchedIndex = findMatchingEpisodeIndex(fallback, preferredList);
         if (matchedIndex >= 0) {
             vodInfo.playIndex = matchedIndex;
+            LOG.i("[SW] Detail.restoreFallback DONE via preferred idx" + matchedIndex);
             return;
         }
         if (vodInfo.seriesFlags != null) {
@@ -1904,6 +1913,7 @@ public class DetailActivity extends BaseActivity {
                 if (matchedIndex >= 0) {
                     vodInfo.playFlag = seriesFlag.name;
                     vodInfo.playIndex = matchedIndex;
+                    LOG.i("[SW] Detail.restoreFallback DONE via flag " + seriesFlag.name + " idx" + matchedIndex);
                     return;
                 }
             }
@@ -1917,11 +1927,19 @@ public class DetailActivity extends BaseActivity {
             if (matchedIndex >= 0) {
                 vodInfo.playFlag = flag;
                 vodInfo.playIndex = matchedIndex;
+                LOG.i("[SW] Detail.restoreFallback DONE via mapKey " + flag + " idx" + matchedIndex);
                 return;
             }
         }
         if (preferredList != null && !preferredList.isEmpty()) {
-            vodInfo.playIndex = nearestEpisodeIndex(fallback, fallbackIndex, preferredList);
+            // ★ 全源均匹配失败 → 退回"最近集数号/裸下标"猜测。若最终错配，就是这一行造成的。
+            int guessed = nearestEpisodeIndex(fallback, fallbackIndex, preferredList);
+            vodInfo.playIndex = guessed;
+            LOG.i("[SW] Detail.restoreFallback ★GUESS★ allSourcesFailed '" + fallback.name
+                    + "' fbIdx=" + fallbackIndex + " → idx" + guessed
+                    + " '" + (preferredList.get(guessed) == null ? "?" : preferredList.get(guessed).name) + "'");
+        } else {
+            LOG.i("[SW] Detail.restoreFallback ABORT: preferredList empty");
         }
     }
 
@@ -2896,6 +2914,10 @@ public class DetailActivity extends BaseActivity {
         boolean sameFlag = TextUtils.equals(oldFlag, newFlag);
         VodInfo.VodSeries playingSeries = getPlayingSeries(playingVodInfo, newFlag);
         int newIndex = findMatchingEpisodeIndex(playingSeries, newSeriesList);
+        LOG.i("[SW] Detail.syncPlaying '" + (playingSeries == null ? "?" : playingSeries.name)
+                + "' oldFlag=" + oldFlag + "@" + oldIndex + " → newFlag=" + newFlag
+                + " newN=" + newSeriesList.size() + " matched=" + newIndex
+                + (newIndex < 0 ? " ★将写入 -1★" : (" '" + newSeriesList.get(newIndex).name + "'")));
         // 第3层：跨域（日期↔期数）且本地未命中时，异步联网精确重定位
         tryOnlineCrossDomainResolve(playingSeries == null ? "" : playingSeries.name, newFlag,
                 newSeriesList, clampIndex(newIndex, newSeriesList));
@@ -3140,10 +3162,19 @@ public class DetailActivity extends BaseActivity {
         final List<String> targetNames = seriesNames(targetList);
         final String currentName = currentSeries.name;
 
+        // ---------- 【诊断日志】切源匹配决策全链路 ----------
+        // 目的：一次性输出每一层的结论，定位"匹配失败后被静默兜成同下标"的具体环节。
+        // 定位完成后可整段删除；不影响任何匹配行为。
+        final long swTraceStart = System.currentTimeMillis();
+        final int swTraceTargetSize = targetList.size();
+
         // ---------- 第1层：本地同域精确匹配 ----------
         // 含"前导零 / 多字少字"等同域变体，全部在此解决，不联网。
         int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
         if (matchedIndex >= 0) {
+            LOG.i("[SW] Detail L1 findIndex '" + currentName + "' → idx" + matchedIndex
+                    + " '" + targetNames.get(matchedIndex) + "' targetN=" + swTraceTargetSize
+                    + " cost=" + (System.currentTimeMillis() - swTraceStart) + "ms");
             return matchedIndex;
         }
 
@@ -3160,21 +3191,35 @@ public class DetailActivity extends BaseActivity {
         if (playIndex >= 0 && !playList.isEmpty()) {
             int byGroup = EpisodeNameMatcher.alignByGroupPosition(
                     currentName, playIndex, seriesNames(playList), targetNames);
+            LOG.i("[SW] Detail L1.5 groupAlign '" + currentName + "' srcIdx=" + playIndex
+                    + " srcN=" + playList.size() + " → " + (byGroup >= 0
+                    ? ("idx" + byGroup + " '" + targetNames.get(byGroup) + "'")
+                    : "-1(拒绝)"));
             if (byGroup >= 0) {
                 return byGroup;
             }
+        } else {
+            LOG.i("[SW] Detail L1.5 skipped: playIndex=" + playIndex + " playListN=" + playList.size());
         }
 
         // ---------- 第2层：跨域 → 权威换算 ----------
         // 严格门控：只有真正跨域（日期 ↔ 期数）才走这一步；同域失败属正常无对应，不联网。
-        if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
+        boolean crossDomain = EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames);
+        LOG.i("[SW] Detail L2 needsCrossDomain=" + crossDomain
+                + " curDomain=" + EpisodeNameMatcher.parse(currentName).domain
+                + " (0=期数 1=日期 -1=未知)");
+        if (crossDomain) {
             // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
             int dictIndex = resolveByOfflineDict(currentName, targetNames);
             if (dictIndex >= 0) {
+                LOG.i("[SW] Detail L2a dictHit idx" + dictIndex + " '" + targetNames.get(dictIndex) + "'");
                 return dictIndex;
             }
             // 2-b 直连站点：默认权威数据源（缓存命中 0ms，未命中约 800ms）
             int online = tryResolveCrossDomainNow(currentName, targetNames);
+            LOG.i("[SW] Detail L2b onlineResolve → " + (online >= 0
+                    ? ("idx" + online + " '" + targetNames.get(online) + "'")
+                    : "-1(无解)"));
             if (online >= 0) {
                 return online;
             }
@@ -3191,10 +3236,18 @@ public class DetailActivity extends BaseActivity {
             // 此处仅允许同域兜底，跨域交给上面的直连层。
             int aligned = EpisodeNameMatcher.alignByOrder(
                     sourceIndex, seriesNames(sourceList), targetNames, false);
+            LOG.i("[SW] Detail L3 orderFallback srcIdx=" + sourceIndex
+                    + " srcN=" + sourceList.size() + " → " + (aligned >= 0
+                    ? ("idx" + aligned + " '" + targetNames.get(aligned) + "'")
+                    : "-1(拒绝)"));
             if (aligned >= 0) {
                 return aligned;
             }
         }
+        // 【关键】所有本地/联网层均未命中 → 返回 -1，由调用方决定是否按下标兜底。
+        // 若调用方最终仍切到了某集，说明存在"猜"的兜底逻辑（本次要定位的目标）。
+        LOG.i("[SW] Detail ALL_FAIL '" + currentName + "' targetN=" + swTraceTargetSize
+                + " → -1 (调用方将决定兜底) cost=" + (System.currentTimeMillis() - swTraceStart) + "ms");
         return matchedIndex;
     }
 
