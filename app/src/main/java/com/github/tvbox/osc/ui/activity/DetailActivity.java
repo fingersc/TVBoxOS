@@ -72,8 +72,10 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -1297,6 +1299,10 @@ public class DetailActivity extends BaseActivity {
             // 可切站点凭空变少（表现为「这部片只有两三个源能切」）。
             detailFallbackDeadKeys.clear();
             detailFallbackSoftTriedKeys.clear();
+            detailFallbackCycleCount = 0;
+            detailFallbackCycleStart = 0;
+            detailFallbackCycleStartOfNext = 0;
+            detailFallbackTimedOutKey = null;
         }
 
         detailFallbackActive = true;
@@ -1359,6 +1365,7 @@ public class DetailActivity extends BaseActivity {
         // 没有任何理由等详情报文回来才显示。不先刷的话，用户点完只能对着旧源发呆
         // 7~8 秒（详情 RTT + 解析 + 起播），以为没生效而反复点击。
         showDetailFallbackIndicators(nextSource, video);
+        markDetailFallbackInflight(nextSource);
         loadDetail(detailFallbackCacheId(detailFallbackTitle, nextSource), nextSource, true);
         return true;
     }
@@ -1418,21 +1425,55 @@ public class DetailActivity extends BaseActivity {
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return "";
         }
-        String picked = pollNextCycledSourceInternal(cachedCandidates);
+        // ★ 把缓存整理成「每个站点一条」的有序候选表：按站点质量分降序。
+        //
+        // 之前直接遍历缓存原序（= 各源返回先后），于是「下一个切谁」取决于网络快慢，
+        // 与站点质量无关；质量排序只在整表层面做了一次，进到轮转里就失效了。
+        // 质量分相同（都是冷启动的 NEUTRAL）时按显示名排，保证同一部片每次进入
+        // 切源顺序稳定可复现，不会「这次先切 A、下次先切 B」。
+        List<String> orderedSources = buildFallbackCycleOrder(cachedCandidates);
+        if (orderedSources.isEmpty()) {
+            return "";
+        }
+        String picked = pollNextCycledSourceInternal(orderedSources);
         if (!TextUtils.isEmpty(picked)) {
             return picked;
         }
-        // 本圈内都被试过了。如果可用候选本来就只有 1 个，清空重来只会把用户
-        // 原地锁死在同一个站点上——这种情况直接返回空，让上层提示「没有更多片源」。
-        if (detailFallbackUsableCandidateCount() <= 1) {
+        // 本圈内都被试过了。整池只有一个站点时清空重来没有意义（只会原地锁死），
+        // 直接返回空，让上层提示「没有更多片源」。
+        if (orderedSources.size() <= 1) {
             return "";
         }
-        // 否则开新圈（允许重复轮转到同一批源，但按顺序，不随机）
+        // 否则开新圈（允许重复轮转到同一批源，但按顺序，不随机）。
+        //
+        // ★ 开新圈必须同时清 SoftTriedKeys —— 它的语义就是「本圈已试过的站点」，
+        // 不清的话新圈里每一个站点都还被判为「试过」，等于开新圈立刻死空。
         detailFallbackCycleKeys.clear();
-        return pollNextCycledSourceInternal(cachedCandidates);
+        detailFallbackSoftTriedKeys.clear();
+        detailFallbackCycleCount++;
+        detailFallbackCycleStart = detailFallbackCycleStartOfNext;
+        LOG.i("[FB] newCycle #" + detailFallbackCycleCount
+                + " pool=" + orderedSources.size()
+                + " start=" + detailFallbackCycleStart);
+        return pollNextCycledSourceInternal(orderedSources);
     }
 
-    private String pollNextCycledSourceInternal(List<Movie.Video> cachedCandidates) {
+    /**
+     * 把缓存整理成「每站一条、按质量降序」的轮转顺序。
+     *
+     * <p>做三件事，缺一不可：
+     * <ol>
+     *   <li><b>按站点折叠</b>：同站多条同名结果只留一条（取源时本来就只认第一条）；</li>
+     *   <li><b>按显示名精确去重</b>：显示名一字不差的源只保留一个。这里是
+     *       {@code String.equals} 的<b>完全相等</b>判定，绝不做包含/前缀/相似度匹配——
+     *       {@code 非凡资源} / {@code 非凡采集} / {@code 🍯HG·🐝非凡资源} 这类
+     *       「局部名字重叠」的站点必须全部保留；</li>
+     *   <li><b>按质量分降序</b>：质量分取自 {@link SourceQualityStore}，让切源与
+     *       搜索页共用同一套站点优劣判断。</li>
+     * </ol>
+     */
+    private List<String> buildFallbackCycleOrder(List<Movie.Video> cachedCandidates) {
+        Map<String, Movie.Video> byKey = new LinkedHashMap<>();
         for (Movie.Video video : cachedCandidates) {
             if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.sourceKey)) {
                 continue;
@@ -1441,32 +1482,100 @@ public class DetailActivity extends BaseActivity {
             if (source == null || !source.isSearchable()) {
                 continue;
             }
-            // ★ 去重粒度 = 「站点」，不是「站点|影片id」。
-            //
-            // 缓存里同一个站点可能有多条匹配（该源搜到多个不同 vod_id 的条目），
-            // 若用「站点|影片id」当圈内标记，这些条目会被当成不同候选，
-            // 一圈内就会**重复切到同一个站点** —— 正是「切源切来切去还是那个站」。
-            // 真正取源时 detailFallbackCacheVideo/CacheId 都只认 sourceKey（取第一条），
-            // 所以去重也必须以 sourceKey 为准，两者粒度才对得上。
-            String cycleKey = video.sourceKey;
+            if (byKey.containsKey(video.sourceKey)) {
+                continue;
+            }
+            // 显示名完全相同的站点只保留先出现的那一个（通常是质量更好的，见下方排序）
+            String displayName = source.getName();
+            if (!TextUtils.isEmpty(displayName)
+                    && detailFallbackDedupedNames.contains(displayName)) {
+                continue;
+            }
+            if (!TextUtils.isEmpty(displayName)) {
+                detailFallbackDedupedNames.add(displayName);
+            }
+            byKey.put(video.sourceKey, video);
+        }
+        detailFallbackDedupedNames.clear();
+        if (byKey.isEmpty()) {
+            return new ArrayList<>();
+        }
+        final List<String> keys = new ArrayList<>(byKey.keySet());
+        // 质量分降序；同分按显示名升序，保证顺序稳定可复现
+        try {
+            final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshot(keys);
+            java.util.Collections.sort(keys, new Comparator<String>() {
+                @Override
+                public int compare(String a, String b) {
+                    String na = detailFallbackDisplayName(a);
+                    String nb = detailFallbackDisplayName(b);
+                    int byQuality = Double.compare(snapshot.get(b), snapshot.get(a));
+                    return byQuality != 0 ? byQuality : na.compareTo(nb);
+                }
+            });
+        } catch (Throwable th) {
+            LOG.e("buildFallbackCycleOrder sort fail: " + th);
+        }
+        return keys;
+    }
+
+    /** 取站点显示名，取不到就退回 key，保证排序键永不为 null。 */
+    private String detailFallbackDisplayName(String sourceKey) {
+        try {
+            SourceBean source = ApiConfig.get().getSource(sourceKey);
+            if (source != null && !TextUtils.isEmpty(source.getName())) {
+                return source.getName();
+            }
+        } catch (Throwable ignored) {
+            // 取不到不是错误，退回 key 即可
+        }
+        return sourceKey == null ? "" : sourceKey;
+    }
+
+    /**
+     * 在既有顺序里从 {@link #detailFallbackCycleStart} 绕一圈找下一个可切站点。
+     *
+     * <p>从 {@code cycleStart} 起绕（而不是从第 0 条起），是为了让<b>新一圈的起点
+     * 紧接上一圈的末尾</b>：上一圈停在位置 k，新一圈就从 k+1 开始，避免「刚切完
+     * 某个站，开新圈又从同一个站开始」的重叠感。
+     */
+    private String pollNextCycledSourceInternal(List<String> orderedSources) {
+        int total = orderedSources.size();
+        for (int step = 0; step < total; step++) {
+            int index = (detailFallbackCycleStart + step) % total;
+            String cycleKey = orderedSources.get(index);
             // 圈内已轮转过 → 跳过（本圈不重复站点）
             if (detailFallbackCycleKeys.contains(cycleKey)) {
                 continue;
             }
-            // 确认该源不可用 → 本圈也跳过（Dead 按「源|影片id」记，判定时两者都认）
-            String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            if (detailFallbackDeadKeys.contains(candidateKey)
-                    || detailFallbackDeadKeys.contains(cycleKey)) {
+            // ★ 已尝试过的站点一律跳过（本圈用 SoftTried，开新圈后 SoftTried 被清）。
+            //
+            // 历史坑：把软失败判定交给调用方（轮询分支只在「开新圈」时才清 CycleKeys），
+            // 会导致「开新圈」永远不发生 —— 每次重新轮询都从池子第一条重新开始，
+            // 于是出现「切了一整天都在头几个站点之间来回」的失控轮转。
+            // 现在把「站点级尝试」固化在这里：本圈里试过就不再选，一圈自然推进到下一站。
+            if (detailFallbackSoftTriedKeys.contains(cycleKey)) {
                 continue;
             }
-            // 软失败（超时/网络错误）：本圈内跳过，但开新圈时允许重试
-            boolean softFailed = detailFallbackSoftTriedKeys.contains(candidateKey)
-                    || detailFallbackSoftTriedKeys.contains(cycleKey);
-            if (softFailed && !detailFallbackNewCycle) {
+            // ★ 黑名单只认「源|影片id」这个精确粒度。
+            //
+            // 之前这里额外用 sourceKey 兜底判断，等于把整个站点一票否决：某站有多条
+            // 同名片时，第 1 条是 MV/预告（点进去没播放列表，被写进 deadKeys），
+            // 后几条是正片却再也轮不到。
+            // "这个站的这一条不行" ≠ "这个站所有片子都不行"，故只做精确匹配。
+            String videoId = detailFallbackCacheId(detailFallbackTitle, cycleKey);
+            if (detailFallbackDeadKeys.contains(getDetailFallbackKey(cycleKey, videoId))) {
                 continue;
             }
             detailFallbackCycleKeys.add(cycleKey);
-            return video.sourceKey;
+            detailFallbackSoftTriedKeys.add(cycleKey);
+            // 记下本圈选到哪了，供开新圈时接续
+            detailFallbackCycleStartOfNext = (index + 1) % total;
+            LOG.i("[FB] pollPick source=" + cycleKey
+                    + " name=" + detailFallbackDisplayName(cycleKey)
+                    + " idx=" + index + "/" + total
+                    + " cycleKeys=" + detailFallbackCycleKeys.size());
+            return cycleKey;
         }
         return "";
     }
@@ -1935,6 +2044,7 @@ public class DetailActivity extends BaseActivity {
                 }
                 // 同 loadNextDetailFallbackFromCache：站点信息已定，先行刷新页面
                 showDetailFallbackIndicators(nextSource, video);
+                markDetailFallbackInflight(nextSource);
                 loadDetail(videoId, nextSource, true);
                 return;
             }
@@ -1993,11 +2103,26 @@ public class DetailActivity extends BaseActivity {
         detailFallbackDetailTimedOut = true;
         // 方案C：详情超时只是网络抖动，记为「软失败」——本圈跳过，下圈可重试，
         // 绝不写进 deadKeys 永久拉黑（这是「越切越少」的根因之一）。
-        // ★ 记 sourceKey（与轮转去重粒度一致），不要用「源|影片id」——
-        // 同一站点的多条候选会各记一次，反而让去重失效。
-        detailFallbackSoftTriedKeys.add(sourceKey);
+        // ★ 记「源|影片id」精确键，与轮转裁剪后的粒度一致；
+        // 记 sourceKey 会把整站连坐，害得同站其它正片再也轮不到。
+        String timedOutKey = detailFallbackTimedOutKey;
+        if (TextUtils.isEmpty(timedOutKey)) {
+            timedOutKey = sourceKey;
+        }
+        detailFallbackSoftTriedKeys.add(timedOutKey);
+        detailFallbackTimedOutKey = null;
         OkGo.getInstance().cancelTag("detail");
         loadNextDetailFallbackSource();
+    }
+
+    /** 发详情请求前记下本次候选键，供超时回调精确记软失败。 */
+    private void markDetailFallbackInflight(String sourceKey) {
+        if (TextUtils.isEmpty(sourceKey)) {
+            detailFallbackTimedOutKey = null;
+            return;
+        }
+        String videoId = detailFallbackCacheId(detailFallbackTitle, sourceKey);
+        detailFallbackTimedOutKey = getDetailFallbackKey(sourceKey, videoId);
     }
 
     private String getDetailFallbackKey(String key, String id) {
@@ -2457,9 +2582,9 @@ public class DetailActivity extends BaseActivity {
         detailFallbackProbeSourceKey = "";
         detailFallbackProbeToken = "";
         llLayout.removeCallbacks(detailFallbackProbeTimeout);
-        // 注意：这里不清 detailFallbackCycleKeys / detailFallbackTitle，
+        // 注意：这里不清 detailFallbackCycleKeys / detailFallbackSoftTriedKeys / detailFallbackTitle，
         // 因为「一圈」跨越多轮点击；清掉会让候选池每轮重置回起点，导致只有两三个源来回循环。
-        // CycleKeys 由 startDetailFallback(boolean) 在换片名或开新圈时负责重置。
+        // 新圈由 pollNextCycledSource() 在本圈转尽时统一开启（它会自己清这两个集合）。
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
         if (llLayout != null) {
@@ -2615,6 +2740,16 @@ public class DetailActivity extends BaseActivity {
     private final Set<String> detailFallbackDeadKeys = new HashSet<>();
     /** 软失败（超时 / 网络错误）：只本圈跳过，下圈可重试。 */
     private final Set<String> detailFallbackSoftTriedKeys = new HashSet<>();
+    /** 当前在途详情请求的「源|影片id」键；超时回调据此精确记软失败，避免整站连坐。 */
+    private String detailFallbackTimedOutKey;
+    /** 已开过的圈数，仅用于日志观察轮转是否正常推进。 */
+    private int detailFallbackCycleCount;
+    /** 本圈轮转的起始下标；开新圈时接续上一圈末尾，避免跨圈撞回头。 */
+    private int detailFallbackCycleStart;
+    /** 本圈刚选中的下一个起点下标，开新圈时赋给 cycleStart。 */
+    private int detailFallbackCycleStartOfNext;
+    /** 显示名精确去重的临时集合（仅在构建轮转顺序时使用）。 */
+    private final Set<String> detailFallbackDedupedNames = new HashSet<>();
     private final Runnable detailFallbackTimeout = new Runnable() {
         @Override
         public void run() {
