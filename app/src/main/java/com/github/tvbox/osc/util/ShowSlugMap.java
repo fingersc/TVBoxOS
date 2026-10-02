@@ -490,10 +490,12 @@ public final class ShowSlugMap {
             }
         }
         // 第二轮：邻域精扫（覆盖一周内的全部日期）
+        // ★ 邻域 ±3 天：若 anchor 的星期几与排播日不一致（如 anchor 为周三、
+        //   站点周六播出），±1 天邻域会与步进点一起错开，导致查不到。
         for (int week = -6; week <= 6; week++) {
             java.util.Calendar base = (java.util.Calendar) cal.clone();
             base.add(java.util.Calendar.DAY_OF_YEAR, week * 7);
-            for (int inner = -1; inner <= 1; inner++) {
+            for (int inner = -3; inner <= 3; inner++) {
                 java.util.Calendar c = (java.util.Calendar) base.clone();
                 c.add(java.util.Calendar.DAY_OF_YEAR, inner);
                 String d = formatDate(c);
@@ -569,11 +571,16 @@ public final class ShowSlugMap {
             }
         }
         // 第二轮：邻域精扫（仅在第一轮无果时进行，保持与单日期版一致的探测预算）
+        // ★ 关键修正：原邻域仅 inner ∈ [-1, 1]（±1 天），当 anchor 的"星期几"
+        //   与站点排播日不一致时，步进点会永远错开（例：站点周六播出，
+        //   anchor 取到列表首条的周三，两轮都踩不到任何真实页面）→ 反向查询彻底失败
+        //   → 退回按位置猜 → 切到错误的集。
+        //   邻域扩到 ±3 天（覆盖任意星期偏移），并对每个周基准都扫全部 7 天。
         if (seenHit.isEmpty()) {
             for (int week = -6; week <= 6; week++) {
                 java.util.Calendar base = (java.util.Calendar) cal.clone();
                 base.add(java.util.Calendar.DAY_OF_YEAR, week * 7);
-                for (int inner = -1; inner <= 1; inner++) {
+                for (int inner = -3; inner <= 3; inner++) {
                     java.util.Calendar c = (java.util.Calendar) base.clone();
                     c.add(java.util.Calendar.DAY_OF_YEAR, inner);
                     String d = formatDate(c);

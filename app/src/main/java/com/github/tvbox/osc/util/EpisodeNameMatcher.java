@@ -514,6 +514,23 @@ public final class EpisodeNameMatcher {
         if (names == null) {
             return "";
         }
+        // ★ 优先取「正片」日期。
+        //   原实现只取首条含日期的条目；但目标源列表常以「回顾特辑 / 先导片」
+        //   开头（如量子资源首条 `20260401回顾特辑`）。若拿它做锚点，
+        //   反向扫描的步进基准会整体偏移，甚至因星期几错开而彻底查不到。
+        //   因此先扫一遍取非特辑的正片日期，取不到时再回退原行为。
+        String firstNonFeature = "";
+        for (String name : names) {
+            EpisodeKey k = parse(name);
+            if (k.domain == DOMAIN_DATE && k.ordinal > 0) {
+                if (firstNonFeature.isEmpty() && !isNonMainFeature(name)) {
+                    firstNonFeature = String.valueOf(k.ordinal);
+                }
+            }
+        }
+        if (!firstNonFeature.isEmpty()) {
+            return firstNonFeature;
+        }
         for (String name : names) {
             EpisodeKey k = parse(name);
             if (k.domain == DOMAIN_DATE && k.ordinal > 0) {
