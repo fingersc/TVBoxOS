@@ -139,12 +139,23 @@ public final class EpisodeOnlineResolver {
             return "";
         }
         // 1. 查缓存（反向遍历已有映射）
+        // ★ HashMap 无序：原实现"碰到哪个返哪个"会让同一期号的结果不确定，
+        //   必须先收齐再升序取最早（最靠近本季开头），并限同年。
         Map<String, Integer> cached = getCached(showName);
+        final int anchorYear = yearOfDate(anchorDate);
         if (cached != null) {
+            java.util.List<String> hits = new java.util.ArrayList<>();
             for (Map.Entry<String, Integer> e : cached.entrySet()) {
-                if (e.getValue() != null && e.getValue() == targetEpisode) {
-                    return e.getKey();
+                if (e.getValue() != null && e.getValue() == targetEpisode && !TextUtils.isEmpty(e.getKey())) {
+                    if (anchorYear > 0 && !sameYear(e.getKey(), anchorYear)) {
+                        continue;
+                    }
+                    hits.add(e.getKey());
                 }
+            }
+            if (!hits.isEmpty()) {
+                java.util.Collections.sort(hits);
+                return hits.get(0);
             }
         }
         // 2. 反向直连
@@ -331,13 +342,27 @@ public final class EpisodeOnlineResolver {
             return out;
         }
         // 1. 缓存里已有的同期限日期
+        // ★ 批量修正：原实现直接遍历 HashMap.entrySet()，而 HashMap 无序，
+        //   且缓存可能同时存在多个被标为同一期的日期（历史污染或跨季残留）。
+        //   这会使 out 里混入异常日期，而调用方会对 out 升序排序后取首位
+        //   → 错误日期因数值更小而排在首位 → 切到完全错误的集。
+        //   修正：先收齐再升序排序，只保留最靠近锚点的一批（同年且最早），
+        //   并限定日期必须与锚点同年，从根上阻断跨季污染的传播。
         Map<String, Integer> cached = getCached(showName);
+        final int anchorYear = yearOfDate(anchorDate);
         if (cached != null) {
+            java.util.List<String> cachedHits = new java.util.ArrayList<>();
             for (Map.Entry<String, Integer> e : cached.entrySet()) {
                 if (e.getValue() != null && e.getValue() == targetEpisode && !TextUtils.isEmpty(e.getKey())) {
-                    out.add(e.getKey());
+                    String k = e.getKey();
+                    if (anchorYear > 0 && !sameYear(k, anchorYear)) {
+                        continue;   // 跨年残留，不采用
+                    }
+                    cachedHits.add(k);
                 }
             }
+            java.util.Collections.sort(cachedHits);
+            out.addAll(cachedHits);
         }
         // 2. 直连站点多日期扫描
         if (OnlineResolveConfig.isDirectConnectEnabled()) {
@@ -460,6 +485,23 @@ public final class EpisodeOnlineResolver {
         } catch (Throwable ignored) {
         }
         return map;
+    }
+
+    /** 取日期字符串的年份；不合法返回 -1。 */
+    private static int yearOfDate(String date) {
+        if (TextUtils.isEmpty(date) || date.length() != 8) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(date.substring(0, 4));
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 日期是否与给定年份同年（用于阻断跨季缓存污染）。 */
+    private static boolean sameYear(String date, int year) {
+        return yearOfDate(date) == year;
     }
 
     private static String urlEncode(String s) {

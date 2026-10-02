@@ -545,8 +545,14 @@ public final class ShowSlugMap {
             return out;
         }
         java.util.Set<String> seenHit = new java.util.LinkedHashSet<>();
+        // 本季窗口：以锚点年份为界，避免把去年同期号的日期一并收进结果。
+        final int seasonYear = seasonYearOf(anchorDate);
         // 第一轮：按周步进快速逼近
-        for (int step = 0; step <= MAX_WEEKS && out.isEmpty(); step++) {
+        // ★ 循环条件修正：原为 {@code out.isEmpty()} —— 但 out 在本函数末尾才被填充，
+        //   该条件恒为 true，使得步进一路扫完 {@link #MAX_WEEKS} 周，
+        //   把不同季的同期号也收进 seenHit → 排序后异常日期可能排在首位 → 错位。
+        //   正确意图是"命中即停"（同一 season 内期号唯一），用 seenHit.isEmpty() 作为迴归条件。
+        for (int step = 0; step <= MAX_WEEKS && seenHit.isEmpty(); step++) {
             for (int sign : new int[]{1, -1}) {
                 if (step == 0 && sign < 0) {
                     continue;
@@ -554,13 +560,16 @@ public final class ShowSlugMap {
                 java.util.Calendar c = (java.util.Calendar) cal.clone();
                 c.add(java.util.Calendar.DAY_OF_YEAR, sign * step * 7);
                 String d = formatDate(c);
+                if (outOfSeason(d, seasonYear)) {
+                    continue;
+                }
                 if (probeEpisodeAtDate(showName, d) == targetEpisode) {
                     seenHit.add(d);
                 }
             }
         }
         // 第二轮：邻域精扫（仅在第一轮无果时进行，保持与单日期版一致的探测预算）
-        if (out.isEmpty() && seenHit.isEmpty()) {
+        if (seenHit.isEmpty()) {
             for (int week = -6; week <= 6; week++) {
                 java.util.Calendar base = (java.util.Calendar) cal.clone();
                 base.add(java.util.Calendar.DAY_OF_YEAR, week * 7);
@@ -568,6 +577,9 @@ public final class ShowSlugMap {
                     java.util.Calendar c = (java.util.Calendar) base.clone();
                     c.add(java.util.Calendar.DAY_OF_YEAR, inner);
                     String d = formatDate(c);
+                    if (outOfSeason(d, seasonYear)) {
+                        continue;
+                    }
                     if (probeEpisodeAtDate(showName, d) == targetEpisode) {
                         seenHit.add(d);
                     }
@@ -592,6 +604,9 @@ public final class ShowSlugMap {
                 java.util.Calendar c = (java.util.Calendar) hc.clone();
                 c.add(java.util.Calendar.DAY_OF_YEAR, off);
                 String d = formatDate(c);
+                if (outOfSeason(d, seasonYear)) {
+                    continue;
+                }
                 if (probeEpisodeAtDate(showName, d) == targetEpisode) {
                     all.add(d);
                 }
@@ -599,6 +614,40 @@ public final class ShowSlugMap {
         }
         out.addAll(all);
         return out;
+    }
+
+    /**
+     * 取锚点日期所属年份（用作本季窗口下界）。
+     *
+     * <p>综艺单季不会跨年（即使跨年也只在年界附近几天），
+     * 因此用"锚点年份"作为本季范围是安全且充分的。
+     * 无效锚点返回 -1（表示不做年份限制）。</p>
+     */
+    private static int seasonYearOf(String anchorDate) {
+        java.util.Calendar c = parseCalendar(anchorDate);
+        return c == null ? -1 : c.get(java.util.Calendar.YEAR);
+    }
+
+    /**
+     * 判断某日期是否超出本季窗口。
+     *
+     * <p><b>为什么需要它</b>：反向扫描会从锚点向两侧跨最多 {@link #MAX_WEEKS} 周。
+     * 若不加限制，去年的「第N期」也会被当作本季命中收进结果，
+     * 排序后早年的日期排在首位，导致切到完全错误的集。</p>
+     *
+     * @param date       待检查日期（YYYYMMDD）
+     * @param seasonYear 本季年份；≤ 0 时不限制
+     * @return true 表示应跳过该日期
+     */
+    private static boolean outOfSeason(String date, int seasonYear) {
+        if (seasonYear <= 0 || TextUtils.isEmpty(date) || date.length() != 8) {
+            return false;
+        }
+        try {
+            return Integer.parseInt(date.substring(0, 4)) != seasonYear;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** 解析 YYYYMMDD 为 Calendar；不合法返回 null。 */

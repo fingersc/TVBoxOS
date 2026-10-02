@@ -1086,11 +1086,15 @@ public class DetailActivity extends BaseActivity {
 
                         // 迁移一致性守卫：定位到的集与期望集（同名记录的 playNote / 快照集名）集数号不一致时，
                         // 说明定位可能错位（如"特别篇"导致整体后移），宁可不迁移，也不能把时间盖到错误的集上
+                        //
+                        // ★ 跨域安全：旧源是期数式（第2期上）、新源是日期式（20260411上）时，
+                        //   两者的 extractEpisodeNumber 量纲不同（2 vs 20260411），直接比数值恒不相等，
+                        //   会把本来正确的"跨域定位"误判为错位 → 整条时间迁移被跳过 → 用户看到"切对了集但时间归零"。
+                        //   改用 EpisodeNameMatcher.positionTrustedAcrossDomain：跨域一律放行，同域才严格比序号。
                         String expectedName = sameNameRestored && vodInfoRecord != null ? vodInfoRecord.playNote
                                 : (fallbackFromValid ? fallbackFromName : "");
-                        int expectedNum = TextUtils.isEmpty(expectedName) ? -1 : extractEpisodeNumber(expectedName);
-                        int actualNum = TextUtils.isEmpty(currentEpisode.name) ? -1 : extractEpisodeNumber(currentEpisode.name);
-                        boolean positionTrusted = expectedNum < 0 || actualNum < 0 || expectedNum == actualNum;
+                        boolean positionTrusted = EpisodeNameMatcher.positionTrustedAcrossDomain(
+                                expectedName, currentEpisode.name);
 
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
@@ -1779,9 +1783,10 @@ public class DetailActivity extends BaseActivity {
         }
         String actualName = getSeriesNameSafely(actual, actual.playFlag, actual.playIndex);
         String targetName = getSeriesNameSafely(vodInfo, vodInfo.playFlag, actual.playIndex);
-        int actualNum = TextUtils.isEmpty(actualName) ? -1 : extractEpisodeNumber(actualName);
-        int targetNum = TextUtils.isEmpty(targetName) ? -1 : extractEpisodeNumber(targetName);
-        if (actualNum >= 0 && targetNum >= 0 && actualNum != targetNum) {
+        // ★ 跨域安全：期数式与日期式的 extractEpisodeNumber 量纲不同，
+        //   直接比数值必然"不相同"，会把本来正确的跨域同集判定为错位而拒绝采纳下标。
+        //   positionTrustedAcrossDomain 跨域一律放行，同域才严格比序号。
+        if (!EpisodeNameMatcher.positionTrustedAcrossDomain(actualName, targetName)) {
             // 下标同名不同集 → 说明两源集序不一致，不能用下标搬
             return;
         }
@@ -3548,16 +3553,26 @@ public class DetailActivity extends BaseActivity {
         if (list == null || list.isEmpty()) return 0;
         int clamped = Math.max(0, Math.min(fallbackIndex, list.size() - 1));
         if (target == null || TextUtils.isEmpty(target.name)) return clamped;
+        // ★ 跨域安全：目标名与新列表若分属不同命名域（期数 ↔ 日期），
+        //   直接比 ordinal 数值没有意义（|20260411 - 2| 恒为巨值，会挑到任意条目）。
+        //   此时改用 score（含跨域判等）挑最佳，而不是比数值距离。
         int targetNum = extractEpisodeNumber(target.name);
-        if (targetNum < 0) return clamped;
-        int bestIndex = -1, bestDiff = Integer.MAX_VALUE;
+        boolean targetIsDate = EpisodeNameMatcher.dateOf(target.name) > 0;
+        boolean targetHasNum = targetNum >= 0;
+        int bestIndex = -1, bestDiff = Integer.MAX_VALUE, bestScore = 0;
         for (int i = 0; i < list.size(); i++) {
             VodInfo.VodSeries s = list.get(i);
             if (s == null || TextUtils.isEmpty(s.name)) continue;
-            int n = extractEpisodeNumber(s.name);
-            if (n < 0) continue;
-            int diff = Math.abs(n - targetNum);
-            if (diff < bestDiff) { bestDiff = diff; bestIndex = i; }
+            boolean sameDomain = (EpisodeNameMatcher.dateOf(s.name) > 0) == targetIsDate;
+            if (sameDomain && targetHasNum) {
+                int n = extractEpisodeNumber(s.name);
+                if (n < 0) continue;
+                int diff = Math.abs(n - targetNum);
+                if (diff < bestDiff) { bestDiff = diff; bestIndex = i; }
+            } else {
+                int sc = EpisodeNameMatcher.score(target.name, s.name);
+                if (sc > bestScore) { bestScore = sc; bestIndex = i; }
+            }
         }
         return bestIndex >= 0 ? bestIndex : clamped;
     }
@@ -3745,19 +3760,29 @@ public class DetailActivity extends BaseActivity {
             }
         }
         // 各线路精确匹配都失败时，按集数号就近兜底，避免调用方退回裸下标错位
-        int targetNum = extractEpisodeNumber(episodeNote);
-        if (targetNum >= 0) {
-            int bestFlagPos = -1, bestIndex = -1, bestDiff = Integer.MAX_VALUE;
+        // ★ 跨域安全：episodeNote 与目标线路分属不同命名域（期数 ↔ 日期）时，
+        //   比 ordinal 数值距离毫无意义（|20260411 - 2| 恒为巨值），改用 score 判等。
+        {
+            boolean noteIsDate = EpisodeNameMatcher.dateOf(episodeNote) > 0;
+            int targetNum = extractEpisodeNumber(episodeNote);
+            boolean targetHasNum = targetNum >= 0;
+            int bestFlagPos = -1, bestIndex = -1, bestDiff = Integer.MAX_VALUE, bestScore = 0;
             for (int pos = 0; pos < flagOrder.size(); pos++) {
                 List<VodInfo.VodSeries> list = vodInfo.seriesMap.get(flagOrder.get(pos));
                 if (list == null || list.isEmpty() || list.size() == 1) continue;
                 for (int i = 0; i < list.size(); i++) {
                     VodInfo.VodSeries s = list.get(i);
                     if (s == null || TextUtils.isEmpty(s.name)) continue;
-                    int n = extractEpisodeNumber(s.name);
-                    if (n < 0) continue;
-                    int diff = Math.abs(n - targetNum);
-                    if (diff < bestDiff) { bestDiff = diff; bestIndex = i; bestFlagPos = pos; }
+                    boolean sameDomain = (EpisodeNameMatcher.dateOf(s.name) > 0) == noteIsDate;
+                    if (sameDomain && targetHasNum) {
+                        int n = extractEpisodeNumber(s.name);
+                        if (n < 0) continue;
+                        int diff = Math.abs(n - targetNum);
+                        if (diff < bestDiff) { bestDiff = diff; bestIndex = i; bestFlagPos = pos; }
+                    } else {
+                        int sc = EpisodeNameMatcher.score(episodeNote, s.name);
+                        if (sc > bestScore) { bestScore = sc; bestIndex = i; bestFlagPos = pos; }
+                    }
                 }
             }
             if (bestIndex >= 0) {

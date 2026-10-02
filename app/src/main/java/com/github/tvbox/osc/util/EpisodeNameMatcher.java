@@ -348,6 +348,86 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 判断两个集名是否指向<b>同一集</b>（语义判等，跨域安全）。
+     *
+     * <p><b>为什么不能用 {@code extractOrdinal(a) == extractOrdinal(b)}</b>：
+     * 该比较只对<b>同域</b>成立。跨域时两边的 ordinal 量纲完全不同：</p>
+     * <pre>
+     *   旧源：第2期上     → extractOrdinal = 2
+     *   新源：20260411上  → extractOrdinal = 20260411
+     *   2 != 20260411  → 被判为"不是同一集"（错！它们其实是同一集）
+     * </pre>
+     * <p>切源时若用这个判据做"定位是否可信"的守卫，跨域必然误判为不可信，
+     * 于是一次都不迁移播放时间——用户看到"集切对了，时间却回到 0"。</p>
+     *
+     * @param a 集名 A
+     * @param b 集名 B
+     * @return true 表示两者指向同一集
+     */
+    public static boolean sameEpisode(String a, String b) {
+        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
+            return false;
+        }
+        if (a.equalsIgnoreCase(b)) {
+            return true;
+        }
+        // 同域判等走 score（含分集/非正片口径）
+        if (score(a, b) >= 80) {
+            return true;
+        }
+        // 日期域判等：两边都含日期且日期相同 → 同一集（再比分段）
+        int da = dateOf(a);
+        int db = dateOf(b);
+        if (da > 0 && db > 0) {
+            return da == db && normalizePart(extractPart(a)) == normalizePart(extractPart(b));
+        }
+        return false;
+    }
+
+    /**
+     * 跨域安全的"定位可信"判定：把期望集名与实际集名对齐，<b>允许跨域</b>。
+     *
+     * <p>切源时的守卫需要回答："新源定位到的这一集，是不是我想去的那一集？"
+     * 若是，才把旧源的播放时间迁过来；若不是，宁可不迁移也不能盖错。
+     * 原实现用 {@code extractOrdinal} 直接比数值，跨域恒不相等（见
+     * {@link #sameEpisode(String, String)} 的说明），导致迁移被整体跳过。</p>
+     *
+     * <p><b>判定顺序</b>：</p>
+     * <ol>
+     *   <li>任一为空 → 无法判定，返回 true（保持旧行为：不阻止迁移）；</li>
+     *   <li>{@link #sameEpisode(String, String)} 判等成立 → true；</li>
+     *   <li>跨域场景（一侧序号域、一侧日期域）→ <b>返回 true</b>：
+     *       两者无法用数值直接比较，但跨域对齐本来就靠联网/日期锚完成，
+     *       此处不应再阻止迁移；</li>
+     *   <li>同域但序号不同 → false（确实定位错了）。</li>
+     * </ol>
+     *
+     * @param expectedName 期望集名（旧源在播集名）
+     * @param actualName   实际集名（新源定位到的集名）
+     * @return true 表示可以安全迁移时间
+     */
+    public static boolean positionTrustedAcrossDomain(String expectedName, String actualName) {
+        if (TextUtils.isEmpty(expectedName) || TextUtils.isEmpty(actualName)) {
+            return true;   // 信息不足，不阻止迁移（与旧行为一致）
+        }
+        if (sameEpisode(expectedName, actualName)) {
+            return true;
+        }
+        EpisodeKey e = parse(expectedName);
+        EpisodeKey a = parse(actualName);
+        if (e.domain == DOMAIN_UNKNOWN || a.domain == DOMAIN_UNKNOWN) {
+            return true;   // 无法解析，交由其它守卫
+        }
+        // 跨域：期数 ↔ 日期。数值不可比，但定位本身是经过跨域换算的，
+        // 此处必须放行，否则"切对了集却丢了时间"。
+        if (e.domain != a.domain) {
+            return true;
+        }
+        // 同域且序号不同 → 确实定位到了别的集，不迁移
+        return false;
+    }
+
+    /**
      * 判断名称是否属于"非正片"衍生内容（花絮/回顾/预告等）。
      *
      * <p>口径来自实际源站命名：{@code 重温经典N}、{@code 精彩回顾3}、
@@ -661,6 +741,39 @@ public final class EpisodeNameMatcher {
                     curKnown, curIsNonMain, curToken);
             if (hit >= 0) {
                 return hit;
+            }
+        }
+        // ②★ 分段兜底：期望的那一天在目标列表里不存在时（典型：站点说一期跨两天，
+        //   但源侧把这两天压缩成同一天的上/下），不能直接取首个命中。
+        //   否则"第N期下"会退化到"第N期上"的位置。
+        //   做法：在目标列表里实际存在的日期中，按分段顺序定位（下段取该日期的最后一段）。
+        if (curKnown && daySlot > 0) {
+            // 按升序依次尝试实际存在的日期，找到最后一个"能落位且分段不是上段"的
+            int lastResort = -1;
+            for (String d : sorted) {
+                // 该日期在目标列表里是否真实存在
+                boolean exists = false;
+                for (String n : names) {
+                    if (!TextUtils.isEmpty(n) && dateOf(n) == parseIntSafe(d)) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    continue;
+                }
+                int hit = pickInDate(d, names, currentName, wantPart,
+                        curKnown, curIsNonMain, curToken);
+                if (hit >= 0) {
+                    return hit;
+                }
+                // 记下该日期的最后一个合法下标作为最后兜底
+                if (lastResort < 0) {
+                    lastResort = findIndexByDate(d, names, currentName);
+                }
+            }
+            if (lastResort >= 0) {
+                return lastResort;
             }
         }
         // ② 按日期顺序，逐个日期尝试（口径放宽：接受该日期的任意正片）
