@@ -1281,13 +1281,17 @@ public class DetailActivity extends BaseActivity {
             return true;
         }
         // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
+        long t0 = System.currentTimeMillis();
         if (playFragment != null) playFragment.saveCurrentProgressNow();
+        long t1 = System.currentTimeMillis();
         syncActualPlayingIntoVodInfo();
         captureLivePlaybackSnapshot();
+        long t2 = System.currentTimeMillis();
         detailFallbackKeepCurrentDetail = mVideo != null && vodInfo != null
                 && vodInfo.seriesMap != null && !vodInfo.seriesMap.isEmpty();
         llLayout.removeCallbacks(detailFallbackDetailTimeout);
         captureDetailFallbackEpisode();
+        long t3 = System.currentTimeMillis();
         if (mVideo != null && !TextUtils.isEmpty(mVideo.name)) {
             vod_name = mVideo.name;
         }
@@ -1318,6 +1322,10 @@ public class DetailActivity extends BaseActivity {
 
         detailFallbackActive = true;
         boolean accepted = loadNextDetailFallbackFromCache();
+        // 分段耗时：用于定位「点击切源后要等很久」到底卡在哪一步。
+        LOG.i("[FB] click cost saveProgress=" + (t1 - t0) + "ms snapshot=" + (t2 - t1)
+                + "ms misc=" + (t3 - t2) + "ms cachePoll=" + (System.currentTimeMillis() - t3)
+                + "ms accepted=" + accepted + " poolSize=" + detailFallbackUsableCandidateCount());
         // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
         // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
         // （detailFallbackLoadingCandidate 为真），就交给异步回调收尾，绝不能在这里复位，
@@ -1336,6 +1344,11 @@ public class DetailActivity extends BaseActivity {
      * @return true 表示已经发起 loadDetail（或已转入全网搜索流程）
      */
     private boolean loadNextDetailFallbackFromCache() {
+        LOG.i("[FB] cachePoll entry cacheUsable=" + detailFallbackCacheEntryUsable()
+                + " poolSize=" + detailFallbackUsableCandidateCount()
+                + " cycleKeys=" + detailFallbackCycleKeys.size()
+                + " newCycle=" + detailFallbackNewCycle
+                + " title=[" + detailFallbackTitle + "]");
         if (!detailFallbackCacheEntryUsable()) {
             // 缓存为空 → 只有这种情况才真正发起一次全网搜索
             if (!detailFallbackSearchCollecting) {
@@ -1873,12 +1886,17 @@ public class DetailActivity extends BaseActivity {
      */
     private void scheduleDetailFallbackSearch() {
         if (!detailFallbackActive || !detailFallbackSearching) {
+            LOG.i("[FB] scheduleSearch skip inactive active=" + detailFallbackActive
+                    + " searching=" + detailFallbackSearching);
             return;
         }
         if (!detailFallbackPendingSources.isEmpty() || detailFallbackLoadingCandidate) {
+            LOG.i("[FB] scheduleSearch skip in-flight pending=" + detailFallbackPendingSources.size()
+                    + " loading=" + detailFallbackLoadingCandidate);
             return;
         }
         if (detailFallbackSourceOrder.isEmpty()) {
+            LOG.i("[FB] scheduleSearch empty order, reuse cache");
             detailFallbackSearching = false;
             loadNextDetailFallbackSource();
             return;
@@ -1896,6 +1914,9 @@ public class DetailActivity extends BaseActivity {
             searchKeys.add(key);
         }
         sortSourcesByHitRate(searchKeys);
+        LOG.i("[FB] scheduleSearch order=" + detailFallbackSourceOrder.size()
+                + " cached=" + (detailFallbackSourceOrder.size() - searchKeys.size())
+                + " toSearch=" + searchKeys.size());
         if (searchKeys.isEmpty()) {
             // 全部命中缓存，无需联网
             detailFallbackSearching = false;
