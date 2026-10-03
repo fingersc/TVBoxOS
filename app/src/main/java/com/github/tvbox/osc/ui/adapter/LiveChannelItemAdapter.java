@@ -27,7 +27,9 @@ public class LiveChannelItemAdapter extends BaseQuickAdapter<LiveChannelItem, Ba
     protected void convert(BaseViewHolder holder, LiveChannelItem item) {
         TextView tvChannelNum = holder.getView(R.id.tvChannelNum);
         TextView tvChannel = holder.getView(R.id.tvChannelName);
-        tvChannelNum.setText(String.format("%s", item.getChannelNum()));
+        // String.format 每次绑定都要构造 Formatter + 查 Locale，上千条频道列表
+        // 快速滑动时是实打实的开销；这里只是把 int 转成字符串而已
+        tvChannelNum.setText(String.valueOf(item.getChannelNum()));
         tvChannel.setText(item.getChannelName());
         tvChannelNum.setSelected(true);
         tvChannel.setSelected(true);

@@ -983,8 +983,10 @@ public class ApiConfig {
                 }
                 ijkCodes.add(codec);
             }
+            // 历史选择对不上时同样优先选中硬解组，而不是默认勾到第一组（软解）
             if (!foundOldSelect && ijkCodes.size() > 0) {
-                ijkCodes.get(0).selected(true);
+                IJKCode hardCodec = findHardCodec();
+                (hardCodec != null ? hardCodec : ijkCodes.get(0)).selected(true);
             }
         }
     }
@@ -1746,11 +1748,40 @@ public class ApiConfig {
     }
 
     public IJKCode getIJKCodec(String name) {
-        for (IJKCode code : ijkCodes) {
-            if (code.getName().equals(name))
-                return code;
+        if (ijkCodes == null || ijkCodes.isEmpty()) {
+            return null;
         }
-        return ijkCodes.get(0);
+        if (!TextUtils.isEmpty(name)) {
+            for (IJKCode code : ijkCodes) {
+                if (code != null && name.equals(code.getName()))
+                    return code;
+            }
+        }
+        // ★ 名字对不上时，优先回落「硬解码」而不是列表首项。
+        //
+        // 历史实现直接 get(0)：内置默认配置里第一组恰恰是「软解码」，于是只要
+        // Hawk 里存的名字和接口下发的分组名对不上（自定义配置改了组名、或配置
+        // 顺序变了），就会静默退化成软解 —— 用户明明选过硬解，实际一直在软解。
+        // 硬解优先：先找名字里带硬解语义的组，都找不到才退回首项。
+        IJKCode hardCodec = findHardCodec();
+        return hardCodec != null ? hardCodec : ijkCodes.get(0);
+    }
+
+    /** 在解码配置列表里找硬解组（中英文组名都认），找不到返回 null。 */
+    private IJKCode findHardCodec() {
+        if (ijkCodes == null) return null;
+        for (IJKCode code : ijkCodes) {
+            if (isHardCodecName(code == null ? null : code.getName())) {
+                return code;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isHardCodecName(String name) {
+        if (TextUtils.isEmpty(name)) return false;
+        String lower = name.toLowerCase();
+        return name.contains("硬") || lower.contains("hard") || lower.contains("media");
     }
 
     String clanToAddress(String lanLink) {

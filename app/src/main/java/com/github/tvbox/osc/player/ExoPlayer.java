@@ -5,8 +5,10 @@ import android.os.Looper;
 import android.util.Pair;
 
 import com.github.tvbox.osc.util.AudioTrackMemory;
+import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.google.android.exoplayer2.C;
+import com.orhanobut.hawk.Hawk;
 import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.DefaultRenderersFactory;
 import com.google.android.exoplayer2.Format;
@@ -42,17 +44,50 @@ public class ExoPlayer extends ExoMediaPlayer {
     private boolean defaultSubtitleTrackSelected;
     private boolean defaultSubtitleTrackSelectionClosed;
 
+    /**
+     * 直播场景的低延迟缓冲水位（毫秒）。
+     *
+     * <p>点播那套默认值是 15s/50s —— 照搬到直播上，等于先攒十几秒数据才起播，
+     * 换台后要等十几秒才出画面，且始终落后直播边缘一大截。IJK 侧早已为直播单独
+     * 调过（见 {@code IjkMediaPlayer#setOptions}），Exo 侧此前还是点播参数，两条
+     * 链路延迟表现差一个量级。这里对齐直播语义：最大只攒 4 秒，够抗抖动即可。</p>
+     */
+    private static final int LIVE_MIN_BUFFER_MS = 1_000;
+    private static final int LIVE_MAX_BUFFER_MS = 4_000;
+    private static final int LIVE_BUFFER_FOR_PLAYBACK_MS = 300;
+    private static final int LIVE_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 500;
+
     public ExoPlayer(Context context) {
         super(context);
-        setLoadControl(new DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                        DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                        DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
-                        DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                        DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
-                .build());
+        setLoadControl(buildLoadControl(Hawk.get(HawkConfig.PLAYER_IS_LIVE, false)));
         setRenderersFactory(buildRenderersFactory(context));
         memory = AudioTrackMemory.getInstance(context);
+    }
+
+    /**
+     * 直播用低延迟水位，点播沿用默认。
+     *
+     * <p>{@code setPrioritizeTimeOverSizeThresholds(true)} 是直播的另一半：默认的
+     * 缓冲策略按"字节数"判断是否够播，直播码率起伏大容易卡在阈值上；改成按
+     * "已缓冲时长"判断后，起播与追帧都更贴合直播场景。</p>
+     */
+    private DefaultLoadControl buildLoadControl(boolean isLive) {
+        DefaultLoadControl.Builder builder = new DefaultLoadControl.Builder();
+        if (isLive) {
+            builder.setBufferDurationsMs(
+                    LIVE_MIN_BUFFER_MS,
+                    LIVE_MAX_BUFFER_MS,
+                    LIVE_BUFFER_FOR_PLAYBACK_MS,
+                    LIVE_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS);
+            builder.setPrioritizeTimeOverSizeThresholds(true);
+        } else {
+            builder.setBufferDurationsMs(
+                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS);
+        }
+        return builder.build();
     }
 
     @Override
@@ -96,7 +131,19 @@ public class ExoPlayer extends ExoMediaPlayer {
             }
         })
                 .setEnableDecoderFallback(true)
-                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER);
+                // ★ 扩展渲染器模式：PREFER → ON。
+                //
+                // 工程里带的是 exoplayer-ffmpeg-extension（**软解**扩展）。
+                // PREFER 的语义是"扩展解码器优先于 MediaCodec"，也就是让 ffmpeg 软解
+                // 排在硬解前面 —— 只要扩展里能解的格式（如 AAC/FLAC 音频、部分视频）
+                // 就永远轮不到 MediaCodec，与「优先硬解」的目标正好相反，直播高码率
+                // 频道还会因此明显吃 CPU。
+                //
+                // ON 才是「硬解优先」：MediaCodec 能解就用 MediaCodec，解不了
+                // （设备缺对应 codec、或安全解码受限）才回落到扩展。
+                // 配合上面的 setEnableDecoderFallback(true)，硬解失败仍有软解兜底，
+                // 不会出现"既没硬解也没软解"的黑屏。
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON);
         try {
             Method method = DefaultRenderersFactory.class.getMethod("forceDisableMediaCodecAsynchronousQueueing");
             method.invoke(factory);

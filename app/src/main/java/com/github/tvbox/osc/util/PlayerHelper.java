@@ -46,9 +46,11 @@ public class PlayerHelper {
             e.printStackTrace();
         }
         if(forcePlayerType>=0)playerType = forcePlayerType;
-        IJKCode codec = ApiConfig.get().getIJKCodec(ijkCode);
         PlayerFactory playerFactory;
         if (playerType == 1) {
+            // 只有真正要用 IJK 时才解析解码配置：既省掉 EXO 链路上的一次遍历，
+            // 也避免配置尚未加载完（ijkCodes 为空）时这里就抛异常打断起播。
+            final IJKCode codec = ApiConfig.get().getIJKCodec(ijkCode);
             playerFactory = new PlayerFactory<IjkMediaPlayer>() {
                 @Override
                 public IjkMediaPlayer createPlayer(Context context) {

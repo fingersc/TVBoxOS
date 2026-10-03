@@ -133,6 +133,22 @@ public class LiveEpgAdapter extends BaseQuickAdapter<Epginfo, BaseViewHolder> {
     }
 
     public void setFocusedEpgIndex(int focusedEpgIndex) {
+        // ★ 原实现只改字段、不刷新 —— convert() 里既读 selectedEpgIndex 也读
+        // focusedEpgIndex（决定高亮色与「直播中/回看中」标记），字段变了却不
+        // notifyItemChanged，界面上焦点框永远停在第一次绘制的样子。遥控器在节目单里
+        // 上下移动时，除了系统自带的焦点框，条目颜色与标记全都不跟着走。
+        if (focusedEpgIndex == this.focusedEpgIndex) {
+            return;
+        }
+        int preFocused = this.focusedEpgIndex;
         this.focusedEpgIndex = focusedEpgIndex;
+        notifyEpgChanged(preFocused);
+        notifyEpgChanged(this.focusedEpgIndex);
+    }
+
+    private void notifyEpgChanged(int position) {
+        if (position >= 0 && position < getItemCount()) {
+            notifyItemChanged(position);
+        }
     }
 }

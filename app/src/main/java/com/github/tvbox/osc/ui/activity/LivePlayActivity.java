@@ -180,12 +180,21 @@ public class LivePlayActivity extends BaseActivity {
     private int currentLiveLookBackIndex = -1;
     private int currentLiveChangeSourceTimes = 0;
     private boolean allowLiveSwitchPlayer = true;
+    /**
+     * 本频道已自动换过几次播放器（换台时归零）。
+     *
+     * <p>上限 2 次 = 最多三种组合：原播放器 → 另一个硬解引擎 → 软解兜底。
+     * 软解放最后，保证「优先硬解」不被一次失败就推翻。</p>
+     */
+    private int livePlayerFailoverStep = 0;
+    private static final int LIVE_PLAYER_MAX_FAILOVER = 2;
     private LiveChannelItem currentLiveChannelItem = null;
     private String pendingLiveRefreshChannelName = null;
     private int pendingLiveRefreshSourceIndex = -1;
     private boolean refreshingLiveChannelList = false;
     private int liveConfigRequestId = 0;
     private LivePlayerManager livePlayerManager = new LivePlayerManager();
+    private com.github.tvbox.osc.player.controller.LiveController liveController;
     private ArrayList<Integer> channelGroupPasswordConfirmed = new ArrayList<>();
 
 //EPG   by 龍
@@ -661,10 +670,17 @@ public class LivePlayActivity extends BaseActivity {
                 } finally {
                     response.close();
                 }
+                // ★ 解析放在 OkHttp 的回调线程（后台）做，主线程只负责渲染。
+                //
+                // 一份全天节目单常有几百条 <programme>，XML 逐节点解析 + 每条目两次
+                // SimpleDateFormat.parse()，原来整段跑在主线程：换台/切日期时正好撞上
+                // 视频解码，表现为切换瞬间画面卡顿几百毫秒。这里把解析挪到后台，
+                // 主线程只接一个已经排好序的 ArrayList。
+                final ArrayList<Epginfo> parsed = parseEpgBody(body, finalEpgTagName, date);
                 mHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        onEpgRequestResponse(body, date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex);
+                        onEpgRequestResponse(parsed, date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex);
                     }
                 });
             }
@@ -685,28 +701,51 @@ public class LivePlayActivity extends BaseActivity {
 //        showBottomEpg();
     }
 
-    private void onEpgRequestResponse(String paramString, Date date, String channelNameReal, String finalEpgTagName,
-                                      String savedEpgKey, ArrayList<String> epgQueryNames, SimpleDateFormat timeFormat, int queryIndex) {
-        if (!isCurrentEpgRequest(savedEpgKey)) return;
-        if (paramString == null || paramString.trim().isEmpty()) {
-            updateEpgPanelState(false);
-            return;
+    /**
+     * 把 EPG 报文解析成节目列表。运行在后台线程（OkHttp 回调线程），不得触碰 UI。
+     *
+     * @return 解析结果；报文为空/格式不认识/解析异常时返回空列表
+     */
+    private ArrayList<Epginfo> parseEpgBody(String body, String epgTagName, Date date) {
+        ArrayList<Epginfo> arrayList = new ArrayList<>();
+        if (body == null || body.trim().isEmpty()) {
+            return arrayList;
         }
-        ArrayList<Epginfo> arrayList = new ArrayList<Epginfo>();
         try {
-            if (isXmlEpgResponse(paramString)) {
-                arrayList = parseXmlEpg(paramString, finalEpgTagName, date);
-            } else if (paramString.contains("epg_data") || paramString.trim().startsWith("{")) {
-                arrayList = parseJsonEpg(paramString, date);
+            if (isXmlEpgResponse(body)) {
+                arrayList = parseXmlEpg(body, epgTagName, date);
+            } else if (body.contains("epg_data") || body.trim().startsWith("{")) {
+                arrayList = parseJsonEpg(body, date);
             }
-
         } catch (JSONException jSONException) {
             jSONException.printStackTrace();
+        } catch (Throwable th) {
+            // XML/JSON 解析库对畸形报文会抛各种运行时异常（XmlPullParserException、
+            // NumberFormatException、StringIndexOutOfBounds…），原来只 catch 了
+            // JSONException，任一条穿透到后台线程就是进程崩溃。这里兜住，当成
+            // 「这次没解析出节目」走正常的降级流程。
+            LOG.e("parseEpgBody fail: " + th);
+        }
+        return arrayList;
+    }
+
+    private void onEpgRequestResponse(ArrayList<Epginfo> arrayList, Date date, String channelNameReal, String finalEpgTagName,
+                                      String savedEpgKey, ArrayList<String> epgQueryNames, SimpleDateFormat timeFormat, int queryIndex) {
+        if (!isCurrentEpgRequest(savedEpgKey)) return;
+        if (arrayList == null) {
+            arrayList = new ArrayList<>();
         }
         if (arrayList.isEmpty() && requestNextEpgQueryName(date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, queryIndex)) {
             return;
         }
-        hsEpg.put(savedEpgKey, arrayList);
+        // ★ 空结果不落缓存。
+        //
+        // 原来无条件 put：某频道第一次拉取失败（EPG 站挂了/频道名没匹配上）就把
+        // 空列表写进 hsEpg，而这个缓存只在换台清空列表时才清 —— 于是这个频道
+        // 在本次会话内再也不会去重新拉，节目单一直是空的。只有拿到真数据才缓存。
+        if (!arrayList.isEmpty()) {
+            hsEpg.put(savedEpgKey, arrayList);
+        }
         if (!isCurrentEpgRequest(savedEpgKey)) return;
         showEpg(date, arrayList);
         showBottomEpg();
@@ -1231,6 +1270,31 @@ public class LivePlayActivity extends BaseActivity {
     private Runnable mLongPressRunnable;
     private static final long LONG_PRESS_DELAY = 800;
     @Override
+    /**
+     * 换台/换源按键的节流：首次按下立即生效，连发（长按）限制最小间隔。
+     *
+     * <p>遥控器按住上下键时 Android 会以几十毫秒一次的频率重复投递 ACTION_DOWN，
+     * 而每一次都会走 {@code release() → setUrl() → start()} 完整起播流程（DNS、
+     * 建连、解复用）。原来不做任何节流，按住 2 秒能触发几十次起播：画面疯狂闪烁、
+     * 前一次的连接还没断开后一次又来了，退出直播页时还可能有一批在途回调打到已
+     * 释放的播放器上。这里首次按下零延迟（保证单击手感），重复事件节流到 400ms。</p>
+     */
+    private static final long CHANNEL_KEY_THROTTLE_MS = 400L;
+    private long lastChannelKeyMs = 0L;
+
+    private boolean allowChannelSwitchKey(KeyEvent event) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (event.getRepeatCount() == 0) {
+            lastChannelKeyMs = now;
+            return true;
+        }
+        if (now - lastChannelKeyMs < CHANNEL_KEY_THROTTLE_MS) {
+            return false;
+        }
+        lastChannelKeyMs = now;
+        return true;
+    }
+
     public boolean dispatchKeyEvent(KeyEvent event) {
         int keyCode = event.getKeyCode();
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -1257,18 +1321,21 @@ public class LivePlayActivity extends BaseActivity {
             } else if (!isListOrSettingLayoutVisible()) {
                 switch (keyCode) {
                     case KeyEvent.KEYCODE_DPAD_UP:
+                        if (!allowChannelSwitchKey(event)) break;
                         if (Hawk.get(HawkConfig.LIVE_CHANNEL_REVERSE, false))
                             playNext();
                         else
                             playPrevious();
                         break;
                     case KeyEvent.KEYCODE_DPAD_DOWN:
+                        if (!allowChannelSwitchKey(event)) break;
                         if (Hawk.get(HawkConfig.LIVE_CHANNEL_REVERSE, false))
                             playPrevious();
                         else
                             playNext();
                         break;
                     case KeyEvent.KEYCODE_DPAD_LEFT:
+                        if (!allowChannelSwitchKey(event)) break;
                         if(isBack){
                             showProgressBars(true);
                         }else{
@@ -1276,6 +1343,7 @@ public class LivePlayActivity extends BaseActivity {
                         }
                         break;
                     case KeyEvent.KEYCODE_DPAD_RIGHT:
+                        if (!allowChannelSwitchKey(event)) break;
                         if(isBack){
                             showProgressBars(true);
                         }else{
@@ -1359,9 +1427,41 @@ public class LivePlayActivity extends BaseActivity {
             mVideoView.release();
             mVideoView = null;
         }
-        mHandler.removeCallbacks(mLoadEpgRun);
-        mHandler.removeCallbacks(mUpdateResolutionInfoRun);
-        mHandler.removeCallbacks(mHideResolutionInfoRun);
+        if (liveController != null) {
+            liveController.clearListener();
+            liveController = null;
+        }
+
+        // ★ 原来只摘了 3 个 Runnable。这个页面一共往 mHandler 里投了 12 个周期/延时
+        // 任务（EPG、分辨率、换源倒计时、隐藏频道列表、隐藏设置面板、时钟、网速…），
+        // 剩下的全都会在 Activity 销毁后继续跑并持有它 —— 退出直播页后定时器仍在
+        // 刷新 tvTime/tvNetSpeed、换源倒计时仍会触发 playNextSource() 去起播一个
+        // 已经释放的 VideoView。这里一次性清干净。
+        mHandler.removeCallbacksAndMessages(null);
+        // 长按调出菜单用的独立 Handler，同样要清
+        mmHandler.removeCallbacksAndMessages(null);
+
+        // 两个倒计时 / 一个无限循环动画同理，不 cancel 会一直持有 Activity
+        if (countDownTimer != null) {
+            countDownTimer.cancel();
+            countDownTimer = null;
+        }
+        if (countDownTimer3 != null) {
+            countDownTimer3.cancel();
+            countDownTimer3 = null;
+        }
+        if (objectAnimator != null) {
+            objectAnimator.cancel();
+            objectAnimator = null;
+        }
+
+        // 静态字段跨实例存活：不置空会让整个 Activity（以及它的 View 树、播放器）
+        // 一直被静态引用吊着，退出直播页后内存不释放；下次进来还能读到上一次的
+        // channel_Name，导致 EPG 回调串到错误的频道上。
+        context = null;
+        channel_Name = null;
+        hsEpg.clear();
+        playUrl = null;
     }
 
     private void showChannelList() {
@@ -1805,7 +1905,9 @@ public class LivePlayActivity extends BaseActivity {
         // 换台 = 全新起播，清掉状态去重标记，保证新频道的首个播放状态不被吞掉
         lastHandledPlayState = -1;
         if ((channelGroupIndex == currentChannelGroupIndex && liveChannelIndex == currentLiveChannelIndex && !changeSource)
-                || (changeSource && currentLiveChannelItem.getSourceNum() == 1)) {
+                // 列表被清空后（切源失败/重载配置）仍可能走到换源分支，这里原来直接
+                // getSourceNum() → NPE。顺便把「只有一个源」的早退一起判掉。
+                || (changeSource && (currentLiveChannelItem == null || currentLiveChannelItem.getSourceNum() == 1))) {
            // showChannelInfo();
             return true;
         }
@@ -1816,11 +1918,17 @@ public class LivePlayActivity extends BaseActivity {
         boolean showPreviousFrame = currentLiveChannelItem != null && mVideoView != null && mVideoView.isPlaying();
         int previousLivePlayerType = livePlayerManager.getLivePlayerType();
         allowLiveSwitchPlayer = true;
+        // 换台 = 新频道的全新起播：自动换播放器的预算重新给足
+        livePlayerFailoverStep = 0;
         if (!changeSource) {
             currentChannelGroupIndex = channelGroupIndex;
             currentLiveChannelIndex = liveChannelIndex;
             currentLiveChannelItem = getLiveChannels(currentChannelGroupIndex).get(currentLiveChannelIndex);
             Hawk.put(HawkConfig.LIVE_CHANNEL, currentLiveChannelItem.getChannelName());
+            // 换台 = 新频道的全新起播，换源计数必须归零。
+            // 否则：A 频道超时换源累计到 2，用户切到 B 频道时计数未清，B 第一次
+            // 超时就被判定「源已试完」，直接跳过 B 剩下几个源、跳到下一个频道。
+            currentLiveChangeSourceTimes = 0;
         }
 
         channel_Name = currentLiveChannelItem;
@@ -2059,13 +2167,19 @@ public class LivePlayActivity extends BaseActivity {
                 if (now.compareTo(selectedData.startdateTime) < 0) {
 
                 } else if (canCurrentChannelCatchup()) {
+                    // ★ 先把回看地址算出来、确认非空，再去动播放器。
+                    //
+                    // 原顺序是先 release() 再算地址：地址拼不出来（模板缺 token、
+                    // 节目时间为空等）时播放器已经拆了，而 isSHIYI 也已置 true，
+                    // 于是画面永久黑屏；更糟的是 showBottomEpg() 开头
+                    // if (isSHIYI) return，底部节目单从此不再刷新，只能退出重进。
+                    shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
+                    if (TextUtils.isEmpty(shiyiUrl)) return;
                     mHandler.removeCallbacks(mHideChannelListRun);
                     mHandler.postDelayed(mHideChannelListRun, 100);
                     mVideoView.release();
                     isSHIYI = true;
                     //mCanSeek=true;
-                    shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
-                    if (TextUtils.isEmpty(shiyiUrl)) return;
                     playUrl = shiyiUrl;
 
                     mVideoView.setUrl(playUrl,liveChannelHeader());
@@ -2125,13 +2239,19 @@ public class LivePlayActivity extends BaseActivity {
                 if (now.compareTo(selectedData.startdateTime) < 0) {
 
                 } else if (canCurrentChannelCatchup()) {
+                    // ★ 先把回看地址算出来、确认非空，再去动播放器。
+                    //
+                    // 原顺序是先 release() 再算地址：地址拼不出来（模板缺 token、
+                    // 节目时间为空等）时播放器已经拆了，而 isSHIYI 也已置 true，
+                    // 于是画面永久黑屏；更糟的是 showBottomEpg() 开头
+                    // if (isSHIYI) return，底部节目单从此不再刷新，只能退出重进。
+                    shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
+                    if (TextUtils.isEmpty(shiyiUrl)) return;
                     mHandler.removeCallbacks(mHideChannelListRun);
                     mHandler.postDelayed(mHideChannelListRun, 100);
                     mVideoView.release();
                     isSHIYI = true;
                     //mCanSeek=true;
-                    shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
-                    if (TextUtils.isEmpty(shiyiUrl)) return;
                     playUrl = shiyiUrl;
                     if(liveChannelHeader()!=null)LOG.i("echo-liveWebHeader :"+ liveChannelHeader().toString());
                     mVideoView.setUrl(playUrl,liveChannelHeader());
@@ -2209,6 +2329,9 @@ public class LivePlayActivity extends BaseActivity {
 
     private void initVideoView() {
         LiveController controller = new LiveController(this);
+        // 持有引用：onDestroy 里要解绑回调，否则 Activity 销毁后播放器最后几个
+        // 状态回调仍会打进来（singleTap / changeSource 会去操作已释放的播放器）
+        liveController = controller;
         controller.setListener(new LiveController.LiveControlListener() {
             @Override
             public boolean singleTap() {
@@ -2297,16 +2420,22 @@ public class LivePlayActivity extends BaseActivity {
         if (!allowLiveSwitchPlayer || currentLiveChannelItem == null || mVideoView == null) {
             return false;
         }
+        // 自动换播放器的预算：先把「另一个硬解引擎」试完，最后才允许落到软解。
+        // 用完就不再折腾播放器，交回给换源/换台流程，避免无限重试。
+        if (livePlayerFailoverStep >= LIVE_PLAYER_MAX_FAILOVER) {
+            allowLiveSwitchPlayer = false;
+            return false;
+        }
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
         mVideoView.release();
         // 换播放器重播 = 全新一次起播，状态去重标记必须清掉，
         // 否则首个状态若与上次相同会被吞掉，换源倒计时就排不上
         lastHandledPlayState = -1;
-        if (!livePlayerManager.switchLivePlayer(mVideoView)) {
+        if (!livePlayerManager.switchLivePlayer(mVideoView, livePlayerFailoverStep)) {
             allowLiveSwitchPlayer = false;
             return false;
         }
-        allowLiveSwitchPlayer = false;
+        livePlayerFailoverStep++;
         String retryUrl = isSHIYI && !TextUtils.isEmpty(playUrl) ? playUrl : currentLiveChannelItem.getUrl();
         mVideoView.setUrl(retryUrl, liveChannelHeader());
         mVideoView.start();
@@ -2619,6 +2748,9 @@ public class LivePlayActivity extends BaseActivity {
                 break;
             case 2://播放解码
                 mVideoView.release();
+                // 用户手动选了播放器：以他选的为准，自动降级预算重新给足
+                livePlayerFailoverStep = 0;
+                allowLiveSwitchPlayer = true;
                 livePlayerManager.changeLivePlayerType(mVideoView, position);
                 mVideoView.setUrl(currentLiveChannelItem.getUrl(),liveChannelHeader());
                 mVideoView.start();
@@ -2850,6 +2982,9 @@ public class LivePlayActivity extends BaseActivity {
 
         if(url.contains(".py") || url.contains(".js")){
             String finalUrl = url;
+            // 外层也要持有引用：这个线程池跑的就是 waitResponse 本体，
+            // 任务结束后必须关掉，否则每次刷新直播配置都留一条永不退出的非守护线程。
+            final ExecutorService loadExecutor = Executors.newSingleThreadExecutor();
             Runnable waitResponse = new Runnable() {
                 @Override
                 public void run() {
@@ -2870,7 +3005,13 @@ public class LivePlayActivity extends BaseActivity {
                         future.cancel(true);
                     } catch (InterruptedException | ExecutionException e) {
                         e.printStackTrace();
-                    } finally {
+                    }
+                    // ★ shutdown 原来写在 finally 里、却排在两条 return 之后：
+                    // 「解析结果为空」和「分组列表为空」这两个分支会直接 return 掉，
+                    // executor 再也没人关，线程永久存活（newSingleThreadExecutor 的
+                    // 核心线程不会超时回收）。刷新几次配置就攒几条僵尸线程。
+                    // 改成 try/finally 包住整段逻辑，任何出口都保证关闭。
+                    try {
                         if (sortJson==null || sortJson.isEmpty()) {
                             // 频道列表为空时，使用默认播放列表
                             mHandler.post(new Runnable() {
@@ -2902,15 +3043,21 @@ public class LivePlayActivity extends BaseActivity {
                                 applyLiveChannelGroups(loadedGroups);
                             }
                         });
+                    } finally {
                         try {
                             executor.shutdown();
+                        } catch (Throwable th) {
+                            th.printStackTrace();
+                        }
+                        try {
+                            loadExecutor.shutdown();
                         } catch (Throwable th) {
                             th.printStackTrace();
                         }
                     }
                 }
             };
-            Executors.newSingleThreadExecutor().execute(waitResponse);
+            loadExecutor.execute(waitResponse);
         }else {
             OkGo.<String>get(url).execute(new AbsCallback<String>() {
 
@@ -3150,6 +3297,10 @@ public class LivePlayActivity extends BaseActivity {
 
     void showTime() {
         if (Hawk.get(HawkConfig.LIVE_SHOW_TIME, false) && !isTopStatusObstructed()) {
+            // ★ 必须先 remove 再 post。showTime() 在每次显示/隐藏顶部状态、设置面板
+            // 开关时都会被调用一次，原实现直接 post，于是每调一次就多一条自续期的
+            // 时钟链：N 条链 = 每秒 N 次setText，且永远不会随 Activity 销毁而停。
+            mHandler.removeCallbacks(mUpdateTimeRun);
             mHandler.post(mUpdateTimeRun);
             tvTime.setVisibility(View.VISIBLE);
         } else {
@@ -3158,12 +3309,15 @@ public class LivePlayActivity extends BaseActivity {
         }
     }
 
+    /** 时钟/网速每秒各跑一次，SimpleDateFormat 与 Date 都复用，避免每秒 new 两个对象。 */
+    private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
+    private final Date timeScratch = new Date();
+
     private Runnable mUpdateTimeRun = new Runnable() {
         @Override
         public void run() {
-            Date day=new Date();
-            @SuppressLint("SimpleDateFormat") SimpleDateFormat df = new SimpleDateFormat("HH:mm");
-            tvTime.setText(df.format(day));
+            timeScratch.setTime(System.currentTimeMillis());
+            tvTime.setText(timeFormat.format(timeScratch));
             mHandler.postDelayed(this, 1000);
         }
     };
@@ -3215,6 +3369,12 @@ public class LivePlayActivity extends BaseActivity {
         dialog.setOnListener(new LivePasswordDialog.OnListener() {
             @Override
             public void onChange(String password) {
+                // 密码弹窗是异步的：等用户输入完，列表可能已经被重载/清空，
+                // groupIndex 成了失效下标，直接 get() 就是 IndexOutOfBounds
+                if (groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) {
+                    Toast.makeText(App.getInstance(), "分组已失效", Toast.LENGTH_SHORT).show();
+                    return;
+                }
                 if (password.equals(liveChannelGroupList.get(groupIndex).getGroupPassword())) {
                     channelGroupPasswordConfirmed.add(groupIndex);
                     loadChannelGroupDataAndPlay(groupIndex, liveChannelIndex);
@@ -3262,7 +3422,14 @@ public class LivePlayActivity extends BaseActivity {
     }
 
     private boolean isNeedInputPassword(int groupIndex) {
-        return !liveChannelGroupList.get(groupIndex).getGroupPassword().isEmpty()
+        // 下标可能来自：换配置后残留的旧值、密码弹窗异步回调里已失效的旧值、
+        // selectChannelGroup 传入的 -1。原实现直接 get(index)，越界即崩。
+        if (liveChannelGroupList == null || groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) {
+            return false;
+        }
+        LiveChannelGroup group = liveChannelGroupList.get(groupIndex);
+        return group != null
+                && !TextUtils.isEmpty(group.getGroupPassword())
                 && !isPasswordConfirmed(groupIndex);
     }
 
@@ -3275,11 +3442,17 @@ public class LivePlayActivity extends BaseActivity {
     }
 
     private ArrayList<LiveChannelItem> getLiveChannels(int groupIndex) {
-        if (!isNeedInputPassword(groupIndex)) {
-            return liveChannelGroupList.get(groupIndex).getLiveChannels();
-        } else {
+        // 调用方遍布换台/换源/列表渲染，且大量直接 .size() / .get(index)。
+        // 组下标越界、或该组 channels 从未赋值（源解析失败时会构造出空分组）时，
+        // 原实现会分别抛 IndexOutOfBoundsException 和 NPE。这里统一兜底成空列表。
+        if (liveChannelGroupList == null || groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) {
             return new ArrayList<>();
         }
+        if (isNeedInputPassword(groupIndex)) {
+            return new ArrayList<>();
+        }
+        ArrayList<LiveChannelItem> channels = liveChannelGroupList.get(groupIndex).getLiveChannels();
+        return channels == null ? new ArrayList<LiveChannelItem>() : channels;
     }
 
     private Integer[] getFirstChannelByName(String keyword) {
@@ -3309,24 +3482,16 @@ public class LivePlayActivity extends BaseActivity {
             if (liveChannelIndex >= getLiveChannels(channelGroupIndex).size()) {
                 liveChannelIndex = 0;
                 if (Hawk.get(HawkConfig.LIVE_CROSS_GROUP, false)) {
-                    do {
-                        channelGroupIndex++;
-                        if (channelGroupIndex >= liveChannelGroupList.size())
-                            channelGroupIndex = 0;
-                    } while (!liveChannelGroupList.get(channelGroupIndex).getGroupPassword().isEmpty() || channelGroupIndex == currentChannelGroupIndex);
+                    channelGroupIndex = nextPlayableGroupIndex(channelGroupIndex, 1);
                 }
             }
         } else {
             liveChannelIndex--;
             if (liveChannelIndex < 0) {
                 if (Hawk.get(HawkConfig.LIVE_CROSS_GROUP, false)) {
-                    do {
-                        channelGroupIndex--;
-                        if (channelGroupIndex < 0)
-                            channelGroupIndex = liveChannelGroupList.size() - 1;
-                    } while (!liveChannelGroupList.get(channelGroupIndex).getGroupPassword().isEmpty() || channelGroupIndex == currentChannelGroupIndex);
+                    channelGroupIndex = nextPlayableGroupIndex(channelGroupIndex, -1);
                 }
-                liveChannelIndex = getLiveChannels(channelGroupIndex).size() - 1;
+                liveChannelIndex = Math.max(0, getLiveChannels(channelGroupIndex).size() - 1);
             }
         }
 
@@ -3337,9 +3502,52 @@ public class LivePlayActivity extends BaseActivity {
         return groupChannelIndex;
     }
 
+    /**
+     * 跨组换台时，从 fromIndex 沿 direction 找下一个「能进且不是当前分组」的分组。
+     *
+     * <p><b>为什么必须是有界循环：</b>原先这里是
+     * {@code do { ... } while (有密码 || == 当前分组)}。
+     * 当「总共只有 1 个分组」或「除当前分组外全部需要密码」时，这个条件<b>恒为真</b>
+     * —— 主线程直接死循环，表现为遥控器按一下上下键整机 ANR（超时自动跳台也会走到
+     * 同一条路径）。所以改成最多绕一圈，绕不到就留在原组从头播。</p>
+     */
+    private int nextPlayableGroupIndex(int fromIndex, int direction) {
+        int size = liveChannelGroupList == null ? 0 : liveChannelGroupList.size();
+        if (size == 0) {
+            return currentChannelGroupIndex;
+        }
+        int fallback = -1;
+        for (int step = 1; step <= size; step++) {
+            int index = ((fromIndex + direction * step) % size + size) % size;
+            LiveChannelGroup group = liveChannelGroupList.get(index);
+            if (group == null || group.getLiveChannels() == null || group.getLiveChannels().isEmpty()) {
+                continue;
+            }
+            if (isNeedInputPassword(index)) {
+                continue;
+            }
+            if (fallback < 0) {
+                fallback = index;
+            }
+            if (index != currentChannelGroupIndex) {
+                return index;
+            }
+        }
+        // 没有别的可播分组（单分组 / 其余全加密 / 其余全空）→ 留在原组从头播
+        return fallback >= 0 ? fallback : currentChannelGroupIndex;
+    }
+
     private int getFirstNoPasswordChannelGroup() {
+        if (liveChannelGroupList == null) {
+            return -1;
+        }
         for (LiveChannelGroup liveChannelGroup : liveChannelGroupList) {
-            if (liveChannelGroup.getGroupPassword().isEmpty())
+            if (liveChannelGroup == null) {
+                continue;
+            }
+            // getGroupPassword() 在解析失败构造出的分组里可能是 null，
+            // 原实现直接 .isEmpty() 会 NPE，导致一进直播页就崩
+            if (TextUtils.isEmpty(liveChannelGroup.getGroupPassword()))
                 return liveChannelGroup.getGroupIndex();
         }
         return -1;
@@ -3550,6 +3758,12 @@ public class LivePlayActivity extends BaseActivity {
         currentLiveChannelIndex = -1;
         currentLiveLookBackIndex = -1;
         currentLiveChangeSourceTimes = 0;
+        // channel_Name / hsEpg 都是静态的，跨 Activity 实例存活。这里只清了实例字段，
+        // 于是「切源失败 / 重载配置 → 列表清空」后：在途的 EPG 回调仍能用残留的
+        // channel_Name 拼出 key 并命中，一路走到 showEpg() → currentLiveChannelItem
+        // 已是 null → NPE 崩溃；hsEpg 里的旧节目单也会串到下一次。两者一起清。
+        channel_Name = null;
+        hsEpg.clear();
         liveChannelGroupList.clear();
         ApiConfig.get().getChannelGroupList().clear();
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);

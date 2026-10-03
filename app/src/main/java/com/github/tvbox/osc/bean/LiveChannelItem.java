@@ -187,20 +187,49 @@ public class LiveChannelItem {
     }
 
     public void setChannelUrls(ArrayList<String> channelUrls) {
-        this.channelUrls = channelUrls;
-        sourceNum = channelUrls.size();
+        this.channelUrls = channelUrls == null ? new ArrayList<String>() : channelUrls;
+        sourceNum = this.channelUrls.size();
+        // ★ 换一组源后必须把下标拨回合法区间。
+        //
+        // sourceIndex 是「当前选到第几条源」，sourceNum 是「现在有几条源」。直播源
+        // 配置可以在 Activity 活着时被整体换掉（切换直播接口、重载配置），此时
+        // 旧的 sourceIndex 可能已经 >= 新的 sourceNum。原代码只更新 sourceNum，
+        // 于是 getUrl() 立刻 IndexOutOfBounds —— 表现为换完配置一进直播就崩。
+        if (sourceNum <= 0) {
+            sourceIndex = 0;
+        } else if (sourceIndex >= sourceNum || sourceIndex < 0) {
+            sourceIndex = 0;
+        }
     }
+
     public void preSource() {
+        // 只有一条源（或压根没有）时没有可切换的余地，保持 0，避免取到 -1
+        if (sourceNum <= 1) {
+            sourceIndex = 0;
+            return;
+        }
         sourceIndex--;
         if (sourceIndex < 0) sourceIndex = sourceNum - 1;
     }
+
     public void nextSource() {
+        if (sourceNum <= 1) {
+            sourceIndex = 0;
+            return;
+        }
         sourceIndex++;
         if (sourceIndex == sourceNum) sourceIndex = 0;
     }
 
     public void setSourceIndex(int sourceIndex) {
-        this.sourceIndex = sourceIndex;
+        // 调用方（换源、恢复上次源）给的下标可能越界，这里统一钳位
+        if (sourceNum <= 0) {
+            this.sourceIndex = 0;
+        } else if (sourceIndex < 0 || sourceIndex >= sourceNum) {
+            this.sourceIndex = 0;
+        } else {
+            this.sourceIndex = sourceIndex;
+        }
     }
 
     public int getSourceIndex() {
@@ -208,7 +237,16 @@ public class LiveChannelItem {
     }
 
     public String getUrl() {
-        return channelUrls.get(sourceIndex);
+        // 直播源随时可能被整体替换，这里是最容易被越界打到的热点，兜底返回空串，
+        // 让上层的「地址为空 → 换下一条源」逻辑接管，而不是直接崩。
+        if (channelUrls == null || channelUrls.isEmpty()) {
+            return "";
+        }
+        if (sourceIndex < 0 || sourceIndex >= channelUrls.size()) {
+            return "";
+        }
+        String url = channelUrls.get(sourceIndex);
+        return url == null ? "" : url;
     }
 
     public int getSourceNum() {
@@ -224,7 +262,16 @@ public class LiveChannelItem {
     }
 
     public String getSourceName() {
-        return channelSourceNames.get(sourceIndex);
+        // 源名数组与源地址数组长度常常不一致（m3u 里只有部分条目带源名），
+        // 原来按下标硬取会 IndexOutOfBounds，崩在换源提示上。
+        if (channelSourceNames == null || channelSourceNames.isEmpty()) {
+            return "";
+        }
+        if (sourceIndex < 0 || sourceIndex >= channelSourceNames.size()) {
+            return "";
+        }
+        String name = channelSourceNames.get(sourceIndex);
+        return name == null ? "" : name;
     }
 
     public boolean isEmptyCatchup() {
@@ -237,11 +284,11 @@ public class LiveChannelItem {
         if (o == null || getClass() != o.getClass()) return false;
         LiveChannelItem that = (LiveChannelItem) o;
         return Objects.equals(channelName, that.channelName)
-                && Objects.equals(channelUrls.get(sourceIndex), that.getUrl());
+                && Objects.equals(getUrl(), that.getUrl());
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(channelName, channelUrls.get(sourceIndex));
+        return Objects.hash(channelName, getUrl());
     }
 }

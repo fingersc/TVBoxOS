@@ -45,19 +45,21 @@ public class IjkMediaPlayer extends IjkPlayer {
     @Override
     public void setOptions() {
         super.setOptions();
-        IJKCode codecTmp = this.codec == null ? ApiConfig.get().getCurrentIJKCode() : this.codec;
-        LinkedHashMap<String, String> options = codecTmp.getOption();
+        IJKCode codecTmp = this.codec != null ? this.codec : ApiConfig.get().getCurrentIJKCode();
+        LinkedHashMap<String, String> options = codecTmp == null ? null : codecTmp.getOption();
         if (options != null) {
             for (String key : options.keySet()) {
                 String value = options.get(key);
                 String[] opt = key.split("\\|");
                 int category = Integer.parseInt(opt[0].trim());
                 String name = opt[1].trim();
-                try {
-                    assert value != null;
-                    long valLong = Long.parseLong(value);
-                    mMediaPlayer.setOption(category, name, valLong);
-                } catch (Exception e) {
+                // 原先靠 Long.parseLong 抛异常来区分「数值 / 字符串」选项。
+                // 一条配置里绝大部分是字符串（fflags=fastseek 之类），每次起播
+                // 都要构造几十个 NumberFormatException（带完整栈回溯），纯浪费。
+                // 先做一次廉价的数字判断，只有确实是数字才走 parseLong。
+                if (isNumericValue(value)) {
+                    mMediaPlayer.setOption(category, name, Long.parseLong(value));
+                } else {
                     mMediaPlayer.setOption(category, name, value);
                 }
             }
@@ -83,6 +85,8 @@ public class IjkMediaPlayer extends IjkPlayer {
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 1000);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "flush_packets", 1);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 1);
+            // 解复用/解码线程数，只在软解时生效；硬解走 mediacodec，与此无关。
+            // 直播单线程即可（帧率低、要的是实时性），点播给 2 线程换吞吐。
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "1");
         }else{
             // 降低延迟
@@ -91,6 +95,24 @@ public class IjkMediaPlayer extends IjkPlayer {
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "2");
         }
 //        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "sync-av-start", 1);//强制音画同步
+    }
+
+    /** 廉价的整数判断，用于避免靠异常来区分选项值类型。 */
+    private static boolean isNumericValue(String value) {
+        if (value == null || value.isEmpty()) {
+            return false;
+        }
+        int start = value.charAt(0) == '-' ? 1 : 0;
+        if (start >= value.length()) {
+            return false;
+        }
+        for (int i = start; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static final String ITV_TARGET_DOMAIN = "gslbserv.itv.cmvideo.cn";

@@ -38,7 +38,9 @@ public class LiveChannelGroup {
     }
 
     public String getGroupPassword() {
-        return groupPassword;
+        // 直播源解析失败/字段缺失时这个字段会是 null，而调用方遍布各处且大量
+        // 直接 .isEmpty() / .equals()，在 getter 里统一兜成空串最省事且不会漏
+        return groupPassword == null ? "" : groupPassword;
     }
 
     public void setGroupPassword(String groupPassword) {

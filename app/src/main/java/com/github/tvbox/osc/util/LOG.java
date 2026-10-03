@@ -62,6 +62,19 @@ public class LOG {
         Log.i("TVBox-switch", "" + msg);
     }
 
+    /**
+     * 直播播放链路专用诊断通道，同样<b>不受 {@link #VERBOSE} 门控影响</b>。
+     *
+     * <p>直播排障最想知道的是「这次到底用的哪个播放器、走的是硬解还是软解」，
+     * 而这恰恰只在几处关键节点发生（起播 / 换台 / 自动降级），量很小。
+     * 用 {@link #i(String)} 会被 release 门控挡掉、现场查不到，故单独开一档。</p>
+     *
+     * <p>过滤：{@code adb logcat -s TVBox-live}</p>
+     */
+    public static void live(String msg) {
+        Log.i("TVBox-live", "" + msg);
+    }
+
     private static void longLog(int priority, String prefix, String msg) {
         String text = msg == null ? "null" : msg;
         String title = prefix == null ? "" : prefix;
