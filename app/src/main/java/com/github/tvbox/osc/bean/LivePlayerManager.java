@@ -118,7 +118,6 @@ public class LivePlayerManager {
                 LOG.i("echo-liveSwitchPlayer: skip unsupported playerType=" + playerType);
                 return false;
             }
-            LOG.i("echo-liveSwitchPlayer: " + playerType + " -> " + switchPlayerType);
             playerConfig.put("pl", switchPlayerType);
         } catch (JSONException e) {
             LOG.i("echo-liveSwitchPlayer error: " + e.getMessage());

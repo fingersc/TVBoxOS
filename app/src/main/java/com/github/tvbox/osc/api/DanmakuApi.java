@@ -93,12 +93,10 @@ public class DanmakuApi {
 
     public static void search(String name, String episode, SearchCallback callback) {
         String apiUrl = getApiUrl();
-//        LOG.i("echo-danmaku search apiUrl: " + apiUrl);
         if (TextUtils.isEmpty(apiUrl) || callback == null) return;
         try {
             OkHttp.cancel(TAG);
             int seq = searchSeq.incrementAndGet();
-//            LOG.i("echo-danmaku search title: " + safeLog(name) + ", episode: " + safeLog(episode));
             if (!hasPlaceholder(apiUrl) && !isDanmakuSearchApi(apiUrl)) {
                 searchBuiltin(apiUrl, name, episode, callback, 0, seq);
                 return;
@@ -252,7 +250,6 @@ public class DanmakuApi {
         final String episodeQuery = getEpisodeQuery(simpleEpisode, queryMode);
         final String searchUrl = baseUrl + "/api/v2/search/episodes?anime=" + encode(simpleName)
                 + (TextUtils.isEmpty(episodeQuery) ? "" : "&episode=" + encode(episodeQuery));
-//        LOG.i("echo-danmaku builtin search episodes: " + searchUrl + ", retry=" + retry + ", mode=" + queryMode);
         OkHttp.newCall(OkHttp.client(BUILTIN_TIMEOUT), searchUrl, TAG).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
@@ -301,14 +298,12 @@ public class DanmakuApi {
     private static boolean tryNextEpisodeQuery(String apiUrl, String name, String episode, SearchCallback callback, int seq, int queryMode) {
         int nextMode = getNextEpisodeQueryMode(Trans.t2s(episode == null ? "" : episode), queryMode);
         if (nextMode < 0) return false;
-//        LOG.i("echo-danmaku builtin retry episodes query mode: " + queryMode + " -> " + nextMode);
         searchBuiltin(apiUrl, name, episode, callback, 0, seq, nextMode);
         return true;
     }
 
     private static void searchBuiltinAnime(String baseUrl, String name, String episode, SearchCallback callback, int seq, boolean notifyOnEmpty) {
         final String searchUrl = baseUrl + "/api/v2/search/anime?keyword=" + encode(name);
-        LOG.i("echo-danmaku builtin search anime: " + searchUrl);
         OkHttp.newCall(OkHttp.client(BUILTIN_TIMEOUT), searchUrl, TAG).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
@@ -338,7 +333,6 @@ public class DanmakuApi {
 
     private static void loadBuiltinBangumi(String baseUrl, String animeId, String episode, SearchCallback callback, int seq) {
         final String bangumiUrl = baseUrl + "/api/v2/bangumi/" + animeId;
-//        LOG.i("echo-danmaku builtin bangumi: " + bangumiUrl);
         OkHttp.newCall(OkHttp.client(BUILTIN_TIMEOUT), bangumiUrl, TAG).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
@@ -356,7 +350,6 @@ public class DanmakuApi {
                     if (episodeMatch != null && !TextUtils.isEmpty(episodeMatch.id)) {
                         loadBuiltinComment(baseUrl, "", episode, episodeMatch, callback, seq);
                     } else {
-//                        LOG.i("echo-danmaku builtin bangumi episode not matched, episode: " + safeLog(episode));
                         notifyNotFound(callback, seq);
                     }
                 } catch (Throwable th) {
@@ -374,7 +367,6 @@ public class DanmakuApi {
                 + ", matched episode: " + safeLog(episodeMatch.title)
                 + ", matched number: " + episodeMatch.number
                 + ", episodeId: " + episodeMatch.id);
-        LOG.i("echo-danmaku builtin comment: " + commentUrl);
         OkHttp.newCall(OkHttp.client(BUILTIN_TIMEOUT), commentUrl, TAG).enqueue(new Callback() {
             @Override
             public void onFailure(@NonNull Call call, @NonNull IOException e) {
@@ -531,15 +523,10 @@ public class DanmakuApi {
         if (match != null) return match;
         EpisodeMatch movieFallback = findMovieFallback(new JSONObject(body), episode);
         if (movieFallback != null) {
-            LOG.i("echo-danmaku episodes movie fallback episode: " + safeLog(movieFallback.title) + ", episodeId: " + movieFallback.id);
         }
         return movieFallback;
     }
 
-    private static JSONArray findEpisodes(JSONObject object) {
-        EpisodeList episodeList = findEpisodeList(object);
-        return episodeList == null ? null : episodeList.episodes;
-    }
 
     private static EpisodeList findEpisodeList(JSONObject object) {
         JSONArray array = object.optJSONArray("episodes");
@@ -685,7 +672,6 @@ public class DanmakuApi {
         }
         builder.append("</i>");
         String xml = builder.toString();
-        LOG.i("echo-danmaku builtin xml length: " + xml.length());
         return xml;
     }
 

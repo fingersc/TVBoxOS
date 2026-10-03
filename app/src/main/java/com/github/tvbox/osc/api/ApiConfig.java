@@ -220,7 +220,6 @@ public class ApiConfig {
             @Override
             public void success(String json) {
                 try {
-//                            LOG.longI("echo-ConfigJson", json);
                     if (switchApiCollectionIfNeeded(apiUrl, json)) {
                         FileUtils.saveCache(cache,json);
                         loadConfig(false, callback, activity);
@@ -271,7 +270,6 @@ public class ApiConfig {
         String liveApiConfigUrl = configUrl(liveApiUrl);
         final String liveConfigKey = TempKey;
         File live_cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/" + MD5.encode(liveApiUrl));
-        LOG.i("echo-load live config "+liveApiUrl);
         if (useCache && live_cache.exists()) {
             try {
                 parseLiveConfigContent(liveApiUrl, live_cache);
@@ -462,7 +460,6 @@ public class ApiConfig {
                         error = "empty body";
                     } else if (isJarInImg) {
                         String respData = response.body().string();
-                        LOG.i("echo---jar Response: " + respData);
                         byte[] imgJar = getImgJar(respData);
                         if (imgJar == null || imgJar.length == 0) {
                             error = "empty img jar";
@@ -555,7 +552,6 @@ public class ApiConfig {
             }
         }else {
             if (Boolean.parseBoolean(jarCache) && cache.exists() && !FileUtils.isWeekAgo(cache)) {
-                LOG.i("echo-load jar jarCache:"+jarUrl);
                 if (cache.exists()) {
                     loadJarAsync(cache, new JarLoadCallback() {
                         @Override
@@ -578,7 +574,6 @@ public class ApiConfig {
 
         boolean isJarInImg = jarUrl.startsWith("img+");
         jarUrl = jarUrl.replace("img+", "");
-        LOG.i("echo-load jar start:"+jarUrl);
         final String requestUrl = jarUrl;
         downloadJarAsync(requestUrl, isJarInImg, cache, new JarDownloadCallback() {
             private boolean retryLoad(String reason) {
@@ -598,7 +593,6 @@ public class ApiConfig {
                         @Override
                         public void complete(boolean success) {
                             if (success) {
-                                LOG.i("echo---load-jar-success");
                                 callback.success();
                             } else {
                                 LOG.e("echo---jar Loader returned false");
@@ -824,7 +818,6 @@ public class ApiConfig {
         // 直播源
         String live_api_url=Hawk.get(HawkConfig.LIVE_API_URL,"");
         if(live_api_url.isEmpty() || apiUrl.equals(live_api_url)){
-            LOG.i("echo-load-config_live");
             initLiveSettings();
             if(infoJson.has("lives")){
                 JsonArray lives_groups=infoJson.get("lives").getAsJsonArray();
@@ -942,7 +935,6 @@ public class ApiConfig {
             Hawk.put(HawkConfig.DOH_JSON,"");
         }
         OkGoHelper.setDnsList();
-        LOG.i("echo-api-config-----------load");
         //追加的广告拦截
         if(infoJson.has("ads")){
             for (JsonElement host : infoJson.getAsJsonArray("ads")) {
@@ -995,7 +987,6 @@ public class ApiConfig {
                 ijkCodes.get(0).selected(true);
             }
         }
-        LOG.i("echo-default-config-----------load");
     }
     private void parseLiveConfigContent(String apiUrl, File f) throws Throwable {
         BufferedReader bReader = new BufferedReader(new InputStreamReader(new FileInputStream(f), "UTF-8"));
@@ -1046,7 +1037,6 @@ public class ApiConfig {
         Hawk.put(HawkConfig.LIVE_WEB_HEADER, null);
         JsonArray livesArray = TxtSubscribe.parseToJsonArray(content);
         loadLives(livesArray);
-        LOG.i("echo-live-text-config-----------load:" + apiUrl);
     }
 
     private String extractLiveTextEpg(String content) {
@@ -1121,7 +1111,6 @@ public class ApiConfig {
                 }
             }
         }
-        LOG.i("echo-api-live-config-----------load");
     }
 
     private final List<LiveSettingGroup> liveSettingGroupList = new ArrayList<>();
@@ -1310,7 +1299,6 @@ public class ApiConfig {
 
     public void loadLiveApi(JsonObject livesOBJ) {
         try {
-            LOG.i("echo-loadLiveApi");
             liveChannelGroupList.clear();
             currentLiveSpider = "";
             currentLivePyKey = "";
@@ -1338,7 +1326,6 @@ public class ApiConfig {
                 if(type.equals("0") || type.equals("3")){
                     url = livesOBJ.has("url")?livesOBJ.get("url").getAsString():"";
                     if(url.isEmpty())url=api;
-                    LOG.i("echo-liveurl"+url);
                     if(!url.startsWith("http://127.0.0.1")){
                         if(url.startsWith("http")){
                             url = Base64.encodeToString(url.getBytes("UTF-8"), Base64.DEFAULT | Base64.URL_SAFE | Base64.NO_WRAP);
@@ -1347,9 +1334,7 @@ public class ApiConfig {
                     }
                     if(type.equals("3")){
                         String jarUrl = livesOBJ.has("jar")?livesOBJ.get("jar").getAsString().trim():"";
-                        LOG.i("echo-liveApi1"+api);
                         if(api.contains(".py")){
-                            LOG.i("echo-pyLoader.getSpider");
                             String ext="";
                             if(livesOBJ.has("ext") && (livesOBJ.get("ext").isJsonObject() || livesOBJ.get("ext").isJsonArray())){
                                 ext=livesOBJ.get("ext").toString();
@@ -1361,7 +1346,6 @@ public class ApiConfig {
                             currentLiveSpider = api;
                             pyLoader.getSpider(currentLivePyKey,api,ext);
                         } else if (api.contains(".js")) {
-                            LOG.i("echo-jsLoader.getSpider");
                             String ext="";
                             if(livesOBJ.has("ext") && (livesOBJ.get("ext").isJsonObject() || livesOBJ.get("ext").isJsonArray())){
                                 ext=livesOBJ.get("ext").toString();
@@ -1484,7 +1468,6 @@ public class ApiConfig {
         configLoadExecutor.execute(new Runnable() {
             @Override
             public void run() {
-                LOG.i("echo-warm-spider start");
                 int eligibleCount = 0;
                 for (SourceBean source : sources) {
                     if (source == null || source.getType() != 3 || !source.isSearchable()) continue;
@@ -1499,7 +1482,6 @@ public class ApiConfig {
                         warmedSearchSpiderKeys.add(warmKey);
                     }
                     try {
-//                        LOG.i("echo-warm-spider load:" + warmKey);
                         getCSP(source);
                     } catch (Throwable th) {
                         LOG.e("echo-warm-search-spider-error " + source.getKey() + ":" + th.getMessage());
@@ -1728,7 +1710,6 @@ public class ApiConfig {
     private List<SourceBean> searchSourceBeanList;
     public List<SourceBean> getSearchSourceBeanList() {
         if(searchSourceBeanList.isEmpty()){
-            LOG.i("echo-第一次getSearchSourceBeanList");
             searchSourceBeanList = new ArrayList<>();
             for (SourceBean bean : sourceBeanList.values()) {
                 if (bean.isSearchable()) {

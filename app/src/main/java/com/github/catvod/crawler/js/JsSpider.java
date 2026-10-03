@@ -83,9 +83,6 @@ public class JsSpider extends Spider {
         return ctx.createNewJSObject();
     }
 
-    private JSArray createArray() {
-        return ctx.createNewJSArray();
-    }
 
     private void set(JSObject object, String name, Object value) {
         ctx.setProperty(object, name, value);
@@ -396,19 +393,15 @@ public class JsSpider extends Spider {
         ctx.setConsole(new QuickJSContext.Console() {
             @Override
             public void log(String s) {
-                LOG.i("echo-QuJs " + s);
             }
             @Override
             public void info(String s) {
-                LOG.i("echo-QuJs " + s);
             }
             @Override
             public void warn(String s) {
-                LOG.i("echo-QuJs " + s);
             }
             @Override
             public void error(String s) {
-                LOG.i("echo-QuJs " + s);
             }
         });
 

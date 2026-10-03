@@ -293,12 +293,6 @@ public class JarLoader {
         }
     }
 
-    private DexClassLoader requireRecentLoader() {
-        DexClassLoader loader = loaders.get(recent);
-        if (loader == null) loader = loaders.get(MAIN_KEY);
-        if (loader == null) throw new IllegalStateException("No jar loaded for recent key: " + recent);
-        return loader;
-    }
 
     private Class<?> loadParserClass(String name) throws ClassNotFoundException {
         DexClassLoader loader = loaders.get(recent);

@@ -53,7 +53,6 @@ public class M3u8 {
     }
 
     public static String purify(String tsUrlPre, String m3u8content) {
-//        LOG.i("echo-fixAdM3u8 m3u8content: " +m3u8content);
         long start = System.currentTimeMillis();
         currentAdCount = 0;
         if (null == m3u8content || m3u8content.length() == 0) return null;
@@ -87,8 +86,6 @@ public class M3u8 {
         }
 
         long cost = System.currentTimeMillis() - start;
-        LOG.i("echo-fixAdM3u8 cost: " + cost + "ms, removed: " + currentAdCount + " segments");
-//        LOG.i("echo-fixAdM3u8 result: " + result );
         return result;
     }
 
@@ -189,7 +186,6 @@ public class M3u8 {
         if (maxTimes == 0) return null;
 
         // Diagnostic logging
-        LOG.i("echo-fixAdM3u8 URL pattern count: " + preUrlMap.size() + ", maxTimes: " + maxTimes + ", total: " + totalSegments);
 
         StringBuilder filtered = new StringBuilder();
         List<String> pendingSegmentTags = new ArrayList<>();
@@ -299,7 +295,6 @@ public class M3u8 {
                 groups.get(i).appendTo(sb);
             }
         }
-        LOG.i("echo-fixAdM3u8 decimal precision detected: major=" + majorPrecision + ", blocks=" + removedBlocks + ", removed=" + removableSegments);
         return normalizeMediaPlaylist(sb.toString());
     }
 
@@ -359,7 +354,6 @@ public class M3u8 {
                 groups.get(i).appendTo(sb);
             }
         }
-        LOG.i("echo-fixAdM3u8 frame rate detected: master=" + masterFrameRate + ", blocks=" + removedBlocks + ", removed=" + removableSegments);
         return normalizeMediaPlaylist(sb.toString());
     }
 

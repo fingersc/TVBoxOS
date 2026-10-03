@@ -91,15 +91,15 @@ public class FileUtils {
     }
 
     public static String readFileToString(String path, String charsetName) {
-        // 定义返回结果
-        String jsonString = "";
-
+        // 用 StringBuilder 累积。原实现是 jsonString += thisLine，
+        // 对较大的配置文件/JSON 会退化成 O(n²) 的反复拷贝。
+        StringBuilder sb = new StringBuilder();
         BufferedReader in = null;
         try {
             in = new BufferedReader(new InputStreamReader(new FileInputStream(new File(path)), charsetName));// 读取文件
             String thisLine = null;
             while ((thisLine = in.readLine()) != null) {
-                jsonString += thisLine;
+                sb.append(thisLine);
             }
             in.close();
         } catch (IOException e) {
@@ -113,7 +113,7 @@ public class FileUtils {
             }
         }
         // 返回拼接好的JSON String
-        return jsonString;
+        return sb.toString();
     }
 
     public static String getRootPath() {
@@ -287,7 +287,6 @@ public class FileUtils {
             } else if (name.contains("cat.js")) {
                 name = "cat.js";
             }
-            LOG.i("echo-loadModule "+name);
             Matcher m = URL_JOIN.matcher(name);
             if (m.find()) {
                 if (!Hawk.get(HawkConfig.DEBUG_OPEN, false)) {
@@ -331,7 +330,6 @@ public class FileUtils {
         // 1. 先从缓存里取目录列表
         Set<String> files = cachedDirFiles.get(dir);
         if (files == null) {
-            LOG.i("echo-读取AssetsList");
             try {
                 String[] list = App.getInstance().getAssets().list(dir);
                 files = new HashSet<>(Arrays.asList(list));

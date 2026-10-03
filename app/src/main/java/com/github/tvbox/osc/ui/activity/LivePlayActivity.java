@@ -152,7 +152,6 @@ public class LivePlayActivity extends BaseActivity {
     private static final long EPG_LOAD_DELAY = 1200L;
     private static final int RESOLUTION_INFO_MAX_RETRY = 10;
     private static final long RESOLUTION_INFO_RETRY_DELAY = 300L;
-    private static final long RESOLUTION_INFO_HIDE_DELAY = 3000L;
     private static final String DEFAULT_EPG_ADDRESS = "http://epg.51zmt.top:8000/api/diyp/?ch={name}&date={date}";
     private static final Pattern CATCHUP_TOKEN_PATTERN = Pattern.compile("(\\$?\\{[^}]*\\})");
     private static final Pattern CATCHUP_TAG_PATTERN = Pattern.compile("\\{([^}]*)\\}");
@@ -198,7 +197,6 @@ public class LivePlayActivity extends BaseActivity {
     TextView tv_srcinfo;
     TextView tv_curepg_left;
     TextView tv_nextepg_left;
-    private MyEpgAdapter myAdapter;
     private TextView tv_right_top_tipnetspeed;
     private TextView tv_right_top_channel_name;
     private TextView tv_right_top_epg_name;
@@ -236,7 +234,6 @@ public class LivePlayActivity extends BaseActivity {
     SimpleDateFormat timeFormat = new SimpleDateFormat("yyyy-MM-dd");
     private View backcontroller;
     private CountDownTimer countDownTimer3;
-    private final int videoWidth = 1920;
     private final int videoHeight = 1080;
     private TextView tv_currentpos;
     private TextView tv_duration;
@@ -685,7 +682,6 @@ public class LivePlayActivity extends BaseActivity {
             updateEpgPanelState(false);
             return;
         }
-        LOG.i("echo-epgTagName:" + channelNameReal);
         ArrayList<Epginfo> arrayList = new ArrayList<Epginfo>();
         try {
             if (isXmlEpgResponse(paramString)) {
@@ -712,7 +708,6 @@ public class LivePlayActivity extends BaseActivity {
             return false;
         }
         String fallbackUrl = buildEpgUrl(DEFAULT_EPG_ADDRESS, epgQueryNames.get(0), date, timeFormat);
-        LOG.i("echo-epg fallback default address");
         requestEpg(fallbackUrl, date, channelNameReal, finalEpgTagName, savedEpgKey, epgQueryNames, timeFormat, epgQueryNames.size());
         return true;
     }
@@ -1611,7 +1606,6 @@ public class LivePlayActivity extends BaseActivity {
 
         if(livesOBJ.has("catchup") && livesOBJ.get("catchup").isJsonObject()){
             catchup = livesOBJ.getAsJsonObject("catchup");
-            LOG.i("echo-catchup :"+ catchup.toString());
         }
         if(livesOBJ.has("logo")){
             logoUrl = livesOBJ.get("logo").getAsString();
@@ -1630,7 +1624,6 @@ public class LivePlayActivity extends BaseActivity {
                 }else {
                     ext= DefaultConfig.safeJsonString(livesOBJ, "ext", "");
                 }
-                LOG.i("echo-ext:"+ext);
                 if(!ext.isEmpty())py_jar=py_jar+"?extend="+ext;
             }
             ApiConfig.get().setLiveJar(py_jar);
@@ -2057,7 +2050,6 @@ public class LivePlayActivity extends BaseActivity {
                     //mCanSeek=true;
                     shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
                     if (TextUtils.isEmpty(shiyiUrl)) return;
-                    LOG.i("echo-回看地址playUrl :"+ shiyiUrl);
                     playUrl = shiyiUrl;
 
                     mVideoView.setUrl(playUrl,liveChannelHeader());
@@ -2124,7 +2116,6 @@ public class LivePlayActivity extends BaseActivity {
                     //mCanSeek=true;
                     shiyiUrl = buildCatchupUrl(shiyiUrl, selectedData);
                     if (TextUtils.isEmpty(shiyiUrl)) return;
-                    LOG.i("echo-回看地址playUrl :"+ shiyiUrl);
                     playUrl = shiyiUrl;
                     if(liveChannelHeader()!=null)LOG.i("echo-liveWebHeader :"+ liveChannelHeader().toString());
                     mVideoView.setUrl(playUrl,liveChannelHeader());
@@ -2157,21 +2148,10 @@ public class LivePlayActivity extends BaseActivity {
     //laoda 生成7天回放日期列表数据
     private void initDayList() {
         liveDayList.clear();
-//        Date firstday = new Date(nowday.getTime() - 2 * 24 * 60 * 60 * 1000);
-//        for (int i = 0; i < 1; i++) {
-//            LiveDayListGroup daylist = new LiveDayListGroup();
-//            Date newday= new Date(firstday.getTime() + i * 24 * 60 * 60 * 1000);
-//            String day = formatDate1.format(newday);
-//            LOG.i("echo-date"+day);
-//            daylist.setGroupIndex(i);
-//            daylist.setGroupName(day);
-//            liveDayList.add(daylist);
-//        }
 
         LiveDayListGroup daylist = new LiveDayListGroup();
         Date newday= new Date((nowday.getTime()));
         String day = formatDate1.format(newday);
-        LOG.i("echo-date"+day);
         daylist.setGroupIndex(0);
         daylist.setGroupName(day);
         liveDayList.add(daylist);
@@ -2205,40 +2185,6 @@ public class LivePlayActivity extends BaseActivity {
             }
         });
 
-//        //电视
-//        mEpgDateGridView.setOnItemListener(new TvRecyclerView.OnItemListener() {
-//            @Override
-//            public void onItemPreSelected(TvRecyclerView parent, View itemView, int position) {
-//                liveEpgDateAdapter.setFocusedIndex(-1);
-//            }
-//
-//            @Override
-//            public void onItemSelected(TvRecyclerView parent, View itemView, int position) {
-//                mHandler.removeCallbacks(mHideChannelListRun);
-//                mHandler.postDelayed(mHideChannelListRun, postTimeout);
-//                liveEpgDateAdapter.setFocusedIndex(position);
-//            }
-//
-//            @Override
-//            public void onItemClick(TvRecyclerView parent, View itemView, int position) {
-//                mHandler.removeCallbacks(mHideChannelListRun);
-//                mHandler.postDelayed(mHideChannelListRun, postTimeout);
-//                liveEpgDateAdapter.setSelectedIndex(position);
-//                getEpg(liveEpgDateAdapter.getData().get(position).getDateParamVal());
-//            }
-//        });
-//
-//        //手机/模拟器
-//        liveEpgDateAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
-//            @Override
-//            public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
-//                FastClickCheckUtil.check(view);
-//                mHandler.removeCallbacks(mHideChannelListRun);
-//                mHandler.postDelayed(mHideChannelListRun, postTimeout);
-//                liveEpgDateAdapter.setSelectedIndex(position);
-//                getEpg(liveEpgDateAdapter.getData().get(position).getDateParamVal());
-//            }
-//        });
         liveEpgDateAdapter.setSelectedIndex(0);
         mEpgDateGridView.setVisibility(View.GONE);
     }
@@ -2299,7 +2245,6 @@ public class LivePlayActivity extends BaseActivity {
                         mHandler.postDelayed(mConnectTimeoutChangeSourceRun, (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L);
                         break;
                     default:
-                        LOG.i("echo-Unexpected live_play state: " + playState);
                         break;
                 }
             }
@@ -2334,7 +2279,6 @@ public class LivePlayActivity extends BaseActivity {
             allowLiveSwitchPlayer = false;
             return false;
         }
-//        LOG.i("echo-liveAutoRetry switch player and replay current stream");
         allowLiveSwitchPlayer = false;
         String retryUrl = isSHIYI && !TextUtils.isEmpty(playUrl) ? playUrl : currentLiveChannelItem.getUrl();
         mVideoView.setUrl(retryUrl, liveChannelHeader());
@@ -2876,7 +2820,6 @@ public class LivePlayActivity extends BaseActivity {
             showLoading();
         }
 
-        LOG.i("echo-live-url:"+url);
 
         if(url.contains(".py") || url.contains(".js")){
             String finalUrl = url;
@@ -2889,7 +2832,6 @@ public class LivePlayActivity extends BaseActivity {
                         public String call() {
                             Spider sp = ApiConfig.get().getLiveCSP(finalUrl);
                             String json=sp.liveContent(finalUrl);
-//                            LOG.i("echo--loadProxyLives-json--"+json);
                             return json;
                         }
                     });
@@ -3130,20 +3072,6 @@ public class LivePlayActivity extends BaseActivity {
         mHandler.postDelayed(mUpdateResolutionInfoRun, RESOLUTION_INFO_RETRY_DELAY);
     }
 
-    private void showResolutionSetting() {
-        mHandler.removeCallbacks(mHideResolutionInfoRun);
-        mHandler.removeCallbacks(mUpdateResolutionInfoRun);
-        if (Hawk.get(HawkConfig.LIVE_SHOW_RESOLUTION, false)) {
-            resolutionInfoPending = true;
-            resolutionInfoRetryCount = 0;
-            if (tvResolution != null) {
-                tvResolution.setVisibility(View.GONE);
-                mHandler.postDelayed(mUpdateResolutionInfoRun, RESOLUTION_INFO_RETRY_DELAY);
-            }
-        } else {
-            showResolutionAfterChannelSwitch();
-        }
-    }
 
     private final Runnable mHideResolutionInfoRun = new Runnable() {
         @Override

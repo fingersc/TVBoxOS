@@ -52,7 +52,6 @@ public class ExoPlayer extends ExoMediaPlayer {
                         DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
                 .build());
         setRenderersFactory(buildRenderersFactory(context));
-        LOG.i("echo-exo-low-memory-load-control");
         memory = AudioTrackMemory.getInstance(context);
     }
 
@@ -80,7 +79,6 @@ public class ExoPlayer extends ExoMediaPlayer {
                 }
             }
         });
-        LOG.i("echo-exo-cues-listener-ready");
     }
 
     @Override
@@ -102,7 +100,6 @@ public class ExoPlayer extends ExoMediaPlayer {
         try {
             Method method = DefaultRenderersFactory.class.getMethod("forceDisableMediaCodecAsynchronousQueueing");
             method.invoke(factory);
-            LOG.i("echo-exo-disable-async-codec-queue");
         } catch (Throwable th) {
             LOG.i("echo-exo-disable-async-codec-queue-skip:" + th.getClass().getSimpleName());
         }

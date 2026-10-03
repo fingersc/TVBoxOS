@@ -87,4 +87,20 @@ public class CacheManager {
         }
         return null;
     }
+
+    /**
+     * 清空整张 cache 表。
+     * <p>由设置页「清空缓存」触发：清除不再属于任何观看历史的直链播放进度，
+     * 以及可再生的字幕缓存。</p>
+     *
+     * @return 实际删除的行数
+     */
+    public static int deleteAll() {
+        try {
+            return AppDataManager.get().getCacheDao().deleteAll();
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
+        }
+    }
 }

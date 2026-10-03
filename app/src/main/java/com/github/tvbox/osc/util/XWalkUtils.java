@@ -89,27 +89,6 @@ public class XWalkUtils {
         }
     }
 
-    private static boolean checkEmbedded(Activity activity) {
-        try {
-            Class clazz = Class.forName("org.xwalk.core.XWalkCoreWrapper");
-            if (clazz != null) {
-                Constructor constructor = clazz.getDeclaredConstructor(new Class[]{Context.class, int.class});
-                constructor.setAccessible(true);
-                Object obj = constructor.newInstance(activity, -1);
-                Method fe = clazz.getDeclaredMethod("findEmbeddedCore", new Class[]{});
-                fe.setAccessible(true);
-                if (!(boolean) fe.invoke(obj)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
-        return true;
-    }
 
     public static boolean apkHadDown(Context context) {
         return new File(apkPath(context)).exists();

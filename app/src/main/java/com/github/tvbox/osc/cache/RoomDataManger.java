@@ -46,8 +46,17 @@ public class RoomDataManger {
         }
     };
 
+    /**
+     * Gson 实例是线程安全的，且构建一次开销不低（含 ExclusionStrategy 注册）。
+     * 原实现每次调用都 new 一个，而它又被 getAllVodRecord / getVodInfoBySameName 等
+     * 在<b>遍历循环内逐条调用</b>，等于对每条历史记录重建一次 Gson。
+     * 改为进程内单例。
+     */
+    private static final Gson VOD_INFO_GSON =
+            new GsonBuilder().addSerializationExclusionStrategy(vodInfoStrategy).create();
+
     private static Gson getVodInfoGson() {
-        return new GsonBuilder().addSerializationExclusionStrategy(vodInfoStrategy).create();
+        return VOD_INFO_GSON;
     }
 
     public static void insertVodRecord(String sourceKey, VodInfo vodInfo) {
@@ -159,8 +168,20 @@ public class RoomDataManger {
     }
 
     public static void deleteVodRecord(String sourceKey, VodInfo vodInfo) {
-        PlayProgressManager.deleteByVod(sourceKey, vodInfo.id);
-        VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodInfo.id);
+        if (vodInfo == null) return;
+        deleteVodRecord(sourceKey, vodInfo.id);
+    }
+
+    /**
+     * 按「源 + 影片ID」删除观看历史，并同步清空该影片的全部播放进度
+     * （看到第几集、各集的播放位置与最后观看时间）。
+     * <p>不要求先取到 VodInfo：即使历史行已不存在（例如刚被超限裁剪），
+     * 直接按主键清进度也能避免残留。</p>
+     */
+    public static void deleteVodRecord(String sourceKey, String vodId) {
+        if (TextUtils.isEmpty(vodId)) return;
+        PlayProgressManager.deleteByVod(sourceKey, vodId);
+        VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodId);
         if (record != null) {
             AppDataManager.get().getVodRecordDao().delete(record);
         }
@@ -198,7 +219,11 @@ public class RoomDataManger {
             }
         }
         if (dao.getCount() > hisNum) {
-            dao.reserver(hisNum);
+            // reserver 会删掉超出条数的旧历史；被删影片的播放进度随即成为孤儿，
+            // 必须一并清理，否则"历史里已经没有这部片了，进度却一直留着"。
+            if (dao.reserver(hisNum) > 0) {
+                PlayProgressManager.deleteOrphaned();
+            }
         }
         int size = Math.min(vodInfoList.size(), Math.min(limit, hisNum));
         return new ArrayList<>(vodInfoList.subList(0, size));
@@ -215,6 +240,9 @@ public class RoomDataManger {
                 VodInfo history = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {
                 }.getType());
                 if (TextUtils.equals(name, getVodRecordName(history))) {
+                    // 同名合并删除旧源历史时，同步清掉它在进度表里的所有集记录，
+                    // 否则这些行会成为读不到的孤儿。
+                    PlayProgressManager.deleteByVod(record.sourceKey, record.vodId);
                     dao.delete(record);
                 }
             } catch (Exception ignored) {
@@ -253,6 +281,17 @@ public class RoomDataManger {
     
     public static void deleteVodCollectAll() {
         AppDataManager.get().getVodCollectDao().deleteAll();
+    }
+
+    /**
+     * 清理"已不在观看历史中"的影片所残留的播放进度（看到第几集、各集播放位置与时间）。
+     * <p>供设置页「清空缓存」调用：历史记录内的影片其进度会被保留，
+     * 只有那些已经从历史里消失（被裁剪 / 合并删除 / 清空）的影片才会被清掉。</p>
+     *
+     * @return 实际删除的进度行数
+     */
+    public static int deleteOrphanedPlayProgress() {
+        return PlayProgressManager.deleteOrphaned();
     }
 
     public static void deleteVodRecordAll() {

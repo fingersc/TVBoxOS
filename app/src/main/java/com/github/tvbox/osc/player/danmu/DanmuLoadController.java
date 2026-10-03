@@ -183,7 +183,6 @@ public class DanmuLoadController {
         int seq = loadSeq.incrementAndGet();
         startedSeq = -1;
         final int currentSeekGeneration = seekGeneration;
-        LOG.i("echo-danmu load title: " + safeLog(danmuTitle) + ", episode: " + safeLog(danmuEpisode) + ", source: " + getSourceSummary(danmu));
         if (executor == null || executor.isShutdown()) {
             executor = Executors.newSingleThreadExecutor();
         }
@@ -196,12 +195,10 @@ public class DanmuLoadController {
             long currentPosition = videoView.getCurrentPosition();
             initialPosition = currentPosition > 0 ? currentPosition : videoView.getPlaybackPosition();
         }
-        LOG.i("echo-danmu parse start at: " + initialPosition);
         executor.execute(() -> {
             Parser currentParser = new Parser(danmu, () -> seq != loadSeq.get(), initialPosition);
             if (seq != loadSeq.get()) return;
             int danmuCount = currentParser.getDanmuCount();
-            LOG.i("echo-danmu parsed count: " + danmuCount);
             if (danmuView == null) return;
             final Parser preparedParser = currentParser;
             danmuView.post(() -> {
@@ -251,7 +248,6 @@ public class DanmuLoadController {
                 if (seq != loadSeq.get() || generation != seekGeneration || !DanmuHelper.isOpen() || danmuView == null) return;
                 danmuView.addDanmaku(item);
             }
-            LOG.i("echo-danmu appended count: " + batch.size());
             if (seq == loadSeq.get() && generation == seekGeneration && DanmuHelper.isOpen() && parser.hasMoreDanmaku()) {
                 long delay = seekFirstBatch ? 1000 : 50;
                 danmuView.postDelayed(() -> appendRemaining(parser, seq, generation), delay);
@@ -297,7 +293,6 @@ public class DanmuLoadController {
         danmuView.seekTo(position);
         danmuView.start(position);
         startedSeq = seq;
-        LOG.i("echo-danmu start at: " + position);
     }
 
     private boolean isVideoReady() {

@@ -35,24 +35,6 @@ public class SearchHelper {
         if (mCheckSources == null || mCheckSources.isEmpty()) {
             mCheckSources = getSources();
         }
-//        else {
-//            HashMap<String, String> newSources = getSources();
-//            for (Map.Entry<String, String> entry : newSources.entrySet()) {
-//                String newKey = entry.getKey();
-//                String newValue = entry.getValue();
-//                if (!mCheckSources.containsKey(newKey)) {
-//                    mCheckSources.put(newKey, newValue);
-//                }
-//            }
-//            Iterator<Map.Entry<String, String>> iterator = mCheckSources.entrySet().iterator();
-//            while (iterator.hasNext()) {
-//                Map.Entry<String, String> oldEntry = iterator.next();
-//                String oldKey = oldEntry.getKey();
-//                if (!newSources.containsKey(oldKey)) {
-//                    iterator.remove();
-//                }
-//            }
-//        }
         return mCheckSources;
     }
 

@@ -75,4 +75,21 @@ public class PlayProgressManager {
             th.printStackTrace();
         }
     }
+
+    /**
+     * 清理"孤儿"进度：所属影片已不在观看历史（vodRecord 表）中，因此永远无法再被读到。
+     * <p>产生途径有三：历史条数超上限被 {@code VodRecordDao.reserver} 自动裁剪、
+     * 开启同名合并时旧源记录被删除、用户清空历史。前两者此前只删历史不删进度，
+     * 残留会随使用时间单调增长（每部片每集一行，永不释放）。</p>
+     *
+     * @return 实际删除的行数
+     */
+    public static int deleteOrphaned() {
+        try {
+            return AppDataManager.get().getPlayProgressDao().deleteOrphaned();
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
+        }
+    }
 }

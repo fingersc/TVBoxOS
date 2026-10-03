@@ -180,7 +180,6 @@ public class PlayFragment extends BaseLazyFragment {
     private final List<Cue> exoCues = new ArrayList<>();
     private boolean exoInternalSubtitle;
 
-    private final long videoDuration = -1;
 
     @Override
     protected int getLayoutResID() {
@@ -258,7 +257,6 @@ public class PlayFragment extends BaseLazyFragment {
                 try {
                     rec = Long.parseLong((String) theCache);
                 } catch (NumberFormatException e) {
-                    LOG.i("echo-String value is not a valid long.");
                 }
             }
         }
@@ -355,7 +353,6 @@ public class PlayFragment extends BaseLazyFragment {
                 }
                 if (switchingPlayback) {
                     if (playState == VideoView.STATE_PLAYBACK_COMPLETED) {
-                        LOG.i("echo-music keep session while resolving next episode");
                         return;
                     } else if (playState == VideoView.STATE_ERROR) {
                         switchingPlayback = false;
@@ -640,7 +637,6 @@ public class PlayFragment extends BaseLazyFragment {
                             @Override
                             public void run() {
                                 String zimuUrl = subtitle.getUrl();
-                                LOG.i("echo-Remote Subtitle Url: " + zimuUrl);
                                 setSubtitle(zimuUrl);//设置字幕
                                 searchSubtitleDialog.dismiss();
                             }
@@ -664,7 +660,6 @@ public class PlayFragment extends BaseLazyFragment {
                         .withChosenListener(new ChooserDialog.Result() {
                             @Override
                             public void onChoosePath(String path, File pathFile) {
-                                LOG.i("echo-Local Subtitle Path: " + path);
                                 setSubtitle(path);//设置字幕
                             }
                         })
@@ -1014,11 +1009,9 @@ public class PlayFragment extends BaseLazyFragment {
             goPlayUrl(url,headers);
             return;
         }
-        LOG.i("echo-playM3u8:" + url);
         mController.playM3u8(url,headers);
     }
     public void goPlayUrl(String url, HashMap<String, String> headers) {
-        LOG.i("echo-goPlayUrl:" + url);
         if (TextUtils.isEmpty(url)) {
             handleResolvePlayUrlFailed("获取播放地址为空");
             return;
@@ -3451,7 +3444,6 @@ public class PlayFragment extends BaseLazyFragment {
         @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
-            LOG.i("echo-onPageFinished url:" + url);
             if(!url.equals("about:blank")){
                 mController.evaluateScript(sourceBean,url,view,null);
             }
@@ -3483,7 +3475,6 @@ public class PlayFragment extends BaseLazyFragment {
                 if (checkVideoFormat(url)) {
                     loadFoundVideoUrls.add(url);
                     loadFoundVideoUrlsHeader.put(url, headers);
-                    LOG.i("echo-loadFoundVideoUrl:" + url );
                     if (loadFoundCount.incrementAndGet() == 1) {
                         stopLoadWebView(false);
                         SuperParse.stopJsonJx();
@@ -3515,7 +3506,6 @@ public class PlayFragment extends BaseLazyFragment {
         @TargetApi(Build.VERSION_CODES.LOLLIPOP)
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             String url = request.getUrl().toString();
-            LOG.i("echo-shouldInterceptRequest url:" + url);
             HashMap<String, String> webHeaders = new HashMap<>();
             Map<String, String> hds = request.getRequestHeaders();
             if (hds != null && hds.keySet().size() > 0) {
@@ -3624,7 +3614,6 @@ public class PlayFragment extends BaseLazyFragment {
         @Override
         public void onLoadFinished(XWalkView view, String url) {
             super.onLoadFinished(view, url);
-            LOG.i("echo-onLoadFinished url:" + url);
             if(!url.equals("about:blank")){
                 mController.evaluateScript(sourceBean,url,null,view);
             }
@@ -3638,7 +3627,6 @@ public class PlayFragment extends BaseLazyFragment {
         @Override
         public XWalkWebResourceResponse shouldInterceptLoadRequest(XWalkView view, XWalkWebResourceRequest request) {
             String url = request.getUrl().toString();
-            LOG.i("echo-shouldInterceptLoadRequest url:" + url);
             // suppress favicon requests as we don't display them anywhere
             if (url.endsWith("/favicon.ico")) {
                 if (url.startsWith("http://127.0.0.1")) {
@@ -3675,7 +3663,6 @@ public class PlayFragment extends BaseLazyFragment {
                     }
                     loadFoundVideoUrls.add(url);
                     loadFoundVideoUrlsHeader.put(url, webHeaders);
-                    LOG.i("echo-loadFoundVideoUrl:" + url );
                     if (loadFoundCount.incrementAndGet() == 1) {
                         stopLoadWebView(false);
                         SuperParse.stopJsonJx();

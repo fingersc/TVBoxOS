@@ -12,7 +12,6 @@ import java.io.Reader;
 public class UnicodeReader extends Reader {
     private InputStreamReader internalIn = null;
     private String encoding;
-    private static final int BOM_SIZE = 4;
 
     public UnicodeReader(String file)
             throws IOException, FileNotFoundException, SecurityException {

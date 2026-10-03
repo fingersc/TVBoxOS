@@ -318,7 +318,6 @@ public class MusicPlaybackService extends Service {
             }
             if (wakeLock != null && !wakeLock.isHeld()) {
                 wakeLock.acquire();
-                LOG.i("echo-music wake lock acquired");
             }
         } catch (Throwable th) {
             LOG.i("echo-music wake lock acquire failed: " + th.getMessage());
@@ -333,7 +332,6 @@ public class MusicPlaybackService extends Service {
             }
             if (wifiLock != null && !wifiLock.isHeld()) {
                 wifiLock.acquire();
-                LOG.i("echo-music wifi lock acquired");
             }
         } catch (Throwable th) {
             LOG.i("echo-music wifi lock acquire failed: " + th.getMessage());
@@ -344,7 +342,6 @@ public class MusicPlaybackService extends Service {
         try {
             if (wifiLock != null && wifiLock.isHeld()) {
                 wifiLock.release();
-                LOG.i("echo-music wifi lock released");
             }
         } catch (Throwable th) {
             LOG.i("echo-music wifi lock release failed: " + th.getMessage());
@@ -354,7 +351,6 @@ public class MusicPlaybackService extends Service {
         try {
             if (wakeLock != null && wakeLock.isHeld()) {
                 wakeLock.release();
-                LOG.i("echo-music wake lock released");
             }
         } catch (Throwable th) {
             LOG.i("echo-music wake lock release failed: " + th.getMessage());

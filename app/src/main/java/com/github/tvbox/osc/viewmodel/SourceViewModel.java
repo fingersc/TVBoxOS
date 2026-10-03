@@ -265,7 +265,6 @@ public class SourceViewModel extends ViewModel {
                         public String call() throws Exception {
                             Spider sp = ApiConfig.get().getCSP(sourceBean);
                             String json = sp.homeContent(true);
-//                            LOG.i("echo--getSort :" + json);
                             return json;
                         }
                     });
@@ -488,7 +487,6 @@ public class SourceViewModel extends ViewModel {
                     String json = null;
                     try {
                         json = future.get(homeSourceBean.getPlayTimeoutSeconds(), TimeUnit.SECONDS);
-//                        LOG.i("echo-categoryContent:"+json);
                     } catch (TimeoutException e) {
                         LOG.i("echo--getList-timeout--" + homeSourceBean.getKey());
                         e.printStackTrace();
@@ -587,7 +585,6 @@ public class SourceViewModel extends ViewModel {
                         @Override
                         public void onSuccess(Response<String> response) {
                             String json = response.body();
-//                            LOG.i("echo-list: " + json);
                             json(listResult, json, homeSourceBean.getKey());
                         }
 
@@ -626,7 +623,6 @@ public class SourceViewModel extends ViewModel {
                     String json = null;
                     try {
                         json = future.get(sourceBean.getPlayTimeoutSeconds(), TimeUnit.SECONDS);
-//                        LOG.i("echo-getfoderList:"+json);
                     } catch (Throwable ignored) {
                         future.cancel(true);
                     } finally {
@@ -713,7 +709,6 @@ public class SourceViewModel extends ViewModel {
                         public String call() throws Exception {
                             Spider sp = ApiConfig.get().getCSP(sourceBean);
                             String json = sp.homeVideoContent();
-//                            LOG.i("echo--getHomeRecList :" + json);
                             return json;
                         }
                     });
@@ -830,7 +825,6 @@ public class SourceViewModel extends ViewModel {
                             List<String> ids = new ArrayList<>();
                             ids.add(id);
                             try {
-//                                LOG.i("echo--getDetail--id: " + id);
                                 return sp.detailContent(ids);
                             } catch (Exception e) {
                                 LOG.i("echo--getDetail--error: " + e.getMessage());
@@ -842,7 +836,6 @@ public class SourceViewModel extends ViewModel {
                     String json = null;
                     try {
                         json = future.get(fallback ? 6 : 30, TimeUnit.SECONDS);
-//                        LOG.i("echo--getDetail--result:" + json);
                     } catch (TimeoutException e) {
                         LOG.i("echo--getDetail--timeout");
                         future.cancel(true);
@@ -951,7 +944,6 @@ public class SourceViewModel extends ViewModel {
             try {
                 Spider sp = ApiConfig.get().getCSP(sourceBean);
                 String search = sp.searchContent(wd, false);
-//                LOG.i("echo--searchContent--result:" + search);
                 if(!TextUtils.isEmpty(search)){
                     json(result, search, sourceBean.getKey(), searchToken);
                 } else {
@@ -1030,7 +1022,6 @@ public class SourceViewModel extends ViewModel {
                     @Override
                     public void onSuccess(Response<String> response) {
                             String json = response.body();
-//                            LOG.i("echo-t4 search onSuccess"+json);
                             json(result, json, sourceBean.getKey(), searchToken);
                     }
 
@@ -1168,7 +1159,6 @@ public class SourceViewModel extends ViewModel {
                             Spider sp = ApiConfig.get().getCSP(sourceBean);
                             if (TextUtils.isEmpty(requestUrl)) return "";
                             try {
-                                LOG.i("echo--getPlay--id: " + requestUrl);
                                 return sp.playerContent(playFlag, requestUrl, ApiConfig.get().getVipParseFlags());
                             } catch (Exception e) {
                                 LOG.i("echo--getPlay--error: " + e.getMessage());
@@ -1179,7 +1169,6 @@ public class SourceViewModel extends ViewModel {
 
                     try {
                         String json = future.get(sourceBean.getPlayTimeoutSeconds(), TimeUnit.SECONDS);
-                        LOG.i("echo--getPlay--result:" + json);
                         // 处理返回的 JSON
                         if (!TextUtils.isEmpty(json)) {
                             JSONObject result = normalizePlayerResult(new JSONObject(json));
@@ -1306,7 +1295,6 @@ public class SourceViewModel extends ViewModel {
             result.put("jx", 0);
             result.put("url", pushUrl.url);
             mergePushHeaders(result, pushUrl);
-            LOG.i("echo--getPlay--direct:" + pushUrl.url);
             return result;
         } catch (Throwable th) {
             th.printStackTrace();
@@ -1485,7 +1473,6 @@ public class SourceViewModel extends ViewModel {
         if(!extend.startsWith("http"))return extend;
         final String key = MD5.string2MD5(extend);
         if (extendCache.containsKey(key)) {
-            LOG.i("echo-getFixUrl Cache");
             return extendCache.get(key);
         }
         Future<String> future = spThreadPool.submit(new Callable<String>() {
@@ -1628,15 +1615,6 @@ public class SourceViewModel extends ViewModel {
                             str = new String[]{urlInfo.urls};
                         }
                         List<Movie.Video.UrlBean.UrlInfo.InfoBean> infoBeanList = new ArrayList<>();
-//                        for (String s : str) {
-//                            if (s.contains("$")) {
-//                                String[] ss = s.split("\\$");
-//                                if (ss.length >= 2) {
-//                                    infoBeanList.add(new Movie.Video.UrlBean.UrlInfo.InfoBean(ss[0], ss[1]));
-//                                }
-//                                //infoBeanList.add(new Movie.Video.UrlBean.UrlInfo.InfoBean(s.substring(0, s.indexOf("$")), s.substring(s.indexOf("$") + 1)));
-//                            }
-//                        }
                         for (String s : str) {
                             String[] ss = s.split("\\$", 2);
                             if (ss.length > 0) {
@@ -1904,23 +1882,6 @@ public class SourceViewModel extends ViewModel {
 
     private AbsXml json(MutableLiveData<AbsXml> result, String json, String sourceKey, String searchToken) {
         try {
-            // 测试数据
-//            json = "{\n" +
-//                    "\t\"list\": [{\n" +
-//                    "\t\t\"vod_id\": \"137133\",\n" +
-//                    "\t\t\"vod_name\": \"磁力测试\",\n" +
-//                    "\t\t\"vod_pic\": \"https:/img9.doubanio.com/view/photo/s_ratio_poster/public/p2656327176.webp\",\n" +
-//                    "\t\t\"type_name\": \"剧情 / 爱情 / 古装\",\n" +
-//                    "\t\t\"vod_year\": \"2022\",\n" +
-//                    "\t\t\"vod_area\": \"中国大陆\",\n" +
-//                    "\t\t\"vod_remarks\": \"40集全\",\n" +
-//                    "\t\t\"vod_actor\": \"刘亦菲\",\n" +
-//                    "\t\t\"vod_director\": \"杨阳\",\n" +
-//                    "\t\t\"vod_content\": \"　　在钱塘开茶铺的赵盼儿（刘亦菲 饰）惊闻未婚夫、新科探花欧阳旭（徐海乔 饰）要另娶当朝高官之女，不甘命运的她誓要上京讨个公道。在途中她遇到了出自权门但生性正直的皇城司指挥顾千帆（陈晓 饰），并卷入江南一场大案，两人不打不相识从而结缘。赵盼儿凭借智慧解救了被骗婚而惨遭虐待的“江南第一琵琶高手”宋引章（林允 饰）与被苛刻家人逼得离家出走的豪爽厨娘孙三娘（柳岩 饰），三位姐妹从此结伴同行，终抵汴京，见识世间繁华。为了不被另攀高枝的欧阳旭从东京赶走，赵盼儿与宋引章、孙三娘一起历经艰辛，将小小茶坊一步步发展为汴京最大的酒楼，揭露了负心人的真面目，收获了各自的真挚感情和人生感悟，也为无数平凡女子推开了一扇平等救赎之门。\",\n" +
-//                    "\t\t\"vod_play_from\": \"磁力测试\",\n" +
-//                    "\t\t\"vod_play_url\": \"0$magnet:?xt=urn:btih:e398ca38fb9d64897ed19b4d16efeea11af4d03b\"\n" +
-//                    "\t}]\n" +
-//                    "}";
             AbsJson absJson = gson.fromJson(json, new TypeToken<AbsJson>() {
             }.getType());
             AbsXml data = absJson.toAbsXml();

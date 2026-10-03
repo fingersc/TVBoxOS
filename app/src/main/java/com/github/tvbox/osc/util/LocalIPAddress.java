@@ -89,7 +89,7 @@ public class LocalIPAddress {
                 }
             }
         } catch (SocketException ex) {
-            System.err.print("error");
+            LOG.e("LocalIPAddress: 获取本地IP失败, " + ex.getMessage());
         }
         return "127.0.0.1";
     }

@@ -41,4 +41,15 @@ public interface CacheDao {
     //只能传递对象昂,删除时根据Cache中的主键 来比对的
     @Update(onConflict = OnConflictStrategy.REPLACE)
     int update(Cache cache);
+
+    /**
+     * 清空整张 cache 表。
+     * <p>该表存放两类数据：一是无 vodId 的直链播放（推送/外部播放器）进度，
+     * 二是字幕文件的下载/解析结果。前者不属于任何观看历史，理应随「清空缓存」一并清掉；
+     * 后者本就是可再生的缓存。</p>
+     *
+     * @return 实际删除的行数
+     */
+    @Query("delete from cache")
+    int deleteAll();
 }

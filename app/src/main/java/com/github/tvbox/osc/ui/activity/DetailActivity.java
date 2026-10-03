@@ -2982,36 +2982,6 @@ public class DetailActivity extends BaseActivity {
         searchTitle = mVideo.name;
         quickSearchData.clear();
         quickSearchWord.addAll(SearchHelper.splitWords(searchTitle));
-        // 分词
-//        OkGo.<String>get("http://api.pullword.com/get.php?source=" + URLEncoder.encode(searchTitle) + "&param1=0&param2=0&json=1")
-//                .tag("fenci")
-//                .execute(new AbsCallback<String>() {
-//                    @Override
-//                    public String convertResponse(okhttp3.Response response) throws Throwable {
-//                        if (response.body() != null) {
-//                            return response.body().string();
-//                        } else {
-//                            throw new IllegalStateException("网络请求错误");
-//                        }
-//                    }
-//
-//                    @Override
-//                    public void onSuccess(Response<String> response) {
-//                        String json = response.body();
-//                        try {
-//                            for (JsonElement je : new Gson().fromJson(json, JsonArray.class)) {
-//                                quickSearchWord.add(je.getAsJsonObject().get("t").getAsString());
-//                            }
-//                        } catch (Throwable th) {
-//                            th.printStackTrace();
-//                        }
-//                        List<String> words = new ArrayList<>(new HashSet<>(quickSearchWord));
-//                        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_QUICK_SEARCH_WORD, words));
-//                    }
-//
-//                    @Override
-//                    public void onError(Response<String> response) {super.onError(response);}
-//                });
 
         searchResult();
     }
@@ -3824,44 +3794,6 @@ public class DetailActivity extends BaseActivity {
     }
 }
 
-    private long readOldTimeFromRecord(VodInfo oldRecord) {
-        try {
-            if (oldRecord == null) {
-                return 0;
-            }
-            String oldFlag = oldRecord.playFlag;
-            String oldSeriesName = oldRecord.playNote;
-            if (TextUtils.isEmpty(oldSeriesName)) {
-                // 注意：oldRecord.seriesMap 未持久化（序列化时被排除），无法回退取集名
-                return 0;
-            }
-            String oldKey = (oldRecord.sourceKey == null ? "" : oldRecord.sourceKey)
-                    + (oldRecord.id == null ? "" : oldRecord.id)
-                    + (oldFlag == null ? "" : oldFlag) + oldRecord.playIndex + oldSeriesName;
-            return readCachedLong(oldKey);
-        } catch (Throwable th) {
-            return 0;
-        }
-    }
-
-    private long readOldTimeFromSnapshot() {
-        try {
-            if (!fallbackFromValid || fallbackFromIndex < 0 || TextUtils.isEmpty(fallbackFromName)) {
-                return 0;
-            }
-            String oldKey = (fallbackFromSourceKey == null ? "" : fallbackFromSourceKey)
-                    + (fallbackFromVodId == null ? "" : fallbackFromVodId)
-                    + (fallbackFromFlag == null ? "" : fallbackFromFlag)
-                    + fallbackFromIndex + fallbackFromName;
-            long t = readCachedLong(oldKey);
-            if (t > 0) {
-                fallbackFromValid = false; // 快照一次性消费，防止残留影响后续切源
-            }
-            return t;
-        } catch (Throwable th) {
-            return 0;
-        }
-    }
     
     /**
      * 同一源内跨线路迁移播放时间（如 hhyun -> hhm3u8）。

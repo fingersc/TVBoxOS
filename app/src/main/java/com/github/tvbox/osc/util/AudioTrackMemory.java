@@ -24,12 +24,10 @@ public class AudioTrackMemory {
         return instance;
     }
     public void save(String playKey, int groupIndex, int trackIndex) {
-        LOG.i("echo-AudioTrackMemory save playKey:"+playKey);
         playKey=playKey + "_exo";
         prefs.edit().putInt(playKey + KEY_GROUP_SUFFIX, groupIndex).putInt(playKey + KEY_TRACK_SUFFIX, trackIndex).apply();
     }
     public void save(String playKey, int trackIndex) {
-        LOG.i("echo-AudioTrackMemory save playKey:"+playKey);
         prefs.edit().putInt(playKey +"_ijk" + KEY_TRACK_SUFFIX, trackIndex).apply();
     }
     public Pair<Integer,Integer> exoLoad(String playKey) {

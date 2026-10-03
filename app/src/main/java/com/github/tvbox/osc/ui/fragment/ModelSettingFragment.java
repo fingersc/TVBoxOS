@@ -24,6 +24,8 @@ import com.github.tvbox.osc.base.BaseActivity;
 import com.github.tvbox.osc.base.BaseLazyFragment;
 import com.github.tvbox.osc.bean.IJKCode;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.cache.CacheManager;
+import com.github.tvbox.osc.cache.RoomDataManger;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.ui.activity.LocalFileActivity;
 import com.github.tvbox.osc.ui.activity.SettingActivity;
@@ -829,7 +831,6 @@ public class ModelSettingFragment extends BaseLazyFragment {
         try {
             SourceViewModel.clearRuntimeCache();
 //            FileUtils.clearSpiderCacheFiles();
-            LOG.i("echo-clear-config-switch-cache");
         } catch (Exception e) {
             LOG.i("echo-clear-config-switch-cache-error:" + e.getMessage());
             e.printStackTrace();
@@ -1066,6 +1067,15 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 ApiConfig.get().clearSpiderCache();
                 if(cacheDir.exists())FileUtils.cleanDirectory(cacheDir);
                 FileUtils.clearSpiderCacheFiles();
+                // ① 清理"已不在观看历史中"的影片残留的播放记录：
+                //    包含看到第几集、以及每一集的播放位置与最后观看时间。
+                //    仍在历史记录内的影片，其播放记录会被完整保留。
+                RoomDataManger.deleteOrphanedPlayProgress();
+                // ② 清理无 vodId 的直链播放（推送/外部播放器）残留的进度，
+                //    这类播放不写观看历史，因此永远不可能属于"历史记录内"，
+                //    只能集中存放在 Room 的 cache 表，一并清掉。
+                //    表内其余内容是可再生的字幕缓存，清除后会自动重新生成。
+                CacheManager.deleteAll();
             } catch (Exception e) {
                 e.printStackTrace();
             } finally {

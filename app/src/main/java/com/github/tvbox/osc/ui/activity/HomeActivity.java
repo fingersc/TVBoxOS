@@ -105,13 +105,16 @@ public class HomeActivity extends BaseActivity {
     private final Handler mHandler = new Handler();
     private long mExitTime = 0;
     private boolean eventBusRegistered = false;
+    // 首页时钟每秒刷新一次。Date/SimpleDateFormat 提到字段复用，避免每秒 new 两个对象。
+    // （SimpleDateFormat 非线程安全，但此处仅在主线程 Handler 中使用。）
+    private final Date mClockDate = new Date();
+    private final SimpleDateFormat mClockFormat = new SimpleDateFormat("yyyy/MM/dd  E  HH:mm", Locale.CHINA);
     private final Runnable mRunnable = new Runnable() {
         @SuppressLint("SetTextI18n")
         @Override
         public void run() {
-            Date date = new Date();
-            SimpleDateFormat timeFormat = new SimpleDateFormat("yyyy/MM/dd  E  HH:mm", Locale.CHINA);
-            tvDate.setText(timeFormat.format(date));
+            mClockDate.setTime(System.currentTimeMillis());
+            tvDate.setText(mClockFormat.format(mClockDate));
             mHandler.postDelayed(this, 1000);
         }
     };

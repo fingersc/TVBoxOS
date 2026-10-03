@@ -200,9 +200,7 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
 
                 if ((vod.id != null && !vod.id.isEmpty()) && (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 2) && HawkConfig.hotVodDelete) {
                     homeHotVodAdapter.remove(position);
-                    VodInfo vodInfo = RoomDataManger.getVodInfo(vod.sourceKey, vod.id);
-                    assert vodInfo != null;
-                    RoomDataManger.deleteVodRecord(vod.sourceKey, vodInfo);
+                    RoomDataManger.deleteVodRecord(vod.sourceKey, vod.id);
                     Toast.makeText(mContext, "已删除当前记录", Toast.LENGTH_SHORT).show();
                 } else if (vod.id != null && vod.id.startsWith("msearch:")) {
                     jumpSearch(vod);

@@ -100,7 +100,6 @@ public class Proxy {
 
             OkHttpClient client = OkGoHelper.ItvClient;
             String redirectUrl = getRedirectedUrl(url);
-//                LOG.i("echo-url"+redirectUrl);
 
             Request request = new Request.Builder().url(redirectUrl).build();
             try (Response response = executeRequest(client, request)) {
@@ -156,7 +155,7 @@ public class Proxy {
         try {
             return client.newCall(request).execute();
         } catch (IOException e) {
-            System.err.println("网络请求异常：" + e.getMessage());
+            LOG.e("Proxy: 网络请求异常：" + e.getMessage());
             throw e; // 重新抛出异常，让外层处理
         }
     }

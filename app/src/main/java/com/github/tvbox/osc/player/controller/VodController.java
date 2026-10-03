@@ -268,13 +268,18 @@ public class VodController extends BaseController {
 
     int videoPlayState = 0;
 
+    // 下面这个 Runnable 每秒执行一次。Date 与 SimpleDateFormat 提到字段复用：
+    // 原实现每秒 new 两个对象，长时间播放会带来持续 GC 压力。
+    // （SimpleDateFormat 非线程安全，但此处仅在主线程 Handler 中使用。）
+    private final Date mClockDate = new Date();
+    private final SimpleDateFormat mClockFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
+
     private final Runnable myRunnable2 = new Runnable() {
         @SuppressLint("SetTextI18n")
         @Override
         public void run() {
-            Date date = new Date();
-            @SuppressLint("SimpleDateFormat") SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm");
-            mPlayPauseTime.setText(timeFormat.format(date));
+            mClockDate.setTime(System.currentTimeMillis());
+            mPlayPauseTime.setText(mClockFormat.format(mClockDate));
             long mSpeed = mControlWrapper.getTcpSpeed();
             String speed = PlayerHelper.getDisplaySpeed(mSpeed,false);
             String speedBps = PlayerHelper.getDisplaySpeedBps(mSpeed,true);
@@ -1850,7 +1855,6 @@ public class VodController extends BaseController {
         if (webPlayUrl != null && !webPlayUrl.contains("127.0.0.1:9978") &&  webPlayUrl.contains(".m3u8")) {
             try {
                 String urlEncode = URLEncoder.encode(webPlayUrl, "UTF-8");
-                LOG.i("echo-BOM-------");
                 return ControlManager.get().getAddress(true) + "proxy?go=bom&url=" + urlEncode;
             } catch (UnsupportedEncodingException e) {
                 e.printStackTrace();
@@ -1872,7 +1876,6 @@ public class VodController extends BaseController {
             int playerType= mPlayerConfig.getInt("pl");
             int p_type = (playerType == 1) ? playerType + 1 : (playerType == 2) ? playerType - 1 : playerType;
             if (p_type != playerType) {
-                LOG.i("echo-switchPlayer: " + playerType + " -> " + p_type);
 //                Toast.makeText(getContext(), "切换到"+(p_type==1?"IJK":"EXO"), Toast.LENGTH_SHORT).show();
                 mPlayerConfig.put("pl", p_type);
                 updatePlayerCfgView();
@@ -1914,7 +1917,6 @@ public class VodController extends BaseController {
                         }
                         String forwardUrl = extractForwardUrl(url, content);
                         if (forwardUrl.isEmpty()) {
-                            LOG.i("echo-m3u81-to-play");
                             processM3u8Content(url, content, headers);
                         } else {
                             fetchAndProcessForwardUrl(forwardUrl, headers, okGoHeaders, url);
@@ -1961,7 +1963,6 @@ public class VodController extends BaseController {
         String basePath = getBasePath(url);
         RemoteServer.m3u8Content = M3u8.purify(basePath, content);
         if (RemoteServer.m3u8Content == null || M3u8.currentAdCount==0) {
-            LOG.i("echo-m3u8内容解析：未检测到广告");
             listener.startPlayUrl(url, headers);
         } else {
             String proxyUrl = ControlManager.get().getAddress(true) + "proxyM3u8";
@@ -1980,7 +1981,6 @@ public class VodController extends BaseController {
                     @Override
                     public void onSuccess(Response<String> response) {
                         String content = response.body();
-                        LOG.i("echo-m3u82-to-play");
                         processM3u8Content(forwardUrl, content, headers);
                     }
                     @Override
@@ -2047,7 +2047,6 @@ public class VodController extends BaseController {
             // 构造点击的 JS 代码
             String js = selector;
 //            if(!selector.contains("click()"))js+=".click();";
-            LOG.i("echo-javascript:" + js);
             if(web_view!=null){
                 //4.4以上才支持这种写法
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {

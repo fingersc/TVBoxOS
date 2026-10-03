@@ -276,7 +276,6 @@ public class Parser extends BaseDanmakuParser {
         afterCursor = end;
         List<BaseDanmaku> items = createDanmakus(data, start, end);
         initialComplete = !isCancelled();
-        LOG.i("echo-danmu rendered initial count: " + items.size() + ", pending: " + (data.size() - (end - start)));
         Danmakus result = new Danmakus(IDanmakus.ST_BY_TIME);
         for (BaseDanmaku item : items) result.addItem(item);
         return result;

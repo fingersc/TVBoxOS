@@ -140,13 +140,11 @@ public class AppDataManager {
                         @Override
                         public void onCreate(@NonNull SupportSQLiteDatabase db) {
                             super.onCreate(db);
-//                        LOG.i("数据库第一次创建成功");
                         }
 
                         @Override
                         public void onOpen(@NonNull SupportSQLiteDatabase db) {
                             super.onOpen(db);
-//                        LOG.i("数据库打开成功");
                         }
                     }).allowMainThreadQueries()//可以在主线程操作
                     .build();

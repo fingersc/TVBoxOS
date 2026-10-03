@@ -129,12 +129,10 @@ public class SuperParse {
     }
 
     public static JSONObject doJsonJx(LinkedHashMap<String, String>json_jxs,String url){
-        LOG.i("echo-jsonJx1"+json_jxs.toString());
         return JsonParallel.parse(json_jxs, url);
     }
 
     public static JSONObject doJsonJx(String url){
-        LOG.i("echo-jsonJx2"+jsonJx.toString());
         return JsonParallel.parse(jsonJx, url);
     }
 

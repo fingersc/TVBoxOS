@@ -131,6 +131,16 @@ public final class EpisodeNameMatcher {
     private static final Pattern MAIN_RESIDUE_JUNK = Pattern.compile(
             "[第期集话\\s:：、,，.·\\-—_（）()\\[\\]【】“”\"'’]+");
 
+    /**
+     * 方括号/圆括号（含全角）包裹的附属内容，如 {@code [HD]}、{@code (国语)}、{@code （上）}。
+     * <p>提为常量：该剥离动作在 {@code parse / stripMainResidue} 等热路径里出现多次，
+     * 原先每次都用 {@code String.replaceAll(字面量)}，等于每次调用重新编译一次正则。</p>
+     */
+    private static final Pattern BRACKET_CONTENT = Pattern.compile("\\[.*?\\]|\\(.*?\\)|（.*?）");
+
+    /** 画质 / 编码噪声词，与集名语义无关。同样提为常量避免重复编译。 */
+    private static final Pattern QUALITY_JUNK = Pattern.compile("2160p|1080p|720p|480p|4k|h26[45]|x26[45]|mp4");
+
     /** 非正片降权分值：使非正片得分显著低于正片的 80，但又高于 0（保留兜底可匹配性）。 */
     public static final int NON_MAIN_PENALTY = 30;
 
@@ -204,9 +214,7 @@ public final class EpisodeNameMatcher {
             return PART_NONE;
         }
         // 只做清晰度去噪，保留括号（分集可能写在括号里）
-        String w = name.toLowerCase(Locale.ROOT)
-                .replaceAll("2160p|1080p|720p|480p|4k|h26[45]|x26[45]|mp4", "")
-                .trim();
+        String w = QUALITY_JUNK.matcher(name.toLowerCase(Locale.ROOT)).replaceAll("").trim();
         Matcher m = PART_TAIL.matcher(w);
         if (!m.find()) {
             return PART_NONE;
@@ -254,9 +262,8 @@ public final class EpisodeNameMatcher {
         int part = extractPart(work);
 
         // 1. 先去噪（与旧实现一致：去掉方括号/圆括号内容、清晰度标记），保证召回率不下降
-        work = work.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "");
-        work = work.toLowerCase(Locale.ROOT)
-                .replaceAll("2160p|1080p|720p|480p|4k|h26[45]|x26[45]|mp4", "");
+        work = BRACKET_CONTENT.matcher(work).replaceAll("");
+        work = QUALITY_JUNK.matcher(work.toLowerCase(Locale.ROOT)).replaceAll("");
 
         // 2. 日期优先（必须在剥离年份之前，否则 8 位日期会被截断误判）
         Matcher compact = DATE_COMPACT.matcher(work);
@@ -738,7 +745,7 @@ public final class EpisodeNameMatcher {
         if (TextUtils.isEmpty(name)) {
             return "";
         }
-        String work = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "");
+        String work = BRACKET_CONTENT.matcher(name).replaceAll("");
         work = DATE_COMPACT.matcher(work).replaceAll("");
         work = DATE_SEPARATED.matcher(work).replaceAll("");
         work = EIGHT_DIGITS.matcher(work).replaceAll("");
@@ -787,7 +794,7 @@ public final class EpisodeNameMatcher {
         if (TextUtils.isEmpty(name)) {
             return false;
         }
-        String work = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "").trim();
+        String work = BRACKET_CONTENT.matcher(name).replaceAll("").trim();
         int start = -1;
         Matcher arabic = ORDINAL_ARABIC.matcher(work);
         if (arabic.find()) {
@@ -821,7 +828,7 @@ public final class EpisodeNameMatcher {
         if (TextUtils.isEmpty(name)) {
             return "";
         }
-        String work = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "");
+        String work = BRACKET_CONTENT.matcher(name).replaceAll("");
         work = DATE_COMPACT.matcher(work).replaceAll("");
         work = DATE_SEPARATED.matcher(work).replaceAll("");
         work = EIGHT_DIGITS.matcher(work).replaceAll("");
