@@ -9,6 +9,8 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Parcelable;
 import android.text.TextUtils;
 import android.util.AttributeSet;
@@ -91,6 +93,32 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     public static final int STATE_BUFFERED = 7;
     public static final int STATE_START_ABORT = 8;//开始播放中止
     protected int mCurrentPlayState = STATE_IDLE;//当前播放器的状态
+
+    /**
+     * 「缓冲开始」上报的防抖窗口（毫秒）。
+     *
+     * <p><b>为什么要它</b>：直播（尤其是 {@code max_cached_duration} 很小的低延迟配置）
+     * 下，IJK 会每几十毫秒就来一轮 {@code FFP_MSG_BUFFERING_START} / {@code END}，
+     * 实测约 14 对/秒。如实往上报的话，上层每秒要做二十多次 UI 刷新与换源倒计时重排，
+     * 画面还会一闪一闪地闪 loading。</p>
+     *
+     * <p><b>做法</b>：收到 START 先不置 {@link #STATE_BUFFERING}，等够这个时长仍没收到
+     * END 才认为"真的卡了"。短于窗口的抖动被完全吃掉，上层一次都不会被打扰。
+     * 真卡顿（&gt;300ms）的显示只晚 300ms，体感反而更稳。</p>
+     */
+    private static final long BUFFERING_DEBOUNCE_MS = 300L;
+    private final Handler mBufferingHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mBufferingStartRun = new Runnable() {
+        @Override
+        public void run() {
+            setPlayState(STATE_BUFFERING);
+        }
+    };
+
+    /** 取消尚未落地的「缓冲开始」上报（暂停/释放/缓冲结束时调用）。 */
+    private void cancelPendingBufferingStart() {
+        mBufferingHandler.removeCallbacks(mBufferingStartRun);
+    }
 
     public static final int PLAYER_NORMAL = 10;        // 普通播放器
     public static final int PLAYER_FULL_SCREEN = 11;   // 全屏播放器
@@ -345,6 +373,7 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
         if (isInPlaybackState()
                 && mMediaPlayer.isPlaying()) {
             mMediaPlayer.pause();
+            cancelPendingBufferingStart();
             setPlayState(STATE_PAUSED);
             if (mAudioFocusHelper != null && !isMute()) {
                 mAudioFocusHelper.abandonFocus();
@@ -407,6 +436,7 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 释放播放器
      */
     public void release() {
+        cancelPendingBufferingStart();
         if (!isInIdleState()) {
             //释放播放器
             if (mMediaPlayer != null) {
@@ -596,10 +626,17 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     public void onInfo(int what, int extra) {
         switch (what) {
             case AbstractPlayer.MEDIA_INFO_BUFFERING_START:
-                setPlayState(STATE_BUFFERING);
+                // 延迟上报：短于 BUFFERING_DEBOUNCE_MS 的抖动不上报（见字段注释）
+                cancelPendingBufferingStart();
+                mBufferingHandler.postDelayed(mBufferingStartRun, BUFFERING_DEBOUNCE_MS);
                 break;
             case AbstractPlayer.MEDIA_INFO_BUFFERING_END:
-                setPlayState(STATE_BUFFERED);
+                cancelPendingBufferingStart();
+                // ★ 抖动被防抖吃掉时状态并未变成 BUFFERING，这里就不该回落到 BUFFERED，
+                //   否则每次抖动仍会多一次无意义的状态分发（上层照样得忙一遍）
+                if (mCurrentPlayState == STATE_BUFFERING) {
+                    setPlayState(STATE_BUFFERED);
+                }
                 break;
             case AbstractPlayer.MEDIA_INFO_RENDERING_START: // 视频/音频开始渲染
                 setPlayState(STATE_PLAYING);
@@ -1029,6 +1066,11 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 向Controller设置播放状态，用于控制Controller的ui展示
      */
     protected void setPlayState(int playState) {
+        // 状态没变就别往下分发：直播高频抖动场景下这里每秒会被打二十几次，
+        // 每次都要遍历一遍 Controller 组件与状态监听器，纯属白干。
+        if (mCurrentPlayState == playState) {
+            return;
+        }
         mCurrentPlayState = playState;
         if (mVideoController != null) {
             mVideoController.setPlayState(playState);

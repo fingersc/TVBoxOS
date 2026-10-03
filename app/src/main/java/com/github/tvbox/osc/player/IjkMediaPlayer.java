@@ -74,7 +74,13 @@ public class IjkMediaPlayer extends IjkPlayer {
         mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT,"safe",0);
 
         if(Hawk.get(HawkConfig.PLAYER_IS_LIVE, false)){
-            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 300);
+            // ★ 缓存水位（毫秒）：原先 300ms 太贴近临界 —— 缓冲区几乎永远处于
+            //   "刚够/不够"的边缘，解复用器每个分片周期都把它顶下去再拉上来，
+            //   实测 IJK 每秒打出约 14 对 FFP_MSG_BUFFERING_START/END。
+            //   放宽到 1000ms 后抖动基本消失（上层不再每秒被折腾二十几次，
+            //   loading 也不再闪），代价是直播延迟增加约 0.5~1 秒。
+            //   这是「低延迟」与「稳定不抖」的取舍点，要更低延迟就把它调回 300。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 1000);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "flush_packets", 1);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 1);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "1");

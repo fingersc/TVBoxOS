@@ -148,6 +148,16 @@ public class LivePlayActivity extends BaseActivity {
     private Handler mHandler = new Handler();
     private int resolutionInfoRetryCount = 0;
     private boolean resolutionInfoPending = false;
+    /**
+     * 分辨率信息任务是否已在队列中。
+     *
+     * <p>直播缓冲高频抖动时 {@code playStateChanged} 每秒会投十几次 BUFFERED，
+     * 每次都 remove+post 一遍这个任务，实际只在最后一次执行 —— 纯属消息队列表抖动。
+     * 有这个标记后，排队期间不再重复投递。</p>
+     */
+    private boolean resolutionInfoRunScheduled = false;
+    /** 上一次已处理过的播放状态；用于挡住同一状态被反复投递（直播抖动场景每秒十几次）。 */
+    private int lastHandledPlayState = -1;
     private boolean exitingLivePlay = false;
     private static final long EPG_LOAD_DELAY = 1200L;
     private static final int RESOLUTION_INFO_MAX_RETRY = 10;
@@ -1778,16 +1788,22 @@ public class LivePlayActivity extends BaseActivity {
     }
 
     private void hideSwitchChannelSnapshot() {
-        if (switchChannelSnapshotOverlay != null) {
+        // 缓冲抖动时这个方法每秒会被调十几次，而绝大多数时候快照早就 GONE 了。
+        // 先判可见性，省掉每轮 setImageBitmap(null) + 两次 setVisibility 引发的重绘。
+        if (switchChannelSnapshotOverlay != null
+                && switchChannelSnapshotOverlay.getVisibility() != View.GONE) {
             switchChannelSnapshotOverlay.setVisibility(View.GONE);
         }
-        if (switchChannelSnapshotImage != null) {
+        if (switchChannelSnapshotImage != null
+                && switchChannelSnapshotImage.getVisibility() != View.GONE) {
             switchChannelSnapshotImage.setImageBitmap(null);
             switchChannelSnapshotImage.setVisibility(View.GONE);
         }
     }
 
     private boolean playChannel(int channelGroupIndex, int liveChannelIndex, boolean changeSource) {
+        // 换台 = 全新起播，清掉状态去重标记，保证新频道的首个播放状态不被吞掉
+        lastHandledPlayState = -1;
         if ((channelGroupIndex == currentChannelGroupIndex && liveChannelIndex == currentLiveChannelIndex && !changeSource)
                 || (changeSource && currentLiveChannelItem.getSourceNum() == 1)) {
            // showChannelInfo();
@@ -2211,6 +2227,13 @@ public class LivePlayActivity extends BaseActivity {
 
             @Override
             public void playStateChanged(int playState) {
+                // 直播流在 buffering/buffered 之间高频抖动时，同一个状态会被反复投递。
+                // 状态没变就无需重排换源倒计时、也无需再收一次换台快照 —— 纯属白干。
+                // 换台时由 playChannel() 把它重置为 -1，保证新频道首帧状态不被吞掉。
+                if (playState == lastHandledPlayState) {
+                    return;
+                }
+                lastHandledPlayState = playState;
                 mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
                 switch (playState) {
                     case VideoView.STATE_IDLE:
@@ -2224,9 +2247,10 @@ public class LivePlayActivity extends BaseActivity {
                     case VideoView.STATE_PLAYING:
                         // 播放状态：当播放器缓冲完成或正在正常播放时，表明当前源是可用的，
                         hideSwitchChannelSnapshot();
-                        if (resolutionInfoPending) {
+                        if (resolutionInfoPending && !resolutionInfoRunScheduled) {
                             resolutionInfoRetryCount = 0;
                             mHandler.removeCallbacks(mUpdateResolutionInfoRun);
+                            resolutionInfoRunScheduled = true;
                             mHandler.post(mUpdateResolutionInfoRun);
                         }
                         currentLiveChangeSourceTimes = 0;
@@ -2275,6 +2299,9 @@ public class LivePlayActivity extends BaseActivity {
         }
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
         mVideoView.release();
+        // 换播放器重播 = 全新一次起播，状态去重标记必须清掉，
+        // 否则首个状态若与上次相同会被吞掉，换源倒计时就排不上
+        lastHandledPlayState = -1;
         if (!livePlayerManager.switchLivePlayer(mVideoView)) {
             allowLiveSwitchPlayer = false;
             return false;
@@ -3069,6 +3096,7 @@ public class LivePlayActivity extends BaseActivity {
         }
         mHandler.removeCallbacks(mHideResolutionInfoRun);
         mHandler.removeCallbacks(mUpdateResolutionInfoRun);
+        resolutionInfoRunScheduled = true;
         mHandler.postDelayed(mUpdateResolutionInfoRun, RESOLUTION_INFO_RETRY_DELAY);
     }
 
@@ -3085,6 +3113,7 @@ public class LivePlayActivity extends BaseActivity {
     private final Runnable mUpdateResolutionInfoRun = new Runnable() {
         @Override
         public void run() {
+            resolutionInfoRunScheduled = false;
             if (tvResolution == null || mVideoView == null) {
                 return;
             }
@@ -3112,6 +3141,7 @@ public class LivePlayActivity extends BaseActivity {
 
     private void retryOrHideResolutionInfo() {
         if (resolutionInfoPending && resolutionInfoRetryCount++ < RESOLUTION_INFO_MAX_RETRY) {
+            resolutionInfoRunScheduled = true;
             mHandler.postDelayed(mUpdateResolutionInfoRun, RESOLUTION_INFO_RETRY_DELAY);
         } else {
             tvResolution.setVisibility(View.GONE);
