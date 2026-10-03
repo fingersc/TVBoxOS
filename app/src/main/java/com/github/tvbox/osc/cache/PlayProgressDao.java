@@ -21,6 +21,14 @@ public interface PlayProgressDao {
     int deleteByVod(String sourceKey, String vodId);
 
     /**
+     * 取某部影片在某个源下的<b>全部集</b>进度行。
+     * <p>用于换源时把整部片的进度整体搬到新源——此前只在详情回调里迁移"当前播的那一集"，
+     * 其余各集随旧源记录被删而一起丢失。</p>
+     */
+    @Query("select * from play_progress where sourceKey = :sourceKey and vodId = :vodId")
+    java.util.List<PlayProgress> getByVod(String sourceKey, String vodId);
+
+    /**
      * 清理"孤儿"进度行：所属影片已不在观看历史（vodRecord）中。
      * 历史记录被裁剪（超出上限自动删除）、同名合并删除、或清空历史后，
      * 这些行已无法再被任何入口读取，只会长期占用数据库体积。

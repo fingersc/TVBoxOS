@@ -148,6 +148,18 @@ public class DetailActivity extends BaseActivity {
     private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = 2500L;
     // ===== 方案B：按源超时（替代 8s 全局超时）=====
     private static final long DETAIL_FALLBACK_SOURCE_TIMEOUT_MS = 3500L;
+
+    /**
+     * 一次切源里，因「候选不可用」而<b>自动续切</b>的次数上限。
+     *
+     * <p>续切触发点有三：详情为空、详情无剧集、详情超时。网络差时（DNS 失败、
+     * 整片站点不可达）这三个条件会连续成立，状态机于是一路往下试，
+     * 表现为用户点一次切源却「连跳好几个站」，且期间无法中断。</p>
+     *
+     * <p>达到上限即停止并保留当前画面，由用户决定是否再点一次——
+     * 连跳十几个站对用户毫无价值，只会让人以为应用失控。</p>
+     */
+    private static final int DETAIL_FALLBACK_MAX_FAILOVER = 3;
     // ===== 方案D：缓存持久化 =====
     private static final String HAWK_FALLBACK_CACHE_PREFIX = "fb_cache_";
     private static final long FALLBACK_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
@@ -1202,6 +1214,9 @@ public class DetailActivity extends BaseActivity {
                         detailFallbackLoadingCandidate = false;
                         detailFallbackDetailTimedOut = true;
                         llLayout.removeCallbacks(detailFallbackDetailTimeout);
+                        if (!consumeFailoverBudget("emptyDetail")) {
+                            return;
+                        }
                         loadNextDetailFallbackSource();
                         return;
                     }
@@ -1313,6 +1328,9 @@ public class DetailActivity extends BaseActivity {
     private void handleNoPlayableDetail() {
         if (detailFallbackActive) {
             detailFallbackLoadingCandidate = false;
+            if (!consumeFailoverBudget("noPlayableDetail")) {
+                return;
+            }
             loadNextDetailFallbackSource();
             return;
         }
@@ -1392,6 +1410,10 @@ public class DetailActivity extends BaseActivity {
         }
 
         detailFallbackActive = true;
+        // 手动发起切源 → 重置失败续切预算。自动续切不清零，那正是要限制的连跳。
+        detailFallbackFailoverCount = 0;
+        LOG.sw("[FB] start title=" + detailFallbackTitle + " manual=" + manual
+                + " from=" + sourceKey + " keepCurrent=" + detailFallbackKeepCurrentDetail);
         boolean accepted = loadNextDetailFallbackFromCache();
         // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
         // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
@@ -1430,8 +1452,9 @@ public class DetailActivity extends BaseActivity {
 
         // 缓存轮转：直接从缓存里按圈取下一个，零网络开销
         String nextSource = pollNextCycledSource();
-        LOG.i("[FB] pollFromCache picked=" + nextSource + " poolSize=" + detailFallbackUsableCandidateCount()
-                + " cycleKeys=" + detailFallbackCycleKeys.size() + " newCycle=" + detailFallbackNewCycle);
+        LOG.sw("[FB] pick picked=" + nextSource + " poolSize=" + detailFallbackUsableCandidateCount()
+                + " cycleKeys=" + detailFallbackCycleKeys.size() + " newCycle=" + detailFallbackNewCycle
+                + " dead=" + detailFallbackDeadKeys.size() + " soft=" + detailFallbackSoftTriedKeys.size());
         if (TextUtils.isEmpty(nextSource)) {
             // 一圈内确实没有可切的源了（所有源都试过且都失败），提示并结束
             if (detailFallbackKeepCurrentDetail && mVideo != null && vodInfo != null) {
@@ -2197,6 +2220,33 @@ public class DetailActivity extends BaseActivity {
      * 统一取源入口：无论从「首次全网搜索结束」还是「后续缓存轮转」进来，
      * 都只从 detailFallbackCache 里按圈取下一个候选，保证两条路径行为一致。
      */
+    /**
+     * 「失败续切」预算：候选不可用（详情为空 / 无剧集 / 超时）而继续跳下一个站之前调用。
+     *
+     * <p>不加限制时，网络差的场景下这三个条件会连续成立，一次手动切源就能连跳十几个站，
+     * 页面不停变化又无法中断，用户只会认为应用失控。达到上限即收尾并保留当前画面。</p>
+     *
+     * @param reason 触发续切的原因，仅用于诊断日志
+     * @return true 表示允许继续续切；false 表示已达上限、调用方应直接返回
+     */
+    private boolean consumeFailoverBudget(String reason) {
+        if (detailFallbackFailoverCount >= DETAIL_FALLBACK_MAX_FAILOVER) {
+            LOG.sw("[FB] failover LIMIT reached reason=" + reason
+                    + " count=" + detailFallbackFailoverCount
+                    + " dead=" + detailFallbackDeadKeys.size()
+                    + " soft=" + detailFallbackSoftTriedKeys.size());
+            Toast.makeText(this, "多个片源暂时不可用，请稍后重试", Toast.LENGTH_SHORT).show();
+            finishDetailFallbackWithoutResult();
+            return false;
+        }
+        detailFallbackFailoverCount++;
+        LOG.sw("[FB] failover #" + detailFallbackFailoverCount + " reason=" + reason
+                + " from=" + sourceKey
+                + " dead=" + detailFallbackDeadKeys.size()
+                + " soft=" + detailFallbackSoftTriedKeys.size());
+        return true;
+    }
+
     private void loadNextDetailFallbackSource() {
         if (!detailFallbackLoadingCandidate && detailFallbackCacheEntryUsable()) {
             String nextSource = pollNextCycledSource();
@@ -2216,6 +2266,8 @@ public class DetailActivity extends BaseActivity {
                 // 同 loadNextDetailFallbackFromCache：站点信息已定，先行刷新页面
                 showDetailFallbackIndicators(nextSource, video);
                 markDetailFallbackInflight(nextSource);
+                LOG.sw("[FB] loadDetail -> " + nextSource + " id=" + videoId
+                        + " failover=" + detailFallbackFailoverCount);
                 loadDetail(videoId, nextSource, true);
                 return;
             }
@@ -2283,6 +2335,9 @@ public class DetailActivity extends BaseActivity {
         detailFallbackSoftTriedKeys.add(timedOutKey);
         detailFallbackTimedOutKey = null;
         OkGo.getInstance().cancelTag("detail");
+        if (!consumeFailoverBudget("detailTimeout")) {
+            return;
+        }
         loadNextDetailFallbackSource();
     }
 
@@ -2724,6 +2779,7 @@ public class DetailActivity extends BaseActivity {
      *                  false = 彻底复位（退出页面 / 换片 / 出错）
      */
     private void resetDetailFallback(boolean keepCache) {
+        detailFallbackFailoverCount = 0;
         detailFallbackActive = false;
         detailFallbackSearching = false;
         detailFallbackSearchCollecting = false;
@@ -2863,6 +2919,13 @@ public class DetailActivity extends BaseActivity {
      * @see #DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS
      */
     private boolean detailFallbackEarlyConsumeScheduled;
+
+    /**
+     * 本轮切源已发生的「失败续切」次数，达到 {@link #DETAIL_FALLBACK_MAX_FAILOVER} 即停止。
+     * 每次<b>手动</b>发起切源时清零；自动续切不清零，正是为了限制连跳。
+     */
+    private int detailFallbackFailoverCount;
+
     /**
      * 提前消费：候选池里已经有可用候选时，不再等搜索阶段收尾就直接放起来。
      *
@@ -3775,6 +3838,9 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
+        LOG.sw("[FB] migrate " + oldRecord.sourceKey + "/" + oldRecord.id + " ep=" + oldSeriesName
+                + " -> " + newSourceKey + "/" + newVodId + " ep=" + newSeriesName
+                + " oldTime=" + oldTime + " newVal=" + newVal);
         if (oldTime > 0) {
             PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
             // ★ 防丢：仅当新集名确实是旧集名的"同一集"时才写（同集名，或由匹配器判定同集）。
@@ -3939,6 +4005,15 @@ public class DetailActivity extends BaseActivity {
             vodInfo.playNote = "";
         } else {
             vodInfo.playNote = list.get(clampIndex(vodInfo.playIndex, list)).name;
+        }
+        // 切源连跳：一站一条地写历史，会挤占历史上限（把其它影片的记录顶掉），
+        // 也让"最近观看"里塞满同一部片。切源本来就是同一部片换站，只保留当前这一条。
+        // 旧源的播放进度会在此之前被整体迁到本源，不会因合并而丢失。
+        if (detailFallbackActive) {
+            int merged = RoomDataManger.mergeSameNameVodRecords(sourceKey, vodInfo);
+            if (merged > 0) {
+                LOG.sw("[FB] mergeSameName removed=" + merged + " keep=" + sourceKey + "/" + vodInfo.id);
+            }
         }
         RoomDataManger.insertVodRecord(sourceKey, vodInfo);
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));

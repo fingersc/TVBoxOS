@@ -18,6 +18,7 @@ import com.orhanobut.hawk.Hawk;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import com.github.tvbox.osc.cache.PlayProgressManager;
@@ -232,6 +233,7 @@ public class RoomDataManger {
     private static void removeSameNameVodRecords(VodRecordDao dao, String sourceKey, VodInfo vodInfo) {
         String name = getVodRecordName(vodInfo);
         if (TextUtils.isEmpty(name)) return;
+        List<String> newEpNames = null;
         for (VodRecord record : dao.getAll(Integer.MAX_VALUE)) {
             if (TextUtils.equals(sourceKey, record.sourceKey) && TextUtils.equals(vodInfo.id, record.vodId)) {
                 continue;
@@ -240,14 +242,44 @@ public class RoomDataManger {
                 VodInfo history = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {
                 }.getType());
                 if (TextUtils.equals(name, getVodRecordName(history))) {
-                    // 同名合并删除旧源历史时，同步清掉它在进度表里的所有集记录，
-                    // 否则这些行会成为读不到的孤儿。
-                    PlayProgressManager.deleteByVod(record.sourceKey, record.vodId);
+                    // ★ 删除旧源历史前，必须先把旧源该片「全部集」的进度搬到新源。
+                    //
+                    // 直接 deleteByVod 会连同其余各集的播放位置与最后观看时间一起抹掉，
+                    // 只留下详情回调里迁移过的「当前正在播的那一集」——表现为换源后
+                    // 以前看过的集时间记忆全部消失。这正是"切源后播放记录丢失"的根因。
+                    if (newEpNames == null) {
+                        newEpNames = collectAllEpisodeNames(vodInfo);
+                    }
+                    PlayProgressManager.migrateByVod(record.sourceKey, record.vodId,
+                            sourceKey, vodInfo.id, newEpNames);
                     dao.delete(record);
                 }
             } catch (Exception ignored) {
             }
         }
+    }
+
+    /** 收集一部影片在<b>所有线路</b>下的集名，供换源时做跨源集名匹配。 */
+    private static List<String> collectAllEpisodeNames(VodInfo vodInfo) {
+        List<String> out = new ArrayList<>();
+        if (vodInfo == null || vodInfo.seriesMap == null) {
+            return out;
+        }
+        try {
+            for (Map.Entry<String, List<VodInfo.VodSeries>> entry : vodInfo.seriesMap.entrySet()) {
+                List<VodInfo.VodSeries> list = entry.getValue();
+                if (list == null) continue;
+                for (VodInfo.VodSeries series : list) {
+                    if (series == null || TextUtils.isEmpty(series.name)) continue;
+                    String n = series.name.trim();
+                    if (!TextUtils.isEmpty(n) && !out.contains(n)) {
+                        out.add(n);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return out;
     }
 
     private static String getVodRecordName(VodInfo vodInfo) {
@@ -281,6 +313,38 @@ public class RoomDataManger {
     
     public static void deleteVodCollectAll() {
         AppDataManager.get().getVodCollectDao().deleteAll();
+    }
+
+    /**
+     * 删除同一部片在<b>其它源</b>下的历史记录，并把它们的播放进度<b>整体迁到本源</b>后
+     * 才清除旧源。等价于把「同名合并历史」这一动作单独开放出来。
+     *
+     * <p>切源连跳会一站一条地写入历史（每跳一个站成功加载详情就写一次），
+     * 既挤占历史上限把其它影片顶掉，也让"最近观看"里塞满同一部片。
+     * 切源本来就是同一部片换站，理应只保留一条——故此处不受
+     * {@code HawkConfig.HISTORY_MERGE} 开关限制。</p>
+     *
+     * @return 被合并掉的旧源条数
+     */
+    public static int mergeSameNameVodRecords(String sourceKey, VodInfo vodInfo) {
+        try {
+            if (vodInfo == null || TextUtils.isEmpty(vodInfo.id)) {
+                return 0;
+            }
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            int before = 0;
+            List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+            if (all != null) {
+                before = all.size();
+            }
+            removeSameNameVodRecords(dao, sourceKey, vodInfo);
+            List<VodRecord> after = dao.getAll(Integer.MAX_VALUE);
+            int now = after == null ? 0 : after.size();
+            return Math.max(0, before - now);
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
+        }
     }
 
     /**

@@ -48,6 +48,20 @@ public class LOG {
         longLog(Log.ERROR, prefix, msg);
     }
 
+    /**
+     * 切源专用诊断通道，<b>不受 {@link #VERBOSE} 门控影响，任何构建都输出</b>。
+     *
+     * <p>切源是一条多节点异步链路（选源 → 详情 → 判空 → 续切 → 起播 → 进度迁移），
+     * 出问题只能靠日志反推。上一轮为性能给 info 级加了 release 门控后，
+     * 这条链路的日志随之消失、无法排障。故单独开一个始终可见的 tag，
+     * 只记切源关键节点，量很小，不影响性能目标。</p>
+     *
+     * <p>过滤：{@code adb logcat -s TVBox-switch}</p>
+     */
+    public static void sw(String msg) {
+        Log.i("TVBox-switch", "" + msg);
+    }
+
     private static void longLog(int priority, String prefix, String msg) {
         String text = msg == null ? "null" : msg;
         String title = prefix == null ? "" : prefix;

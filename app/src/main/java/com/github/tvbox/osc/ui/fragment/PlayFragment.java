@@ -1747,17 +1747,12 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     boolean tryNextLineIfEnabled() {
-        // 诊断：记录换线路/换源入口来源，保留精简调用栈（最近 3 层）。
-        // 用于区分「播放失败自动换源」与「详情页主动切源」；排查完毕可整体删除本段。
-        try {
-            StackTraceElement[] st = Thread.currentThread().getStackTrace();
-            StringBuilder sb = new StringBuilder("[FB] tryNextLineIfEnabled from=");
-            for (int i = 2; i < st.length && i < 5; i++) {
-                sb.append(st[i].getMethodName()).append("<").append(st[i].getLineNumber()).append(") ");
-            }
-            LOG.i(sb.toString());
-        } catch (Throwable ignore) {
-        }
+        // 本处曾有一段「打印调用栈区分换源入口」的诊断代码。
+        // Thread.getStackTrace() 开销可观，而它挂在换线路/换源这条路径上，
+        // 播放失败自动重试时会被反复触发；排查已结束，整体移除。
+        // 需要再次定位入口时，用 TAG「TVBox-switch」的切源日志即可（不受 release 门控）。
+        LOG.sw("[FB] tryNextLineIfEnabled retry=" + autoRetryCount
+                + " allowLine=" + allowAutoSwitchLine + " triedLines=" + triedLineFlags.size());
         restoreAutoSwitchedPlayer();
         if (allowAutoSwitchLine && Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true)) return tryNextLine();
         LOG.i("echo-autoRetry line switching disabled");
