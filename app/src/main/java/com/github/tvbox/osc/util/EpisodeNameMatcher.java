@@ -104,6 +104,29 @@ public final class EpisodeNameMatcher {
     private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
             "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享");
 
+    /**
+     * 期号必须出现在名字<b>开头</b>（允许前置"第x季"），才算"期数式正片"。
+     *
+     * <p><b>为什么需要它（真实 case）</b>：综艺源里衍生内容的命名常把期号写在<b>尾部</b>——
+     * {@code 超前企划第1期}、{@code 超前企划第2期}、{@code 预热直播第2期}、{@code 加更版第1期}。
+     * 它们会被 {@link #ORDINAL_ARABIC} 解析成"第2期"，与真正的 {@code 第2期一公挑战赛（上）}
+     * 撞号；靠关键词黑名单永远列不全，而"期号是否在开头"是稳定的结构特征。</p>
+     *
+     * <p>实测（披荆斩棘2026，红牛源）：用户在看 {@code 20260815}（= 第1期：初舞台（上）），
+     * 秩对齐算出期号 1，却在目标列表里命中了排在更前面的 {@code 超前企划第2期}
+     * ——因为簇序偏了 1（源侧衍生条目未被识别），加上"第2期"被尾巴命中。</p>
+     */
+    /** 季号前缀（"第三季"、"第2季"），判定"期号领衔"时先剥离它。 */
+    private static final Pattern SEASON_PREFIX =
+            Pattern.compile("^第?\\s*[0-9一二三四五六七八九十]{1,4}\\s*季\\s*$");
+
+    /** 是否含中日韩汉字（用于识别"期号前压着内容词"的衍生条目）。 */
+    private static final Pattern HAS_CJK = Pattern.compile("[\\u4e00-\\u9fa5]");
+
+    /** 结构化正片判定用：剥离日期/分段/标点后应无残余字符，否则说明名字里带了内容词（衍生条目）。 */
+    private static final Pattern MAIN_RESIDUE_JUNK = Pattern.compile(
+            "[第期集话\\s:：、,，.·\\-—_（）()\\[\\]【】“”\"'’]+");
+
     /** 非正片降权分值：使非正片得分显著低于正片的 80，但又高于 0（保留兜底可匹配性）。 */
     public static final int NON_MAIN_PENALTY = 30;
 
@@ -446,6 +469,107 @@ public final class EpisodeNameMatcher {
             return false;
         }
         return NON_MAIN_FEATURE.matcher(name).find();
+    }
+
+    /**
+     * 结构化"正片"判定：名字是不是<b>当期正片</b>（区别于超前企划/观演区/直拍/加更/纯享等衍生内容）。
+     *
+     * <p>判定规则（按序）：</p>
+     * <ol>
+     *   <li>命中非正片词表 → 非正片（快速路径，保留原词表的语义）；</li>
+     *   <li>期数域：期号前不得压着中文内容词（见 {@link #isLeadingOrdinal}）→ 正片；<br>
+     *       于是 {@code 第1期：初舞台（上）}、{@code 第2期一公挑战赛（上）} 是正片，
+     *       而 {@code 超前企划第2期}、{@code 加更版第1期} 不是；</li>
+     *   <li>日期域：剥掉日期数字、尾部分段（上/中/下）、标点后<b>没有残余</b>才算正片。<br>
+     *       于是 {@code 20260815}、{@code 20260828上}、{@code 第20260502期上} 是正片，
+     *       而 {@code 20260809超前企划上}、{@code 20260817备战篇}、{@code 20260821一公挑战赛上}、
+     *       {@code 20260822纯享版} 都不是；</li>
+     *   <li>其余（无日期也无可识别期号，如 {@code 先导片}、{@code 直拍机位}、{@code 一公挑战赛（下）}）
+     *       → 非正片。</li>
+     * </ol>
+     *
+     * <p><b>为什么不能只靠词表</b>：衍生内容的名字五花八门（超前企划/观演区/直拍/选歌组队/
+     * 备战篇/全纪录/小考/宿舍日记/“聚”乐部…），黑名单永远列不全；列不全的后果是
+     * "正片簇序"整体偏移，跨域切源就会系统性错一期。</p>
+     */
+    public static boolean isMainFeatureEntry(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        if (NON_MAIN_FEATURE.matcher(name).find()) {
+            return false;
+        }
+        EpisodeKey key = parse(name);
+        if (key.domain == DOMAIN_ORDINAL && key.ordinal > 0) {
+            return isLeadingOrdinal(name);
+        }
+        if (key.domain == DOMAIN_DATE && key.ordinal > 0) {
+            return stripMainResidue(name).isEmpty();
+        }
+        return false;
+    }
+
+    /** {@link #isMainFeatureEntry} 的取反，语义读起来更顺：该条目不是正片。 */
+    private static boolean isNonMainEntry(String name) {
+        return !isMainFeatureEntry(name);
+    }
+
+    /**
+     * 期号是否"领衔"——即期号（或纯序号）之前<b>没有压着中文内容词</b>。
+     *
+     * <p>这是区分正片与衍生内容最稳定的结构特征，且不会误伤以纯数字/字母命名的源：</p>
+     * <ul>
+     *   <li>{@code 第1期：初舞台（上）}、{@code 第2期一公挑战赛（上）} → 领衔 ✅</li>
+     *   <li>{@code 第三季 第1期} → 前置的"第三季"属季号，剥离后仍领衔 ✅</li>
+     *   <li>{@code 01}、{@code EP01} → 无中文内容词前缀 ✅（兼容纯序号命名的源）</li>
+     *   <li>{@code 超前企划第2期}、{@code 预热直播第2期}、{@code 加更版第1期} → 前缀是内容词 ❌</li>
+     * </ul>
+     */
+    private static boolean isLeadingOrdinal(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        String work = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "").trim();
+        int start = -1;
+        Matcher arabic = ORDINAL_ARABIC.matcher(work);
+        if (arabic.find()) {
+            start = arabic.start();
+        }
+        Matcher chinese = ORDINAL_CHINESE.matcher(work);
+        if (chinese.find() && (start < 0 || chinese.start() < start)) {
+            start = chinese.start();
+        }
+        if (start < 0) {
+            // 无"期/集"后缀的纯序号命名（01 / EP01 / Part 1）：数字前无中文内容词即为正片。
+            // 8 位数字属日期语义，不在此判定（由日期分支处理）。
+            if (EIGHT_DIGITS.matcher(work).find()) {
+                return false;
+            }
+            String prefix = work.replaceAll("[0-9]+.*$", "");
+            return !HAS_CJK.matcher(prefix).find();
+        }
+        String prefix = work.substring(0, start);
+        if (SEASON_PREFIX.matcher(prefix).matches()) {
+            return true;
+        }
+        return !HAS_CJK.matcher(prefix).find();
+    }
+
+    /**
+     * 剥离日期、尾部分段与标点，返回残余文本（用于结构化正片判定）。
+     * 残余为空 = 名字只由"日期（+上/下）"构成 = 正片。
+     */
+    private static String stripMainResidue(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return "";
+        }
+        String work = name.replaceAll("\\[.*?\\]|\\(.*?\\)|（.*?）", "");
+        work = DATE_COMPACT.matcher(work).replaceAll("");
+        work = DATE_SEPARATED.matcher(work).replaceAll("");
+        work = EIGHT_DIGITS.matcher(work).replaceAll("");
+        work = PART_TAIL.matcher(work).replaceAll("");
+        work = MAIN_RESIDUE_JUNK.matcher(work).replaceAll("");
+        return work.trim();
     }
 
     /**
@@ -914,8 +1038,10 @@ public final class EpisodeNameMatcher {
         if (sourceIndex < 0 || sourceIndex >= sourceNames.size()) {
             return -1;
         }
-        // 非正片（加更/花絮/特辑…）不参与秩对齐：它们与"期"没有稳定的对应关系
-        if (isNonMainFeature(currentName)) {
+        // 非正片（加更/花絮/特辑/超前企划/观演区/直拍…）不参与秩对齐：
+        // 它们与"期"没有稳定的对应关系，硬对齐必然错位。
+        // 这里用"结构化正片判定"，覆盖关键词表列不全的衍生命名。
+        if (isNonMainEntry(currentName)) {
             return -1;
         }
         EpisodeKey cur = parse(currentName);
@@ -927,16 +1053,11 @@ public final class EpisodeNameMatcher {
             if (rank < clusters.size()) {
                 long expectedDay = expectedDayOf(targetNames, clusters, rank);
                 int picked = pickMainFeatureEntry(targetNames, clusters.get(rank), wantPart, expectedDay);
-                // 落点日期应贴近"首簇 + 7×rank 天"的周更快照；偏差过大说明簇序被
-                // 伪正片（特辑写成裸期数等）污染，不可采信
-                boolean trustworthy = picked >= 0;
-                if (trustworthy && expectedDay >= 0) {
-                    int d = dateOf(targetNames.get(picked));
-                    if (d > 0 && Math.abs(dayNumberOf(d) - expectedDay) > CLUSTER_TOLERANCE_DAYS) {
-                        trustworthy = false;
-                    }
-                }
-                if (trustworthy) {
+                // expectedDay 只作为簇内"就近挑条"的依据，不再作为硬性可信度门槛：
+                // 非严格周更的节目（隔周更新、中间插特辑等）会让"首簇 + 7×rank"整体偏移，
+                // 旧实现对这类节目会把<b>正确结果误拒</b>而退回按位置猜。
+                // 簇序在"结构化正片判定"下已足够可靠（衍生条目不再进簇）。
+                if (picked >= 0) {
                     return picked;
                 }
             }
@@ -946,23 +1067,34 @@ public final class EpisodeNameMatcher {
         }
         if (cur.domain == DOMAIN_DATE && cur.ordinal > 0) {
             final long curDay = dayNumberOf(cur.ordinal);
-            final int wantPart = normalizePart(extractPart(currentName));
+            final int explicitPart = extractPart(currentName);
             // ① 簇法：用旧源列表自身的正片簇求当前集的期簇序。
             // 注意簇序只依赖列表内的相对次序，与日期数值无关，
             // 因此源站年份整体错标（2025… vs 实际 2026…）不影响结果。
             List<List<Integer>> clusters = buildMainFeatureClusters(sourceNames);
             int rank = mainFeatureClusterRank(sourceNames, sourceIndex);
             if (rank >= 0) {
-                long expectedDay = expectedDayOf(sourceNames, clusters, rank);
-                boolean trustworthy = true;
-                if (expectedDay >= 0) {
-                    int d = dateOf(sourceNames.get(sourceIndex));
-                    if (d > 0 && Math.abs(dayNumberOf(d) - expectedDay) > CLUSTER_TOLERANCE_DAYS) {
-                        trustworthy = false;
-                    }
+                // 分段推断：名字没写上/下时，用簇内位置推（2 条 → 上/下；3 条 → 上/中/下）。
+                // 例：dytt 的裸日期「20260815 / 20260816」= 第1期上 / 第1期下，
+                // 若不推断，看「20260816」切源会落到第1期<b>上</b>（用户实测 case）。
+                int wantPart = normalizePart(explicitPart);
+                boolean partKnown = explicitPart != PART_NONE;
+                List<Integer> cl = clusters.get(rank);
+                if (!partKnown && cl.size() >= 2 && cl.size() <= 3 && cl.contains(sourceIndex)) {
+                    int pos = cl.indexOf(sourceIndex);
+                    wantPart = pos == 0 ? PART_UP
+                            : (cl.size() == 3 && pos == 1 ? PART_MIDDLE : PART_DOWN);
+                    partKnown = true;
                 }
-                if (trustworthy) {
-                    return findIndexByEpisode(currentName, rank + 1, targetNames);
+                // ★ 不再用"首簇日期 + 7×rank"的周更快照做可信度校验：
+                //   该假设只对"严格周更"成立。实测披荆斩棘2026 第1期 0815、第2期 0828
+                //   （中间夹一公选歌组队等衍生内容，间隔 13 天），旧实现会把正确结果误拒，
+                //   再退回"按位置猜"从而切错集。改为<b>自校验</b>：按秩算出的期号
+                //   必须在目标列表里真实存在（能找到领衔期数条目），否则走外推法。
+                int byRank = findIndexByEpisode(currentName, rank + 1, targetNames,
+                        partKnown ? wantPart : -1);
+                if (byRank >= 0) {
+                    return byRank;
                 }
             }
             // ② 外推法：期号 ≈ (当前日期 − 首播日) / 7 周 + 1。
@@ -995,7 +1127,7 @@ public final class EpisodeNameMatcher {
             return -1;
         }
         for (String n : names) {
-            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n)) {
                 continue;
             }
             int d = dateOf(n);
@@ -1028,7 +1160,7 @@ public final class EpisodeNameMatcher {
         long bestDist = Long.MAX_VALUE;
         for (int i = 0; i < names.size(); i++) {
             String n = names.get(i);
-            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n)) {
                 continue;
             }
             if (normalizePart(extractPart(n)) != wantPart) {
@@ -1125,6 +1257,18 @@ public final class EpisodeNameMatcher {
                 matching.add(i);
             }
         }
+        if (matching.isEmpty() && cluster.size() >= 2 && cluster.size() <= 3) {
+            // 簇内条目都没写分段（典型：裸日期式源 "20260815/20260816"）→ 按簇内位置推断：
+            // 2 条 → 上/下；3 条 → 上/中/下。
+            // 否则「第1期下」会落到「第1期上」（披荆斩棘2026 实测 case）。
+            if (wantPart == PART_UP) {
+                return cluster.get(0);
+            }
+            if (wantPart == PART_MIDDLE) {
+                return cluster.get(Math.min(1, cluster.size() - 1));
+            }
+            return cluster.get(cluster.size() - 1);
+        }
         if (matching.isEmpty()) {
             matching = cluster;
         }
@@ -1162,12 +1306,17 @@ public final class EpisodeNameMatcher {
     /**
      * 把剧集列表切分成"正片簇"：每个簇是一段连续同期的正片条目。
      *
-     * <p>开新簇的两个条件（满足其一）：</p>
-     * <ol>
-     *   <li>与上一个正片之间隔着非正片条目（加更/特辑/花絮…）——这是最主要的分隔回信号；</li>
-     *   <li>与上一个正片的日期差超过 {@link #CLUSTER_GAP_DAYS} 天——兜底覆盖
-     *       "列表里完全没有非正片条目"的源（此时只有日期间隔可用）。</li>
-     * </ol>
+     * <p><b>切分规则（只按日期间隔）</b>：相邻两个正片的日期差超过
+     * {@link #CLUSTER_GAP_DAYS} 天即视为新的一期；衍生内容条目直接跳过、<b>不再强行断开</b>。</p>
+     *
+     * <p><b>为什么去掉"夹衍生条目即断开"</b>：同期的上/下两段常被若干衍生条目隔开。
+     * 实测披荆斩棘2026（dytt 源）：{@code 20260815} 与 {@code 20260816} 之间夹着
+     * {@code 20260816舞台纯享版}，若按"夹内容即断开"会把同一期的上/下拆成两个簇，
+     * 导致之后所有期号整体偏移（第2期被算成第3期…）。改按日期间隔切分后，
+     * 该源的正片簇恰好是 7 个，与"第1~7期"完全对应。</p>
+     *
+     * <p>同日期间隔阈值取 {@link #CLUSTER_GAP_DAYS} 天：同期的上/下一般相邻 0~2 天
+     * （少数节目隔 3 天），而相邻两期之间至少隔 5~7 天，两侧余量都足够。</p>
      *
      * <p>非正片条目与无法解析域名的噪声条目都不进簇。</p>
      *
@@ -1178,24 +1327,22 @@ public final class EpisodeNameMatcher {
         if (names == null || names.isEmpty()) {
             return clusters;
         }
-        boolean lastWasMain = false;
         int lastMainDate = -1;
         for (int i = 0; i < names.size(); i++) {
             String n = names.get(i);
-            if (TextUtils.isEmpty(n) || isNonMainFeature(n)) {
-                lastWasMain = false;
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n)) {
                 continue;
             }
             int d = dateOf(n);
-            // 日期差必须走日历天序数：YYYYMMDD 整数相减跨月即失真（0429→0502 差 73）
-            boolean gapBoundary = d > 0 && lastMainDate > 0
-                    && Math.abs(dayNumberOf(d) - dayNumberOf(lastMainDate)) > CLUSTER_GAP_DAYS;
-            boolean boundary = !lastWasMain || gapBoundary;
-            if (boundary || clusters.isEmpty()) {
+            boolean boundary = clusters.isEmpty();
+            if (!boundary && d > 0 && lastMainDate > 0) {
+                // 日期差必须走日历天序数：YYYYMMDD 整数相减跨月即失真（0429→0502 差 73）
+                boundary = Math.abs(dayNumberOf(d) - dayNumberOf(lastMainDate)) > CLUSTER_GAP_DAYS;
+            }
+            if (boundary) {
                 clusters.add(new ArrayList<Integer>());
             }
             clusters.get(clusters.size() - 1).add(i);
-            lastWasMain = true;
             if (d > 0) {
                 lastMainDate = d;
             }
@@ -1214,7 +1361,7 @@ public final class EpisodeNameMatcher {
         if (names == null || index < 0 || index >= names.size()) {
             return -1;
         }
-        if (isNonMainFeature(names.get(index))) {
+        if (isNonMainEntry(names.get(index))) {
             return -1;
         }
         List<List<Integer>> clusters = buildMainFeatureClusters(names);
@@ -1248,23 +1395,23 @@ public final class EpisodeNameMatcher {
             return Math.max(0, fallbackIndex);
         }
         int clamped = Math.max(0, Math.min(fallbackIndex, names.size() - 1));
-        if (TextUtils.isEmpty(currentName) || isNonMainFeature(currentName)) {
+        if (TextUtils.isEmpty(currentName) || isNonMainEntry(currentName)) {
             return clamped;
         }
         String landed = clamped >= 0 && clamped < names.size() ? names.get(clamped) : null;
-        if (TextUtils.isEmpty(landed) || !isNonMainFeature(landed)) {
+        if (TextUtils.isEmpty(landed) || !isNonMainEntry(landed)) {
             return clamped;
         }
         // 落点是非正片：向前找最近的正片，找不到再向后
         for (int i = clamped; i >= 0; i--) {
             String n = names.get(i);
-            if (!TextUtils.isEmpty(n) && !isNonMainFeature(n)) {
+            if (!TextUtils.isEmpty(n) && !isNonMainEntry(n)) {
                 return i;
             }
         }
         for (int i = clamped + 1; i < names.size(); i++) {
             String n = names.get(i);
-            if (!TextUtils.isEmpty(n) && !isNonMainFeature(n)) {
+            if (!TextUtils.isEmpty(n) && !isNonMainEntry(n)) {
                 return i;
             }
         }
@@ -1485,18 +1632,37 @@ public final class EpisodeNameMatcher {
      * @return 命中的下标；目标列表里没有该期数时返回 -1
      */
     public static int findIndexByEpisode(String currentName, int episode, List<String> targetNames) {
+        return findIndexByEpisode(currentName, episode, targetNames, -1);
+    }
+
+    /**
+     * 带"分段口径覆盖"的期数匹配（内部实现）。
+     *
+     * @param wantPartOverride 调用方推断出的分段；传 {@code -1} 表示按 {@code currentName} 自身推断
+     */
+    private static int findIndexByEpisode(String currentName, int episode, List<String> targetNames,
+                                          int wantPartOverride) {
         if (episode <= 0 || targetNames == null || targetNames.isEmpty()) {
             return -1;
         }
         // 当前条目是否非正片，决定本次走哪套口径
         final boolean curIsNonMain = isNonMainFeature(currentName);
         final String curToken = nonMainFeatureToken(currentName);
+        // 结构化判为非正片、又没有系列词可配对（如「突袭云小考」「一公挑战赛（下）」）：
+        // 这类条目与"期"没有稳定对应关系，按期数硬匹配只会错位，直接交给上层兜底
+        if (!curIsNonMain && isNonMainEntry(currentName)) {
+            return -1;
+        }
         // ★ 分段口径：当前名带 上/中/下 时，必须挑到同分段的条目。
         //   否则「第2期下」会落到「第2期上」（findIndexByEpisode 早期只取第一条）。
-        final boolean curHasPart = extractPart(currentName) != PART_NONE;
-        final int wantPart = normalizePart(extractPart(currentName));
+        //   调用方也可直接给出推断分段（源侧裸日期没有分段标记时按簇内位置推断）。
+        final boolean curHasPart = wantPartOverride > 0 || extractPart(currentName) != PART_NONE;
+        final int wantPart = wantPartOverride > 0
+                ? wantPartOverride : normalizePart(extractPart(currentName));
         // 分段不一致时的候选（用于兜底：目标源确实没有该分段时，仍给一个近似落点）
         int partMismatchFallback = -1;
+        int nonLeadingFallback = -1;
+        final boolean curIsNonMainEntry = isNonMainEntry(currentName);
         for (int i = 0; i < targetNames.size(); i++) {
             String name = targetNames.get(i);
             if (TextUtils.isEmpty(name)) {
@@ -1514,10 +1680,24 @@ public final class EpisodeNameMatcher {
                     continue;
                 }
             } else {
-                // 当前是正片：只在正片里找，跳过一切非正片条目
-                if (isNonMainFeature(name)) {
+                // 当前是正片：只在<b>正片</b>里找，跳过一切衍生条目
+                if (isNonMainEntry(name)) {
                     continue;
                 }
+                // ★ 期号必须领衔（「第2期…」），否则是衍生条目把期号写在尾巴上：
+                //   如「超前企划第2期」「预热直播第2期」「加更版第1期」——
+                //   它们解析出的期号与真正片撞号，实测会让 20260815 落到「超前企划第2期」。
+                //   这类条目降级为最后兜底，绝不抢占领衔条目的位置。
+                if (!isLeadingOrdinal(name)) {
+                    if (nonLeadingFallback < 0) {
+                        nonLeadingFallback = i;
+                    }
+                    continue;
+                }
+            }
+            if (curIsNonMainEntry && !curIsNonMain) {
+                // 结构化判为非正片但没有系列词（如「突袭云小考」）：不参与正片匹配
+                continue;
             }
             // 分段一致 → 直接命中
             if (!curHasPart || normalizePart(key.part) == wantPart) {
@@ -1529,7 +1709,10 @@ public final class EpisodeNameMatcher {
             }
         }
         // 目标源没有同分段的条目时，退回首个候选（保持旧行为，避免整体失配）
-        return partMismatchFallback;
+        if (partMismatchFallback >= 0) {
+            return partMismatchFallback;
+        }
+        return nonLeadingFallback;
     }
 
     /**

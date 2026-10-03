@@ -153,24 +153,47 @@ public final class SlugMapUpdater {
         return map;
     }
 
+    /**
+     * 抓取索引页（带重试与快速超时）。
+     *
+     * <p>与 {@link ShowSlugMap} 的探测同源同站：实测约半数首请求会被
+     * 重置/超时，8s 快速失败 + 短退避重试即可覆盖绝大多数瞬时故障。
+     * 本方法在后台更新线程调用，重试不影响切源主流程。</p>
+     */
     private static String httpGet(String url, String ua) {
-        okhttp3.Response response = null;
-        try {
-            okhttp3.Request request = new okhttp3.Request.Builder()
-                    .url(url)
-                    .header("User-Agent", ua == null ? "" : ua)
-                    .build();
-            okhttp3.OkHttpClient client = com.github.catvod.net.OkHttp.client();
-            response = client.newCall(request).execute();
-            if (response.body() != null) {
-                return response.body().string();
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (response != null) {
+        final int attempts = 3;
+        final long[] backoffMs = {300, 800};
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            if (attempt > 0) {
                 try {
-                    response.close();
+                    Thread.sleep(backoffMs[Math.min(attempt - 1, backoffMs.length - 1)]);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
                 } catch (Throwable ignored) {
+                }
+            }
+            okhttp3.Response response = null;
+            try {
+                okhttp3.Request request = new okhttp3.Request.Builder()
+                        .url(url)
+                        .header("User-Agent", ua == null ? "" : ua)
+                        .build();
+                okhttp3.OkHttpClient client = com.github.catvod.net.OkHttp.client(8000);
+                response = client.newCall(request).execute();
+                if (response.body() != null) {
+                    String body = response.body().string();
+                    if (!TextUtils.isEmpty(body)) {
+                        return body;
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (response != null) {
+                    try {
+                        response.close();
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         }

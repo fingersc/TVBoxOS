@@ -110,6 +110,34 @@ public class SourceViewModel extends ViewModel {
     public static final ExecutorService spThreadPool = Executors.newSingleThreadExecutor();
     private static final ExecutorService httpPrepareThreadPool = Executors.newFixedThreadPool(3);
 
+    /**
+     * 整包响应日志专用后台线程。
+     *
+     * <p><b>为什么必须挪出主线程</b>：OkGo 的 {@code onSuccess} 默认在主线程回调，
+     * 直接 {@code LOG.i(json)} 会把几十~上百 KB 的响应体在主线程写进 logcat。
+     * 详情页"切源一圈"会同时探测数十个源（每批 20 个），叠加调试模式的 BODY 级
+     * 网络日志后，实测主线程一次卡顿 2.1s（Skipped 226 frames），
+     * 首屏内容 8.8s 才出现——用户看到的就是"只有背景"的空白页。
+     * 挪到后台线程后诊断信息一条不少，主线程零开销。</p>
+     */
+    private static final ExecutorService responseLogPool = Executors.newSingleThreadExecutor();
+
+    /** 后台打印整包响应体（不阻塞主线程）。 */
+    private static void logResponseBody(final String body) {
+        if (body == null) {
+            return;
+        }
+        responseLogPool.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    LOG.i(body);
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
     //homeContent缓存，最多存储5个sourceKey的AbsSortXml对象
     private static final Map<String, AbsSortXml> sortCache = new LinkedHashMap<String, AbsSortXml>(5, 0.75f, true) {
         @Override
@@ -856,7 +884,7 @@ public class SourceViewModel extends ViewModel {
                                 xml(detailResult, xml, sourceBean.getKey());
                             } else {
                                 String json = response.body();
-                                LOG.i(json);
+                                logResponseBody(json);
                                 json(detailResult, json, sourceBean.getKey());
                             }
                         }
@@ -1101,7 +1129,7 @@ public class SourceViewModel extends ViewModel {
                     @Override
                     public void onSuccess(Response<String> response) {
                         String json = response.body();
-                        LOG.i(json);
+                        logResponseBody(json);
                         json(quickSearchResult, json, sourceBean.getKey(), searchToken);
                     }
 
@@ -1230,7 +1258,7 @@ public class SourceViewModel extends ViewModel {
                     @Override
                     public void onSuccess(Response<String> response) {
                         String json = response.body();
-                        LOG.i(json);
+                        logResponseBody(json);
                         try {
                             JSONObject result = normalizePlayerResult(new JSONObject(json));
                             result.put("key", url);

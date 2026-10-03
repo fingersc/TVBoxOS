@@ -105,8 +105,43 @@ public class DetailActivity extends BaseActivity {
     private static final String STATE_FULL_WINDOWS = "detail_full_windows";
     private static final String DETAIL_FALLBACK_SEARCH_TAG = "detail_fallback_search";
     public static final String EXTRA_DETAIL_FALLBACK_CANDIDATES = "detailFallbackCandidates";
+    /**
+     * 全网搜索时的<b>并发上限</b>（滑动窗口大小），不再是"每批固定发这么多个"。
+     *
+     * <p><b>历史包袱</b>：原实现是"凑满 20 个发一批，等这批全部回来或超时才发下一批"。
+     * 实测日志（09:02:08 → 09:02:16）显示第 1、2 批各耗满 3.5s —— 批次要等<b>最慢</b>的
+     * 那个源，哪怕同批 19 个源 243ms 就失败了也照样干等 3.5s。结果是：40 个源花了 7s 才
+     * 试完，第一个命中要到第 3 批，进入详情页后<b>空白 8.1s</b> 才有内容。</p>
+     *
+     * <p><b>现在</b>：改为固定并发上限的滑动窗口 —— 只要有源返回（成功/失败/超时）腾出名额，
+     * 立刻补发列表里的下一个源。于是：
+     * <ul>
+     *   <li>不再为最慢的源陪跑，快源能持续把列表往前推；</li>
+     *   <li>所有源的总发完时间 ≈ ⌈列表长度 ÷ 并发⌉ × 平均单源耗时，而不是"批次数 × 3.5s"。</li>
+     * </ul>
+     * 上限取 20：与上一版（锁步分批时的批大小）<b>完全相同</b>，也就是这台设备与网络
+     * 已经跑通过的并发量，不引入新的带宽风险；变快的部分全部来自「不再等最慢的源」。</p>
+     */
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
     private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000L;
+    /**
+     * 「提前消费」等待窗口：第一个候选进缓存后等这么久就立刻放起来。
+     *
+     * <p><b>这是空白期的真正主因</b>。原流程规定：搜索阶段（collecting）只负责把候选池灌满，
+     * <b>第一个候选要等搜索阶段结束才被消费</b>。而搜索阶段只有两条结束路径：
+     * <ol>
+     *   <li>全部源发完（旧实现 = 5 批 × 3.5s ≈ 17.5s）；</li>
+     *   <li>{@link #DETAIL_FALLBACK_SEARCH_TIMEOUT_MS} 全局超时（8s）。</li>
+     * </ol>
+     * 实测日志里 {@code pollPick}（第一个候选被选中的那一刻）发生在 startSearch 之后
+     * <b>8.1s</b> —— 正好是第 2 条路径，也就是"干等了 8 秒全局超时"。这 8 秒就是用户看到的
+     * "只有背景"，和源快慢基本无关。</p>
+     *
+     * <p>现在：第一个候选落进缓存后再等 1.2s（让另外几个快源也落地，
+     * 便于 {@code pollNextCycledSource()} 按质量挑，而不是闭眼拿第一个回来的），
+     * 就提前放起来。搜索阶段在后台继续跑，照样把整圈缓存补满 —— 两者互不冲突。</p>
+     */
+    private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = 1200L;
     private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = 6000L;
     // ===== 方案A：探路请求 =====
     private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
@@ -1210,6 +1245,17 @@ public class DetailActivity extends BaseActivity {
         loadDetail(vid, key, false);
     }
 
+    /**
+     * 页面上是否已有可显示的详情内容（剧集列表非空）。
+     *
+     * <p>用于区分两种"加载中"：有内容时切源不打扰用户（不盖 Loading），
+     * 无内容时必须有指示，否则就是"只有背景"的空页。</p>
+     */
+    private boolean hasRenderedDetail() {
+        return mVideo != null && vodInfo != null
+                && vodInfo.seriesMap != null && !vodInfo.seriesMap.isEmpty();
+    }
+
     private void loadDetail(String vid, String key, boolean fallback) {
         if (!fallback) {
             resetDetailFallback();
@@ -1218,10 +1264,24 @@ public class DetailActivity extends BaseActivity {
         sourceKey = key;
         firstsourceKey = key;
         if (TextUtils.isEmpty(vid) || vid.startsWith("msearch:") || ApiConfig.get().getSource(sourceKey) == null) {
+            // ★ 进入即无可用详情（聚合搜索的 msearch: 结果、源已失效/被删等）：
+            //   这里必然要走"切源"流程去找可播放源。而切源链路为了不遮挡正在播放的
+            //   播放器，刻意不显示全屏 Loading（见 startDetailFallback 注释）。
+            //   但此时页面上<b>本来就没有任何内容</b>——既不显示 Loading、页面内的
+            //   "正在切换片源…"提示又写在没有内容的 tvPlayUrl 行上，用户看到的就是
+            //   "只有背景"的空页，直到首个可用源加载完成（实测最长约 9s）。
+            //   故：无内容时补一个加载指示；内容就绪后由 showSuccess() 自动收起。
+            if (!hasRenderedDetail()) {
+                showLoading();
+            }
             handleNoPlayableDetail();
             return;
         }
         if (!fallback) {
+            showLoading();
+        } else if (!hasRenderedDetail() && !isLoading()) {
+            // 切源模式但有内容时不打扰；无内容时（如首次拉取候选源、上一轮落空清空页面后）
+            // 必须给指示，否则用户面对空页无从判断应用是否在工作。
             showLoading();
         }
         if (fallback && detailFallbackActive) {
@@ -1679,10 +1739,27 @@ public class DetailActivity extends BaseActivity {
         detailFallbackDetailTimedOut = false;
         detailFallbackSearchTimeoutScheduled = false;
         detailFallbackLoadingCandidate = false;
+        // 清掉上一轮可能残留的「提前消费」预约，避免旧预约抢在本轮前面放片
+        detailFallbackEarlyConsumeScheduled = false;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackEarlyConsume);
+        }
         detailFallbackBatchIndex = 0;
         detailFallbackNextSourceIndex = 0;
         detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
+        // 批令牌仍要每轮轮转：滑动窗口下不再分"批"，但它仍是「这条结果/这次超时
+        // 属于本轮还是上轮」的唯一凭据（见 onDetailFallbackSearchResult 的守卫）。
+        // 必须在首次派发之前定好 —— 线程池在 keepCache 复位后会存活到下一轮，
+        // 令牌若跟着池一起复用就会漏更新，上一轮的迟到结果会被当成本轮结果收下。
+        detailFallbackBatchToken = detailFallbackToken + "_batch_" + (++detailFallbackBatchIndex);
+        detailFallbackBatchStartMs = System.currentTimeMillis();
         LOG.i("[FB] startSearch title=" + detailFallbackTitle + " sources=" + detailFallbackSourceOrder.size() + " token=" + detailFallbackToken);
+        // 新的一轮搜索前先把上一轮残留的派发线程收掉：
+        //  1) 上一轮的结果会因 token 轮转被 onDetailFallbackSearchResult 的守卫全部丢弃，
+        //     留着跑没有意义；
+        //  2) 线程池现在是长生命周期复用的（原来每批都新建池），若不收掉，上一轮那些
+        //     阻塞在 type==3 爬虫 searchContent 上的任务会占住线程名额，让本轮新派发排队。
+        stopDetailFallbackSearchExecutor();
         scheduleDetailFallbackSearch();
         // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
         // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
@@ -1990,11 +2067,17 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackActive || !detailFallbackSearchCollecting || !detailFallbackBatchToken.equals(data.searchToken)) {
             return;
         }
-        // 方案E：批次里每个源返回，记录命中/失败统计（耗时从本批发出时刻起算）
+        // 方案E：每个源返回，记录命中/失败统计（耗时按该源自己的发出时刻算，
+        // 滑动窗口下"批次开始时刻"已无意义）
+        Long dispatchedAt = detailFallbackSourceStartMs.remove(data.sourceKey);
+        long searchCostMs = dispatchedAt == null
+                ? (detailFallbackBatchStartMs > 0 ? System.currentTimeMillis() - detailFallbackBatchStartMs : 0L)
+                : System.currentTimeMillis() - dispatchedAt;
         recordFallbackStat(data.sourceKey,
                 data.movie != null && data.movie.videoList != null && !data.movie.videoList.isEmpty(),
-                detailFallbackBatchStartMs > 0 ? System.currentTimeMillis() - detailFallbackBatchStartMs : 0L);
+                searchCostMs);
         detailFallbackPendingSources.remove(data.sourceKey);
+        boolean cachedAny = false;
         if (data.movie != null && data.movie.videoList != null) {
             for (Movie.Video video : data.movie.videoList) {
                 if (video == null || TextUtils.isEmpty(video.id)
@@ -2004,7 +2087,14 @@ public class DetailActivity extends BaseActivity {
                 // 全网搜索的职责是「建立这一圈完整的缓存」，所以这里不再按「已用源」过滤，
                 // 只要片名精确命中就全部纳入（含当前正在播放的源，使一圈能真正闭合）。
                 cacheDetailFallbackCandidate(video);
+                cachedAny = true;
             }
+        }
+        // ★ 提前消费：一旦本批结果里出现了可用候选，就安排一次「不再死等搜索收尾」的放片。
+        // 见 DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS 的说明 —— 这是空白期的主因。
+        if (cachedAny && detailFallbackSearchCollecting && !detailFallbackEarlyConsumeScheduled) {
+            detailFallbackEarlyConsumeScheduled = true;
+            llLayout.postDelayed(detailFallbackEarlyConsume, DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS);
         }
         if (!detailFallbackLoadingCandidate) {
             if (detailFallbackSearching) {
@@ -2015,50 +2105,77 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
+    /**
+     * 滑动窗口补发全网搜索。
+     *
+     * <p>原实现是"整批 20 个一起发，等这批全部回来或超时（3.5s）才发下一批"，
+     * 批次要等<b>最慢</b>的那个源，快源白等（详见 {@link #DETAIL_FALLBACK_MAX_SEARCH}）。
+     * 现在改为：在途数 &lt; 并发上限就立刻补发下一个源；一个源返回（成功/失败/超时）后
+     * 由 {@link #onDetailFallbackSearchResult} / {@link #scheduleDetailFallbackSourceTimeout}
+     * 再次调进来补位。</p>
+     *
+     * <p>收尾条件：<b>所有源都已发出</b>且<b>没有在途请求</b>。二者缺一不可，
+     * 否则会把还没试的源跳过。</p>
+     */
     private void scheduleDetailFallbackSearch() {
         if (!detailFallbackActive || !detailFallbackSearching) {
             return;
         }
-        if (!detailFallbackPendingSources.isEmpty() || detailFallbackLoadingCandidate) {
+        if (detailFallbackLoadingCandidate) {
             return;
         }
-        if (detailFallbackNextSourceIndex >= detailFallbackSourceOrder.size()) {
+        // 全部源都已发出 + 无在途 → 搜索阶段结束
+        if (detailFallbackNextSourceIndex >= detailFallbackSourceOrder.size()
+                && detailFallbackPendingSources.isEmpty()) {
             detailFallbackSearching = false;
             llLayout.removeCallbacks(detailFallbackTimeout);
             stopDetailFallbackSearchExecutor();
             loadNextDetailFallbackSource();
             return;
         }
+        ensureDetailFallbackSearchExecutor();
 
-        stopDetailFallbackSearchExecutor();
-        detailFallbackSearchExecutor = Executors.newFixedThreadPool(DETAIL_FALLBACK_MAX_SEARCH);
-        detailFallbackBatchToken = detailFallbackToken + "_batch_" + (++detailFallbackBatchIndex);
-        detailFallbackBatchStartMs = System.currentTimeMillis();
-        int batchEnd = Math.min(detailFallbackNextSourceIndex + DETAIL_FALLBACK_MAX_SEARCH, detailFallbackSourceOrder.size());
-        // 方案E：本批按「历史命中率降序」发，让更可能命中的源先回来
-        List<String> batchKeys = new ArrayList<>();
-        while (detailFallbackNextSourceIndex < batchEnd) {
-            batchKeys.add(detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++));
-        }
-        sortSourcesByHitRate(batchKeys);
-        LOG.i("[FB] sendBatch token=" + detailFallbackBatchToken + " keys=" + batchKeys);
-        for (final String searchKey : batchKeys) {
+        List<String> dispatched = new ArrayList<>();
+        while (detailFallbackPendingSources.size() < DETAIL_FALLBACK_MAX_SEARCH
+                && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
+            final String searchKey = detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++);
             final String searchTitle = detailFallbackTitle;
             final String searchToken = detailFallbackBatchToken;
             detailFallbackPendingSources.add(searchKey);
-            // 方案B：每个源各挂一个超时，卡死的站点不再拖累整批
+            // 逐源记录发出时刻，统计耗时不再用"批次开始时刻"（滑动窗口下批次无意义）
+            detailFallbackSourceStartMs.put(searchKey, System.currentTimeMillis());
+            // 方案B：每个源各挂一个超时，卡死的站点不再拖累其它源
             scheduleDetailFallbackSourceTimeout(searchKey, searchToken);
             detailFallbackSearchExecutor.execute(new Runnable() {
                 @Override
                 public void run() {
-                    long startMs = System.currentTimeMillis();
                     sourceViewModel.getDetailFallbackSearch(searchKey, searchTitle, searchToken);
                 }
             });
+            dispatched.add(searchKey);
+        }
+        if (!dispatched.isEmpty()) {
+            LOG.i("[FB] dispatch token=" + detailFallbackBatchToken + " n=" + dispatched.size()
+                    + " inflight=" + detailFallbackPendingSources.size() + " keys=" + dispatched);
         }
         if (!detailFallbackSearchTimeoutScheduled) {
             detailFallbackSearchTimeoutScheduled = true;
             llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
+        }
+    }
+
+    /**
+     * 懒建搜索线程池：整轮搜索只建一次，滑动窗口全程复用。
+     *
+     * <p>原实现每批都 {@code shutdownNow()} 再新建，池子反复重建；现在只在需要时建一次。
+     * 注意<b>不在这里轮转</b> {@link #detailFallbackBatchToken} —— 该池在
+     * {@link #resetDetailFallbackKeepCache()} 之后会存活到下一轮切源，
+     * 若令牌跟着池走就永远不更新，上一轮的迟到结果会被误认成本轮结果。
+     * 令牌由 {@link #startDetailFallback()} 在派发前统一轮转。</p>
+     */
+    private void ensureDetailFallbackSearchExecutor() {
+        if (detailFallbackSearchExecutor == null || detailFallbackSearchExecutor.isShutdown()) {
+            detailFallbackSearchExecutor = Executors.newFixedThreadPool(DETAIL_FALLBACK_MAX_SEARCH);
         }
     }
 
@@ -2308,7 +2425,7 @@ public class DetailActivity extends BaseActivity {
 
     /**
      * 给单个源挂超时。到点若还没回来，就把它从 pending 里摘掉；
-     * pending 空了且当前无加载 → 立即推进（不必等 8 秒全局超时）。
+     * 腾出的名额<b>立刻补发</b>下一个源（滑动窗口，不再等整批）。
      */
     private void scheduleDetailFallbackSourceTimeout(final String searchKey, final String searchToken) {
         llLayout.postDelayed(new Runnable() {
@@ -2322,11 +2439,11 @@ public class DetailActivity extends BaseActivity {
                 }
                 // 该源仍未返回 → 认为是慢源，摘掉它
                 if (detailFallbackPendingSources.remove(searchKey)) {
+                    detailFallbackSourceStartMs.remove(searchKey);
                     recordFallbackStat(searchKey, false, DETAIL_FALLBACK_SOURCE_TIMEOUT_MS);
+                    // 腾出名额 → 立刻补发下一个（若已无剩余源，则由本次调用收尾）
                     if (!detailFallbackLoadingCandidate) {
-                        if (detailFallbackPendingSources.isEmpty()) {
-                            scheduleDetailFallbackSearch();
-                        }
+                        scheduleDetailFallbackSearch();
                     }
                 }
             }
@@ -2533,19 +2650,11 @@ public class DetailActivity extends BaseActivity {
         return false;
     }
 
-    /** 把一批源按键的分数降序重排（分数高的先发，先回来的概率更大）。 */
-    private void sortSourcesByHitRate(List<String> keys) {
-        try {
-            Collections.sort(keys, new Comparator<String>() {
-                @Override
-                public int compare(String a, String b) {
-                    return Double.compare(detailFallbackSourceScore(b), detailFallbackSourceScore(a));
-                }
-            });
-        } catch (Throwable th) {
-            LOG.e("sortSourcesByHitRate fail: " + th);
-        }
-    }
+    // 原 sortSourcesByHitRate(List<String>) 已删除：
+    // 它的作用只是"把当前这批 20 个按键分降序重排"，而整张列表在搜索开始时
+    // 已经由 sortDetailFallbackSourceOrderByQuality() 用同一份分数
+    // （SourceQualityStore）全量降序排过，逐批再排一次是冗余的。
+    // 改为滑动窗口后"批"的概念消失，这个方法的语义也就不存在了。
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
         title = title == null ? "" : title.trim();
@@ -2631,6 +2740,7 @@ public class DetailActivity extends BaseActivity {
         persistDetailFallbackCache(detailFallbackTitle);
         detailFallbackSourceOrder.clear();
         detailFallbackPendingSources.clear();
+        detailFallbackSourceStartMs.clear();
         // 方案A：清理探路状态
         detailFallbackProbePending = false;
         detailFallbackProbeSourceKey = "";
@@ -2645,7 +2755,9 @@ public class DetailActivity extends BaseActivity {
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
+            llLayout.removeCallbacks(detailFallbackEarlyConsume);
         }
+        detailFallbackEarlyConsumeScheduled = false;
         if (!keepCache) {
             // 只有「彻底复位」才掐断批处理；切源成功后的收尾必须让它继续跑完，
             // 否则候选池永远只有第一个源 —— 这正是「一直切回同一站点」的根因。
@@ -2738,6 +2850,39 @@ public class DetailActivity extends BaseActivity {
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     private final HashMap<String, List<Movie.Video>> detailFallbackCache = new HashMap<>();
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
+    /**
+     * 滑动窗口下每个在途源的发出时刻（key = sourceKey）。
+     *
+     * <p>原来记录耗实用的是"批次发出时刻"，但滑动窗口里批次边界已不存在：
+     * 一个源可能是第 1 批发的，3s 后才收到结果，而批次时刻是它刚发出时的时刻。
+     * 逐源记录才能得到真实的单源响应耗时，喂给 SourceQualityStore 的分数才准。</p>
+     */
+    private final HashMap<String, Long> detailFallbackSourceStartMs = new HashMap<>();
+    /**
+     * 是否已经为「提前消费」排过一次延时放片（一轮只排一次）。
+     * @see #DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS
+     */
+    private boolean detailFallbackEarlyConsumeScheduled;
+    /**
+     * 提前消费：候选池里已经有可用候选时，不再等搜索阶段收尾就直接放起来。
+     *
+     * <p>只做一次判断，真正的选源/加载交给 {@link #loadNextDetailFallbackSource()}，
+     * 与「搜索结束」「详情超时」两条既有路径共用同一段逻辑，避免多出一条选源分支。</p>
+     */
+    private final Runnable detailFallbackEarlyConsume = new Runnable() {
+        @Override
+        public void run() {
+            detailFallbackEarlyConsumeScheduled = false;
+            // 已复位 / 已在放另一个候选 → 什么都不做
+            if (!detailFallbackActive || detailFallbackLoadingCandidate) {
+                return;
+            }
+            if (!detailFallbackCacheEntryUsable()) {
+                return;
+            }
+            loadNextDetailFallbackSource();
+        }
+    };
     /**
      * 本「一圈」内已经轮转到过的**站点 key**。
      *
