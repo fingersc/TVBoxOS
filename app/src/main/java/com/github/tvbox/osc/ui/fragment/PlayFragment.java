@@ -2800,6 +2800,10 @@ public class PlayFragment extends BaseLazyFragment {
             return;
         }
         LOG.i("echo-switchLinePlay timeout, try next line");
+        // ★ 与 resolveTimeout / resolveFailed / parseStall 三个入口对齐：
+        //   起播超时同样是「这个站这次没播成」，不记的话 SourceQualityStore 会
+        //   少掉一大半失败样本，站点质量分被系统性高估 → 切源优先挑到的仍是慢站。
+        recordPlaybackFailure("switchLineTimeout");
         stopParse();
         if (hasAutoSwitchedPlayer) {
             if (!tryNextLineIfEnabled()) {
