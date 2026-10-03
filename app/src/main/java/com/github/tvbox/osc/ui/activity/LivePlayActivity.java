@@ -1269,7 +1269,7 @@ public class LivePlayActivity extends BaseActivity {
     private final Handler mmHandler = new Handler();
     private Runnable mLongPressRunnable;
     private static final long LONG_PRESS_DELAY = 800;
-    @Override
+
     /**
      * 换台/换源按键的节流：首次按下立即生效，连发（长按）限制最小间隔。
      *
@@ -1295,6 +1295,7 @@ public class LivePlayActivity extends BaseActivity {
         return true;
     }
 
+    @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         int keyCode = event.getKeyCode();
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
@@ -3309,15 +3310,20 @@ public class LivePlayActivity extends BaseActivity {
         }
     }
 
-    /** 时钟/网速每秒各跑一次，SimpleDateFormat 与 Date 都复用，避免每秒 new 两个对象。 */
-    private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
-    private final Date timeScratch = new Date();
+    /**
+     * 时钟/网速每秒各跑一次，SimpleDateFormat 与 Date 都复用，避免每秒 new 两个对象。
+     *
+     * <p>注意别叫 timeFormat —— 类里已有一个同名字段（EPG 用的 yyyy-MM-dd），
+     * 重名会直接编译不过。</p>
+     */
+    private final SimpleDateFormat clockTimeFormat = new SimpleDateFormat("HH:mm", Locale.getDefault());
+    private final Date clockTimeScratch = new Date();
 
     private Runnable mUpdateTimeRun = new Runnable() {
         @Override
         public void run() {
-            timeScratch.setTime(System.currentTimeMillis());
-            tvTime.setText(timeFormat.format(timeScratch));
+            clockTimeScratch.setTime(System.currentTimeMillis());
+            tvTime.setText(clockTimeFormat.format(clockTimeScratch));
             mHandler.postDelayed(this, 1000);
         }
     };
