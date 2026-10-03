@@ -1939,8 +1939,23 @@ public class LivePlayActivity extends BaseActivity {
             return false;
         }
         boolean showPreviousFrame = currentLiveChannelItem != null && mVideoView != null && mVideoView.isPlaying();
+        // 必须在「恢复默认播放器」之前取：这个值代表 mVideoView 里当前实际持有的
+        // 播放器实例（可能是上一次降级留下的 IJK），下面靠它判断能否直接复用。
         int previousLivePlayerType = livePlayerManager.getLivePlayerType();
         allowLiveSwitchPlayer = true;
+        // ★ 新的每一次起播（换台 / 换线路）都把播放器换回用户配置的默认值。
+        //
+        //   自动降级只对「这一次」播放尝试有效，不该污染后续频道。实测日志：
+        //   第一次降级是因为切到了一条死链线路（ott.fj.chinamobile.com），
+        //   EXO→IJK硬解→IJK软解 逐级退让；等换到能播的线路、乃至后面连换 5 个
+        //   频道（全是好线路、EXO 本来完全能播），播放器却一直粘在 IJK 软解上，
+        //   只能手动切回 EXO 才恢复 —— 降级的原因早就消失了，播放器却没回弹。
+        //
+        //   只在真的降级过时才恢复：没降级过就完全不动，
+        //   避免每次换台都重建播放器、丢掉「同类型播放器直接复用」的优化。
+        if (livePlayerFailoverStep > 0) {
+            livePlayerManager.getDefaultLiveChannelPlayer(mVideoView);
+        }
         // 换台 = 新频道的全新起播：自动换播放器的预算重新给足
         livePlayerFailoverStep = 0;
         if (!changeSource) {
