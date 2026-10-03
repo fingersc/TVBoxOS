@@ -82,12 +82,28 @@ public class IjkMediaPlayer extends IjkPlayer {
             //   放宽到 1000ms 后抖动基本消失（上层不再每秒被折腾二十几次，
             //   loading 也不再闪），代价是直播延迟增加约 0.5~1 秒。
             //   这是「低延迟」与「稳定不抖」的取舍点，要更低延迟就把它调回 300。
-            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 1000);
+            //
+            //   但对「分片长 + 每片重建连接」的源，1 秒仍然太薄：实测该类源
+            //   （IP:非标准端口的备份线路）一个分片约 10 秒、每片都要重新
+            //   WILL_HTTP_OPEN 一次，单片下载只要慢一点就欠载 → 周期性卡顿。
+            //   1500ms 是延迟与抗抖的折中；还在卡就调到 3000，代价是延迟再 +1~2 秒。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 1500);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "flush_packets", 1);
-            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 1);
-            // 解复用/解码线程数，只在软解时生效；硬解走 mediacodec，与此无关。
-            // 直播单线程即可（帧率低、要的是实时性），点播给 2 线程换吞吐。
-            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "1");
+            // 起播至少攒够 2 帧再出画面。原来是 1 帧（抢起播速度），对慢源等于
+            // 刚出画面就没货，紧接着立刻再卡一次。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 2);
+            // ★ 解码线程数：原来是写死 1，注释假定「直播一定走 mediacodec 硬解，
+            //   该选项不生效」。但硬解用不用得上取决于设备：没有硬件解码器
+            //   （模拟器、部分盒子）、或 mediacodec 不支持该编码、或分辨率超过
+            //   硬解能力时，ijk 会**静默**回落到 ffmpeg 软解 —— 这时 threads=1
+            //   就是拿单线程去解 1080p，直接表现为卡顿，而上层完全不知情。
+            //
+            //   判定依据：软解时 ijk 的 vout overlay 是 RV32（ffmpeg 转 RGB 上屏），
+            //   硬解时是 AMC overlay。实测日志里是
+            //   "SDL_VoutFFmpeg_CreateOverlay(w=1920, h=1080, fmt=RV32)" → 软解。
+            //
+            //   硬解本来就不走 ffmpeg 解码线程，所以给多线程没有任何副作用。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", liveDecodeThreads());
         }else{
             // 降低延迟
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 3000);
@@ -95,6 +111,17 @@ public class IjkMediaPlayer extends IjkPlayer {
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "2");
         }
 //        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "sync-av-start", 1);//强制音画同步
+    }
+
+    /**
+     * 直播软解时的解码线程数。
+     *
+     * <p>硬解（mediacodec）压根不走 ffmpeg 的解码线程，这个值不起作用；只有软解生效。
+     * 所以按「最坏情况 = 1080p 软解」来配，代价为零。</p>
+     */
+    private static String liveDecodeThreads() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        return String.valueOf(cores <= 2 ? 2 : Math.min(4, cores / 2));
     }
 
     /** 廉价的整数判断，用于避免靠异常来区分选项值类型。 */

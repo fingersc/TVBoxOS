@@ -188,6 +188,26 @@ public class LivePlayActivity extends BaseActivity {
      */
     private int livePlayerFailoverStep = 0;
     private static final int LIVE_PLAYER_MAX_FAILOVER = 2;
+    /**
+     * 本次起播是否已渲染出首帧。
+     *
+     * <p>用来区分两类失败：<ul>
+     *   <li><b>起播失败</b>——还没渲染出首帧就报错。这类几乎都是源侧问题
+     *       （DNS 失败 / 连接被拒 / 404 / 协议不支持），换播放器毫无意义：
+     *       同一个 URL 用 IJK 硬解、软解、EXO 去试，结果必然一样。</li>
+     *   <li><b>播放中断</b>——已经出画面之后才报错。这才可能是解码器或
+     *       流中断的问题，值得换播放器重试。</li>
+     * </ul></p>
+     *
+     * <p>实测（CCTV-2）：同一条坏线路上 EXO→IJK硬解→IJK软解 三次尝试全部失败，
+     * 每次还要各空等 3.5s，一共浪费 13.5 秒才换到能播的线路。
+     * 区分开之后，起播失败的等待从 3.5s 缩到 800ms。</p>
+     */
+    private boolean liveFirstFrameShown = false;
+    /** 起播失败的重试间隔：源侧失败判定很快（实测 80ms），没必要空等 3.5s。 */
+    private static final long LIVE_RETRY_BOOT_FAIL_MS = 800L;
+    /** 播放中失败的重试间隔：给网络一点恢复时间，沿用原节奏。 */
+    private static final long LIVE_RETRY_PLAYING_FAIL_MS = 3500L;
     private LiveChannelItem currentLiveChannelItem = null;
     private String pendingLiveRefreshChannelName = null;
     private int pendingLiveRefreshSourceIndex = -1;
@@ -1905,6 +1925,8 @@ public class LivePlayActivity extends BaseActivity {
     private boolean playChannel(int channelGroupIndex, int liveChannelIndex, boolean changeSource) {
         // 换台 = 全新起播，清掉状态去重标记，保证新频道的首个播放状态不被吞掉
         lastHandledPlayState = -1;
+        // 每次起播重新等首帧；失败时据此判定是「起播失败」还是「播放中断」
+        liveFirstFrameShown = false;
         if ((channelGroupIndex == currentChannelGroupIndex && liveChannelIndex == currentLiveChannelIndex && !changeSource)
                 // 列表被清空后（切源失败/重载配置）仍可能走到换源分支，这里原来直接
                 // getSourceNum() → NPE。顺便把「只有一个源」的早退一起判掉。
@@ -1930,6 +1952,9 @@ public class LivePlayActivity extends BaseActivity {
             // 否则：A 频道超时换源累计到 2，用户切到 B 频道时计数未清，B 第一次
             // 超时就被判定「源已试完」，直接跳过 B 剩下几个源、跳到下一个频道。
             currentLiveChangeSourceTimes = 0;
+            // 注意：这里不做任何「跳过坏线路」的处理。
+            // 线路的顺序由用户自己的服务端下发，客户端无权重排，
+            // 排第几就播第几；播不动了按既有的换源流程往后走。
         }
 
         channel_Name = currentLiveChannelItem;
@@ -1975,6 +2000,26 @@ public class LivePlayActivity extends BaseActivity {
         return mVideoView != null
                 && mVideoView.getCurrentPlayState() != VideoView.STATE_IDLE
                 && previousLivePlayerType == currentLivePlayerType;
+    }
+
+    /**
+     * 失败后等多久重试。
+     *
+     * <p><b>还没出过首帧就失败</b> ⟹ 起播失败。绝大多数是源侧问题（DNS 无记录 /
+     * 连接被拒 / 404 / 协议不支持），实测 IJK 只用 80ms 就返回，再等 3.5 秒纯属空等。
+     * 这里缩到 800ms：<ul>
+     *   <li>换引擎的兜底能力仍然保留（codec 不支持时下一个引擎可能就通了），
+     *       次数由 {@code livePlayerFailoverStep} 管着，用完自然落到换线路；</li>
+     *   <li>一条坏线路上原来要耗 3×3.5s，现在 3×0.8s。</li>
+     * </ul></p>
+     *
+     * <p><b>出过首帧之后才失败</b> ⟹ 播放中断，可能是中途断流或解码器崩了，
+     * 保持原来的 3.5 秒节奏，给网络一点恢复时间。</p>
+     *
+     * <p>线路本身是否可用、谁排前面，由下发线路的服务端决定，客户端不做记忆与重排。</p>
+     */
+    private long delayForLiveFailure() {
+        return liveFirstFrameShown ? LIVE_RETRY_PLAYING_FAIL_MS : LIVE_RETRY_BOOT_FAIL_MS;
     }
 
     private void loadEpgAfterChannelStarted() {
@@ -2379,13 +2424,18 @@ public class LivePlayActivity extends BaseActivity {
                         }
                         currentLiveChangeSourceTimes = 0;
                         allowLiveSwitchPlayer = true;
+                        if (playState == VideoView.STATE_PLAYING && !liveFirstFrameShown) {
+                            // 真的出画面了：后续若再失败就按「播放中断」处理
+                            // （中途断流 / 解码器问题，值得换播放器重试）
+                            liveFirstFrameShown = true;
+                        }
                         break;
                     case VideoView.STATE_ERROR:
                     case VideoView.STATE_PLAYBACK_COMPLETED:
-                        // 错误或播放结束状态：播放器遇到错误或播放完毕时，
-                        // 启动自动换源任务，等待3秒后尝试切换至备选源
+                        // 错误或播放结束状态：先判定失败发生在哪个阶段 ——
+                        // 起播阶段（还没出画面）直接换线路，播放中才先换播放器
                         hideSwitchChannelSnapshot();
-                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, 3500);
+                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, delayForLiveFailure());
                         break;
                     case VideoView.STATE_PREPARING:
                     case VideoView.STATE_BUFFERING:
@@ -2432,6 +2482,9 @@ public class LivePlayActivity extends BaseActivity {
         // 换播放器重播 = 全新一次起播，状态去重标记必须清掉，
         // 否则首个状态若与上次相同会被吞掉，换源倒计时就排不上
         lastHandledPlayState = -1;
+        // 重新等首帧：换引擎之后若仍旧秒失败，说明还是源的问题，
+        // 下次失败会被判定为「起播失败」而直接换线路，不再继续换引擎。
+        liveFirstFrameShown = false;
         if (!livePlayerManager.switchLivePlayer(mVideoView, livePlayerFailoverStep)) {
             allowLiveSwitchPlayer = false;
             return false;
@@ -2449,6 +2502,8 @@ public class LivePlayActivity extends BaseActivity {
             if (switchLivePlayerAndReplay()) {
                 return;
             }
+            // 走到这里说明播放器已经不给机会了：从头到尾没出过画面
+            // （起播超时 / 坏流 / 一直 buffering），交给换源流程往下一条线路走。
             currentLiveChangeSourceTimes++;
             if (currentLiveChannelItem.getSourceNum() == currentLiveChangeSourceTimes) {
                 currentLiveChangeSourceTimes = 0;
