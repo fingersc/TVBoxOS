@@ -1726,7 +1726,9 @@ public final class EpisodeNameMatcher {
      * 实测曾因随手取到这种条目，建了个错误锚点，比不探路更糟。</p>
      */
     public static boolean looksLikeMainEpisode(String name) {
-        if (TextUtils.isEmpty(name) || isNonMainEntry(name) || !isMainEntry(name)) {
+        // isMainEntry 只有带 FeatureLabels 的重载；此处是公开 API 拿不到 labels，
+        // 传 null 表示"不依赖采集到的系列标签"，与 isNonMainEntry(name) 单参口径一致。
+        if (TextUtils.isEmpty(name) || isNonMainEntry(name) || !isMainEntry(name, null)) {
             return false;
         }
         String residue = stripMainResidue(name);
@@ -2228,7 +2230,7 @@ public final class EpisodeNameMatcher {
         }
         java.util.TreeMap<Integer, Integer> counts = new java.util.TreeMap<>();
         for (String n : names) {
-            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels) || !isMainEntry(n)) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels) || !isMainEntry(n, labels)) {
                 continue;
             }
             if (extractPart(n) == PART_NONE) {
