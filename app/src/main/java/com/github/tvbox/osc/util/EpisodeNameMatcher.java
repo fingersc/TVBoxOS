@@ -105,8 +105,26 @@ public final class EpisodeNameMatcher {
     /**
      * 非正片词表（用于 {@link #isNonMainFeature} 判定与"同词"前缀提取）。
      */
+    /**
+     * 非正片标记词表。
+     *
+     * <p><b>全部按「词根」匹配，允许前后有其它字</b>（间隔匹配）：
+     * {@code 第20260814期一公观演区}、{@code 20260821一公观演区上}、{@code 观演区}
+     * 都能命中 {@code 观演区}。词根化后可覆盖「舞台纯享 / 初舞台观演区 / 二公观演区」
+     * 等各种包裹形式，不必逐个枚举组合（组合形式实测有 48 种）。</p>
+     *
+     * <p><b>入表判据</b>：该词在<b>全部 10 个真实源</b>（歌手2026 四源、披荆斩棘四源、
+     * 我家那闺女两源）里都只出现在衍生条目中，从未出现在正片上。
+     * 用户 2026-10 确认「观演区 / 预热直播 / 直拍机位 / 特别企划」四词均为衍生；
+     * 「初舞台」是中性词（可能是正片板块名）故<b>不入表</b>，
+     * 但「初舞台观演区」由「观演区」命中。</p>
+     */
     private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
-            "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享");
+            "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享"
+            // —— 综艺常见衍生栏目（用户 2026-10 确认）——
+            + "|观演区|预热直播|直拍机位|特别企划"
+            // —— 实测在所有真实源里均为纯衍生的组合词根 ——
+            + "|舞台纯享|毕业特辑|端午特辑|纯享典藏");
 
     /**
      * 期号必须出现在名字<b>开头</b>（允许前置"第x季"），才算"期数式正片"。
@@ -641,10 +659,78 @@ public final class EpisodeNameMatcher {
         if (names == null) {
             return out;
         }
+        // ★ 同日裸日期优先：见 sameDayBareDates 的说明。
+        java.util.Set<Integer> bareDays = sameDayBareDates(names, labels);
         for (int i = 0; i < names.size(); i++) {
             String n = names.get(i);
-            if (!TextUtils.isEmpty(n) && isMainEntry(n, labels)) {
+            if (TextUtils.isEmpty(n) || !isMainEntry(n, labels)) {
+                continue;
+            }
+            if (bareDays.isEmpty()) {
                 out.add(i);
+                continue;
+            }
+            int d = dateOf(n);
+            // 同日已有裸日期正片时，本条若带内容词则判为衍生
+            if (d > 0 && bareDays.contains(d) && !isBareDateName(n)) {
+                continue;
+            }
+            out.add(i);
+        }
+        return out;
+    }
+
+    /**
+     * 集名是否"裸日期式"：剥掉日期/期号/分段/「期」字后什么都不剩。
+     *
+     * <p>例：{@code 20260904上} → true（残留为分段标记，视为裸）；
+     * {@code 20260904二公观演区上} → false（残留含内容词）。</p>
+     */
+    private static boolean isBareDateName(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        String r = stripMainResidue(name);
+        return TextUtils.isEmpty(r) || isAllDigits(r);
+    }
+
+    private static boolean isAllDigits(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 返回"该日存在裸日期正片条目"的日期集合（列表级上下文）。
+     *
+     * <p>实测《披荆斩棘2026》电影天堂源：20260904 那天同时有
+     * {@code 20260904二公观演区上}（衍生）与 {@code 20260904上}（正片），
+     * 只看单条无法区分，看"同日是否有裸条目"就能判出来。</p>
+     *
+     * <p>这类源的正片<b>只有 13~23% 是裸日期</b>（其余都带「观演区/小考/全纪录」
+     * 等内容词），所以只靠扩充内容词表永远补不全 —— 必须用这个结构信号。</p>
+     */
+    private static java.util.Set<Integer> sameDayBareDates(List<String> names, FeatureLabels labels) {
+        java.util.Set<Integer> out = new java.util.HashSet<>();
+        if (names == null || names.isEmpty()) {
+            return out;
+        }
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels) || !isMainEntry(n, labels)) {
+                continue;
+            }
+            if (!isBareDateName(n)) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d > 0) {
+                out.add(d);
             }
         }
         return out;
@@ -1432,6 +1518,16 @@ public final class EpisodeNameMatcher {
             int srcSpan = ordinalSpan(sourceNames, labels);
             if (byDay >= 0 && srcSpan > 0 && clusters.size() != srcSpan) {
                 return byDay;
+            }
+            // ★★ 簇数 < 源侧期数时，簇秩会把后续所有期**整体前移** —— 静默错一集。
+            //   实测《披荆斩棘2026》360资源源：源侧 8 期，但 0904 那期的裸锚
+            //   （正片「二公团秀对决上」）整组被判成衍生，簇只剩 7 个，
+            //   于是「第4期」被映到簇3（=0911 那期，第5期）—— 错一期且毫无迹象。
+            //   日期外推 byDay 也不可靠（首播日 0815 + 7×3 = 0905 也不在列表里）。
+            //   此时**宁可返回 -1**（不落，保持原集不动），绝不能猜。
+            if (srcSpan > 0 && !clusters.isEmpty() && clusters.size() < srcSpan
+                    && byDay < 0 && byCluster >= 0) {
+                return -1;
             }
             if (byCluster >= 0) {
                 return byCluster;
@@ -2662,12 +2758,19 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return clusters;
         }
         int lastMainDate = -1;
+        // ★ 同日裸日期优先：见 sameDayBareDates 的说明。
+        //   不加这一步，「20260904二公观演区上」会被当成正片簇首，
+        //   把首播基准往前挪一整天，后续每期整体偏一期。
+        java.util.Set<Integer> bareDays = sameDayBareDates(names, labels);
         for (int i = 0; i < names.size(); i++) {
             String n = names.get(i);
             if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels)) {
                 continue;
             }
             int d = dateOf(n);
+            if (!bareDays.isEmpty() && d > 0 && bareDays.contains(d) && !isBareDateName(n)) {
+                continue;
+            }
             boolean boundary = clusters.isEmpty();
             if (!boundary && d > 0 && lastMainDate > 0) {
                 // 日期差必须走日历天序数：YYYYMMDD 整数相减跨月即失真（0429→0502 差 73）
@@ -3298,11 +3401,26 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (names == null) {
             return out;
         }
+        // ★ 必须排除衍生条目：同一天里正片与衍生混排（如 20260904 有
+        //   「二公观演区上」与「上」），把衍生也算进来会让"同日多段对齐"
+        //   在衍生条目之间乱配。实测《披荆斩棘2026》：源侧
+        //   「第20260904期预热直播」会通过本函数对到目标的
+        //   「20260904二公观演区上」—— 两者都是衍生，毫无对应关系。
+        java.util.Set<Integer> bareDays = sameDayBareDates(names, null);
         for (int i = 0; i < names.size(); i++) {
             EpisodeKey k = parse(names.get(i));
-            if (k.domain == DOMAIN_DATE && k.ordinal == ordinal) {
-                out.add(i);
+            if (k.domain != DOMAIN_DATE || k.ordinal != ordinal) {
+                continue;
             }
+            String n = names.get(i);
+            if (isNonMainEntry(n) || !isMainEntry(n, null)) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (!bareDays.isEmpty() && d > 0 && bareDays.contains(d) && !isBareDateName(n)) {
+                continue;
+            }
+            out.add(i);
         }
         return out;
     }
@@ -3351,6 +3469,14 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return -1;
         }
         if (sourceIndex < 0 || sourceIndex >= sourceNames.size()) {
+            return -1;
+        }
+        // ★ 衍生条目之间没有任何对应关系，同下标纯属巧合 —— 必须拒绝。
+        //   实测《披荆斩棘2026》：源侧「20260904二公观演区上」（idx25，衍生）
+        //   与目标侧「一公挑战赛（下）」（idx25，第2期的衍生）**恰好同下标**，
+        //   被"同下标兜底"配成了一对，切到了完全错误的期次。
+        //   同域判定对衍生条目不成立：它们只是"排在那个位置的衍生内容"。
+        if (isNonMainEntry(sourceNames.get(sourceIndex))) {
             return -1;
         }
         EpisodeKey current = parse(sourceNames.get(sourceIndex));
