@@ -2162,8 +2162,11 @@ public class PlayFragment extends BaseLazyFragment {
     private int resolveBackwardCrossDomain(String showName, String currentName,
                                            List<String> targetNames, long budget) {
         if (targetNames == null || targetNames.isEmpty()) return -1;
-        EpisodeNameMatcher.EpisodeKey cur = EpisodeNameMatcher.parse(currentName);
-        if (cur.domain != EpisodeNameMatcher.DOMAIN_ORDINAL || cur.ordinal <= 0) return -1;
+        // ★ 用 extractOrdinal 而非 parse().domain：「第20260612期」这类"期数里嵌日期"
+        //   的写法会被 parse 按「日期优先」判成 DOMAIN_DATE，严格判断会把这整类切源
+        //   挡在反向联网之外 —— 而它正是 feifan / 360zy 侧最常见的形态。
+        int curOrdinal = EpisodeNameMatcher.extractOrdinal(currentName);
+        if (curOrdinal <= 0) return -1;
         if (!EpisodeNameMatcher.isDateDominated(targetNames)) return -1;
 
         String anchor = EpisodeNameMatcher.firstDate(targetNames);
@@ -2174,7 +2177,7 @@ public class PlayFragment extends BaseLazyFragment {
         //   第2期上=20260411、第2期下=20260412）。只取单个日期会丢掉分段归属，
         //   于是"第2期上"可能被对到 20260412上。
         java.util.List<String> dates = EpisodeOnlineResolver.resolveDatesWithin(
-                showName, cur.ordinal, anchor, reverseBudget);
+                showName, curOrdinal, anchor, reverseBudget);
         if (dates != null && !dates.isEmpty()) {
             // 按「日期顺序 + 分集后缀」精确落位（第N期上→第1天、第N期下→第2天…）
             int byDates = EpisodeNameMatcher.findIndexByDates(dates, targetNames, currentName);
@@ -2191,7 +2194,7 @@ public class PlayFragment extends BaseLazyFragment {
         }
         // 兼容回退：多日期查询不可用时，仍走原来的单日期路径
         String date = EpisodeOnlineResolver.resolveDateWithin(
-                showName, cur.ordinal, anchor, reverseBudget);
+                showName, curOrdinal, anchor, reverseBudget);
         if (TextUtils.isEmpty(date)) return -1;
         // 带入 currentName 保持正片/非正片口径一致（避免正片落到同日的特辑上）
         return EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);

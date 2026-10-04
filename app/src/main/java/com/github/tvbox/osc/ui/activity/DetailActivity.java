@@ -3848,9 +3848,13 @@ public class DetailActivity extends BaseActivity {
     private int resolveBackwardCrossDomain(String showName, String currentName,
                                            List<String> targetNames, long budget) {
         if (targetNames == null || targetNames.isEmpty()) return -1;
-        // 当前名必须能解析出期数（序号域），否则反向无从谈起
-        EpisodeNameMatcher.EpisodeKey cur = EpisodeNameMatcher.parse(currentName);
-        if (cur.domain != EpisodeNameMatcher.DOMAIN_ORDINAL || cur.ordinal <= 0) return -1;
+        // 当前名必须能解析出期数，否则反向无从谈起。
+        // ★ 不能只看 domain == DOMAIN_ORDINAL：`第20260612期` 这类"期数式里嵌了日期"
+        //   的写法会被 parse 按「日期优先」判成 DOMAIN_DATE，于是这条路径整体失效 ——
+        //   而它恰恰是跨源对齐最常见的形态（实测 feifan / 360zy 侧全是这种写法）。
+        //   因此这里改为用 extractOrdinal：只要名字里能解出真实期号即可，与 domain 无关。
+        int curOrdinal = EpisodeNameMatcher.extractOrdinal(currentName);
+        if (curOrdinal <= 0) return -1;
         // 目标列表必须是日期域主导，才是我们要处理的反向场景
         if (!EpisodeNameMatcher.isDateDominated(targetNames)) return -1;
 
@@ -3863,7 +3867,7 @@ public class DetailActivity extends BaseActivity {
         //   第2期上=20260411、第2期下=20260412）。只取单个日期会丢掉分段归属，
         //   于是"第2期上"可能被对到 20260412上。
         java.util.List<String> dates = EpisodeOnlineResolver.resolveDatesWithin(
-                showName, cur.ordinal, anchor, reverseBudget);
+                showName, curOrdinal, anchor, reverseBudget);
         if (dates != null && !dates.isEmpty()) {
             // 按「日期顺序 + 分集后缀」精确落位（第N期上→第1天、第N期下→第2天…）
             int byDates = EpisodeNameMatcher.findIndexByDates(dates, targetNames, currentName);
@@ -3881,7 +3885,7 @@ public class DetailActivity extends BaseActivity {
         }
         // 兼容回退：多日期查询不可用时，仍走原来的单日期路径
         String date = EpisodeOnlineResolver.resolveDateWithin(
-                showName, cur.ordinal, anchor, reverseBudget);
+                showName, curOrdinal, anchor, reverseBudget);
         if (TextUtils.isEmpty(date)) return -1;
         // 带入 currentName 保持正片/非正片口径一致：
         // 当前是正片时，不会落到同日期但实为特辑/加更的条目上（那属于错配）。

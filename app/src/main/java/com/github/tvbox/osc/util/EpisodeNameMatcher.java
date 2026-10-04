@@ -1454,15 +1454,20 @@ public final class EpisodeNameMatcher {
                 byRank = findIndexByEpisode(currentName, rank + 1, targetNames,
                         partKnown ? wantPart : -1, labels);
             }
-            // ② 绝对日期外推：期号 ≈ (当前日期 − 首播日) / 7 周 + 1。
+            // ② 绝对日期外推：期号 ≈ (当前日期 − 首播日) / 节拍 + 1。
             int firstDate = firstMainDate(sourceNames, labels);
             int byEpisode = -1;
+            int srcPeriod = expectedPeriodBetweenClusters(sourceNames, labels);
+            if (srcPeriod <= 0) {
+                srcPeriod = 7;         // 保留原周更快照（实测行为正确）
+            }
             if (firstDate > 0 && curDay > 0) {
                 long diff = curDay - dayNumberOf(firstDate);
                 if (diff >= 0) {
-                    int episode = (int) Math.round(diff / 7.0) + 1;
-                    // 周更快照校验：当前日期应贴近"首播日 + 7×(期号-1) 天"
-                    if (Math.abs(diff - 7L * (episode - 1)) <= CLUSTER_TOLERANCE_DAYS) {
+                    int episode = (int) Math.round(diff / (double) srcPeriod) + 1;
+                    // 周更快照校验：当前日期应贴近"首播日 + 节拍×(期号-1) 天"
+                    int epTol = srcPeriod <= 3 ? 0 : Math.max(1, srcPeriod / 4);
+                    if (Math.abs(diff - (long) srcPeriod * (episode - 1)) <= epTol) {
                         byEpisode = findIndexByEpisode(currentName, episode, targetNames, -1, labels);
                     }
                 }
@@ -1628,7 +1633,8 @@ public final class EpisodeNameMatcher {
             rememberCrossDomainFact(curOrd, tgtDate, part);
             return;
         }
-        // 方向三：两侧都是「第YYYYMMDD期」包裹式 → 期号语义就是日期，跳过（无新信息）
+        // 方向三：两侧都是日期式 → 不产生新的期号锚点，跳过。
+        //   （这类对齐不提供"期号 ↔ 日期"的对应关系，强行入库反而会污染事实表。）
     }
 
     /**
@@ -1667,8 +1673,11 @@ public final class EpisodeNameMatcher {
         if (curHasDate) {
             wantOrdinal = recallOrdinalOfDate(curDate, wantPart0);
             if (wantOrdinal <= 0) {
-                // 分段口径可能两侧不一致（"上/下" vs 无后缀），退化到"不分段"再试
                 wantOrdinal = recallOrdinalOfDate(curDate, PART_NONE);
+            }
+            if (wantOrdinal <= 0) {
+                // 表里没有这一天 → 用已有锚点外推它的期号
+                wantOrdinal = ordinalOfDateByFacts(curDate, wantPart0);
             }
             if (wantOrdinal > 0) {
                 // 有期号 → 直接按期号在目标里找
@@ -1690,7 +1699,239 @@ public final class EpisodeNameMatcher {
                     return byDate;
                 }
             }
+            // 查表没有这一期 → 用已有锚点拟合周更节奏外推（见 alignByFactExtrapolation）
+            return alignByFactExtrapolation(curOrdinal, wantPart0, currentName, targetNames);
+        }
+        return -1;
+    }
+
+    // ================= 第 -2 层：事实锚点外推（用已知锚点拟合周更节奏） =================
+
+    /**
+     * 用<b>已记住的事实</b>外推第 N 期的播出日，再按日期落位。
+     *
+     * <p><b>为什么需要它</b>：查表只能回答"第4期 = 20260612"这种<b>记过的</b>期号。
+     * 但用户看的是第5期时，事实表里并没有第5期 —— 若此时直接返回 -1，
+     * 就退回"首播日 + 7×(N−1)"的老路，而那条路的基准日可能被"特别企划"污染，
+     * 于是又整体偏移一期（实测：第4期能切对，第5期却切到错误条目）。</p>
+     *
+     * <p><b>怎么做</b>：事实表里只要有<b>两个及以上</b>锚点，
+     * 就能拟合出"每期多少天"（周更=7、隔周=14、日更=1），
+     * 于是 20260612 + 7 = <b>20260619 = 第5期</b>，可直接落位。
+     * 这比"列表首条日期"可靠得多 —— 首条可能是特别企划，而事实锚点是两侧证实的。</p>
+     *
+     * <p>只有一个锚点时不做外推（无法确定周期，可能是周更也可能是隔周）。</p>
+     *
+     * @return 目标列表下标；锚点不足或落位失败返回 -1
+     */
+    private static int alignByFactExtrapolation(int curOrdinal, int wantPart0,
+                                                 String currentName, List<String> targetNames) {
+        if (curOrdinal <= 0 || targetNames == null || targetNames.isEmpty()) {
             return -1;
+        }
+        int p = normalizePart(wantPart0);
+        // 收集本分段下已知的（期号 → 日期）锚点
+        int minOrd = Integer.MAX_VALUE, maxOrd = Integer.MIN_VALUE;
+        long baseDay = 0;
+        int baseOrd = 0;
+        int anchors = 0;
+        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+            String key = e.getKey();
+            int bar = key.lastIndexOf('|');
+            if (bar <= 0) {
+                continue;
+            }
+            if (parseIntSafe(key.substring(bar + 1), -1) != p) {
+                continue;
+            }
+            int ord = parseIntSafe(key.substring(1, bar), -1);
+            Integer date = e.getValue();
+            if (ord <= 0 || date == null || date <= 0) {
+                continue;
+            }
+            anchors++;
+            if (ord < minOrd) {
+                minOrd = ord;
+            }
+            if (ord > maxOrd) {
+                maxOrd = ord;
+            }
+            if (baseOrd == 0 || ord < baseOrd) {
+                baseOrd = ord;
+                baseDay = dayNumberOf(date);
+            }
+        }
+        // 两个锚点才能拟合周期；只有一个时"周更/隔周"无法区分，宁可不做
+        if (anchors < 2 || baseOrd == 0 || baseDay <= 0) {
+            return -1;
+        }
+        // 取"跨度 / 期数差"作为每期天数；非整数倍说明锚点来自不同更新节奏，退回
+        int ordGap = maxOrd - minOrd;
+        long daySpan = 0;
+        int baseDate = 0;
+        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+            String key = e.getKey();
+            int bar = key.lastIndexOf('|');
+            if (bar <= 0 || parseIntSafe(key.substring(bar + 1), -1) != p) {
+                continue;
+            }
+            if (parseIntSafe(key.substring(1, bar), -1) != minOrd) {
+                continue;
+            }
+            baseDate = e.getValue() == null ? 0 : e.getValue();
+            break;
+        }
+        if (baseDate <= 0 || ordGap <= 0) {
+            return -1;
+        }
+        int maxDate = 0;
+        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+            String key = e.getKey();
+            int bar = key.lastIndexOf('|');
+            if (bar <= 0 || parseIntSafe(key.substring(bar + 1), -1) != p) {
+                continue;
+            }
+            if (parseIntSafe(key.substring(1, bar), -1) != maxOrd) {
+                continue;
+            }
+            maxDate = e.getValue() == null ? 0 : e.getValue();
+            break;
+        }
+        if (maxDate <= 0) {
+            return -1;
+        }
+        daySpan = dayNumberOf(maxDate) - dayNumberOf(baseDate);
+        if (daySpan <= 0) {
+            return -1;
+        }
+        long perPeriod = daySpan / ordGap;
+        // 只接受"像更新节奏"的周期：日更1 / 周双更2~3 / 周更7 / 隔周14 / 月更28~31
+        if (perPeriod < 1 || perPeriod > 31) {
+            return -1;
+        }
+        // 锚点必须严格等比（不整除说明锚点里混入了非正片或缺期），放弃外推
+        if (daySpan % ordGap != 0) {
+            return -1;
+        }
+        long expectDay = dayNumberOf(baseDate) + perPeriod * (curOrdinal - baseOrd);
+        if (expectDay <= 0) {
+            return -1;
+        }
+        // ★ 容差必须随周期收紧，且日更/周双更一律不放宽。
+        //   反例（日更节目缺第5期）：period=1，若沿用 ±3 天容差，
+        //   期望日 0604 会静默命中 0603（第4期）——危险的错切。
+        //   正确做法是"精确命中，否则不猜"。
+        final int tol = perPeriod <= 3 ? 0 : Math.max(1, (int) (perPeriod / 4));
+        // 在目标列表里找离期望播出日最近、同分段、且为正片的条目
+        int best = -1;
+        long bestDist = Long.MAX_VALUE;
+        for (int i = 0; i < targetNames.size(); i++) {
+            String n = targetNames.get(i);
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n)) {
+                continue;
+            }
+            if (normalizePart(extractPart(n)) != p) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d <= 0) {
+                continue;
+            }
+            long dist = Math.abs(dayNumberOf(d) - expectDay);
+            if (dist <= tol && dist < bestDist) {
+                bestDist = dist;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /** 宽松的字符串转 int，失败返回默认值。 */
+    private static int parseIntSafe(String s, int def) {
+        if (TextUtils.isEmpty(s)) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /**
+     * 用事实表反推某个播出日期的期号（供"当前集名是日期、目标源是期数式"这一方向使用）。
+     *
+     * <p><b>为什么需要它</b>：目标侧是 {@code 第N期} 时，得知道"当前日期是第几期"才能落位。
+     * 老办法是 {@code firstMainDate + 7×(N−1)}，但对<b>全无名的日期式源</b>
+     * （{@code 第20260515期} 其实是"特别企划"）这个基准日会整体偏移一期。
+     * 事实表里的锚点是两侧证实的，比任何启发式可靠：
+     * 精确命中直接返回；否则用两个锚点的<b>线性夹逼</b>推出期号。</p>
+     *
+     * @return 期号；无法确定时返回 -1
+     */
+    private static int ordinalOfDateByFacts(int date, int part) {
+        if (date <= 0) {
+            return -1;
+        }
+        int p = normalizePart(part);
+        int exact = recallOrdinalOfDate(date, p);
+        if (exact > 0) {
+            return exact;
+        }
+        exact = recallOrdinalOfDate(date, PART_NONE);
+        if (exact > 0) {
+            return exact;
+        }
+        // 收集本分段下所有锚点：期号 → 日期
+        List<int[]> anchors = new ArrayList<>();   // {ordinal, date}
+        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+            String key = e.getKey();
+            int bar = key.lastIndexOf('|');
+            if (bar <= 0) {
+                continue;
+            }
+            int ps = parseIntSafe(key.substring(bar + 1), -1);
+            if (ps != p && ps != PART_NONE) {
+                continue;
+            }
+            int ord = parseIntSafe(key.substring(1, bar), -1);
+            Integer d = e.getValue();
+            if (ord > 0 && d != null && d > 0) {
+                anchors.add(new int[]{ord, d});
+            }
+        }
+        if (anchors.isEmpty()) {
+            return -1;
+        }
+        long targetDay = dayNumberOf(date);
+        if (targetDay <= 0) {
+            return -1;
+        }
+        // 两两配对，用「日期差 : 期号差」的比例线性外推
+        for (int[] a : anchors) {
+            for (int[] b : anchors) {
+                if (b[0] <= a[0]) {
+                    continue;
+                }
+                long da = dayNumberOf(a[1]);
+                long db = dayNumberOf(b[1]);
+                if (da <= 0 || db <= 0 || db <= da || targetDay < da) {
+                    continue;
+                }
+                long dayDiff = db - da;
+                if (dayDiff % (b[0] - a[0]) != 0) {
+                    continue;
+                }
+                long perPeriod = dayDiff / (b[0] - a[0]);
+                if (perPeriod < 1 || perPeriod > 31) {
+                    continue;
+                }
+                long off = targetDay - da;
+                if (off % perPeriod != 0) {
+                    continue;
+                }
+                return a[0] + (int) (off / perPeriod);
+            }
         }
         return -1;
     }
@@ -1737,11 +1978,18 @@ public final class EpisodeNameMatcher {
         if (names == null || names.isEmpty() || ordinal <= 0) {
             return -1;
         }
-        int firstDate = firstMainDate(names, labels);
+int firstDate = firstMainDate(names, labels);
         if (firstDate <= 0) {
             return -1;
         }
-        long expected = dayNumberOf(firstDate) + 7L * (ordinal - 1);
+        int period = expectedPeriodBetweenClusters(names, labels);
+        if (period <= 0) {
+            period = 7;                 // 保留原周更快照（实测行为正确）
+        }
+long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
+        // ★ 容差随节拍收紧：日更 / 周双更只允许精确命中，
+        //   否则目标侧缺该期时会静默命中邻居集（实测错切到隔壁一期）。
+        final int tol = period <= 3 ? 0 : Math.max(1, period / 4);
         int best = -1;
         long bestDist = Long.MAX_VALUE;
         for (int i = 0; i < names.size(); i++) {
@@ -1757,7 +2005,7 @@ public final class EpisodeNameMatcher {
                 continue;
             }
             long dist = Math.abs(dayNumberOf(d) - expected);
-            if (dist <= CLUSTER_TOLERANCE_DAYS && dist < bestDist) {
+            if (dist <= tol && dist < bestDist) {
                 bestDist = dist;
                 best = i;
             }
@@ -1765,12 +2013,89 @@ public final class EpisodeNameMatcher {
         return best;
     }
 
+    /**
+     * 用列表自身"簇与簇之间的实测间隔"估计节拍；推不出返回 -1。
+     *
+     * <p>比"统计相邻间隔众数"可靠：簇是<b>一期一组</b>，簇间间隔天然就是期距，
+     * 不会被"期内的每日衍生条目"污染。仍推不出时由调用方退回 7 天周更快照 ——
+     * 7 天在真实数据上行为正确，而"猜节拍"的三种做法（众数 / 最长等差链 /
+     * 周期性探测打分）实测都会误判，详见 {@link #inferPeriodDays} 的说明。</p>
+     */
+    private static int expectedPeriodBetweenClusters(List<String> names, FeatureLabels labels) {
+        if (names == null || names.isEmpty()) {
+            return -1;
+        }
+        List<List<Integer>> clusters = buildMainFeatureClusters(names, labels);
+        List<Integer> starts = new ArrayList<>();
+        for (List<Integer> cl : clusters) {
+            for (int idx : cl) {
+                int d = dateOf(names.get(idx));
+                if (d > 0) {
+                    starts.add((int) dayNumberOf(d));
+                    break;
+                }
+            }
+        }
+        if (starts.size() < 3) {
+            return -1;
+        }
+        Map<Integer, Integer> cnt = new HashMap<>();
+        int total = 0;
+        for (int i = 0; i + 1 < starts.size(); i++) {
+            int g = starts.get(i + 1) - starts.get(i);
+            if (g > 0) {
+                Integer c = cnt.get(g);
+                cnt.put(g, c == null ? 1 : c + 1);
+                total++;
+                }
+        }
+        if (total == 0) {
+            return -1;
+        }
+        int bestGap = -1, bestCount = 0;
+        for (Map.Entry<Integer, Integer> e : cnt.entrySet()) {
+            int g = e.getKey(), c = e.getValue();
+            if (c > bestCount || (c == bestCount && g > bestGap)) {
+                bestCount = c;
+                bestGap = g;
+            }
+        }
+        if (bestGap < 1 || bestGap > 31) {
+            return -1;
+        }
+        // 众数需占多数，否则节拍很杂，不可信
+        if (bestCount * 2 <= total) {
+            return -1;
+        }
+        return bestGap;
+    }
+
+    /**
+     * 从列表自身推断「每期间隔天数」。
+     *
+     * <p><b>本项目实测证明：不可靠，已停用（恒返回 -1），不要重新启用。</b>
+     * 三种尝试全部失败并造成回退：</p>
+     * <ul>
+     *   <li><b>众数法</b>：feifan 源间隔分布 {1天:59, 3:8, 2:3, 4:1} → 众数 1，
+     *       但它其实是<b>周更综艺、只是每天都有内容</b>，真实节拍是 7；</li>
+     *   <li><b>最长等差链</b>：衍生条目也会成链，起点落到「特别企划」；</li>
+     *   <li><b>周期性探测打分</b>：p=1 得分 894 压倒 p=7 的 357（日更天然占优）。</li>
+     * </ul>
+     * <p>本地无解的证明：p=1 与 p=7 在"第1期与第2期的日期都在列表里"这一事实上
+     * <b>同样成立</b>，无法区分。因此保留 7 天周更快照，
+     * 非周更节拍交由事实查表 / 事实外推两层处理（它们用真实锚点直接算日期）。</p>
+     */
+    private static int inferPeriodDays(List<String> names, FeatureLabels labels) {
+        return -1;
+    }
+
     /** 周更快照校验容差（天）：落点/当前集日期与期望播出日的最大偏差。 */
     private static final int CLUSTER_TOLERANCE_DAYS = 3;
 
     /**
-     * 计算第 {@code rank} 个簇的期望播出日（天序数）：首簇日期 + 每周 7 天 × rank。
-     * 首簇没有可解析日期时返回 -1（表示无法建立周更快照，调用方跳过校验）。
+     * 计算第 {@code rank} 个簇的期望播出日（天序数）：首簇日期 + 节拍 × rank。
+     * 节拍优先取簇间实测间隔（{@link #expectedPeriodBetweenClusters}），
+     * 推不出时退回 7 天周更快照（实测行为正确）。
      */
     private static long expectedDayOf(List<String> names, List<List<Integer>> clusters, int rank) {
         if (clusters == null || clusters.isEmpty()) {
@@ -1780,7 +2105,11 @@ public final class EpisodeNameMatcher {
         if (c0 <= 0) {
             return -1;
         }
-        return dayNumberOf(c0) + 7L * rank;
+        int period = expectedPeriodBetweenClusters(names, null);
+        if (period <= 0) {
+            period = 7;
+        }
+        return dayNumberOf(c0) + (long) period * rank;
     }
 
     /**
