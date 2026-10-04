@@ -822,6 +822,22 @@ public final class EpisodeNameMatcher {
         if (names == null) {
             return;
         }
+        // ★ 只有「孤立单期」的标签才算数 —— 它是某一期正片的别名
+        //   （实测《披荆斩棘2026》豪华源「第2期一公挑战赛（上）」里的
+        //   「一公挑战赛」只属于第 2 期；矩阵 R 组的「初舞台」「一公挑战赛」
+        //   「二公挑战赛」…每期一个名字、各只覆盖 1 期）。
+        //
+        //   反之，**多期出现的栏目名是衍生**（实测《魔力歌先生》豪华源的
+        //   「怼脸拍」覆盖 6 期、「超会变」7 期、「魔先堡」7 期、「唱享版」8 期，
+        //   而真正片是裸的「第N期上/下」）。把它们收进标签表会让 isMainEntry
+        //   反过来把所有衍生条目提升成正片 —— 该节目 360资源源正片数从 20
+        //   虚增到 56、日期簇从 10 塌成 9，簇秩整体错位，切到隔壁期。
+        //
+        //   ★ 为什么用「孤立单期」而不是覆盖率：源站常常只更新到第 3 期
+        //     （`第1期…第3期上/下` 就没了），此时「小日记」覆盖 [1,2,3]、
+        //     覆盖率 100%，仍是每期都出的衍生栏目；而正片别名天然只属一期。
+        //     覆盖率对这个源站形态完全失效，孤立性才是稳定判据。
+        Map<String, Set<Integer>> hits = new HashMap<>();
         for (String n : names) {
             if (TextUtils.isEmpty(n) || NON_MAIN_FEATURE.matcher(n).find()) {
                 continue;
@@ -833,7 +849,22 @@ public final class EpisodeNameMatcher {
             if (!isLeadingOrdinal(n)) {
                 continue;
             }
-            out.add(featureLabelOf(n), key.ordinal);
+            String lbl = featureLabelOf(n);
+            if (TextUtils.isEmpty(lbl)) {
+                continue;
+            }
+            Set<Integer> s = hits.get(lbl);
+            if (s == null) {
+                s = new HashSet<>();
+                hits.put(lbl, s);
+            }
+            s.add(key.ordinal);
+        }
+        for (Map.Entry<String, Set<Integer>> en : hits.entrySet()) {
+            // 只认「孤立单期」标签；覆盖 ≥2 期的一律是每期都出的衍生栏目
+            if (en.getValue().size() == 1) {
+                out.add(en.getKey(), en.getValue().iterator().next());
+            }
         }
     }
 
@@ -1558,13 +1589,22 @@ public final class EpisodeNameMatcher {
         if (curHasDate) {
             final long curDay = dayNumberOf(cur.ordinal);
             final int explicitPart = curPart;
+            // ★★★ 开头幽灵簇裁剪：先导片/加更版被当成正片时，簇序整体后移，
+            //   簇秩会把每一期都算大（实测《魔力歌先生》360资源源开头有
+            //   `第20260302期`/`第20260306期` 两条先导片，簇数 12 ≠ 目标 10 期，
+            //   20260508 的簇秩算成第 11 期 → 错落第 8 期）。
+            //   裁剪后簇序与真实期序一致，byRank 与 byEpisode 两条路同时修正。
+            final int ghost = leadingGhostClusters(sourceNames, labels);
             // ① 簇法：用旧源列表自身的正片簇求当前集的期簇序。
             // 注意簇序只依赖列表内的相对次序，与日期数值无关，
             // 因此源站年份整体错标（2025… vs 实际 2026…）不影响结果。
-            List<List<Integer>> clusters = buildMainFeatureClusters(sourceNames, labels);
+            List<List<Integer>> clusters = applyGhostSkip(sourceNames, labels, ghost);
             int rank = mainFeatureClusterRank(sourceNames, sourceIndex, labels);
+            if (rank >= 0 && ghost > 0) {
+                rank -= ghost;                 // 裁掉的幽灵簇不参与期序编号
+            }
             int byRank = -1;
-            if (rank >= 0) {
+            if (rank >= 0 && rank < clusters.size()) {
                 // 分段推断：名字没写上/下时，用簇内位置推（2 条 → 上/下；3 条 → 上/中/下）。
                 // 例：dytt 的裸日期「20260815 / 20260816」= 第1期上 / 第1期下，
                 // 若不推断，看「20260816」切源会落到第1期<b>上</b>（用户实测 case）。
@@ -1585,7 +1625,10 @@ public final class EpisodeNameMatcher {
                         partKnown ? wantPart : -1, labels);
             }
             // ② 绝对日期外推：期号 ≈ (当前日期 − 首播日) / 节拍 + 1。
-            int firstDate = firstMainDate(sourceNames, labels);
+            // ★ 幽灵簇被裁掉时，首播基准同步后挪（否则日期外推会从先导片起算）
+            int firstDate = ghost > 0
+                    ? firstMainDateSkip(sourceNames, labels, ghost)
+                    : firstMainDate(sourceNames, labels);
             // ★★★ 开头插入簇校准：真第1期不在列表首条时把首播基准往后挪。
             //   仅在目标侧带分段时启用（见 leadingInsertClusters 的说明），
             //   对无分段节目完全不触发。
@@ -2806,6 +2849,100 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
         }
         return clusters;
+    }
+
+    /**
+     * 判定源侧开头有几个「幽灵簇」—— 先导片/加更版等被误当成正片的孤立簇。
+     *
+     * <p>★ 与 {@link #leadingInsertClusters} 的区别：那一个靠"簇条数序列 vs 每期分段条数"
+     * 对齐，只在<b>目标侧带分段</b>时可用；本节目源侧开头是 {@code 第20260302期}、
+     * {@code 第20260306期}（先导片，裸日期、判不出任何衍生词），条数序列也对不上，
+     * 于是插入簇校准返回 0，簇数 12 ≠ 目标 10 期，簇秩整体后移 2 位
+     * （实测《魔力歌先生》20260508 →错落第 8 期）。</p>
+     *
+     * <p>判据：<b>带分段的等差尾部</b>。真实正片一期有多条（带「上/下」分段），
+     * 且簇首日期严格等间隔；而开头的先导片/加更版是<b>孤立单条、无分段</b>，
+     * 与正片簇形态截然不同。从尾部往回扩展，只认「带分段 + 等间隔」的簇，
+     * 停在第一个形态不符的簇之前，返回其下标。</p>
+     *
+     * <p>守卫极保守，四条全满足才敢裁：</p>
+     * <ul>
+     *   <li>带分段的等差尾部至少 3 个簇（保证有足够长的拟合段）；</li>
+     *   <li>被裁的头部簇 ≤ 4 个（"先导片"不会有 5 条以上）；</li>
+     *   <li>头部被裁簇必须<b>全部</b>是"孤立单条且无分段"形态；</li>
+     *   <li>尾部间隔必须严格恒定。</li>
+     * </ul>
+     * <p>不满足时返回 0，宁可不动。</p>
+     *
+     * @param names  源侧剧集名列表
+     * @param labels 期标签
+     * @return 需要跳过的头部幽灵簇个数；不可信时返回 0
+     */
+    private static int leadingGhostClusters(List<String> names, FeatureLabels labels) {
+        List<List<Integer>> clusters = buildMainFeatureClusters(names, labels);
+        if (clusters.size() < 4) {
+            return 0;
+        }
+        int k = clusters.size();
+        int[] days = new int[k];
+        boolean[] segmented = new boolean[k];
+        for (int i = 0; i < k; i++) {
+            int d = -1;
+            boolean hasSeg = false;
+            List<Integer> c = clusters.get(i);
+            for (int idx : c) {
+                if (extractPart(names.get(idx)) != PART_NONE) {
+                    hasSeg = true;
+                }
+                int dd = dateOf(names.get(idx));
+                if (dd > 0 && d <= 0) {
+                    d = dd;
+                }
+            }
+            if (d <= 0) {
+                return 0;                // 有簇无日期 → 无法做节拍拟合
+            }
+            days[i] = dayNumberOf(d);
+            segmented[i] = hasSeg;
+        }
+        // 从尾部往回扩展：必须「带分段」且间隔恒定
+        int keepFrom = k - 1;
+        int lastGap = days[k - 1] - days[k - 2];
+        while (keepFrom > 0 && segmented[keepFrom] && segmented[keepFrom - 1]
+                && days[keepFrom] - days[keepFrom - 1] == lastGap) {
+            keepFrom--;
+        }
+        if (k - keepFrom < 3) {
+            return 0;
+        }
+        int drop = keepFrom;
+        if (drop <= 0 || drop > 4) {
+            return 0;
+        }
+        // 头部被裁簇必须全是"孤立单条且无分段"，否则可能是真实正片
+        for (int i = 0; i < drop; i++) {
+            if (clusters.get(i).size() != 1 || segmented[i]) {
+                return 0;
+            }
+        }
+        return drop;
+    }
+
+    /**
+     * 按节拍尾部对齐裁掉开头 {@code drop} 个幽灵簇，返回裁剪后的簇列表。
+     *
+     * @param names  剧集名列表
+     * @param labels 期标签
+     * @param drop   要跳过的头部簇数
+     * @return 裁剪后的簇列表
+     */
+    private static List<List<Integer>> applyGhostSkip(List<String> names,
+                                                     FeatureLabels labels, int drop) {
+        List<List<Integer>> clusters = buildMainFeatureClusters(names, labels);
+        if (drop <= 0 || drop >= clusters.size()) {
+            return clusters;
+        }
+        return new ArrayList<List<Integer>>(clusters.subList(drop, clusters.size()));
     }
 
     /**
