@@ -200,6 +200,16 @@ public class DetailActivity extends BaseActivity {
     private TextView tvQuickSearch;
     private TextView tvChangeSource;
     private TextView tvCollect;
+    /** 「正在切换片源…」提示最长驻留时长；超时自动关闭，避免候选源全挂时弹窗永久残留。 */
+    private static final long SWITCHING_SOURCE_TOAST_TIMEOUT_MS = 8000L;
+    /** 切源进行中的提示弹窗实例（同一会话内复用，避免连点堆叠）。 */
+    private Toast switchingSourceToast = null;
+    private final Runnable hideSwitchingSourceToast = new Runnable() {
+        @Override
+        public void run() {
+            dismissSwitchingSourceToast();
+        }
+    };
     private TvRecyclerView mGridViewFlag;
     private TvRecyclerView mGridViewQuality;
     private TvRecyclerView mGridView;
@@ -1364,6 +1374,43 @@ public class DetailActivity extends BaseActivity {
     }
 
     /**
+     * 切源进行中的提示弹窗（带超时自关）。
+     *
+     * <p>原实现直接 {@code Toast.LENGTH_SHORT} 显示「正在切换片源，请稍候…」：
+     * 若候选源全部不可用（DNS 失败 / 整片站点不可达），切源状态机在 3 次续切预算
+     * 耗尽后停止，但该 Toast 早已消失，用户看不到任何结果；反过来若用户在
+     * {@code DETAIL_FALLBACK_MAX_FAILOVER} 轮续切期间连续点按，旧 Toast 还没走完
+     * 就被不断顶掉，屏幕上会闪过一串同样的文字，看起来像应用卡死重复响应。</p>
+     *
+     * <p>改为「先关旧的再显示新的」+ 超时强制关闭：同一次切源会话内只保留一个弹窗，
+     * 且其生命周期不超过 {@link #SWITCHING_SOURCE_TOAST_TIMEOUT_MS}。</p>
+     */
+    private void showSwitchingSourceToast() {
+        if (switchingSourceToast != null) {
+            switchingSourceToast.cancel();
+            switchingSourceToast = null;
+        }
+        if (llLayout != null) {
+            llLayout.removeCallbacks(hideSwitchingSourceToast);
+        }
+        switchingSourceToast = Toast.makeText(this, "正在切换片源，请稍候…", Toast.LENGTH_LONG);
+        switchingSourceToast.show();
+        if (llLayout != null) {
+            llLayout.postDelayed(hideSwitchingSourceToast, SWITCHING_SOURCE_TOAST_TIMEOUT_MS);
+        }
+    }
+
+    private void dismissSwitchingSourceToast() {
+        if (llLayout != null) {
+            llLayout.removeCallbacks(hideSwitchingSourceToast);
+        }
+        if (switchingSourceToast != null) {
+            switchingSourceToast.cancel();
+            switchingSourceToast = null;
+        }
+    }
+
+    /**
      * 切源入口（菜单点击 / 播放器线路耗尽）。
      *
      * 设计：
@@ -1380,7 +1427,7 @@ public class DetailActivity extends BaseActivity {
             return false;
         }
         if (detailFallbackActive) {
-            Toast.makeText(this, "正在切换片源，请稍候…", Toast.LENGTH_SHORT).show();
+            showSwitchingSourceToast();
             return true;
         }
         // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
@@ -2994,6 +3041,8 @@ public class DetailActivity extends BaseActivity {
     private void resetDetailFallback(boolean keepCache) {
         detailFallbackFailoverCount = 0;
         detailFallbackActive = false;
+        // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
+        dismissSwitchingSourceToast();
         detailFallbackSearching = false;
         detailFallbackSearchCollecting = false;
         detailFallbackSearchTimedOut = false;
@@ -4353,6 +4402,7 @@ public class DetailActivity extends BaseActivity {
         OkGo.getInstance().cancelTag("detail");
         OkGo.getInstance().cancelTag("quick_search");
         releasePlayFragment();
+        dismissSwitchingSourceToast();
         EventBus.getDefault().unregister(this);
     }
 
