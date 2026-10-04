@@ -379,6 +379,15 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
                 mAudioFocusHelper.abandonFocus();
             }
             mPlayerContainer.setKeepScreenOn(false);
+        } else if (mAudioFocusHelper != null && !isMute()) {
+            // ★ 守卫不成立时（播放器处于 IDLE / PREPARING / BUFFERING /
+            //   COMPLETED，或 isPlaying() 已是 false）同样要把音频焦点还掉，
+            //   否则 PageFragment.onHiddenChanged(true) → pause() 会空转，
+            //   焦点一直被本应用持有 —— 表现是"退出到首页声音还在"，
+            //   而且别的应用也抢不到音频焦点。
+            //   仅归还焦点、不动播放状态，避免影响切源/缓冲中的正常流程。
+            mAudioFocusHelper.abandonFocus();
+            mPlayerContainer.setKeepScreenOn(false);
         }
     }
 
@@ -457,20 +466,32 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
                     e.printStackTrace();
                 }
             }
-            //关闭AudioFocus监听
-            if (mAudioFocusHelper != null) {
-                mAudioFocusHelper.abandonFocus();
-                mAudioFocusHelper = null;
-            }
-            //关闭屏幕常亮
-            mPlayerContainer.setKeepScreenOn(false);
-            //保存播放进度
-            saveProgress();
             //重置播放进度
             mCurrentPosition = 0;
             //切换转态
             setPlayState(STATE_IDLE);
         }
+        // ★★ 以下三步必须无条件执行，不能放在上面那个 if 里。
+        //
+        // 实测问题（2026-10）：从播放页退回到首页后**声音仍在继续**。
+        // 根因是它们原先被 `if (!isInIdleState())` 整体包住，而播放器在
+        // 退栈瞬间常处于 STATE_IDLE（直播尤其明显：HLS 频繁 PREPARING/
+        // BUFFERING，切源竞态下换源失败会把状态重置为 IDLE），于是整块被跳过 ——
+        // 音频焦点不归还、屏幕常亮不关、进度不落盘。
+        // 这三步本身都是幂等的，不依赖播放器状态，放到 if 外最安全。
+        //
+        // 说明：mMediaPlayer.release() / mRenderView.release() 仍留在 if 内，
+        // 因为它们需要 mMediaPlayer 非空这一判空保护，不能无条件调用。
+        //
+        //关闭AudioFocus监听
+        if (mAudioFocusHelper != null) {
+            mAudioFocusHelper.abandonFocus();
+            mAudioFocusHelper = null;
+        }
+        //关闭屏幕常亮
+        mPlayerContainer.setKeepScreenOn(false);
+        //保存播放进度
+        saveProgress();
         mVideoSize[0] = 0;
         mVideoSize[1] = 0;
     }
