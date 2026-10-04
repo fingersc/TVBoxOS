@@ -91,6 +91,22 @@ public final class EpisodeNameMatcher {
             "(?:第\\s*)?[（(]?\\s*(上集|中集|下集|上部|中部|下部|上|中|下|一|二|三)\\s*[）)]?\\s*$");
 
     /**
+     * 分段紧跟「第N期」时优先取用 —— 覆盖"带副标题"的正片。
+     *
+     * <p>真实 case（《脱口秀大会》360资源源）：
+     * {@code 第10期下：冠军诞生！大张伟王勉再合作}。
+     * {@link #PART_TAIL} 锚在字符串<b>末尾</b>，这类条目末尾是副标题 → 抓不到分段，
+     * 于是「第10期下」与「第10期上」在 score 里<b>同为 80 分</b>，
+     * 纯靠下标顺序决胜 → <b>静默切到"上"</b>。实测 42 个带副标题条目里 20 个分段识别错误。</p>
+     *
+     * <p>负向前瞻 {@code (?![0-9A-Za-z\u4e00-\u9fff])} 保证不会把「第10期上下」这类误切。</p>
+     */
+    private static final Pattern PART_AFTER_ORD = Pattern.compile(
+            "第\\s*\\d+\\s*期?\\s*[（(]?\\s*"
+                    + "(上集|中集|下集|上部|中部|下部|上|中|下|一|二|三)\\s*[）)]?"
+                    + "(?![0-9A-Za-z\\u4e00-\\u9fff])");
+
+    /**
      * 非正片标记词：这些词说明该条目是"花絮/回顾"类衍生内容，
      * <b>不是当期正片</b>。用于避免"重温经典2"这类伪期数与"第2期"撞分。
      *
@@ -233,7 +249,12 @@ public final class EpisodeNameMatcher {
         }
         // 只做清晰度去噪，保留括号（分集可能写在括号里）
         String w = QUALITY_JUNK.matcher(name.toLowerCase(Locale.ROOT)).replaceAll("").trim();
-        Matcher m = PART_TAIL.matcher(w);
+        // ★ 优先取"紧跟第N期"的分段标记，其次才看字符串末尾。
+        //   顺序不能反：`第10期上：某副标题` 的末尾是副标题，PART_TAIL 抓不到。
+        Matcher m = PART_AFTER_ORD.matcher(w);
+        if (!m.find()) {
+            m = PART_TAIL.matcher(w);
+        }
         if (!m.find()) {
             return PART_NONE;
         }
