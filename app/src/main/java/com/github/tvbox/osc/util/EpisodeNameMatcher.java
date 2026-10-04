@@ -2884,7 +2884,9 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return 0;
         }
         int k = clusters.size();
-        int[] days = new int[k];
+        // dayNumberOf 返回 long，数组与间隔变量必须用 long，否则编译期报
+        // "possible lossy conversion from long to int"（v27 实测踩过）。
+        long[] days = new long[k];
         boolean[] segmented = new boolean[k];
         for (int i = 0; i < k; i++) {
             int d = -1;
@@ -2907,7 +2909,7 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         }
         // 从尾部往回扩展：必须「带分段」且间隔恒定
         int keepFrom = k - 1;
-        int lastGap = days[k - 1] - days[k - 2];
+        long lastGap = days[k - 1] - days[k - 2];
         while (keepFrom > 0 && segmented[keepFrom] && segmented[keepFrom - 1]
                 && days[keepFrom] - days[keepFrom - 1] == lastGap) {
             keepFrom--;
