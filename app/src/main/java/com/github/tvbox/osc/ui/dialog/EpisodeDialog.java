@@ -5,6 +5,7 @@ import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.Typeface;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -156,9 +157,13 @@ public class EpisodeDialog extends BaseDialog {
         protected void convert(BaseViewHolder helper, VodInfo.VodSeries item) {
             TextView series = helper.getView(R.id.tvSeries);
             series.setText(item == null ? "" : item.name);
-            series.setTextColor(helper.getLayoutPosition() == selectedPosition
-                    ? mContext.getResources().getColor(R.color.color_02F8E1)
+            // 与详情页 SeriesAdapter 保持一致的选中样式：亮黄 + 加粗。
+            // （原用 color_02F8E1 亮青，对比度低于未选中白字，选中不明显。）
+            boolean selected = helper.getLayoutPosition() == selectedPosition;
+            series.setTextColor(selected
+                    ? mContext.getResources().getColor(R.color.color_series_selected)
                     : Color.WHITE);
+            series.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
         }
     }
 }

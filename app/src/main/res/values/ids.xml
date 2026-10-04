@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      纯标记用 id（不用于 findViewById），仅供 View.setTag 作为 key。
+      「底部按钮组滚动复位器是否已注册」的防重入标记。
+    -->
+    <item name="tag_btn_group_scroll_reset" type="id" />
+</resources>

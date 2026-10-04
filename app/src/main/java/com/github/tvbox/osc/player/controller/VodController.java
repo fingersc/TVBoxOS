@@ -20,6 +20,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.webkit.WebView;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
@@ -971,8 +972,53 @@ public class VodController extends BaseController {
         } else {
             mCastBtn.setVisibility(VISIBLE);
         }
-        mScreenDisplay.setNextFocusRightId(R.id.play_next);
-        mNextBtn.setNextFocusLeftId(R.id.screen_display);
+        // ★ 「屏显」是底部按钮组（HorizontalScrollView 内）的最后一个控件，右侧已无兄弟。
+        //   原实现把它的 nextFocusRight 指向 R.id.play_next（「下一集」）——
+        //   而 play_next 是组内第 2 个控件、位于屏显<b>左侧</b>，等价于：
+        //   按右键 → 焦点跳回最左 → ScrollView 为把 play_next 滚进可视区而反向滚动
+        //   → 屏显被甩出可视区并在右侧留下错位（真机表现为「屏显向右位移」）。
+        //   正确做法是「右边界闭合」：显式声明右侧无处可去，让系统自行判定。
+        //   配合下方 bindBottomBtnGroupScrollReset() 在按钮显隐变化后复位 scrollX，
+        //   两条一起才能根治（实测仅改此处仍会因滚动残留偶发偏移）。
+        mScreenDisplay.setNextFocusRightId(View.NO_ID);
+        // 「下一集」左焦点不再回指屏显，避免形成「最右↔最左」的反向环路。
+        mNextBtn.setNextFocusLeftId(View.NO_ID);
+        bindBottomBtnGroupScrollReset();
+    }
+
+    /**
+     * 底部按钮组（HorizontalScrollView + play_btn_group）的滚动位置复位器。
+     *
+     * <p>为什么必须做这个：{@code play_btn_group} 里有 21 个按钮，其中
+     * 音轨 / 视轨 / 弹幕 / 搜弹幕 / 横竖屏 等默认 {@code GONE}，运行时会随
+     * 片源能力与用户设置动态显隐。HorizontalScrollView 在内容总宽变化时
+     * <b>不会</b>自动复位 {@code scrollX}，于是一轮轮显隐叠加下来滚动偏移持续累积，
+     * 把最右的「屏显」顶到非预期位置。</p>
+     *
+     * <p>处理方式：加一个全局布局监听，一旦按钮组总宽发生变化就把滚动位置归零
+     * （仅当当前没有子控件持有焦点时才复位，避免打断用户正在进行的焦点导航）。
+     * 监听注册在按钮组自身上，随 View 生命周期自动解除。</p>
+     */
+    private void bindBottomBtnGroupScrollReset() {
+        if (mPlayBtnGroup == null || mPlayBtnGroup.getParent() == null) return;
+        final View scrollHost = (View) mPlayBtnGroup.getParent();
+        if (!(scrollHost instanceof HorizontalScrollView)) return;
+        final HorizontalScrollView hsv = (HorizontalScrollView) scrollHost;
+        if (mPlayBtnGroup.getTag(R.id.tag_btn_group_scroll_reset) != null) return; // 防重复注册
+        mPlayBtnGroup.setTag(R.id.tag_btn_group_scroll_reset, Boolean.TRUE);
+        final int[] lastWidth = {mPlayBtnGroup.getWidth()};
+        mPlayBtnGroup.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(View v, int left, int top, int right, int bottom,
+                                       int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                int width = right - left;
+                if (width == lastWidth[0]) return;
+                lastWidth[0] = width;
+                // 有子控件持有焦点时说明用户正在导航，此时复位会打断操作，跳过。
+                if (mPlayBtnGroup.findFocus() != null) return;
+                if (hsv.getScrollX() != 0) hsv.scrollTo(0, 0);
+            }
+        });
     }
 
     private void showScaleDialog() {

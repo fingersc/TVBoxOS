@@ -27,6 +27,14 @@
     <color name="color_CC000000">#CC000000</color>
     <color name="color_000000_30">#48000000</color>
     <color name="color_02F8E1">#02F8E1</color>
+    <!--
+       「已选中剧集」专用文字色。
+       原用 color_02F8E1(#02F8E1 亮青)，在 item 深灰底(#6C3D3D3D 叠视频)上对比度仅
+       8.03:1，反而低于未选中态的白字(10.86:1) —— 选中项比未选中项还暗，视觉上被压下去。
+       改用亮黄 #FFEB3B：对比度 8.90:1（高于白色），且靠色相与白字拉开差异，
+       配合 textStyle=bold 双重强调。详情页选集与全屏播放选集弹窗共用此色。
+    -->
+    <color name="color_series_selected">#FFEB3B</color>
     <color name="color_353744">#353744</color>
     <color name="color_CC353744">#CC353744</color>
     <color name="color_6C3D3D3D">#6c3d3d3d</color>
