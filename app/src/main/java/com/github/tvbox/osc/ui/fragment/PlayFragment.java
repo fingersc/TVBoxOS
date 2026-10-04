@@ -1996,24 +1996,79 @@ public class PlayFragment extends BaseLazyFragment {
      * @return 目标源下标；无法可靠匹配返回 -1
      */
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
-        final int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
-        // 跨源事实记忆：本次成功落位即一条"期号↔日期"的双侧强证据。
-        // 与 DetailActivity 同一套机制——两个入口必须都记，否则从详情页切源与
-        // 播放页内切源会积累出不一致的事实表。
-        if (resolved >= 0 && targetList != null && resolved < targetList.size()
-                && currentSeries != null && !TextUtils.isEmpty(currentSeries.name)) {
-            try {
+        int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
+        if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)
+                || targetList == null || targetList.isEmpty()) {
+            return resolved;
+        }
+        try {
+            List<String> srcNames = getPlayingSeriesList() == null
+                    ? null : seriesNames(getPlayingSeriesList());
+            List<String> tgtNames = seriesNames(targetList);
+            // ★ 冷启动探路（与 DetailActivity 同一机制，两个入口必须一致）：
+            //   落点"不可信"时先从其它线路把「第N期 = 某日期」建起来，再精确落位。
+            //   注意触发条件是「落点不可信」而非「没落上」——冷启动的典型症状是
+            //   错切到一个**存在的**条目，必须能识别"落了但不可信"。
+            if (!EpisodeNameMatcher.isMatchTrusted(currentSeries.name,
+                    resolved >= 0 && resolved < targetList.size()
+                            ? targetList.get(resolved).name : null,
+                    srcNames, tgtNames)) {
+                int retry = probeFromOtherSources(currentSeries, targetList, srcNames);
+                if (retry >= 0 && retry < targetList.size()) {
+                    resolved = retry;
+                }
+            }
+            // 跨源事实记忆：本次成功落位即一条"期号↔日期"的双侧强证据。
+            if (resolved >= 0 && resolved < targetList.size()) {
                 // ★ 传入两侧列表，让事实层做"序关系守卫"（与 DetailActivity 同一机制）
-                List<String> srcNames = getPlayingSeriesList() == null
-                        ? null : seriesNames(getPlayingSeriesList());
                 EpisodeNameMatcher.learnCrossDomainFact(
                         currentSeries.name, targetList.get(resolved).name,
-                        srcNames, seriesNames(targetList));
-            } catch (Throwable ignored) {
-                // 记忆失败绝不影响主流程
+                        srcNames, tgtNames);
             }
+        } catch (Throwable ignored) {
+            // 记忆/探路失败绝不影响主流程
         }
         return resolved;
+    }
+
+    /**
+     * 冷启动探路：把 {@code mVodInfo.seriesMap} 里其它线路的完整集名列表交给匹配器。
+     *
+     * <p>必须传<b>完整列表</b>：{@code rankConsistent} 依赖列表的正片序列规模做校验，
+     * 单元素列表会让它把正确结果也判成不可信。详见
+     * {@link EpisodeNameMatcher#probeFactFromOtherSources}。</p>
+     */
+    private int probeFromOtherSources(VodInfo.VodSeries currentSeries,
+                                      List<VodInfo.VodSeries> targetList,
+                                      List<String> srcNames) {
+        try {
+            if (srcNames == null || srcNames.isEmpty() || mVodInfo == null
+                    || mVodInfo.seriesMap == null || mVodInfo.seriesMap.isEmpty()) {
+                return -1;
+            }
+            // 只探「期号式 → 日期式」这一方向：源侧不带期号时建不出事实
+            if (EpisodeNameMatcher.leadingOrdinalOf(currentSeries.name) <= 0) {
+                return -1;
+            }
+            List<List<String>> others = new ArrayList<>();
+            for (Map.Entry<String, List<VodInfo.VodSeries>> e : mVodInfo.seriesMap.entrySet()) {
+                if (e.getKey() == null || e.getKey().equals(mVodInfo.playFlag)) {
+                    continue;
+                }
+                List<VodInfo.VodSeries> l = e.getValue();
+                if (l == null || l.isEmpty() || l == targetList) {
+                    continue;
+                }
+                others.add(seriesNames(l));
+            }
+            if (others.isEmpty()) {
+                return -1;
+            }
+            return EpisodeNameMatcher.probeFactFromOtherSources(
+                    currentSeries.name, srcNames, seriesNames(targetList), others);
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 
     private int findMatchingEpisodeIndexRaw(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {

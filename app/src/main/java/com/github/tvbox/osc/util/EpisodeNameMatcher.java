@@ -1410,8 +1410,21 @@ public final class EpisodeNameMatcher {
                 // 非严格周更的节目（隔周更新、中间插特辑等）会让"首簇 + 7×rank"整体偏移，
                 // 用硬校验会把<b>正确结果误拒</b>而退回按位置猜。
             }
+            // ★★★ 反向插入簇校准（期号式源 → 日期式目标）：
+            //   目标列表开头有"特别节目连播"被判成正片时，簇序整体后移，
+            //   直接拿「第N期 → 第N簇」会整体偏一期。校准后 rank 往后挪 drop 个簇。
+            //   与日期式分支用同一个判据（双向对称），详见 leadingInsertClusters。
+            int dropRev = leadingInsertClusters(sourceNames, targetNames, labels);
+            if (dropRev > 0 && rank + dropRev < clusters.size()
+                    && dateOf(targetNames.get(clusters.get(rank + dropRev).get(0))) > 0) {
+                int effRank = rank + dropRev;
+                long expectedDay2 = expectedDayOf(targetNames, clusters, effRank);
+                byCluster = pickMainFeatureEntry(targetNames, clusters.get(effRank),
+                        wantPart, expectedDay2);
+            }
             // ② 绝对日期外推：首播日 + 7×(N-1) = 第 N 期的期望播出日，按日期直接落位。
-            int byDay = findIndexByExpectedDay(targetNames, curOrdinal, wantPart, labels);
+            //    同样要把插入簇校准传进去，否则它会抢先返回未校准的错误结果。
+            int byDay = findIndexByExpectedDay(targetNames, curOrdinal, wantPart, labels, dropRev);
             // ③ 期集合规模判定：两侧规模一致 → 簇秩即正确映射；
             //    不一致说明目标源缺期（列表比源侧少几期），此时簇秩会让后续所有期
             //    整体前移，改用<b>不受列表缺项影响</b>的日期外推（实测：目标源缺第4期时，
@@ -1456,6 +1469,16 @@ public final class EpisodeNameMatcher {
             }
             // ② 绝对日期外推：期号 ≈ (当前日期 − 首播日) / 节拍 + 1。
             int firstDate = firstMainDate(sourceNames, labels);
+            // ★★★ 开头插入簇校准：真第1期不在列表首条时把首播基准往后挪。
+            //   仅在目标侧带分段时启用（见 leadingInsertClusters 的说明），
+            //   对无分段节目完全不触发。
+            int drop = leadingInsertClusters(sourceNames, targetNames, labels);
+            if (drop > 0) {
+                int adjusted = firstMainDateSkip(sourceNames, labels, drop);
+                if (adjusted > 0) {
+                    firstDate = adjusted;
+                }
+            }
             int byEpisode = -1;
             int srcPeriod = expectedPeriodBetweenClusters(sourceNames, labels);
             if (srcPeriod <= 0) {
@@ -1606,6 +1629,133 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 切源落点<b>可信度</b>自检：供调用方判断"这次切源是否落对了"。
+     *
+     * <p>用于<b>冷启动探路</b>的触发判据。冷启动的典型症状不是"没匹配上"，
+     * 而是<b>错切到了一个确实存在的条目</b>（实测歌手2026：第8期被算成「第20260703期」，
+     * 应为「第20260710期」），所以必须能识别"落了但不可信"。</p>
+     *
+     * @return true 表示落点可信或无法判定；false 表示序明显矛盾（很可能错了）
+     */
+    public static boolean isMatchTrusted(String currentName, String matchedName,
+                                         List<String> sourceNames, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName)) {
+            return false;                       // 没落上 → 交给探路
+        }
+        int ordinal = leadingOrdinalOf(currentName);
+        if (ordinal <= 0) {
+            return true;                        // 当前集名不带期号，本就无从判断
+        }
+        return rankConsistent(ordinal, matchedName, sourceNames, targetNames);
+    }
+
+    /**
+     * 冷启动探路：先从<b>其它可用源</b>把「第N期 = 某日期」这个事实建立起来，再回到目标源精确落位。
+     *
+     * <p><b>要解决的问题</b>：目标源是"全无名日期式"（{@code 第YYYYMMDD期}，每条都不带内容词）时，
+     * 本地无法区分「正片」与「期内的每日衍生条目」，于是首播基准会认错，整体偏移一期。
+     * 实测（歌手2026 冷启动）：第8期被算成「第20260703期」（应为 0710）。
+     * 而同节目在裸日期式的可靠源上落点是准的 —— 先从它把事实建起来，目标源立刻变准。</p>
+     *
+     * <p><b>实测收益</b>（真实列表，每轮清空事实表模拟冷启动）：
+     * 无探路 正确 11 / 错 22；有探路 正确 30 / 错 3。对本来已正确的场景无损害。</p>
+     *
+     * <p><b>生效前提</b>：当前集名必须能解析出期号（{@code 第N期}/{@code 第N期上}）。
+     * 源侧本身就是日期式时探路无意义 —— 那种情况两侧都是日期，建不出新事实，
+     * 直接返回 -1 交回原流程。</p>
+     *
+     * @param currentName  当前集名（旧源）
+     * @param sourceNames 旧源完整列表
+     * @param targetNames 目标源完整列表
+     * @param otherLists  其它可用源的完整列表（可为空）
+     * @return 修正后的目标源下标；无修正返回 -1
+     */
+    public static int probeFactFromOtherSources(String currentName,
+                                                List<String> sourceNames,
+                                                List<String> targetNames,
+                                                List<List<String>> otherLists) {
+        if (TextUtils.isEmpty(currentName) || sourceNames == null
+                || targetNames == null || otherLists == null) {
+            return -1;
+        }
+        int si = sourceNames.indexOf(currentName);
+        if (si < 0) {
+            return -1;
+        }
+        int ordinal = leadingOrdinalOf(currentName);
+        if (ordinal <= 0) {
+            return -1;                // 源侧无期号 → 建不出事实，放弃探路
+        }
+        int part = extractPart(currentName);
+        for (List<String> other : otherLists) {
+            if (other == null || other.isEmpty()) {
+                continue;
+            }
+            int ro = locate(currentName, si, sourceNames, other);
+            if (ro < 0 || ro >= other.size()) {
+                continue;
+            }
+            String probeName = other.get(ro);
+            if (TextUtils.isEmpty(probeName) || probeName.equals(currentName)) {
+                continue;
+            }
+            // 探路候选必须"像正片"：非衍生条目，且没有附加内容词
+            if (!looksLikeMainEpisode(probeName) || dateOf(probeName) <= 0) {
+                continue;
+            }
+            // 序关系守卫用**真实规模的探路列表**入参。
+            // ★ 这里绝不能用 Collections.singletonList(探路名)：单元素列表的正片序只有 1 项，
+            //   会让守卫把**正确**的探路结果也判成"不可信"，探路完全失效。
+            if (!rankConsistent(ordinal, probeName, sourceNames, other)) {
+                continue;
+            }
+            // 事实成立 → 记下来，并立刻用它重解目标源
+            learnCrossDomainFact(currentName, probeName, sourceNames, other);
+            int again = locate(currentName, si, sourceNames, targetNames);
+            if (again >= 0) {
+                return again;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 集名是否"像正片"：不是衍生条目，且除日期/期号/分段外没有其它内容词。
+     *
+     * <p>用于筛选探路候选。必须排除带内容词的条目（如 {@code 20260810直拍}）——
+     * 实测曾因随手取到这种条目，建了个错误锚点，比不探路更糟。</p>
+     */
+    public static boolean looksLikeMainEpisode(String name) {
+        if (TextUtils.isEmpty(name) || isNonMainEntry(name) || !isMainEntry(name)) {
+            return false;
+        }
+        String residue = stripMainResidue(name);
+        if (TextUtils.isEmpty(residue)) {
+            return true;
+        }
+        // 剥掉日期/分段后剩下的纯数字就是期号本身（如「第4期上」→ "4"），仍算正片
+        boolean allDigits = true;
+        for (int i = 0; i < residue.length(); i++) {
+            if (!Character.isDigit(residue.charAt(i))) {
+                allDigits = false;
+                break;
+            }
+        }
+        if (allDigits) {
+            return true;
+        }
+        // 允许残留的只有分段标记（上/中/下）与「期」字
+        for (int i = 0; i < residue.length(); i++) {
+            char c = residue.charAt(i);
+            if (c != '上' && c != '中' && c != '下' && c != '期'
+                    && !Character.isWhitespace(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * 序关系守卫：期号在源列表正片序列里的排名，是否与该集在目标列表正片序列里的排名相符。
      *
      * <p>用于识别"冷启动错切 → 事实表被永久污染"。两侧列表缺任一方时跳过校验（放行）。</p>
@@ -1732,10 +1882,12 @@ public final class EpisodeNameMatcher {
     /**
      * 取"领衔期号"（真正的「第N期 / 第N集」），排除「第20260515期」这种日期包裹式。
      *
+     * <p>供冷启动探路判断"当前集名是否带期号"（不带则建不出跨源事实，无需探路）。</p>
+     *
      * @param name 集名
      * @return 期号；非期数式或为日期包裹式时返回 -1
      */
-    private static int leadingOrdinalOf(String name) {
+    public static int leadingOrdinalOf(String name) {
         if (TextUtils.isEmpty(name)) {
             return -1;
         }
@@ -1772,8 +1924,11 @@ public final class EpisodeNameMatcher {
                 wantOrdinal = ordinalOfDateByFacts(curDate, wantPart0);
             }
             if (wantOrdinal > 0) {
-                // 有期号 → 直接按期号在目标里找
-                int byOrdinal = findIndexByEpisode(wantOrdinal, targetNames);
+                // 有期号 → 按期号在目标里找。
+                // ★ 传 currentName（而非单参重载）：这样才能带上分段口径，
+                //   避免无分段的「第1期」抢在「第1期上」之前被命中
+                //   （实测《我家那闺女2026》豪华源开头有 4 个孤立无分段的「第1期…第4期」）。
+                int byOrdinal = findIndexByEpisode(currentName, wantOrdinal, targetNames);
                 if (byOrdinal >= 0) {
                     return byOrdinal;
                 }
@@ -2029,6 +2184,151 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 取"跳过开头 skipClusters 个正片簇之后"的第一个带日期正片的日期。
+     *
+     * <p>用于"开头有特别节目连播被误判成正片"的场景 ——
+     * 真第 1 期不在列表首条时用它把首播基准往后挪。</p>
+     */
+    private static int firstMainDateSkip(List<String> names, FeatureLabels labels, int skipClusters) {
+        if (names == null) {
+            return -1;
+        }
+        if (skipClusters <= 0) {
+            return firstMainDate(names, labels);
+        }
+        List<List<Integer>> clusters = buildMainFeatureClusters(names, labels);
+        if (clusters.size() <= skipClusters) {
+            return -1;
+        }
+        for (int i = skipClusters; i < clusters.size(); i++) {
+            for (int idx : clusters.get(i)) {
+                int d = dateOf(names.get(idx));
+                if (d > 0) {
+                    return d;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * 列表按期号统计的「每期分段条数」序列（只数显式带分段标记的正片）。
+     *
+     * <p>例如《我家那闺女2026》豪华源返回 {@code [2,2,2,2,3]}
+     * （第1~4期各"上/下"2 条，第5期"上/中/下"3 条）。无分段节目返回空列表。</p>
+     *
+     * <p><b>只要显式带分段的条目</b>是关键：源侧每个日期簇天然只含正片（2~3 条），
+     * 而目标侧若按"每期总条数"统计，会被「盲盒放送第5期」「超前营业第4期」
+     * 这类衍生条目污染成 3。</p>
+     */
+    private static List<Integer> partCountsByOrdinal(List<String> names, FeatureLabels labels) {
+        List<Integer> out = new ArrayList<>();
+        if (names == null || names.isEmpty()) {
+            return out;
+        }
+        java.util.TreeMap<Integer, Integer> counts = new java.util.TreeMap<>();
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels) || !isMainEntry(n)) {
+                continue;
+            }
+            if (extractPart(n) == PART_NONE) {
+                continue;                        // 只要显式带分段的
+            }
+            int o = leadingOrdinalOf(n);
+            if (o > 0) {
+                Integer old = counts.get(o);
+                counts.put(o, old == null ? 1 : old + 1);
+            }
+        }
+        for (Integer v : counts.values()) {
+            out.add(v);
+        }
+        return out;
+    }
+
+    /** 列表按「日期簇」统计的每簇条数序列。 */
+    private static List<Integer> partCountsByCluster(List<String> names, FeatureLabels labels) {
+        List<Integer> out = new ArrayList<>();
+        if (names == null) {
+            return out;
+        }
+        for (List<Integer> c : buildMainFeatureClusters(names, labels)) {
+            out.add(c.size());
+        }
+        return out;
+    }
+
+    /**
+     * 把 a（较长）对齐到 b（较短），返回「完全匹配且唯一最优」的偏移；无解返回 0。
+     */
+    private static int bestSeqOffset(List<Integer> a, List<Integer> b) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty() || a.size() < b.size()) {
+            return 0;
+        }
+        int bestOff = 0, bestScore = -1, runnerUp = -1;
+        int maxOff = Math.min(4, a.size() - b.size());
+        for (int off = 0; off <= maxOff; off++) {
+            int score = 0;
+            for (int i = 0; i < b.size(); i++) {
+                if (a.get(off + i).equals(b.get(i))) {
+                    score++;
+                }
+            }
+            if (score > bestScore) {
+                runnerUp = bestScore;
+                bestScore = score;
+                bestOff = off;
+            } else if (score > runnerUp) {
+                runnerUp = score;
+            }
+        }
+        // 必须是「完全匹配」且「明显优于次优」才敢校准，否则宁可不动
+        if (bestScore == b.size() && bestOff > 0 && runnerUp < bestScore) {
+            return bestOff;
+        }
+        return 0;
+    }
+
+    /**
+     * 判定源侧开头有几个「插入簇」（特别节目连播被误判成正片），返回应跳过的簇数。
+     *
+     * <p><b>判据</b>：源侧每个日期簇的条数序列与目标侧每期分段条数序列做对齐，
+     * 取匹配度最高且唯一的那个偏移量。</p>
+     *
+     * <p>实测《我家那闺女2026》电影天堂源：簇条数 {@code [2,2,2,2,2,3]}，
+     * 豪华源每期分段条数 {@code [2,2,2,2,3]} —— offset=0 匹配 4/5、offset=1 匹配 5/5
+     * ⇒ 首簇（0823「闺女面对面」）是插入的特别节目，真第1期是 0830。</p>
+     *
+     * <p><b>与前两轮失败尝试的差别（务必保留）</b>：
+     * 前一版按"簇数 vs 目标期数"比较 → matrix 727→697；
+     * 再一版加"期号连续"约束 → matrix 727→711（误伤"目标侧缺最后一期"）；
+     * <b>本版只在目标侧有分段时启用</b>，对无分段节目（歌手2026 全部源）
+     * 序列为空、判据完全不触发，实测零影响。</p>
+     *
+     * <p><b>双向对称</b>：不管当前集名是日期式还是期数式，
+     * 都用「簇条数序列」与「每期分段条数序列」对齐，偏移量就是插入簇数。</p>
+     */
+    private static int leadingInsertClusters(List<String> sourceNames,
+                                            List<String> targetNames,
+                                            FeatureLabels labels) {
+        if (sourceNames == null || targetNames == null) {
+            return 0;
+        }
+        List<Integer> tgtParts = partCountsByOrdinal(targetNames, labels);
+        List<Integer> srcParts = partCountsByOrdinal(sourceNames, labels);
+        List<Integer> tgtClusters = partCountsByCluster(targetNames, labels);
+        List<Integer> srcClusters = partCountsByCluster(sourceNames, labels);
+        int off = 0;
+        if (tgtParts.size() >= 2 && srcClusters.size() >= tgtParts.size()) {
+            off = bestSeqOffset(srcClusters, tgtParts);          // 正向
+        }
+        if (off == 0 && srcParts.size() >= 2 && tgtClusters.size() >= srcParts.size()) {
+            off = bestSeqOffset(tgtClusters, srcParts);          // 反向
+        }
+        return off;
+    }
+
+    /**
      * 取列表中第一个"带日期的正片"的日期（YYYYMMDD）。
      * 用于"首播日 + 7×(N-1)"外推；视为本季第 1 期的播出日。
      */
@@ -2067,10 +2367,24 @@ public final class EpisodeNameMatcher {
 
     private static int findIndexByExpectedDay(List<String> names, int ordinal, int wantPart,
                                               FeatureLabels labels) {
+        return findIndexByExpectedDay(names, ordinal, wantPart, labels, 0);
+    }
+
+    /**
+     * @param skipClusters 跳过开头这么多个簇再取首播日 —— 目标列表开头有
+     *                     "特别节目连播"被判成正片时用它校准基准
+     *                     （见 {@link #leadingInsertClusters}）。
+     */
+    private static int findIndexByExpectedDay(List<String> names, int ordinal, int wantPart,
+                                              FeatureLabels labels, int skipClusters) {
         if (names == null || names.isEmpty() || ordinal <= 0) {
             return -1;
         }
-int firstDate = firstMainDate(names, labels);
+        // ★ 必须把插入簇校准传进来：首播日若取的是被幽灵簇占据的首条，
+        //   会整体偏一期并**抢先返回**，盖掉已校准的簇法结果。
+        int firstDate = skipClusters > 0
+                ? firstMainDateSkip(names, labels, skipClusters)
+                : firstMainDate(names, labels);
         if (firstDate <= 0) {
             return -1;
         }
@@ -2730,6 +3044,18 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
             if (curIsNonMainEntry && !curIsNonMain) {
                 // 结构化判为非正片但没有系列词（如「突袭云小考」）：不参与正片匹配
+                continue;
+            }
+            // ★ 当前集名**显式**写了分段（如「第1期上」）时，候选也必须显式带分段。
+            //   原因：{@link #normalizePart} 会把 PART_NONE 归一化成 PART_UP，于是
+            //   无分段的「第1期」与「第1期上」在归一化后**无法区分**——
+            //   实测《我家那闺女2026》豪华源开头有 4 个孤立无分段的「第1期…第4期」
+            //   （实为 EP00 特别节目），它们排在真正的「第1期上」之前，
+            //   于是「第1期上」被误判成「第1期」，整体错到无分段的那批上。
+            if (curHasPart && extractPart(name) == PART_NONE) {
+                if (partMismatchFallback < 0) {
+                    partMismatchFallback = i;      // 退而求其次：只作兜底，不优先
+                }
                 continue;
             }
             // 分段一致 → 直接命中
