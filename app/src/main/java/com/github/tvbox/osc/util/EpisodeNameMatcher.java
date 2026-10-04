@@ -788,6 +788,66 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 列表里"期"的个数（同一期的上/下/中只算一期），用于规模校准。
+     *
+     * <p>按期号去重计数：期数式列表每期只有 2~3 条且无日期，先走簇切分会
+     * 把它们并成 1 个假簇（实测返回 1，明显错误）。</p>
+     *
+     * @param names  剧集名列表
+     * @param labels 期标签
+     * @return 期数；无期号条目时返回 0
+     */
+    private static int countMainFeaturePeriods(List<String> names, FeatureLabels labels) {
+        if (names == null || names.isEmpty()) {
+            return 0;
+        }
+        Set<Integer> ords = new HashSet<>();
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels)) {
+                continue;
+            }
+            int o = leadingOrdinalOf(n);
+            if (o > 0) {
+                ords.add(o);
+            }
+        }
+        return ords.size();
+    }
+
+    /**
+     * 列表的期号是否连续（min..max 无洞），作为"期数可信"的判据。
+     *
+     * @param names  剧集名列表
+     * @param labels 期标签
+     * @return 期号连续返回 true；无期号条目也返回 false
+     */
+    private static boolean ordinalsContiguous(List<String> names, FeatureLabels labels) {
+        if (names == null || names.isEmpty()) {
+            return false;
+        }
+        Set<Integer> ords = new HashSet<>();
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels)) {
+                continue;
+            }
+            int o = leadingOrdinalOf(n);
+            if (o > 0) {
+                ords.add(o);
+            }
+        }
+        if (ords.isEmpty()) {
+            return false;
+        }
+        int lo = Integer.MAX_VALUE;
+        int hi = Integer.MIN_VALUE;
+        for (int v : ords) {
+            lo = Math.min(lo, v);
+            hi = Math.max(hi, v);
+        }
+        return (hi - lo + 1) == ords.size();
+    }
+
+    /**
      * 按「期标签 + 分段」在目标列表里找落点。
      *
      * <p>期标签是两侧对"同一期"的<b>显式</b>对应关系（内容词相同），比簇秩更可靠：
@@ -1595,6 +1655,8 @@ public final class EpisodeNameMatcher {
             //   20260508 的簇秩算成第 11 期 → 错落第 8 期）。
             //   裁剪后簇序与真实期序一致，byRank 与 byEpisode 两条路同时修正。
             final int ghost = leadingGhostClusters(sourceNames, labels);
+            // 日期外推推出的期号（源侧列表截断守卫用）
+            int inferred = -1;
             // ① 簇法：用旧源列表自身的正片簇求当前集的期簇序。
             // 注意簇序只依赖列表内的相对次序，与日期数值无关，
             // 因此源站年份整体错标（2025… vs 实际 2026…）不影响结果。
@@ -1652,8 +1714,32 @@ public final class EpisodeNameMatcher {
                     int epTol = srcPeriod <= 3 ? 0 : Math.max(1, srcPeriod / 4);
                     if (Math.abs(diff - (long) srcPeriod * (episode - 1)) <= epTol) {
                         byEpisode = findIndexByEpisode(currentName, episode, targetNames, -1, labels);
+                        inferred = episode;
                     }
                 }
+            }
+            // ★★★★ 源侧列表截断守卫（本项目实测最隐蔽的一类静默错切）。
+            //   **必须放在下一行"规模不一致就返回 byEpisode"之前** —— 那行判据
+            //   （clusters.size() != tgtSpan）在截断场景同样成立，会抢先返回
+            //   并绕过本守卫，实测就是这么漏出去的。
+            //
+            //   场景：源站接口只返回最近若干集，源侧列表从第 7 期才开始
+            //   （`第20260424期上…`）。首播基准退化成"列表首条日期"=0424，
+            //   簇秩也只数到 4 个簇 → 两条路**一致地**把 20260508 算成第 3 期
+            //   （实测 logcat：feifan/93731 ep=第20260508期上 -> hongniuziyuan ep=第3期上）。
+            //
+            //   为什么本地不可辨：源站确实可能只更新到第 4 期，两种情况在
+            //   单源信息下完全等价 → 只能靠**规模矛盾**兜底：
+            //     目标侧已更新到第 N 期，源侧簇数只有 M < N，说明源侧至少缺 N-M 期，
+            //     于是任何以"源侧首条 = 第1期"为基准的推算都不可信。
+            //
+            //   守卫条件（三条全满足才判截断，宁可放过也不误伤）：
+            //     · 目标侧期数可信（期号连续、≥3 期）；
+            //     · 源侧缺失 ≥2 期**且**缺失占比 ≥1/3（见函数内注释）；
+            //     · 两条路推出**同一个**期号且该期号 < 目标侧期数。
+            if (looksLikeTruncatedSource(sourceNames, targetNames, labels,
+                    clusters, rank + 1, inferred)) {
+                return -1;
             }
             // ③ 期集合规模判定（同前）：源侧缺期时簇秩会让后续所有期整体后移，
             //    改用日期外推——它基于绝对日期，不受源列表缺项影响。
@@ -2945,6 +3031,74 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return clusters;
         }
         return new ArrayList<List<Integer>>(clusters.subList(drop, clusters.size()));
+    }
+
+    /**
+     * 源侧列表是否被截断（只返回最近若干集），使"簇秩 + 日期外推"整体偏早。
+     *
+     * <p>实测事故（logcat_10-04-2026_15-42-46.txt）：
+     * {@code migrate feifan/93731 ep=第20260508期上 -> hongniuziyuan ep=第3期上}。
+     * 源侧 feifan 只返回了第 7~10 期（{@code 第20260424期上…第20260515期下}），于是：
+     * <ul>
+     *   <li>簇秩 = 2 → 推出「第3期」；</li>
+     *   <li>日期外推：首播基准 = 列表首条 0424，(0508−0424)/7+1 = 3 → 也是「第3期」。</li>
+     * </ul>
+     * 两条路<b>一致地错</b>，且错的方向是"把后面的期当成前面的期"。</p>
+     *
+     * <p><b>为什么本地不可辨</b>：源站确实可能只更新到第 4 期，
+     * "源侧只有 4 期" 与 "源侧被截断只剩 4 期" 在单源信息下完全等价。
+     * 唯一可用的兜底是<b>规模矛盾</b>：目标侧已更新到第 N 期，
+     * 源侧只有 M 个簇 → 至少缺 N−M 期 → 以"源侧首条 = 第1期"为基准的推算都不可信。</p>
+     *
+     * <p>判据（三条全满足才判截断，宁可放过也不误伤）：</p>
+     * <ol>
+     *   <li>目标侧期号连续且 ≥3 期（期数可信）；</li>
+     *   <li>源侧缺失 ≥2 期<b>且</b>缺失占比 ≥1/3 —— 阈值必须够严，否则误伤
+     *       matrix G2「源侧缺第4期」这类<b>正常缺期</b>：G2 源侧 9 簇 vs 目标 10 期
+     *       （缺 1 期，源侧首条确实就是第 1 期，本应正常对齐）；截断场景是
+     *       4 簇 vs 10 期（缺 6 期，基准整体偏后）。</li>
+     *   <li>簇秩与日期外推推出<b>同一</b>期号，且该期号 &lt; 目标侧期数
+     *       （说明它在拿"列表首条"当第 1 期，基准明显偏早）。</li>
+     * </ol>
+     *
+     * @param sourceNames      源侧剧集名列表
+     * @param targetNames      目标侧剧集名列表
+     * @param labels           期标签
+     * @param clusters         源侧（已裁幽灵簇）的正片簇
+     * @param rankEpisode      簇秩推出的期号（1 起），-1 表示不可用
+     * @param inferredEpisode  日期外推推出的期号（1 起），-1 表示不可用
+     * @return 判为截断返回 {@code true}
+     */
+    private static boolean looksLikeTruncatedSource(List<String> sourceNames,
+                                                     List<String> targetNames,
+                                                     FeatureLabels labels,
+                                                     List<List<Integer>> clusters,
+                                                     int rankEpisode,
+                                                     int inferredEpisode) {
+        if (clusters == null || clusters.isEmpty() || rankEpisode <= 0) {
+            return false;
+        }
+        if (inferredEpisode <= 0) {
+            return false;               // 无法确认基准偏移，交给既有守卫处理
+        }
+        // ① 目标侧期数可信：期号连续、≥3 期
+        int tgtPeriods = countMainFeaturePeriods(targetNames, labels);
+        if (tgtPeriods < 3) {
+            return false;
+        }
+        if (!ordinalsContiguous(targetNames, labels)) {
+            return false;
+        }
+        // ② 源侧缺失比例显著（阈值说明见 javadoc）
+        int missing = tgtPeriods - clusters.size();
+        if (missing < 2 || missing * 3 < tgtPeriods) {
+            return false;
+        }
+        // ③ 两条路一致、且都明显小于目标侧期数
+        if (rankEpisode != inferredEpisode) {
+            return false;
+        }
+        return rankEpisode < tgtPeriods;
     }
 
     /**
