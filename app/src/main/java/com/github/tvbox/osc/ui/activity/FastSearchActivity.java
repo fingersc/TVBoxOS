@@ -32,10 +32,13 @@ import com.github.tvbox.osc.ui.adapter.FastListAdapter;
 import com.github.tvbox.osc.ui.adapter.FastSearchAdapter;
 import com.github.tvbox.osc.ui.adapter.SearchWordAdapter;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
+import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
+
+import com.orhanobut.hawk.Hawk;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
 import com.owen.tvrecyclerview.widget.TvRecyclerView;
@@ -468,8 +471,20 @@ public class FastSearchActivity extends BaseActivity {
     private void initData() {
         initCheckedSourcesForSearch();
         Intent intent = getIntent();
+        String title = null;
         if (intent != null && intent.hasExtra("title")) {
-            String title = intent.getStringExtra("title");
+            title = intent.getStringExtra("title");
+        }
+        // ★ 进程被回收后Activity 会被系统重建，Intent 里的 title 还在，
+        //   但已暂停的搜索不会自动重跑 —— 结果区只剩一个空白页。
+        //   因此额外记住"最近一次搜索词"，重建时若尚未真正搜过则自动补跑。
+        if (TextUtils.isEmpty(title) && TextUtils.isEmpty(searchTitle)) {
+            String last = Hawk.get(HawkConfig.LAST_SEARCH_KEYWORD, "");
+            if (!TextUtils.isEmpty(last)) {
+                title = last;
+            }
+        }
+        if (!TextUtils.isEmpty(title)) {
             showLoading();
             search(title);
         }
@@ -529,6 +544,12 @@ public class FastSearchActivity extends BaseActivity {
 
         //写入历史记录
         HistoryHelper.setSearchHistory(title);
+        // 记住最近一次搜索词：进程被回收、Activity 重建时用于自动恢复搜索，
+        // 否则用户从详情页返回会落到一个空白的搜索结果页。
+        try {
+            Hawk.put(HawkConfig.LAST_SEARCH_KEYWORD, title);
+        } catch (Throwable ignored) {
+        }
 
         searchResult();
     }

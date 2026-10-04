@@ -1370,6 +1370,16 @@ public final class EpisodeNameMatcher {
             }
         }
 
+        // ================= 第 -1 层：跨源事实查表（最高优先级）=================
+        // 之前某次切源已经把"这个期号 = 那个日期"两侧证实过了，直接查表落位。
+        // 这一层不受列表形态影响——对"两侧都是密集日更/衍生夹心"的列表尤其关键，
+        // 因为那些列表会让下面的簇秩与周更快照整体偏移一期。
+        int byFact = alignByRememberedFact(currentName, curOrdinal, curHasDate,
+                cur.ordinal, wantPart0, targetNames);
+        if (byFact >= 0) {
+            return byFact;
+        }
+
         // ================= 第 1 层：期标签锚定（两侧对同一期的显式对应）=================
         // 内容词是同一期在两侧的公共标签，用它落位**不受目标侧缺期影响**——
         // 目标源少了几期也不会让标签指错，因此排在簇秩之前。
@@ -1467,6 +1477,220 @@ public final class EpisodeNameMatcher {
                 return byRank;
             }
             return byEpisode;
+        }
+        return -1;
+    }
+
+    // ================= 跨源事实记忆（跨命名域换算的"已验证对应关系"） =================
+    //
+    // 【为什么需要它】
+    // 期数式与日期式之间的对应关系，只有两侧都带"期号语义"时才能本地推导。
+    // 但真实源站里有一类列表<b>两侧都没有干净的期号语义</b>：
+    //   · 期数式源：第1期…第6期 之间夹着「特别企划 / 超前营业 / 加更版 / 纯享版 / 直拍」；
+    //   · 日期式源：第20260515期…第20260626期 全部是「第YYYYMMDD期」包裹式，
+    //     且首条 20260515 其实是"特别企划"而不是第1期正片。
+    // 此时"首播日 + 7×(N−1)"的基准取错一条，整档节目所有期号<b>整体偏移一期</b>
+    // （实测歌手2026：第3期被算成第20260529期，正确是第20260605期）。
+    //
+    // 【为什么这一层能解决】
+    // 切源是<b>连续多次</b>的动作：歌手2026 在本次会话里已经成功走过
+    // 「20260605 → 第3期」（HG → 红牛）。这条对应关系是<b>已被两侧同时证实</b>的，
+    // 比任何猜测都可靠。把它记下来，后续「第3期 → 任意源」都能直接查表命中，
+    // 不再依赖脆弱的周更快照推算。
+    //
+    // 【安全性】
+    // 只记录"两侧都自证"的强证据（当前名带期号且命中名带日期，或反之），
+    // 不记录任何推断结果；条目按节目无关的全局键存储，数量级极小（几十条），
+    // 超出上限按插入顺序淘汰最旧的。
+    private static final int FACT_LIMIT = 128;
+
+    /** key = 归一化期号 + "|" + 分段；value = 该期对应的播出日期 YYYYMMDD。 */
+    private static final Map<String, Integer> FACT_ORDINAL_TO_DATE = new HashMap<>();
+
+    /** key = 日期 + "|" + 分段；value = 该日期对应的期号。 */
+    private static final Map<String, Integer> FACT_DATE_TO_ORDINAL = new HashMap<>();
+
+    /** 记录顺序，用于 FIFO 淘汰。 */
+    private static final List<String> FACT_ORDER = new ArrayList<>();
+
+    /** 记忆键前缀：期号命名空间（避免与日期命名空间撞键）。 */
+    private static String factKeyOfOrdinal(int ordinal, int part) {
+        return "O" + ordinal + "|" + part;
+    }
+
+    /** 记忆键前缀：日期命名空间。 */
+    private static String factKeyOfDate(int date, int part) {
+        return "D" + date + "|" + part;
+    }
+
+    /**
+     * 记住一条"期号 ↔ 日期"的对应关系。
+     *
+     * @param ordinal 期号（>0）
+     * @param date    播出日期 YYYYMMDD（>0）
+     * @param part    {@link #normalizePart(int)} 归一化后的分段
+     */
+    public static void rememberCrossDomainFact(int ordinal, int date, int part) {
+        if (ordinal <= 0 || date <= 0) {
+            return;
+        }
+        int p = normalizePart(part);
+        String k1 = factKeyOfOrdinal(ordinal, p);
+        String k2 = factKeyOfDate(date, p);
+        // 冲突时以先到为准（先到者来自更早的一次成功对齐，同样可靠）
+        if (!FACT_ORDINAL_TO_DATE.containsKey(k1)) {
+            FACT_ORDINAL_TO_DATE.put(k1, date);
+            FACT_ORDER.add(k1);
+        }
+        if (!FACT_DATE_TO_ORDINAL.containsKey(k2)) {
+            FACT_DATE_TO_ORDINAL.put(k2, ordinal);
+            FACT_ORDER.add(k2);
+        }
+        while (FACT_ORDER.size() > FACT_LIMIT) {
+            String old = FACT_ORDER.remove(0);
+            if (FACT_ORDINAL_TO_DATE.containsKey(old)) {
+                FACT_ORDINAL_TO_DATE.remove(old);
+            } else {
+                FACT_DATE_TO_ORDINAL.remove(old);
+            }
+        }
+    }
+
+    /** 查询记住的"期号 → 日期"。未命中返回 -1。 */
+    public static int recallDateOfOrdinal(int ordinal, int part) {
+        if (ordinal <= 0) {
+            return -1;
+        }
+        Integer v = FACT_ORDINAL_TO_DATE.get(factKeyOfOrdinal(ordinal, normalizePart(part)));
+        return v == null ? -1 : v;
+    }
+
+    /** 查询记住的"日期 → 期号"。未命中返回 -1。 */
+    public static int recallOrdinalOfDate(int date, int part) {
+        if (date <= 0) {
+            return -1;
+        }
+        Integer v = FACT_DATE_TO_ORDINAL.get(factKeyOfDate(date, normalizePart(part)));
+        return v == null ? -1 : v;
+    }
+
+    /** 清空跨源事实记忆（切源列表整体变化时调用，避免陈旧事实干扰）。 */
+    public static void clearCrossDomainFacts() {
+        FACT_ORDINAL_TO_DATE.clear();
+        FACT_DATE_TO_ORDINAL.clear();
+        FACT_ORDER.clear();
+    }
+
+    /**
+     * 在目标列表里定位指定日期的条目（记事实时用来反查分段口径）。
+     *
+     * @param date  播出日期 YYYYMMDD
+     * @param names 目标集名列表
+     * @return 命中的条目名；未命中返回 null
+     */
+    private static String nameOfDate(List<String> names, int date) {
+        if (names == null || date <= 0) {
+            return null;
+        }
+        for (String n : names) {
+            if (!TextUtils.isEmpty(n) && dateOf(n) == date) {
+                return n;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 记事实的统一入口：从"一次成功的跨域对齐"中抽取两侧的（期号, 日期）。
+     *
+     * <p>调用时机：任何跨命名域成功落位之后。两侧名字至少有一侧带日期、
+     * 另一侧带期号（或两侧都是「第YYYYMMDD期」这类双语义）时才真正入库。</p>
+     *
+     * @param currentName 切源前（旧源）的集名
+     * @param matchedName 切源后（新源）命中的集名
+     */
+    public static void learnCrossDomainFact(String currentName, String matchedName) {
+        if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName)) {
+            return;
+        }
+        int curDate = dateOf(currentName);
+        int curOrd = leadingOrdinalOf(currentName);
+        int tgtDate = dateOf(matchedName);
+        int tgtOrd = leadingOrdinalOf(matchedName);
+        int part = extractPart(matchedName);
+        // 方向一：旧源给日期、新源给期号
+        if (curDate > 0 && curOrd <= 0 && tgtOrd > 0 && tgtOrd < 1000) {
+            rememberCrossDomainFact(tgtOrd, curDate, part);
+            return;
+        }
+        // 方向二：旧源给期号、新源给日期
+        if (curOrd > 0 && curOrd < 1000 && curDate <= 0 && tgtDate > 0) {
+            rememberCrossDomainFact(curOrd, tgtDate, part);
+            return;
+        }
+        // 方向三：两侧都是「第YYYYMMDD期」包裹式 → 期号语义就是日期，跳过（无新信息）
+    }
+
+    /**
+     * 取"领衔期号"（真正的「第N期 / 第N集」），排除「第20260515期」这种日期包裹式。
+     *
+     * @param name 集名
+     * @return 期号；非期数式或为日期包裹式时返回 -1
+     */
+    private static int leadingOrdinalOf(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return -1;
+        }
+        // 名字里含 8 位日期 → 是「第YYYYMMDD期」包裹式，期号语义即日期，不算期数
+        if (dateOf(name) > 0) {
+            return -1;
+        }
+        return extractOrdinal(name);
+    }
+
+    /**
+     * 第 -1 层：跨源事实查表。
+     *
+     * <p>命中即返回——这是<b>唯一被两侧同时证实过</b>的对应关系，
+     * 优先级高于任何启发式（第0层位置映射、期标签、簇秩、周更快照）。</p>
+     *
+     * <p>之所以放在最前面：那些启发式在"两侧都是密集日更/衍生条目夹心"的列表上
+     * 会整体偏移一期（见类注释【为什么需要它】），而查表法不受列表形态影响。</p>
+     *
+     * @return 目标列表下标；无记录或目标列表里找不到该日期时返回 -1
+     */
+    private static int alignByRememberedFact(String currentName, int curOrdinal,
+                                             boolean curHasDate, int curDate,
+                                             int wantPart0, List<String> targetNames) {
+        int wantDate = -1;
+        int wantOrdinal = -1;
+        if (curHasDate) {
+            wantOrdinal = recallOrdinalOfDate(curDate, wantPart0);
+            if (wantOrdinal <= 0) {
+                // 分段口径可能两侧不一致（"上/下" vs 无后缀），退化到"不分段"再试
+                wantOrdinal = recallOrdinalOfDate(curDate, PART_NONE);
+            }
+            if (wantOrdinal > 0) {
+                // 有期号 → 直接按期号在目标里找
+                int byOrdinal = findIndexByEpisode(wantOrdinal, targetNames);
+                if (byOrdinal >= 0) {
+                    return byOrdinal;
+                }
+            }
+            return -1;
+        }
+        if (curOrdinal > 0) {
+            wantDate = recallDateOfOrdinal(curOrdinal, wantPart0);
+            if (wantDate <= 0) {
+                wantDate = recallDateOfOrdinal(curOrdinal, PART_NONE);
+            }
+            if (wantDate > 0) {
+                int byDate = findIndexByDate(String.valueOf(wantDate), targetNames, currentName);
+                if (byDate >= 0) {
+                    return byDate;
+                }
+            }
+            return -1;
         }
         return -1;
     }

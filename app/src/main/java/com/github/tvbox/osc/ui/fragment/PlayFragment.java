@@ -1996,6 +1996,23 @@ public class PlayFragment extends BaseLazyFragment {
      * @return 目标源下标；无法可靠匹配返回 -1
      */
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        final int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
+        // 跨源事实记忆：本次成功落位即一条"期号↔日期"的双侧强证据。
+        // 与 DetailActivity 同一套机制——两个入口必须都记，否则从详情页切源与
+        // 播放页内切源会积累出不一致的事实表。
+        if (resolved >= 0 && targetList != null && resolved < targetList.size()
+                && currentSeries != null && !TextUtils.isEmpty(currentSeries.name)) {
+            try {
+                EpisodeNameMatcher.learnCrossDomainFact(
+                        currentSeries.name, targetList.get(resolved).name);
+            } catch (Throwable ignored) {
+                // 记忆失败绝不影响主流程
+            }
+        }
+        return resolved;
+    }
+
+    private int findMatchingEpisodeIndexRaw(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
         if (targetList == null || targetList.isEmpty()) {
             return -1;
         }

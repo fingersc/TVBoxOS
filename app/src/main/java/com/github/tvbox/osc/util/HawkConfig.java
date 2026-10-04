@@ -59,6 +59,14 @@ public class HawkConfig {
     public static final String LIVE_WEB_HEADER = "live_web_header";
     public static final String DEFAULT_LOAD_LIVE = "DEFAULT_LOAD_LIVE";
     public static final String SEARCH_HISTORY = "search_history";
+    /**
+     * 最近一次执行的搜索词。
+     *
+     * <p>用于进程被系统回收后恢复搜索页：Activity 重建时 {@code Intent} 会被重放，
+     * 但搜索结果只存在内存里，重建后必须重新搜；如果重建发生在"从搜索页跳详情页"
+     * 期间（此时搜索已暂停、结果不回填），用户回到搜索页就会看到一个空白页。</p>
+     */
+    public static final String LAST_SEARCH_KEYWORD = "last_search_keyword";
     public static final String DANMU_OPEN = "danmu_open";
     public static final String DANMU_MAX_LINE = "danmu_max_line";
     public static final String DANMU_SPEED = "danmu_speed";
