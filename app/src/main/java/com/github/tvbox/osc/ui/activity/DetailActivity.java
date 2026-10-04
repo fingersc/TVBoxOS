@@ -3658,8 +3658,14 @@ public class DetailActivity extends BaseActivity {
         if (resolved >= 0 && targetList != null && resolved < targetList.size()
                 && currentSeries != null && !TextUtils.isEmpty(currentSeries.name)) {
             try {
+                // ★ 传入两侧列表，让事实层做"序关系守卫"——
+                //   冷启动时的错切若被记成事实，会永久污染后续每一次切源
+                //   （实测歌手2026 事实表会错成 8=20260703、7=20260626，整体错一期）。
+                List<String> srcNames = getPlayingSeriesList() == null
+                        ? null : seriesNames(getPlayingSeriesList());
                 EpisodeNameMatcher.learnCrossDomainFact(
-                        currentSeries.name, targetList.get(resolved).name);
+                        currentSeries.name, targetList.get(resolved).name,
+                        srcNames, seriesNames(targetList));
             } catch (Throwable ignored) {
                 // 记忆失败绝不影响主流程
             }

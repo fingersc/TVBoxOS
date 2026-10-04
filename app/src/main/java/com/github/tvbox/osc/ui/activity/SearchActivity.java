@@ -650,15 +650,22 @@ public class SearchActivity extends BaseActivity {
         applySearchWordMode();
         Intent intent = getIntent();
         String title = null;
+        // ★ 只有"带 title 的重建"才允许用上次的关键词补跑。
+        //   首页点搜索图标进来时 Intent 里没有 title —— 那是一个全新的搜索入口，
+        //   应当停在默认页。若此时拿 LAST_SEARCH_KEYWORD 兜底，用户会看到
+        //   "一进搜索页就自动搜了上次那个词"（实测：首页进搜索直接搜了"歌手2026"，
+        //   得再返回一次才回到默认搜索页）。
+        boolean rebuiltWithTitle = false;
         if (intent != null && intent.hasExtra("title")) {
             title = intent.getStringExtra("title");
+            rebuiltWithTitle = true;
         }
-        // ★ 进程被回收后 Activity 会被系统重建，Intent 的 title 还在，
-        //   但已暂停的搜索不会自动重跑 —— 结果区只剩一个空白页。
-        //   因此额外记住"最近一次搜索词"，重建时若尚未真正搜过则自动补跑。
-        if (TextUtils.isEmpty(title) && TextUtils.isEmpty(searchTitle)) {
+        // 进程被回收后 Activity 会被系统重建，Intent 的 title 还在，
+        // 但已暂停的搜索不会自动重跑 —— 结果区只剩一个空白页。
+        // 仅当"本来就有 title"且本次尚未真正搜过（searchTitle 为空）时补跑。
+        if (rebuiltWithTitle && TextUtils.isEmpty(searchTitle)) {
             String last = Hawk.get(HawkConfig.LAST_SEARCH_KEYWORD, "");
-            if (!TextUtils.isEmpty(last)) {
+            if (!TextUtils.isEmpty(last) && !TextUtils.equals(last, title)) {
                 title = last;
             }
         }

@@ -1606,6 +1606,73 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 序关系守卫：期号在源列表正片序列里的排名，是否与该集在目标列表正片序列里的排名相符。
+     *
+     * <p>用于识别"冷启动错切 → 事实表被永久污染"。两侧列表缺任一方时跳过校验（放行）。</p>
+     *
+     * @return true 表示序相符或无法判定（可入库）；false 表示序明显矛盾（拒绝入库）
+     */
+    private static boolean rankConsistent(int ordinal, String matchedInList,
+                                          List<String> sourceNames, List<String> targetNames) {
+        if (sourceNames == null || targetNames == null
+                || sourceNames.isEmpty() || targetNames.isEmpty()) {
+            return true;                       // 无从判定，放行
+        }
+        // 目标列表里该集在正片序列中的排名（0 起）
+        int tgtRank = mainFeatureRankOf(matchedInList, targetNames);
+        if (tgtRank < 0) {
+            return true;
+        }
+        // 源侧：用「第N期」在源列表正片序列里的排名作为参照
+        int srcRank = ordinal - 1;
+        List<Integer> srcSeq = mainFeatureSequence(sourceNames, null);
+        if (!srcSeq.isEmpty()) {
+            // 源列表是正片式（能识别期号）→ 直接按期号定位更准
+            int byOrd = -1;
+            for (int i = 0; i < srcSeq.size(); i++) {
+                EpisodeKey k = parse(sourceNames.get(srcSeq.get(i)));
+                if (k.domain == DOMAIN_ORDINAL && k.ordinal == ordinal) {
+                    byOrd = i;
+                    break;
+                }
+            }
+            if (byOrd >= 0) {
+                srcRank = byOrd;
+            } else {
+                return true;                   // 源侧找不到该期号，无从判定
+            }
+        }
+        int maxRank = Math.max(srcRank, tgtRank);
+        if (maxRank <= 0) {
+            return true;
+        }
+        // 序偏差不超过 50% 视为正常（两侧正片数不同、衍生条目分布不同都会造成偏差）
+        return Math.abs(srcRank - tgtRank) * 2 <= maxRank;
+    }
+
+    /** 条目在列表正片序列中的排名（0 起）；不是正片或找不到返回 -1。 */
+    private static int mainFeatureRankOf(String name, List<String> names) {
+        if (TextUtils.isEmpty(name) || names == null) {
+            return -1;
+        }
+        List<Integer> seq = mainFeatureSequence(names, null);
+        int idx = indexOfIgnoreCase(seq, names, name);
+        return idx;
+    }
+
+    /** 在 names 中找到 name 的下标（线性查找，列表规模小）；找不到返回 -1。 */
+    private static int indexOfIgnoreCase(List<Integer> seq, List<String> names, String name) {
+        int r = -1;
+        for (int k = 0; k < seq.size(); k++) {
+            int i = seq.get(k);
+            if (i >= 0 && i < names.size() && TextUtils.equals(names.get(i), name)) {
+                return k;
+            }
+        }
+        return r;
+    }
+
+    /**
      * 记事实的统一入口：从"一次成功的跨域对齐"中抽取两侧的（期号, 日期）。
      *
      * <p>调用时机：任何跨命名域成功落位之后。两侧名字至少有一侧带日期、
@@ -1615,6 +1682,26 @@ public final class EpisodeNameMatcher {
      * @param matchedName 切源后（新源）命中的集名
      */
     public static void learnCrossDomainFact(String currentName, String matchedName) {
+        learnCrossDomainFact(currentName, matchedName, null, null);
+    }
+
+    /**
+     * 带<b>序关系守卫</b>的记事实入口（推荐调用）。
+     *
+     * <p><b>为什么必须加守卫</b>：事实表采用"先到为准"，一旦入库就是<b>永久</b>的。
+     * 而冷启动时的错切（例如全无名日期源把「第8期」算成「第20260703期」，
+     * 正确应为第20260722期）会把错事实钉死，之后<b>每一次</b>切源都被它带偏 ——
+     * 实测歌手2026 的事实表会错成 {@code 8=20260703、7=20260626}，整体错一期。</p>
+     *
+     * <p>守卫原理：期号在源列表正片序列里的<b>序</b>必须与命中项在目标列表正片序列里的
+     * <b>序</b>同向且大致相当。上面那个错例里，「第8期」在源侧正片序列排第8，
+     * 而命中的「第20260703期」在目标侧只排第 30 位 —— 序严重不符，即为可疑，入库前否决。</p>
+     *
+     * @param sourceNames 旧源列表（可为null → 跳过守卫）
+     * @param targetNames 新源列表（可为null → 跳过守卫）
+     */
+    public static void learnCrossDomainFact(String currentName, String matchedName,
+                                            List<String> sourceNames, List<String> targetNames) {
         if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName)) {
             return;
         }
@@ -1625,12 +1712,17 @@ public final class EpisodeNameMatcher {
         int part = extractPart(matchedName);
         // 方向一：旧源给日期、新源给期号
         if (curDate > 0 && curOrd <= 0 && tgtOrd > 0 && tgtOrd < 1000) {
-            rememberCrossDomainFact(tgtOrd, curDate, part);
+            if (rankConsistent(tgtOrd, matchedName, sourceNames, targetNames)) {
+                rememberCrossDomainFact(tgtOrd, curDate, part);
+            }
             return;
         }
         // 方向二：旧源给期号、新源给日期
+        // 守卫要在**目标列表**里查命中项的序，故传 matchedName（不是 currentName）
         if (curOrd > 0 && curOrd < 1000 && curDate <= 0 && tgtDate > 0) {
-            rememberCrossDomainFact(curOrd, tgtDate, part);
+            if (rankConsistent(curOrd, matchedName, sourceNames, targetNames)) {
+                rememberCrossDomainFact(curOrd, tgtDate, part);
+            }
             return;
         }
         // 方向三：两侧都是日期式 → 不产生新的期号锚点，跳过。

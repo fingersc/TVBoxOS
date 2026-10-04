@@ -2003,8 +2003,12 @@ public class PlayFragment extends BaseLazyFragment {
         if (resolved >= 0 && targetList != null && resolved < targetList.size()
                 && currentSeries != null && !TextUtils.isEmpty(currentSeries.name)) {
             try {
+                // ★ 传入两侧列表，让事实层做"序关系守卫"（与 DetailActivity 同一机制）
+                List<String> srcNames = getPlayingSeriesList() == null
+                        ? null : seriesNames(getPlayingSeriesList());
                 EpisodeNameMatcher.learnCrossDomainFact(
-                        currentSeries.name, targetList.get(resolved).name);
+                        currentSeries.name, targetList.get(resolved).name,
+                        srcNames, seriesNames(targetList));
             } catch (Throwable ignored) {
                 // 记忆失败绝不影响主流程
             }
