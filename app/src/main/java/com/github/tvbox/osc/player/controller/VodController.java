@@ -1361,6 +1361,18 @@ public class VodController extends BaseController {
         void clickCast();
 
         void setAllowSwitchPlayer(boolean isAllow);
+
+        /**
+         * 播放/暂停状态变化的用户意图上报。
+         *
+         * <p>{@code pausedByUser=true} 表示「播放器进入了暂停态」这一事实。
+         * 由宿主（PlayFragment）结合自身是否处于后台来判定它是不是用户主动按的暂停，
+         * 从而决定回到前台时要不要恢复播放。
+         *
+         * <p>之所以走这个回调：暂停/播放键在控制器内部就被消费（库里的 togglePlay），
+         * 宿主拿不到原始按键，只能从状态变化反推。
+         */
+        void onPlayPauseStateChanged(boolean pausedByUser);
     }
 
     public void setListener(VodControlListener listener) {
@@ -1567,6 +1579,10 @@ public class VodController extends BaseController {
             case VideoView.STATE_PLAYING:
                 initLandscapePortraitBtnInfo();
                 startProgress();
+                // 恢复播放 → 清除「用户暂停」意图（用户按了播放，或换了集/源）。
+                if (listener != null) {
+                    listener.onPlayPauseStateChanged(false);
+                }
                 break;
             case VideoView.STATE_PAUSED:
                 mTopRoot1.setVisibility(GONE);
@@ -1577,6 +1593,11 @@ public class VodController extends BaseController {
                 }
                 showPauseRoot();
                 mPlayTitle.setVisibility(VISIBLE);
+                // 上报「已进入暂停态」。宿主据此判断是否为用户主动暂停，
+                // 以免回到前台时把用户主动暂停的视频自动播起来。
+                if (listener != null) {
+                    listener.onPlayPauseStateChanged(true);
+                }
                 break;
             case VideoView.STATE_ERROR:
                 listener.errReplay();

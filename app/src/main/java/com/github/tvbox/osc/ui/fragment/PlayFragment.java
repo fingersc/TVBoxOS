@@ -169,6 +169,38 @@ public class PlayFragment extends BaseLazyFragment {
     private boolean exitingPreview = false;
     private boolean audioPlayback;
     private boolean switchingPlayback;
+    /**
+     * 用户是否「主动暂停」了播放。
+     *
+     * <p>背景（实测复现）：暂停视频后按 Home 回到桌面，再切回 TVBox，视频会自己
+     * 又播起来。根因是 {@link #onResume()} / {@link #onHiddenChanged(boolean)} 里
+     * 无条件调 {@code mVideoView.resume()} —— 播放器回到前台就恢复，完全不记得
+     * 「用户刚才是主动暂停的」。
+     *
+     * <p>Android 框架不会自己恢复已暂停的播放器，一定是应用自己调的 resume，
+     * 因此这里必须维护「用户意图」这一个状态位：
+     * <ul>
+     *   <li>用户按播放/暂停键暂停 → 置 true（见 {@link #onPlayPauseStateChanged(boolean)}）</li>
+     *   <li>用户再次按播放键 / 切集 / 切源 / 换解析 → 置 false（用户表达了要播）</li>
+     * </ul>
+     * 生命周期回调只在 {@code !userPaused} 时才恢复播放。
+     */
+    private volatile boolean userPaused;
+    /**
+     * 最近一次「程序化暂停」（退后台 / 可见性变化 / 退出预览）的时间戳。
+     *
+     * <p>这类暂停同样会触发控制器的 STATE_PAUSED 回调，必须与「用户按暂停键」
+     * 区分开，否则会被误记成用户意图，导致回到前台后永远不恢复播放。
+     * 用时间窗（{@link #PROGRAMMATIC_PAUSE_WINDOW_MS}）判定即可，无需在多个
+     * 回调间维护易残留的布尔标记。
+     */
+    private long lastProgrammaticPauseMs;
+    /** 程序化暂停的识别窗口：主动调 pause() 后这段时间内到达的 STATE_PAUSED 不算用户意图。 */
+    private static final long PROGRAMMATIC_PAUSE_WINDOW_MS = 500L;
+    /** {@link #onHiddenChanged(boolean)} 的防抖时间戳：抑制「隐藏后立刻显示」造成的瞬停瞬播。 */
+    private long lastHiddenChangeMs;
+    /** 分片可见性变化的防抖窗口：小于该间隔的 隐藏→显示 视为同一次抖动，不做恢复。 */
+    private static final long HIDDEN_CHANGE_DEBOUNCE_MS = 300L;
     private boolean reusePlayerOnSwitch;
     private boolean releasePlayerOnSwitch;
     private boolean previewMode;
@@ -506,6 +538,11 @@ public class PlayFragment extends BaseLazyFragment {
 
             @Override
             public void setAllowSwitchPlayer(boolean isAllow){allowSwitchPlayer=isAllow;}
+
+            @Override
+            public void onPlayPauseStateChanged(boolean pausedByUser) {
+                PlayFragment.this.onPlayPauseStateChanged(pausedByUser);
+            }
         });
         mVideoView.setVideoController(mController);
     }
@@ -1459,6 +1496,38 @@ public class PlayFragment extends BaseLazyFragment {
         this.exitingPreview = exitingPreview;
     }
 
+    /**
+     * 控制器上报的播放/暂停状态变化（见 VodController.onPlayStateChanged）。
+     *
+     * <p>只有「退后台」或「切集/切源重建播放器」引起的暂停才允许恢复播放；
+     * 用户在暂停态下按 Home 再切回，必须保持暂停。
+     *
+     * <p>判定依据：
+     * <ul>
+     *   <li>距最近一次程序化暂停（{@link #lastProgrammaticPauseMs}）不足
+     *       {@link #PROGRAMMATIC_PAUSE_WINDOW_MS} → 是退后台/可见性变化引起，忽略</li>
+     *   <li>{@code exitingPreview} → 退出预览，忽略</li>
+     *   <li>其余情况收到 {@code STATE_PAUSED} → 判定为用户主动暂停，置 {@code userPaused=true}</li>
+     * </ul>
+     *
+     * @param pausedByUser 控制器观察到的「进入了暂停态」这一事实
+     */
+    public void onPlayPauseStateChanged(boolean pausedByUser) {
+        if (!pausedByUser) {
+            // 播放态 → 用户表达了想播，清除暂停意图
+            userPaused = false;
+            return;
+        }
+        // 程序化暂停（退后台 / 可见性变化 / 退出预览）会在极短时间内触发 STATE_PAUSED，
+        // 用时间窗判定：距我们主动调 pause() 以内的，都不算用户意图。
+        if (exitingPreview
+                || System.currentTimeMillis() - lastProgrammaticPauseMs < PROGRAMMATIC_PAUSE_WINDOW_MS) {
+            return;
+        }
+        userPaused = true;
+        LOG.i("echo-lifecycle userPaused=true");
+    }
+
     private boolean hasAudioOnlyPlayback() {
         return Boolean.TRUE.equals(getAudioOnlyPlayback());
     }
@@ -1561,27 +1630,42 @@ public class PlayFragment extends BaseLazyFragment {
     public void onPause() {
         super.onPause();
         if (mVideoView != null && !exitingPreview && !hasAudioOnlyPlayback()) {
+            // ★ 这是程序化暂停，先打时间戳，避免随后的 STATE_PAUSED 被误记为用户意图。
+            lastProgrammaticPauseMs = System.currentTimeMillis();
             mVideoView.pause();
         }
+        LOG.i("echo-lifecycle onPause userPaused=" + userPaused);
     }
 
     @Override
     public void onResume() {
         super.onResume();
         exitingPreview = false;
-        if (mVideoView != null) {
+        // ★ 关键闸门：用户主动暂停过 → 回到前台也不恢复播放，保持暂停画面。
+        // 之前这里无条件 resume()，导致「暂停 → 回桌面 → 切回来自动播放」。
+        if (mVideoView != null && !userPaused) {
             mVideoView.resume();
         }
+        LOG.i("echo-lifecycle onResume userPaused=" + userPaused
+                + " state=" + (mVideoView == null ? -1 : mVideoView.getCurrentPlayState()));
     }
 
     @Override
     public void onHiddenChanged(boolean hidden) {
+        // ★ 防抖：隐藏后极短时间内又显示（系统覆盖层闪现 / 遥控器抖动），
+        // 不视为一次「暂停→恢复」，避免画面瞬停瞬播。
+        long now = System.currentTimeMillis();
+        boolean tooFast = now - lastHiddenChangeMs < HIDDEN_CHANGE_DEBOUNCE_MS;
+        lastHiddenChangeMs = now;
         if (hidden) {
             if (mVideoView != null) {
+                // ★ 标记这次暂停是「可见性变化」引起，不是用户意图，
+                // 否则 STATE_PAUSED 回调会把它误判成用户主动暂停。
+                lastProgrammaticPauseMs = System.currentTimeMillis();
                 mVideoView.pause();
             }
         } else {
-            if (mVideoView != null) {
+            if (mVideoView != null && !userPaused && !tooFast) {
                 mVideoView.resume();
             }
         }
@@ -2727,6 +2811,8 @@ public class PlayFragment extends BaseLazyFragment {
         stopParse();
         playbackStarted = false;
         if (mVideoView != null) {
+            // 页面切走引起的暂停，不是用户意图 —— 打时间戳避免被误记。
+            lastProgrammaticPauseMs = System.currentTimeMillis();
             mVideoView.pause();
             mVideoView.release();
         }
