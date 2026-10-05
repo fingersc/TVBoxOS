@@ -106,6 +106,19 @@ public class DetailActivity extends BaseActivity {
     private static final String DETAIL_FALLBACK_SEARCH_TAG = "detail_fallback_search";
     public static final String EXTRA_DETAIL_FALLBACK_CANDIDATES = "detailFallbackCandidates";
     /**
+     * 候选池读取键（标题）。
+     *
+     * <p>与 {@link #EXTRA_DETAIL_FALLBACK_CANDIDATES} 的区别：旧的候选列表是
+     * 「点击搜索结果那一刻的快照」，而聚合搜索当时仍在分批跑，快照必然残缺，
+     * 表现为「切源只有两三个站，返回一趟再进才变多」。</p>
+     *
+     * <p>现在改为只传一个标题，详情页凭它去
+     * {@code SourceViewModel.getSearchSession()} 的候选池读取<b>当前最新</b>集合。
+     * 池子由搜索会话单一持有、边搜边补，因此进详情页时看到的就是完整候选，
+     * 且后续新增的也会自然可见。</p>
+     */
+    public static final String EXTRA_DETAIL_FALLBACK_TITLE = "detailFallbackTitle";
+    /**
      * 全网搜索时的<b>并发上限</b>（滑动窗口大小），不再是"每批固定发这么多个"。
      *
      * <p><b>历史包袱</b>：原实现是"凑满 20 个发一批，等这批全部回来或超时才发下一批"。
@@ -777,6 +790,9 @@ public class DetailActivity extends BaseActivity {
             bundle.putString("sourceKey", sourceKey);
 //            bundle.putSerializable("VodInfo", vodInfo);
             App.getInstance().setVodInfo(vodInfo);
+            // 方向5：起播在即 → 开起播保护窗。窗口内聚合搜索只暂停「新派发」，
+            // 在途请求不动；首帧到达（PlayFragment.markPlaybackStarted）即恢复。
+            sourceViewModel.getSearchSession().beginStartupGuard("jumpToPlay");
             if (showPreview) {
                 ensurePlayFragment();
                 updatePreviewVodInfo();
@@ -1276,7 +1292,16 @@ public class DetailActivity extends BaseActivity {
             fromCollect = bundle.getBoolean("collect", false);
             Object fallbackCandidates = bundle.getSerializable(EXTRA_DETAIL_FALLBACK_CANDIDATES);
             if (fallbackCandidates instanceof ArrayList) {
+                // 兼容旧路径（其它入口若仍打包快照，照常消费）
                 cacheDetailFallbackCandidates(vod_name, (ArrayList<Movie.Video>) fallbackCandidates);
+            }
+            // ★ 新路径：从搜索会话的单一候选池读取最新集合（无快照残缺问题）
+            String fallbackTitle = bundle.getString(EXTRA_DETAIL_FALLBACK_TITLE, "");
+            if (!TextUtils.isEmpty(fallbackTitle)) {
+                List<Movie.Video> poolCandidates = sourceViewModel.getSearchSession().getCandidates(fallbackTitle);
+                if (!poolCandidates.isEmpty()) {
+                    cacheDetailFallbackCandidates(vod_name, poolCandidates);
+                }
             }
             loadDetail(bundle.getString("id", null), bundle.getString("sourceKey", ""));
         }
@@ -3166,7 +3191,26 @@ public class DetailActivity extends BaseActivity {
     private ExecutorService searchExecutorService = null;
     private ExecutorService detailFallbackSearchExecutor;
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
-    private final HashMap<String, List<Movie.Video>> detailFallbackCache = new HashMap<>();
+    /**
+     * 候选池（内存层），按归一化片名索引。
+     *
+     * <p><b>★ 本轮补上内存层 LRU</b>：此前这里是普通 {@code HashMap}，只增不删，
+     * 全靠 {@code onDestroy()} 整体清空兜底。搜索执行体解耦后，
+     * 「Activity 销毁 = 清空」这道闸门对长会话不再可靠 —— 连续浏览多部片会让
+     * 内存里堆积成百上千条完整 {@code Movie.Video}（含简介全文），
+     * 对 2GB 设备是不必要的风险。</p>
+     *
+     * <p>现改为 {@link LinkedHashMap} + {@code removeEldestEntry}，
+     * 上限与落盘层 {@code FALLBACK_CACHE_MAX_ENTRIES = 40} 对齐
+     * （插入顺序即访问顺序，超限淘汰最旧的片名）。</p>
+     */
+    private final LinkedHashMap<String, List<Movie.Video>> detailFallbackCache =
+            new LinkedHashMap<String, List<Movie.Video>>(16, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, List<Movie.Video>> eldest) {
+                    return size() > FALLBACK_CACHE_MAX_ENTRIES;
+                }
+            };
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
     /**
      * 滑动窗口下每个在途源的发出时刻（key = sourceKey）。
@@ -4615,6 +4659,14 @@ public class DetailActivity extends BaseActivity {
         playFragment = new PlayFragment();
         getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commitNowAllowingStateLoss();
         playFragment.setPreviewMode(!fullWindows);
+        // 方向5：把「首帧到达」事件接到搜索会话的起播保护窗上 ——
+        // 首帧一出就让聚合搜索恢复派发（不等 5s 兜底）。
+        playFragment.setStartupGuardListener(new PlayFragment.StartupGuardListener() {
+            @Override
+            public void onFirstFrame() {
+                sourceViewModel.getSearchSession().endStartupGuardOnFirstFrame();
+            }
+        });
     }
 
     void releasePlayFragment() {

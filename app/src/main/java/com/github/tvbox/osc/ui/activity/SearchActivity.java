@@ -29,7 +29,6 @@ import android.widget.Toast;
 import androidx.lifecycle.ViewModelProvider;
 
 import com.chad.library.adapter.base.BaseQuickAdapter;
-import com.github.catvod.crawler.JsLoader;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.ApiConfig;
 import com.github.tvbox.osc.base.BaseActivity;
@@ -49,6 +48,7 @@ import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
+import com.github.tvbox.osc.viewmodel.SearchSession;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -71,17 +71,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author pj567
@@ -153,9 +144,9 @@ public class SearchActivity extends BaseActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (searchPaused) {
-            resumePausedSearches();
-        }
+        // ★ 原地续跑：进详情页时只是 pauseDispatch，token/pending 全部保留，
+        //   返回后从这里恢复派发，不重头搜索、快照不再残缺。
+        session().resumeDispatch();
         requestSearchFocusWhenReady();
         applySearchWordMode();
         if (aggregateSearchMode) {
@@ -539,8 +530,20 @@ public class SearchActivity extends BaseActivity {
         });
     }
 
+    /**
+     * 打开搜索结果。
+     *
+     * <p><b>★ 关键修正</b>：旧实现第一行就 {@code pauseSearchTasks()} —— 它会
+     * {@code shutdownNow()} 掉线程池并把 token 清空，返回时再用<b>新 token</b>
+     * 从头重跑。后果是「进详情页那一刻打包给详情页的候选池永远残缺」，
+     * 表现就是用户说的「切源只有两个站，返回一趟才变多」。</p>
+     *
+     * <p>现在改为 {@link SearchSession#pauseDispatch()}：只停止<b>新任务派发</b>，
+     * token 与 pending 集合全部保留，在途请求继续跑完并把结果并入候选池。
+     * 返回时原地续跑，不重头来。</p>
+     */
     private void openSearchVideo(Movie.Video video) {
-        pauseSearchTasks();
+        session().pauseDispatch();
         hasKeyBoard = false;
         if (TextUtils.equals("folder", video.tag)) {
             folderHistory.add(new ArrayList<>(searchAdapter.getData()));
@@ -555,7 +558,10 @@ public class SearchActivity extends BaseActivity {
         bundle.putString("sourceKey", video.sourceKey);
         bundle.putString("title", video.name);
         bundle.putString("picture", video.pic);
-        putDetailFallbackCandidates(bundle, video);
+        // 不再打包「点击时刻快照」：候选池已由 session 单一持有，详情页直接读，
+        // 且随时能读到后续增量。这里只传一个标题作为读取 key。
+        bundle.putString(DetailActivity.EXTRA_DETAIL_FALLBACK_TITLE,
+                video.name == null ? "" : video.name.trim());
         jumpActivity(DetailActivity.class, bundle);
     }
 
@@ -569,6 +575,9 @@ public class SearchActivity extends BaseActivity {
             searchAdapter.setNewData(previous);
             return;
         }
+        // 用户真正离开搜索页 → 显式终止本轮搜索（方向1：取消由显式动作触发，
+        // 而非 Activity 销毁被动触发）。
+        session().cancelRound();
         super.onBackPressed();
     }
 
@@ -670,12 +679,21 @@ public class SearchActivity extends BaseActivity {
             }
         }
         if (!TextUtils.isEmpty(title)) {
-            showLoading();
-            if(Hawk.get(HawkConfig.FAST_SEARCH_MODE, true)){
+            // ★ Activity 重建（如从详情页返回、配置变更）时，若 session 里
+            //   已有针对同一关键词的在跑/已完成的搜索，就不要再起一轮 ——
+            //   否则「返回搜索页」会重跑一遍，正是要修掉的老毛病。
+            boolean reuseRunning = session().canReuseRound(title);
+            if (reuseRunning) {
+                this.searchTitle = title;
+                showLoading();
+                session().resumeDispatch();
+            } else if (Hawk.get(HawkConfig.FAST_SEARCH_MODE, true)) {
+                showLoading();
                 Bundle bundle = new Bundle();
                 bundle.putString("title", title);
                 jumpActivity(FastSearchActivity.class, bundle);
-            }else {
+            } else {
+                showLoading();
                 search(title);
             }
         }
@@ -795,14 +813,12 @@ public class SearchActivity extends BaseActivity {
         searchResult();
     }
 
-    private ExecutorService searchExecutorService = null;
-    private ScheduledExecutorService searchTimeoutExecutor = null;
-    private AtomicInteger allRunCount = new AtomicInteger(0);
-    private final Set<String> pendingSearchKeys = Collections.synchronizedSet(new HashSet<String>());
-    private final List<SearchTask> waitingSearchTasks = Collections.synchronizedList(new ArrayList<SearchTask>());
-    private final Set<String> startedSearchKeys = Collections.synchronizedSet(new HashSet<String>());
-    private final Set<String> releasedSearchKeys = Collections.synchronizedSet(new HashSet<String>());
-    private final AtomicInteger searchTokenSeq = new AtomicInteger(0);
+    // ===== 搜索状态已迁至 SearchSession（方向1：执行体与 Activity 解耦）=====
+    // 这里不再持有 Executor / token / pending 集合，全部委托给
+    // sourceViewModel.getSearchSession()，使搜索跨 Activity 重建存活。
+    private SearchSession session() {
+        return sourceViewModel.getSearchSession();
+    }
 
     // 聚合搜索：把短时间内的多次源结果合并为一次列表提交，避免 RecyclerView 高频重排
     // 导致封面请求被反复取消、同一张失败图被反复重试
@@ -813,78 +829,53 @@ public class SearchActivity extends BaseActivity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
 
-    private final AtomicInteger totalSearchCount = new AtomicInteger(0);
-    private String currentSearchToken = "";
-    private boolean searchPaused = false;
+    /** 本轮搜索结果里「片名高位匹配」的集合（仅本 Activity 用于展示，候选池已由 session 持有）。 */
     private final List<Movie.Video> detailFallbackSearchResults = new ArrayList<>();
     private final List<List<Movie.Video>> folderHistory = new ArrayList<>();
     private boolean folderLoading;
 
+    /**
+     * 发起一轮新的聚合搜索。
+     *
+     * <p>筛选与排序仍在 Activity 侧完成（依赖 UI 的 {@code mCheckSources} 勾选状态），
+     * 但<b>状态与线程池全部交给 {@link SearchSession}</b>。搜索自此不再随
+     * Activity 的销毁而丢失，也不再因进详情页被打断。</p>
+     */
     private void searchResult() {
-        try {
-            if (searchExecutorService != null) {
-                searchExecutorService.shutdownNow();
-                searchExecutorService = null;
-                JsLoader.stopAll();
-            }
-            if (searchTimeoutExecutor != null) {
-                searchTimeoutExecutor.shutdownNow();
-                searchTimeoutExecutor = null;
-            }
-        } catch (Throwable th) {
-            th.printStackTrace();
-        } finally {
-            pendingResultBuffer.clear();
-            flushScheduled = false;
-            mainHandler.removeCallbacksAndMessages(null);
-            searchAdapter.setNewData(new ArrayList<>());
-            allRunCount.set(0);
-            pendingSearchKeys.clear();
-            waitingSearchTasks.clear();
-            startedSearchKeys.clear();
-            releasedSearchKeys.clear();
-            highMatchVods.clear();
-            detailFallbackSearchResults.clear();
-            folderHistory.clear();
-            showHighMatchResults = false;
-            totalSearchCount.set(0);
-            currentSearchToken = String.valueOf(searchTokenSeq.incrementAndGet());
-            searchPaused = false;
-        }
+        pendingResultBuffer.clear();
+        flushScheduled = false;
+        mainHandler.removeCallbacksAndMessages(null);
+        searchAdapter.setNewData(new ArrayList<>());
+        highMatchVods.clear();
+        detailFallbackSearchResults.clear();
+        folderHistory.clear();
+        showHighMatchResults = false;
+
         List<SourceBean> searchRequestList = new ArrayList<>();
         searchRequestList.addAll(ApiConfig.get().getSourceBeanList());
         SourceBean home = ApiConfig.get().getHomeSourceBean();
         searchRequestList.remove(home);
         searchRequestList.add(0, home);
 
-        ArrayList<SearchTask> searchTasks = new ArrayList<>();
+        List<SourceBean> filtered = new ArrayList<>();
         for (SourceBean bean : searchRequestList) {
-            if (!bean.isSearchable()) {
+            if (bean == null || !bean.isSearchable()) {
                 continue;
             }
             if (mCheckSources != null && !mCheckSources.containsKey(bean.getKey())) {
                 continue;
             }
-            searchTasks.add(new SearchTask(bean.getKey(), searchTitle, currentSearchToken, isBlockingSearchSource(bean)));
+            filtered.add(bean);
         }
         // 按源质量重排下发顺序：好源先搜、先出结果。
         // 冷启动（无统计数据）时得分相同，稳定排序保持原始顺序，与改动前一致。
-        sortSearchTasksByQuality(searchTasks);
-        if (searchTasks.size() <= 0) {
+        sortSourceBeansByQuality(filtered);
+        if (filtered.isEmpty()) {
             Toast.makeText(mContext, "没有指定搜索源", Toast.LENGTH_SHORT).show();
             showEmpty();
             return;
         }
-        for (SearchTask task : searchTasks) {
-            pendingSearchKeys.add(task.sourceKey);
-        }
-        allRunCount.set(searchTasks.size());
-        totalSearchCount.set(searchTasks.size());
-        searchExecutorService = createSearchExecutor();
-        searchTimeoutExecutor = Executors.newSingleThreadScheduledExecutor();
-        startFastSearchTasks(searchTasks);
-        waitingSearchTasks.addAll(searchTasks);
-        startNextSearchBatch(currentSearchToken);
+        session().startNewRound(searchTitle, filtered);
     }
 
     private boolean matchSearchResult(String name, String searchTitle) {
@@ -899,9 +890,9 @@ public class SearchActivity extends BaseActivity {
 
     private boolean shouldShowHighMatchResults() {
         if (showHighMatchResults || searchAdapter.getData().size() > 0) return false;
-        int total = totalSearchCount.get();
+        int total = session().getTotalSearchCount();
         int threshold = Math.min(SEARCH_THREAD_COUNT, total);
-        return threshold > 0 && total - allRunCount.get() >= threshold;
+        return threshold > 0 && total - session().getAllRunCount() >= threshold;
     }
 
     private void addSearchResults(List<Movie.Video> data) {
@@ -960,37 +951,40 @@ public class SearchActivity extends BaseActivity {
     }
 
     /**
-     * 按源质量重排「搜索任务的下发顺序」——决定先搜哪个源，而不是先显示哪条结果。
+     * 按源质量重排源列表（决定先搜哪个源，而不是先显示哪条结果）。
      *
      * <p>好源先发 ⇒ 好源的结果先回来 ⇒ 用户更早看到能播的片子。
-     * 冷启动（无统计数据）时所有源得分相同，稳定排序保持仓库原始顺序。
+     * 冷启动（无统计数据）时所有源得分相同，稳定排序保持仓库原始顺序。</p>
+     *
+     * <p>注：搜索任务对象（{@code SearchTask}）与派发顺序已迁入
+     * {@link SearchSession}，排序改为直接作用于 {@link SourceBean}，
+     * 排序语义与原先完全一致。</p>
      */
-    private void sortSearchTasksByQuality(List<SearchTask> tasks) {
-        if (tasks == null || tasks.size() <= 1) {
+    private void sortSourceBeansByQuality(List<SourceBean> beans) {
+        if (beans == null || beans.size() <= 1) {
             return;
         }
         try {
-            // ★ 先批量取分，比较器内不再读 Hawk
-            List<String> keys = new ArrayList<>(tasks.size());
-            for (SearchTask task : tasks) {
-                if (task != null && !TextUtils.isEmpty(task.sourceKey)) {
-                    keys.add(task.sourceKey);
+            List<String> keys = new ArrayList<>(beans.size());
+            for (SourceBean bean : beans) {
+                if (bean != null && !TextUtils.isEmpty(bean.getKey())) {
+                    keys.add(bean.getKey());
                 }
             }
             final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshotForSearch(keys);
             if (snapshot.isEmpty()) {
-                return;   // 冷启动：无可参考历史，保持原下发顺序
+                return;
             }
-            Collections.sort(tasks, new Comparator<SearchTask>() {
+            Collections.sort(beans, new Comparator<SourceBean>() {
                 @Override
-                public int compare(SearchTask a, SearchTask b) {
-                    String ka = a == null ? null : a.sourceKey;
-                    String kb = b == null ? null : b.sourceKey;
+                public int compare(SourceBean a, SourceBean b) {
+                    String ka = a == null ? null : a.getKey();
+                    String kb = b == null ? null : b.getKey();
                     return Double.compare(snapshot.get(kb), snapshot.get(ka));
                 }
             });
         } catch (Throwable th) {
-            LOG.e("sortSearchTasksByQuality fail: " + th);
+            LOG.e("sortSourceBeansByQuality fail: " + th);
         }
     }
 
@@ -1005,16 +999,23 @@ public class SearchActivity extends BaseActivity {
         return keys;
     }
 
+    /**
+     * 单个源搜索返回。
+     *
+     * <p>本轮改动：代际校验与「候选池增量写入」下沉到 {@link SearchSession#onSourceResult}。
+     * 这里只负责 UI 侧（列表展示 / 高位匹配）。即使本 Activity 已不在前台，
+     * session 也会照常把候选并入池子 —— 这正是修掉快照残缺的关键。</p>
+     */
     private void searchData(AbsXml absXml) {
-        if (!isCurrentSearchResult(absXml)) {
+        if (!session().onSourceResult(absXml)) {
             return;
         }
-        String sourceKey = absXml == null ? "" : absXml.sourceKey;
-        if (!markSearchFinished(sourceKey, absXml.searchToken)) {
-            return;
-        }
-        releaseSearchSlotAndStartNext(sourceKey, absXml.searchToken);
-        if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
+        if (absXml != null && absXml.movie != null && absXml.movie.videoList != null
+                && absXml.movie.videoList.size() > 0) {
+            // Activity 已进入后台（如已跳详情页）时不必刷 UI，省一次列表重排
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
             List<Movie.Video> exactData = new ArrayList<>();
             List<Movie.Video> highData = new ArrayList<>();
             for (Movie.Video video : absXml.movie.videoList) {
@@ -1043,33 +1044,23 @@ public class SearchActivity extends BaseActivity {
         finishSearchIfDone();
     }
 
-    private void putDetailFallbackCandidates(Bundle bundle, Movie.Video selectedVideo) {
-        if (bundle == null || selectedVideo == null || TextUtils.isEmpty(selectedVideo.name)) {
-            return;
-        }
-        String title = selectedVideo.name.trim();
-        ArrayList<Movie.Video> candidates = new ArrayList<>();
-        Set<String> keys = new HashSet<>();
-        for (Movie.Video video : detailFallbackSearchResults) {
-            if (video == null || TextUtils.isEmpty(video.id)
-                    || !TextUtils.equals(title, video.name == null ? "" : video.name.trim())) {
-                continue;
-            }
-            String key = (video.sourceKey == null ? "" : video.sourceKey) + "|" + video.id;
-            if (keys.add(key)) {
-                // 只保留 fallback 缓存需要的轻量字段，剥离 urlBean（播放列表），
-                // 避免长剧多候选序列化后 Intent 超过 Binder 1MB 触发 TransactionTooLargeException 崩溃。
-                candidates.add(trimVideoForIntent(video));
-                if (candidates.size() >= 20) {
-                    break;
-                }
-            }
-        }
-        if (!candidates.isEmpty()) {
-            bundle.putSerializable(DetailActivity.EXTRA_DETAIL_FALLBACK_CANDIDATES, candidates);
-        }
+    /**
+     * 候选池读取入口：优先从 {@link SearchSession} 的单一候选池取。
+     *
+     * <p>保留此方法是为了兼容 DetailActivity 的读取契约 —— 详情页拿到标题后
+     * 调 {@code getDetailFallbackCandidates(title)}，返回<b>当前最新</b>的候选集合。
+     * 池子为空时返回空表，详情页会自行发起全网搜索（原有逻辑不变）。</p>
+     */
+    public List<Movie.Video> getDetailFallbackCandidates(String title) {
+        return session().getCandidates(title);
     }
-    
+
+    /**
+     * 把视频裁成「只保留候选池需要的轻量字段」，剥离 {@code urlBean}。
+     *
+     * <p>旧的 Intent 打包路径已废弃（候选池改为内存单一真相源），但此方法仍被
+     * 其它路径复用（如候选池落盘前的瘦身），故保留。</p>
+     */
     private Movie.Video trimVideoForIntent(Movie.Video src) {
         Movie.Video dst = new Movie.Video();
         if (src == null) return dst;
@@ -1094,281 +1085,52 @@ public class SearchActivity extends BaseActivity {
         return dst;
     }
     
-    private void scheduleSearchAdvance(final String sourceKey, final String searchToken) {
-        if (searchTimeoutExecutor == null) return;
-        searchTimeoutExecutor.schedule(new Runnable() {
-            @Override
-            public void run() {
-                if (!isCurrentSearchToken(searchToken)) return;
-                if (isSearchPending(sourceKey, searchToken) && releaseSearchSlot(sourceKey, searchToken)) {
-                    startNextSearchTask(searchToken);
-                }
-            }
-        }, SEARCH_NEXT_BATCH_SECONDS, TimeUnit.SECONDS);
-    }
+    // ===== 以下派发/调度/代际逻辑已整体迁入 SearchSession =====
+    // 原 scheduleSearchAdvance / scheduleSearchTimeout / submitSearchTask /
+    // createSearchExecutor / startNextSearchBatch / startNextSearchTask /
+    // takeNextSearchTask / resumePausedSearches / pauseSearchTasks /
+    // isCurrentSearchToken / markSearchFinished / releaseSearchSlot /
+    // isSearchPending / startFastSearchTasks / submitDirectSearchTask /
+    // getPendingSearchKeys / SearchTask(内部类) 等，均已在
+    // com.github.tvbox.osc.viewmodel.SearchSession 中重写。
+    // 关键差异：pauseDispatch() 只停新派发、保留 token 与 pending 集合，
+    // 因此「进详情页」不再打断搜索，候选池得以边搜边补。
 
-    private void scheduleSearchTimeout(final String sourceKey, final String searchToken) {
-        if (searchTimeoutExecutor == null) return;
-        searchTimeoutExecutor.schedule(new Runnable() {
-            @Override
-            public void run() {
-                if (!isCurrentSearchToken(searchToken)) return;
-                if (markSearchFinished(sourceKey, searchToken)) {
-                    releaseSearchSlotAndStartNext(sourceKey, searchToken);
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            finishSearchIfDone();
-                        }
-                    });
-                }
-            }
-        }, SEARCH_SITE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-    }
-
-    private boolean submitSearchTask(SearchTask task) {
-        if (!isSearchPending(task.sourceKey, task.searchToken)) return false;
-        if (searchExecutorService == null || searchExecutorService.isShutdown()) return false;
-        try {
-            searchExecutorService.execute(task);
-        } catch (RejectedExecutionException e) {
-            return false;
-        }
-        scheduleSearchAdvance(task.sourceKey, task.searchToken);
-        scheduleSearchTimeout(task.sourceKey, task.searchToken);
-        return true;
-    }
-
-    private ExecutorService createSearchExecutor() {
-        return new ThreadPoolExecutor(0, SEARCH_MAX_THREAD_COUNT, 30L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>());
-    }
-
-    private void startNextSearchBatch(String searchToken) {
-        for (int i = 0; i < SEARCH_THREAD_COUNT; i++) {
-            if (!startNextSearchTask(searchToken)) {
-                return;
-            }
-        }
-    }
-
-    private boolean startNextSearchTask(String searchToken) {
-        if (!isCurrentSearchToken(searchToken)) return false;
-        SearchTask task = takeNextSearchTask(searchToken);
-        if (task == null) {
-            return false;
-        }
-        if (!submitSearchTask(task)) {
-            startedSearchKeys.remove(task.sourceKey);
-            synchronized (waitingSearchTasks) {
-                waitingSearchTasks.add(0, task);
-            }
-            return false;
-        }
-        return true;
-    }
-
-    private SearchTask takeNextSearchTask(String searchToken) {
-        synchronized (waitingSearchTasks) {
-            while (!waitingSearchTasks.isEmpty()) {
-                SearchTask task = waitingSearchTasks.remove(0);
-                if (!isSearchPending(task.sourceKey, searchToken) || !startedSearchKeys.add(task.sourceKey)) {
-                    continue;
-                }
-                return task;
-            }
-        }
-        return null;
-    }
-
-    private void resumePausedSearches() {
-        if (!searchPaused) {
-            return;
-        }
-        searchPaused = false;
-        List<String> sourceKeys = getPendingSearchKeys();
-        if (sourceKeys.isEmpty()) {
-            finishSearchIfDone();
-            return;
-        }
-        currentSearchToken = String.valueOf(searchTokenSeq.incrementAndGet());
-        waitingSearchTasks.clear();
-        startedSearchKeys.clear();
-        releasedSearchKeys.clear();
-        for (String sourceKey : sourceKeys) {
-            SourceBean bean = ApiConfig.get().getSource(sourceKey);
-            waitingSearchTasks.add(new SearchTask(sourceKey, searchTitle, currentSearchToken, isBlockingSearchSource(bean)));
-        }
-        if (searchExecutorService == null || searchExecutorService.isShutdown()) {
-            searchExecutorService = createSearchExecutor();
-        }
-        if (searchTimeoutExecutor == null || searchTimeoutExecutor.isShutdown()) {
-            searchTimeoutExecutor = Executors.newSingleThreadScheduledExecutor();
-        }
-        startNextSearchBatch(currentSearchToken);
-    }
-
-    private void pauseSearchTasks() {
-        try {
-            if (searchExecutorService != null) {
-                searchExecutorService.shutdownNow();
-                searchExecutorService = null;
-                JsLoader.stopAll();
-            }
-            if (searchTimeoutExecutor != null) {
-                searchTimeoutExecutor.shutdownNow();
-                searchTimeoutExecutor = null;
-            }
-            searchPaused = allRunCount.get() > 0;
-            if (searchPaused) {
-                cancel();
-                currentSearchToken = "";
-            }
-        } catch (Throwable th) {
-            th.printStackTrace();
-        }
-    }
-
-    private boolean isCurrentSearchResult(AbsXml absXml) {
-        return absXml != null && isCurrentSearchToken(absXml.searchToken);
-    }
-
-    private boolean isCurrentSearchToken(String searchToken) {
-        return !TextUtils.isEmpty(searchToken) && searchToken.equals(currentSearchToken);
-    }
-
-    private boolean markSearchFinished(String sourceKey, String searchToken) {
-        if (!isCurrentSearchToken(searchToken)) return false;
-        synchronized (pendingSearchKeys) {
-            if (TextUtils.isEmpty(sourceKey)) {
-                return false;
-            }
-            if (!pendingSearchKeys.remove(sourceKey)) {
-                return false;
-            }
-            allRunCount.set(pendingSearchKeys.size());
-            return true;
-        }
-    }
-
-    private boolean releaseSearchSlot(String sourceKey, String searchToken) {
-        if (!isCurrentSearchToken(searchToken) || TextUtils.isEmpty(sourceKey)) return false;
-        return releasedSearchKeys.add(sourceKey);
-    }
-
-    private void releaseSearchSlotAndStartNext(String sourceKey, String searchToken) {
-        if (releaseSearchSlot(sourceKey, searchToken)) {
-            startNextSearchTask(searchToken);
-        }
-    }
-
-    private boolean isSearchPending(String sourceKey, String searchToken) {
-        if (!isCurrentSearchToken(searchToken) || TextUtils.isEmpty(sourceKey)) return false;
-        synchronized (pendingSearchKeys) {
-            return pendingSearchKeys.contains(sourceKey);
-        }
-    }
-
-    private boolean isBlockingSearchSource(SourceBean bean) {
-        return bean == null || bean.getType() == 3;
-    }
-
-    private void startFastSearchTasks(List<SearchTask> tasks) {
-        for (SearchTask task : tasks) {
-            if (task.blocking) {
-                continue;
-            }
-            if (startedSearchKeys.add(task.sourceKey)) {
-                submitDirectSearchTask(task);
-            }
-        }
-    }
-
-    private void submitDirectSearchTask(SearchTask task) {
-        if (!isSearchPending(task.sourceKey, task.searchToken)) return;
-        scheduleSearchTimeout(task.sourceKey, task.searchToken);
-        try {
-            sourceViewModel.getSearch(task.sourceKey, task.title, task.searchToken);
-        } catch (Throwable th) {
-            th.printStackTrace();
-            if (markSearchFinished(task.sourceKey, task.searchToken)) {
-                finishSearchIfDone();
-            }
-        }
-    }
-
-    private List<String> getPendingSearchKeys() {
-        synchronized (pendingSearchKeys) {
-            return new ArrayList<>(pendingSearchKeys);
-        }
-    }
-
+    /**
+     * 一轮搜索收尾（所有源都已返回/超时）。
+     *
+     * <p>只做 UI 侧收尾；线程池的清理由 session 自己负责 —— 它必须活得比
+     * 本 Activity 久。</p>
+     */
     private void finishSearchIfDone() {
-        if (allRunCount.get() > 0) return;
-        searchPaused = false;
+        if (session().getAllRunCount() > 0) {
+            return;
+        }
         if (searchAdapter.getData().size() <= 0) {
             showEmpty();
         }
         cancel();
-        if (searchTimeoutExecutor != null) {
-            searchTimeoutExecutor.shutdownNow();
-            searchTimeoutExecutor = null;
-        }
     }
-
-    private class SearchTask implements Runnable {
-        private final String sourceKey;
-        private final String title;
-        private final String searchToken;
-        private final boolean blocking;
-
-        private SearchTask(String sourceKey, String title, String searchToken, boolean blocking) {
-            this.sourceKey = sourceKey;
-            this.title = title;
-            this.searchToken = searchToken;
-            this.blocking = blocking;
-        }
-
-        @Override
-        public void run() {
-            if (!isSearchPending(sourceKey, searchToken)) return;
-            try {
-                sourceViewModel.getSearch(sourceKey, title, searchToken);
-            } catch (Throwable th) {
-                th.printStackTrace();
-                if (markSearchFinished(sourceKey, searchToken)) {
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            finishSearchIfDone();
-                        }
-                    });
-                }
-            }
-        }
-    }
-
 
     private void cancel() {
         OkGo.getInstance().cancelTag("search");
     }
 
+    /**
+     * 退出搜索页。
+     *
+     * <p><b>★ 与旧实现的关键差异</b>：不再 {@code shutdownNow()} 搜索线程池。
+     * 搜索状态已迁至 {@link SearchSession}（由 ViewModel 持有），
+     * Activity 销毁只是「界面没了」，一轮搜索该跑完的照跑完 —— 这样
+     * 用户从详情页返回时，候选池是完整的，而不是重头再搜一遍。</p>
+     *
+     * <p>真正要终止搜索的场景（用户发起新搜索 / 退出应用）由
+     * {@link SearchSession#cancelRound()} 与 {@link SearchSession#startNewRound} 处理。</p>
+     */
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        cancel();
-        try {
-            if (searchExecutorService != null) {
-                searchExecutorService.shutdownNow();
-                searchExecutorService = null;
-                JsLoader.stopAll();
-            }
-            if (searchTimeoutExecutor != null) {
-                searchTimeoutExecutor.shutdownNow();
-                searchTimeoutExecutor = null;
-            }
-        } catch (Throwable th) {
-            th.printStackTrace();
-        }
+        // 仅取消「本页面发起」的 OkGo 请求；不动 session 的线程池
         EventBus.getDefault().unregister(this);
     }
 

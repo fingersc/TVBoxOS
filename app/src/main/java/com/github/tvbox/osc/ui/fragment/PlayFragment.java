@@ -2875,6 +2875,28 @@ public class PlayFragment extends BaseLazyFragment {
         playbackStarted = true;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
+        // ★ 起播保护窗收尾：首帧已出，聚合搜索可以立刻恢复派发
+        //   （不必再等 5s 兜底）。见 SearchSession.STARTUP_GUARD_MAX_MS。
+        if (startupGuardListener != null) {
+            startupGuardListener.onFirstFrame();
+        }
+    }
+
+    /**
+     * 首帧回调：用于结束「起播保护窗」。
+     *
+     * <p>搜索与播放共用同一条 QuickJS 队列，起播阶段的 spider 解析
+     * （{@code playerContent}）会被搜索的 {@code searchContent} 抢占。
+     * 窗口期内暂停搜索派发，首帧一出来就恢复 —— 这比固定等待更精准。</p>
+     */
+    public interface StartupGuardListener {
+        void onFirstFrame();
+    }
+
+    private StartupGuardListener startupGuardListener;
+
+    public void setStartupGuardListener(StartupGuardListener listener) {
+        this.startupGuardListener = listener;
     }
 
     // ==================== 播放质量数据采集（第 1 阶段）====================

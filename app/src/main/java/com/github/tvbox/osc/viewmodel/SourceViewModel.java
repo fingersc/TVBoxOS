@@ -95,6 +95,16 @@ public class SourceViewModel extends ViewModel {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicInteger playRequestSeq = new AtomicInteger();
 
+    /**
+     * 聚合搜索会话：承载一轮搜索的状态与线程池，跨 Activity 重建存活。
+     *
+     * <p>搜索原本由 {@code SearchActivity} 自身持有，Activity 一销毁就全丢；
+     * 迁到 ViewModel 后，进详情页/返回搜索页都不再打断正在跑的搜索，
+     * 候选池也得以边搜边补（修掉「切源只有两三个站」的根因）。
+     * 详见 {@link SearchSession}。</p>
+     */
+    private SearchSession searchSession;
+
     public SourceViewModel() {
         sortResult = new MutableLiveData<>();
         listResult = new MutableLiveData<>();
@@ -105,6 +115,14 @@ public class SourceViewModel extends ViewModel {
         actionResult = new MutableLiveData<>();
         playResult = new MutableLiveData<>();
         gson=new Gson();
+    }
+
+    /** 取得（惰性创建）本 ViewModel 的搜索会话。 */
+    public SearchSession getSearchSession() {
+        if (searchSession == null) {
+            searchSession = new SearchSession(this);
+        }
+        return searchSession;
     }
 
     public static final ExecutorService spThreadPool = Executors.newSingleThreadExecutor();
