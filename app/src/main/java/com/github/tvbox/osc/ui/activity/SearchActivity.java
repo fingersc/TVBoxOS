@@ -144,8 +144,11 @@ public class SearchActivity extends BaseActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        // ★ 原地续跑：进详情页时只是 pauseDispatch，token/pending 全部保留，
-        //   返回后从这里恢复派发，不重头搜索、快照不再残缺。
+        // ★ v42：本页只在 FAST_SEARCH_MODE=false 时才是真正的搜索执行体
+        //   （默认 true 时它 1.3s 后跳到 FastSearchActivity，聚合搜索由那边跑）。
+        //   两条路径共用一个候选池，故这里也要解除详情页降速。
+        session().exitDetailThrottle();
+        // 起播保护窗若把派发压住了，这里补一次（幂等）。
         session().resumeDispatch();
         requestSearchFocusWhenReady();
         applySearchWordMode();
@@ -560,6 +563,8 @@ public class SearchActivity extends BaseActivity {
             return;
         }
         isSearchBack = true;
+        // ★ v42：与 FastSearchActivity 一致 —— 进详情页改为「降速」而非暂停。
+        session().enterDetailThrottle();
         Bundle bundle = new Bundle();
         bundle.putString("id", video.id);
         bundle.putString("sourceKey", video.sourceKey);

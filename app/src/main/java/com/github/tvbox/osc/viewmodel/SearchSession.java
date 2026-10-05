@@ -9,7 +9,6 @@ import com.github.catvod.crawler.JsLoader;
 import com.github.tvbox.osc.bean.AbsXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
-import com.github.tvbox.osc.util.LOG;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -55,6 +54,30 @@ public class SearchSession {
 
     /** 单批并发派发数。维持 6 不动（降线程数不对症，见 v46 结论）。 */
     public static final int SEARCH_THREAD_COUNT = 6;
+
+    /**
+     * 详情页停留期间的降速并发数。
+     *
+     * <p><b>为什么需要降速而不是暂停</b>：paused 会让候选池停止增长（v41 的
+     * 老毛病）；全速 6 线程又会让搜索的 {@code searchContent} JS 与详情页预览
+     * 起播的 {@code playerContent} JS 抢同一条 QuickJS 队列，起播变慢。
+     * 折中：降到 2 —— 池子仍在涨，但把队列留给播放。</p>
+     *
+     * <p><b>必须是「软降速」</b>：不改线程池容量（{@code SEARCH_MAX_THREAD_COUNT}
+     * 不动），只限制「单批派发数」。这样在途请求不受影响，而且免去重建线程池
+     * 的抖动。</p>
+     */
+    public static final int SEARCH_THREAD_COUNT_DETAIL = 2;
+
+    /**
+     * 当前生效的单批派发数。可被 {@link #enterDetailThrottle()} /
+     * {@link #exitDetailThrottle()} 在 6 与 2 之间切换。
+     *
+     * <p>用 {@code volatile} 而非纳入 {@code lock}：读点在 {@code startNextBatch}
+     * 的循环条件里，纳入锁会让每次循环都取锁；而它只是一个整数快照，
+     * 读到旧值最坏后果是「多派发一两个」，无害。</p>
+     */
+    private volatile int batchDispatchCount = SEARCH_THREAD_COUNT;
     public static final int SEARCH_MAX_THREAD_COUNT =
             Build.VERSION.SDK_INT >= 35 ? 24 : Build.VERSION.SDK_INT >= 30 ? 18 : 12;
     public static final int SEARCH_NEXT_BATCH_SECONDS = 3;
@@ -135,8 +158,8 @@ public class SearchSession {
      */
     private boolean dispatchingPaused = false;
 
-    /** 起播保护窗是否生效中。 */
-    private boolean startupGuardActive = false;
+    /** 起播保护窗是否生效中。volatile：供派发循环无锁读取（见 isStartupGuardActive）。 */
+    private volatile boolean startupGuardActive = false;
     private final Handler guardHandler = new Handler(Looper.getMainLooper());
     private final Runnable startupGuardExpire = new Runnable() {
         @Override
@@ -376,13 +399,58 @@ public class SearchSession {
             token = currentSearchToken;
             inFlight = inFlightCountLocked();
         }
-        // 补满到单批并发数；暂停期间被挡下的推进在这里一次性补齐。
-        int need = SEARCH_THREAD_COUNT - inFlight;
+        // 补满到当前批派发上限；暂停期间被挡下的推进在这里一次性补齐。
+        int need = batchDispatchCount - inFlight;
         for (int i = 0; i < need; i++) {
             if (!startNextTask(token)) {
                 break;
             }
         }
+    }
+
+    // ==================== 详情页降速（v42） ====================
+
+    /**
+     * 进入详情页：把单批派发数从 6 降到 2，<b>但不停止</b>。
+     *
+     * <p><b>为什么不暂停</b>：用户的操作时序是「刚出几条结果就点进详情页」，
+     * 此时聚合搜索还远没跑完。若暂停（v41 的做法），停留期间候选池冻结，
+     * 返回时也只能靠 {@code resumePausedSearches()} 换 token 重跑 ——
+     * 表现为「切源数量不随时间增加」。降速则让池子持续增长。</p>
+     *
+     * <p><b>为什么不保持 6</b>：详情页有预览起播，其 {@code playerContent} 与
+     * 搜索的 {@code searchContent} 共用一条 QuickJS 队列，6 路并发会把起播
+     * 排到队尾。降到 2 是「池子仍涨 + 起播不卡」的平衡点。</p>
+     *
+     * <p>本方法幂等；降速期间<b>不做</b> {@code shutdownNow()}，在途请求照常跑完。</p>
+     */
+    public void enterDetailThrottle() {
+        batchDispatchCount = SEARCH_THREAD_COUNT_DETAIL;
+    }
+
+    /**
+     * 离开详情页：恢复单批派发数到 6，并补齐降速期间被压制的派发。
+     *
+     * <p>与 {@link #resumeDispatch()} 的区别：本方法只补「差额」且不依赖
+     * {@code dispatchingPaused} 标志 —— 因为降速期间派发<b>并没有被禁止</b>，
+     * 只是每批少了几个，所以这里安全地再推一批即可。</p>
+     */
+    public void exitDetailThrottle() {
+        batchDispatchCount = SEARCH_THREAD_COUNT;
+        String token;
+        synchronized (lock) {
+            token = currentSearchToken;
+        }
+        if (TextUtils.isEmpty(token)) {
+            return;
+        }
+        // 恢复到 6 并发：把降速期间攒下的等待任务再推出去。
+        startNextBatch(token);
+    }
+
+    /** 当前生效的批派发数（诊断用）。 */
+    public int getBatchDispatchCount() {
+        return batchDispatchCount;
     }
 
     /** 真实在途任务数 = 已派发 key − 已释放 key（均在同一把锁内读取）。 */
@@ -425,9 +493,6 @@ public class SearchSession {
             }
             startupGuardActive = true;
         }
-        // ★ 走免门控通道（LOG.sw）：release 包上 LOG.longI 会被 VERBOSE 门控吞掉，
-        //   而「起播保护窗何时开/关」是现场排障的关键节点，必须任何构建都可见。
-        LOG.sw("[GUARD] begin reason=" + reason + " maxMs=" + STARTUP_GUARD_MAX_MS);
         guardHandler.removeCallbacks(startupGuardExpire);
         guardHandler.postDelayed(startupGuardExpire, STARTUP_GUARD_MAX_MS);
         pauseDispatch();
@@ -436,6 +501,17 @@ public class SearchSession {
     /** 首帧到达 → 立刻结束保护窗（不等 5s 兜底）。 */
     public void endStartupGuardOnFirstFrame() {
         releaseStartupGuard("firstFrame");
+    }
+
+    /**
+     * 起播保护窗是否生效中。
+     *
+     * <p>供 {@code FastSearchActivity} 的派发循环查询：窗口内跳过新任务派发，
+     * 把 QuickJS 队列让给详情页起播。查询点在高频循环里，故只读 volatile 语义
+     * 的标志、不进锁。</p>
+     */
+    public boolean isStartupGuardActive() {
+        return startupGuardActive;
     }
 
     private void releaseStartupGuard(String reason) {
@@ -448,7 +524,6 @@ public class SearchSession {
             }
         }
         guardHandler.removeCallbacks(startupGuardExpire);
-        LOG.sw("[GUARD] end reason=" + reason);
         resumeDispatch();
     }
 
@@ -482,26 +557,35 @@ public class SearchSession {
         if (absXml.movie != null && absXml.movie.videoList != null) {
             mergeIntoCandidatePool(absXml.movie.videoList);
         }
-        // ★ 免门控进度日志：现场只需 adb logcat -s TVBox-switch 就能看到
-        //   「还有几个源在搜 / 候选池当前规模」，用来判断搜索是否真的在推进。
-        LOG.sw("[SEARCH] result src=" + sourceKey
-                + " remain=" + allRunCount.get()
-                + " pool=" + poolSizeLocked());
         releaseSlotAndAdvance(sourceKey, token);
         return true;
     }
 
-    /** 候选池当前总候选数（所有片名求和），仅用于诊断。 */
-    private int poolSizeLocked() {
-        synchronized (lock) {
-            int n = 0;
-            for (List<Movie.Video> list : candidatePool.values()) {
-                if (list != null) {
-                    n += list.size();
-                }
-            }
-            return n;
+    /**
+     * 把命中的视频增量并入候选池（<b>对外公开入口</b>）。
+     *
+     * <p><b>为什么必须公开</b>：本项目的聚合搜索有<b>两条并行实现</b> ——</p>
+     * <ol>
+     *   <li>{@code FastSearchActivity}：{@code FAST_SEARCH_MODE=true}（默认）时走这条，
+     *       它<b>自持一整套</b> {@code allRunCount/pendingSearchKeys/searchData()} 状态机，
+     *       与 {@link SearchSession} 原本毫无关系；</li>
+     *   <li>{@link com.github.tvbox.osc.ui.activity.SearchActivity}：只在
+     *       {@code FAST_SEARCH_MODE=false} 时生效，走本类。</li>
+     * </ol>
+     *
+     * <p>用户实测（logcat 实锤）：搜索页 1.3s 后自动跳 {@code FastSearchActivity}，
+     * 真正的结果由它的 {@code detailFallbackSearchResults} 承载，而详情页读的是
+     * 本类的候选池 —— <b>两边根本不是同一个池子</b>，故详情页切源候选永远只有
+     * 点击那一刻的快照。开放本方法后，FastSearch 每收一批结果就同步写进来，
+     * 两条路径共用同一个候选池。</p>
+     *
+     * @param videos 命中的视频（可含未命中/重复项，内部会去重）
+     */
+    public void mergeVideos(List<Movie.Video> videos) {
+        if (videos == null || videos.isEmpty()) {
+            return;
         }
+        mergeIntoCandidatePool(videos);
     }
 
     /**
@@ -591,7 +675,8 @@ public class SearchSession {
     }
 
     private void startNextBatch(String token) {
-        for (int i = 0; i < SEARCH_THREAD_COUNT; i++) {
+        int limit = batchDispatchCount;
+        for (int i = 0; i < limit; i++) {
             if (!startNextTask(token)) {
                 return;
             }

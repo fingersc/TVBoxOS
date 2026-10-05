@@ -1508,9 +1508,6 @@ public class DetailActivity extends BaseActivity {
         //   是进页面那一刻的副本；不重新拉取的话，切源能在几个站之间轮转，
         //   但「可切站点总数」永远停在进页面时的数量 —— 这正是要修的现象。
         refreshFallbackCandidatesFromSession();
-        LOG.sw("[FB] start title=" + detailFallbackTitle + " manual=" + manual
-                + " from=" + sourceKey + " keepCurrent=" + detailFallbackKeepCurrentDetail
-                + " cached=" + detailFallbackCacheSize(detailFallbackTitle));
         boolean accepted = loadNextDetailFallbackFromCache();
         // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
         // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
@@ -3028,15 +3025,6 @@ public class DetailActivity extends BaseActivity {
             // 会话不可用时不影响切源主流程
             th.printStackTrace();
         }
-    }
-
-    /** 某片名当前缓存了多少个候选（仅用于日志诊断）。 */
-    private int detailFallbackCacheSize(String title) {
-        if (TextUtils.isEmpty(title)) {
-            return 0;
-        }
-        List<Movie.Video> cached = detailFallbackCache.get(title.trim());
-        return cached == null ? 0 : cached.size();
     }
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
