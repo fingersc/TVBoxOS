@@ -533,17 +533,24 @@ public class SearchActivity extends BaseActivity {
     /**
      * 打开搜索结果。
      *
-     * <p><b>★ 关键修正</b>：旧实现第一行就 {@code pauseSearchTasks()} —— 它会
-     * {@code shutdownNow()} 掉线程池并把 token 清空，返回时再用<b>新 token</b>
-     * 从头重跑。后果是「进详情页那一刻打包给详情页的候选池永远残缺」，
-     * 表现就是用户说的「切源只有两个站，返回一趟才变多」。</p>
+     * <p><b>★ v41 修正：这里不再暂停搜索</b></p>
      *
-     * <p>现在改为 {@link SearchSession#pauseDispatch()}：只停止<b>新任务派发</b>，
-     * token 与 pending 集合全部保留，在途请求继续跑完并把结果并入候选池。
-     * 返回时原地续跑，不重头来。</p>
+     * <p>历史演变：</p>
+     * <ol>
+     *   <li>最初第一行 {@code pauseSearchTasks()} —— 会 {@code shutdownNow()} 线程池并清空
+     *       token，返回时用新 token 重跑，候选池永远残缺。</li>
+     *   <li>v39 改为 {@code pauseDispatch()}：保留 token 与在途请求，但<b>停掉新任务派发</b>。
+     *       实测仍不对：用户「搜索刚开始（只出几条）就点进详情页」，此后搜索一直暂停，
+     *       候选池再也不增长 —— 表现为「切源数量不随时间增加，只能在几个站里打转」
+     *       （日志证据：poolSize=5 恒定、newCycle 恒为 false）。</li>
+     *   <li><b>现在：进详情页不暂停，搜索继续跑</b>，池子边看边涨。
+     *       真正需要「给起播让路」的时刻是——用户按下播放，此时由
+     *       {@link SearchSession#beginStartupGuard}(在 {@code DetailActivity.jumpToPlay}
+     *       里触发) 短暂暂停新派发，首帧到达或 5s 超时后自动恢复。
+     *       即：<b>让路是「起播瞬间」的事，不是「待在详情页」的事</b>。</li>
+     * </ol>
      */
     private void openSearchVideo(Movie.Video video) {
-        session().pauseDispatch();
         hasKeyBoard = false;
         if (TextUtils.equals("folder", video.tag)) {
             folderHistory.add(new ArrayList<>(searchAdapter.getData()));

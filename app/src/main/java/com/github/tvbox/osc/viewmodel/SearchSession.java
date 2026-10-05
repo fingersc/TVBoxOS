@@ -425,7 +425,9 @@ public class SearchSession {
             }
             startupGuardActive = true;
         }
-        LOG.longI(TAG, "[GUARD] begin reason=" + reason + " maxMs=" + STARTUP_GUARD_MAX_MS);
+        // ★ 走免门控通道（LOG.sw）：release 包上 LOG.longI 会被 VERBOSE 门控吞掉，
+        //   而「起播保护窗何时开/关」是现场排障的关键节点，必须任何构建都可见。
+        LOG.sw("[GUARD] begin reason=" + reason + " maxMs=" + STARTUP_GUARD_MAX_MS);
         guardHandler.removeCallbacks(startupGuardExpire);
         guardHandler.postDelayed(startupGuardExpire, STARTUP_GUARD_MAX_MS);
         pauseDispatch();
@@ -446,7 +448,7 @@ public class SearchSession {
             }
         }
         guardHandler.removeCallbacks(startupGuardExpire);
-        LOG.longI(TAG, "[GUARD] end reason=" + reason);
+        LOG.sw("[GUARD] end reason=" + reason);
         resumeDispatch();
     }
 
@@ -480,8 +482,26 @@ public class SearchSession {
         if (absXml.movie != null && absXml.movie.videoList != null) {
             mergeIntoCandidatePool(absXml.movie.videoList);
         }
+        // ★ 免门控进度日志：现场只需 adb logcat -s TVBox-switch 就能看到
+        //   「还有几个源在搜 / 候选池当前规模」，用来判断搜索是否真的在推进。
+        LOG.sw("[SEARCH] result src=" + sourceKey
+                + " remain=" + allRunCount.get()
+                + " pool=" + poolSizeLocked());
         releaseSlotAndAdvance(sourceKey, token);
         return true;
+    }
+
+    /** 候选池当前总候选数（所有片名求和），仅用于诊断。 */
+    private int poolSizeLocked() {
+        synchronized (lock) {
+            int n = 0;
+            for (List<Movie.Video> list : candidatePool.values()) {
+                if (list != null) {
+                    n += list.size();
+                }
+            }
+            return n;
+        }
     }
 
     /**
