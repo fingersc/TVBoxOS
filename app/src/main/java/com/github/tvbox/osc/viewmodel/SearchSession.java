@@ -6,7 +6,6 @@ import android.os.Looper;
 import android.text.TextUtils;
 
 import com.github.catvod.crawler.JsLoader;
-import com.github.tvbox.osc.api.ApiConfig;
 import com.github.tvbox.osc.bean.AbsXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
@@ -321,7 +320,7 @@ public class SearchSession {
             }
             startupGuardActive = true;
         }
-        LOG.i(TAG, "[GUARD] begin reason=" + reason + " maxMs=" + STARTUP_GUARD_MAX_MS);
+        LOG.longI(TAG, "[GUARD] begin reason=" + reason + " maxMs=" + STARTUP_GUARD_MAX_MS);
         guardHandler.removeCallbacks(startupGuardExpire);
         guardHandler.postDelayed(startupGuardExpire, STARTUP_GUARD_MAX_MS);
         pauseDispatch();
@@ -342,7 +341,7 @@ public class SearchSession {
             }
         }
         guardHandler.removeCallbacks(startupGuardExpire);
-        LOG.i(TAG, "[GUARD] end reason=" + reason);
+        LOG.longI(TAG, "[GUARD] end reason=" + reason);
         resumeDispatch();
     }
 
