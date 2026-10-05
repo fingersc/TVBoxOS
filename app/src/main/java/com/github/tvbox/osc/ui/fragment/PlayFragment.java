@@ -1497,6 +1497,39 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     /**
+     * 宿主 Activity 即将销毁时调用的**无条件停止**入口。
+     *
+     * <p>与 {@link #onPause()} 的区别：onPause 会尊重「纯音频后台播放」这一产品能力
+     * （{@code hasAudioOnlyPlayback()} 为真时不暂停），而这里代表"播放生命周期彻底
+     * 结束"，任何情况下都必须让播放器停下来，避免声音留在后台。</p>
+     *
+     * <p>之所以单独开一个方法，而不是直接复用 onPause：两者语义不同 ——
+     * 一旦混用，将来任何一处调整都可能再次让"退出后仍有声音"回归。
+     * 这个方法不读任何状态标记（exitingPreview / userPaused 都不看），
+     * 只做一件事：停。</p>
+     */
+    public void stopPlaybackForDetach() {
+        if (mVideoView == null) return;
+        try {
+            lastProgrammaticPauseMs = System.currentTimeMillis();
+            mVideoView.pause();
+        } catch (Throwable th) {
+            LOG.i("echo-lifecycle stopPlaybackForDetach pause failed: " + th.getMessage());
+        }
+        // VideoView.pause() 在「未进入播放态」时（IDLE / PREPARING / BUFFERING）
+        // 只还焦点、不真正停下解码；而 release() 会无条件清理音频焦点、关闭
+        // 屏幕常亮并释放播放器，是这里唯一能保证"绝不留声音"的手段。
+        // release() 本身幂等（内部对 STATE_IDLE 有保护），且在 onDestroyView 中
+        // 还会再调一次，重复调用是安全的。
+        try {
+            mVideoView.release();
+        } catch (Throwable th) {
+            LOG.i("echo-lifecycle stopPlaybackForDetach release failed: " + th.getMessage());
+        }
+        LOG.i("echo-lifecycle stopPlaybackForDetach done");
+    }
+
+    /**
      * 控制器上报的播放/暂停状态变化（见 VodController.onPlayStateChanged）。
      *
      * <p>只有「退后台」或「切集/切源重建播放器」引起的暂停才允许恢复播放；
@@ -1629,12 +1662,27 @@ public class PlayFragment extends BaseLazyFragment {
     @Override
     public void onPause() {
         super.onPause();
-        if (mVideoView != null && !exitingPreview && !hasAudioOnlyPlayback()) {
-            // ★ 这是程序化暂停，先打时间戳，避免随后的 STATE_PAUSED 被误记为用户意图。
+        // ★ 这里曾经有 `!exitingPreview` 这个前置条件，是「退出到首页声音还在」的直接原因。
+        //
+        //   exitingPreview 的本意只是「从全屏退回详情页小窗预览」，此时确实不该暂停。
+        //   但它是 DetailActivity.onBackPressed() 无条件置 true、只有本 Fragment 的
+        //   onResume() 才会清掉的**残留布尔标记**。于是出现这条路径：
+        //     全屏播放 → 返回（置 true）→ 详情页可见但 PlayFragment 不触发 onResume
+        //     → 再返回一次退到 TVBox 首页 → onPause 因 exitingPreview 为真而**跳过暂停**
+        //     → 播放器仍在后台出声，音频焦点也没还。
+        //   小米盒子 3 增强版上「退出到首页还有声音」即由此而来（TV 上
+        //   MusicPlaybackService.isSupported() 为 false，声音只可能来自播放器本体）。
+        //
+        //   修复：不再依赖该布尔标记，改用与 onPlayPauseStateChanged() 完全相同的
+        //   时间窗口语义 —— 退出预览引起的那次 STATE_PAUSED 会落在窗口内被自然忽略，
+        //   无需在暂停路径上看 exitingPreview。这样暂停与否只取决于「是否在播」，
+        //   不会因为一个标记的残留而失效。
+        if (mVideoView != null && !hasAudioOnlyPlayback()) {
+            // 程序化暂停，先打时间戳，避免随后的 STATE_PAUSED 被误记为用户意图。
             lastProgrammaticPauseMs = System.currentTimeMillis();
             mVideoView.pause();
         }
-        LOG.i("echo-lifecycle onPause userPaused=" + userPaused);
+        LOG.i("echo-lifecycle onPause userPaused=" + userPaused + " exitingPreview=" + exitingPreview);
     }
 
     @Override

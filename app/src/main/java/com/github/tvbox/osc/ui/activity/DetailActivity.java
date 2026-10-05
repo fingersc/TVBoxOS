@@ -4390,6 +4390,23 @@ public class DetailActivity extends BaseActivity {
     protected void onDestroy() {
         resetDetailFallback();
         super.onDestroy();
+        // ★ 兜底静音：详情页销毁意味着这一轮播放彻底结束（返回首页 / 退出播放页），
+        //   绝不能把声音留在后台。
+        //
+        //   为什么需要它：正常的暂停链是 DetailActivity.onPause → PlayFragment.onPause
+        //   → VideoView.pause()。但历史上有过一个残留布尔标记（exitingPreview）会在
+        //   某些返回路径上让这一链断掉，表现就是「退回 TVBox 首页后仍有声音」。
+        //   主链路已在 PlayFragment.onPause() 修好，这里再加一道与任何标记都无关的
+        //   兜底：只要 Activity 要销毁了，就先把播放器停掉，再去 release。
+        //   顺序很重要 —— 必须在 releasePlayFragment() 之前，否则 Fragment 已经
+        //   被移除、mVideoView 已置空，就没有对象可停了。
+        try {
+            if (playFragment != null) {
+                playFragment.stopPlaybackForDetach();
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
         try {
             if (searchExecutorService != null) {
                 searchExecutorService.shutdownNow();
