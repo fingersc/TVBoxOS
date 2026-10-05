@@ -10,7 +10,6 @@ import com.github.tvbox.osc.util.LOG;
 import com.google.android.exoplayer2.C;
 import com.orhanobut.hawk.Hawk;
 import com.google.android.exoplayer2.DefaultLoadControl;
-import com.google.android.exoplayer2.DefaultAllocator;
 import com.google.android.exoplayer2.DefaultRenderersFactory;
 import com.google.android.exoplayer2.Format;
 import com.google.android.exoplayer2.Player;
@@ -24,6 +23,10 @@ import com.google.android.exoplayer2.text.CueGroup;
 import com.google.android.exoplayer2.text.TextOutput;
 import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
 import com.google.android.exoplayer2.trackselection.MappingTrackSelector;
+// ⚠️ DefaultAllocator 在 upstream 子包下，不是 com.google.android.exoplayer2 根包：
+//    正确路径 = com.google.android.exoplayer2.upstream.DefaultAllocator
+//    （曾误写成根包，CI 报 "cannot find symbol ... class DefaultAllocator"）
+import com.google.android.exoplayer2.upstream.DefaultAllocator;
 import com.google.android.exoplayer2.util.MimeTypes;
 
 import java.util.ArrayList;
