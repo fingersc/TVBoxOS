@@ -60,6 +60,7 @@ import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
+import com.github.tvbox.osc.viewmodel.SearchSession;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
 import com.orhanobut.hawk.Hawk;
@@ -792,7 +793,7 @@ public class DetailActivity extends BaseActivity {
             App.getInstance().setVodInfo(vodInfo);
             // 方向5：起播在即 → 开起播保护窗。窗口内聚合搜索只暂停「新派发」，
             // 在途请求不动；首帧到达（PlayFragment.markPlaybackStarted）即恢复。
-            sourceViewModel.getSearchSession().beginStartupGuard("jumpToPlay");
+            SearchSession.getShared().beginStartupGuard("jumpToPlay");
             if (showPreview) {
                 ensurePlayFragment();
                 updatePreviewVodInfo();
@@ -1298,7 +1299,7 @@ public class DetailActivity extends BaseActivity {
             // ★ 新路径：从搜索会话的单一候选池读取最新集合（无快照残缺问题）
             String fallbackTitle = bundle.getString(EXTRA_DETAIL_FALLBACK_TITLE, "");
             if (!TextUtils.isEmpty(fallbackTitle)) {
-                List<Movie.Video> poolCandidates = sourceViewModel.getSearchSession().getCandidates(fallbackTitle);
+                List<Movie.Video> poolCandidates = SearchSession.getShared().getCandidates(fallbackTitle);
                 if (!poolCandidates.isEmpty()) {
                     cacheDetailFallbackCandidates(vod_name, poolCandidates);
                 }
@@ -1502,8 +1503,14 @@ public class DetailActivity extends BaseActivity {
         detailFallbackActive = true;
         // 手动发起切源 → 重置失败续切预算。自动续切不清零，那正是要限制的连跳。
         detailFallbackFailoverCount = 0;
+        // ★ 每次切源前，把搜索会话候选池的「最新增量」并入本地缓存。
+        //   搜索是边跑边补的（单一真相源在 SearchSession），而本地 detailFallbackCache
+        //   是进页面那一刻的副本；不重新拉取的话，切源能在几个站之间轮转，
+        //   但「可切站点总数」永远停在进页面时的数量 —— 这正是要修的现象。
+        refreshFallbackCandidatesFromSession();
         LOG.sw("[FB] start title=" + detailFallbackTitle + " manual=" + manual
-                + " from=" + sourceKey + " keepCurrent=" + detailFallbackKeepCurrentDetail);
+                + " from=" + sourceKey + " keepCurrent=" + detailFallbackKeepCurrentDetail
+                + " cached=" + detailFallbackCacheSize(detailFallbackTitle));
         boolean accepted = loadNextDetailFallbackFromCache();
         // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
         // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
@@ -2993,6 +3000,44 @@ public class DetailActivity extends BaseActivity {
     // 已经由 sortDetailFallbackSourceOrderByQuality() 用同一份分数
     // （SourceQualityStore）全量降序排过，逐批再排一次是冗余的。
     // 改为滑动窗口后"批"的概念消失，这个方法的语义也就不存在了。
+
+    /**
+     * 把搜索会话候选池的「当前最新」集合并入本地缓存。
+     *
+     * <p><b>为什么每次切源都要调</b>：聚合搜索是边跑边补的，
+     * 单一真相源在 {@code SearchSession}（进程级单例，与搜索页共享）。
+     * 而本地 {@code detailFallbackCache} 只是进页面那一刻的副本。
+     * 若只在 {@code initData()} 读一次，切源就只能在「进页面时已搜到的那些站」
+     * 之间轮转 —— 后台后续搜到的源永远进不来，表现为
+     * 「切源数量不随时间增加」。</p>
+     *
+     * <p>{@code cacheDetailFallbackCandidates} 内部按 sourceKey+id 去重，
+     * 重复调用只做增量合并，安全。</p>
+     */
+    private void refreshFallbackCandidatesFromSession() {
+        if (TextUtils.isEmpty(detailFallbackTitle) || sourceViewModel == null) {
+            return;
+        }
+        try {
+            List<Movie.Video> latest =
+                    SearchSession.getShared().getCandidates(detailFallbackTitle);
+            if (latest != null && !latest.isEmpty()) {
+                cacheDetailFallbackCandidates(detailFallbackTitle, latest);
+            }
+        } catch (Throwable th) {
+            // 会话不可用时不影响切源主流程
+            th.printStackTrace();
+        }
+    }
+
+    /** 某片名当前缓存了多少个候选（仅用于日志诊断）。 */
+    private int detailFallbackCacheSize(String title) {
+        if (TextUtils.isEmpty(title)) {
+            return 0;
+        }
+        List<Movie.Video> cached = detailFallbackCache.get(title.trim());
+        return cached == null ? 0 : cached.size();
+    }
 
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
         title = title == null ? "" : title.trim();
@@ -4664,7 +4709,7 @@ public class DetailActivity extends BaseActivity {
         playFragment.setStartupGuardListener(new PlayFragment.StartupGuardListener() {
             @Override
             public void onFirstFrame() {
-                sourceViewModel.getSearchSession().endStartupGuardOnFirstFrame();
+                SearchSession.getShared().endStartupGuardOnFirstFrame();
             }
         });
     }

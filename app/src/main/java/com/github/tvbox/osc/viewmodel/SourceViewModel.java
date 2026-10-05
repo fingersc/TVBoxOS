@@ -117,12 +117,28 @@ public class SourceViewModel extends ViewModel {
         gson=new Gson();
     }
 
-    /** 取得（惰性创建）本 ViewModel 的搜索会话。 */
+    /**
+     * 取得（惰性创建）搜索会话。
+     *
+     * <p><b>★ 返回的是进程级单例</b>（{@link SearchSession#getInstance()}），
+     * 不是本 ViewModel 私有的一份。</p>
+     *
+     * <p><b>为什么必须是单例</b>：本项目每个 Activity 都
+     * {@code new ViewModelProvider(this)}，SearchActivity 与 DetailActivity
+     * 拿到的是<b>两个不同的 SourceViewModel</b>。若会话挂在实例上，
+     * 详情页读到的必然是一份<b>全新空会话</b> —— 正是「搜索页候选在涨、
+     * 详情页切源数量却不动」的根因。</p>
+     *
+     * <p>每次调用都把「自己」注册为触发通道（弱引用），保证
+     * 「谁在搜，就用谁的 {@code getSearch} 发请求」；详情页只读候选池，
+     * 即使覆盖了触发通道也不影响它读取。</p>
+     */
     public SearchSession getSearchSession() {
-        if (searchSession == null) {
-            searchSession = new SearchSession(this);
-        }
-        return searchSession;
+        SearchSession session = SearchSession.getInstance();
+        // 谁在用，谁就是当前触发通道（弱引用，不阻塞本 ViewModel 回收）。
+        session.setViewModel(this);
+        this.searchSession = session;
+        return session;
     }
 
     public static final ExecutorService spThreadPool = Executors.newSingleThreadExecutor();

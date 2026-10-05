@@ -76,9 +76,43 @@ public class SearchSession {
      */
     public static final long STARTUP_GUARD_MAX_MS = 5000L;
 
+    /**
+     * 进程级单例。
+     *
+     * <p><b>为什么必须是单例</b>：本项目每个 Activity 都各自
+     * {@code new ViewModelProvider(this)}，因此 SearchActivity 与 DetailActivity
+     * 拿到的是<b>两个不同的 SourceViewModel</b>。若会话挂在 ViewModel 上，
+     * 详情页读到的是一份<b>全新空会话</b> —— 这正是「搜索页候选在涨、
+     * 详情页切源数量却不动」的根因（候选池不共享）。</p>
+     *
+     * <p>会话代表「当前这一轮聚合搜索」，天然是进程级的东西，
+     * 与某个 Activity 的存亡无关，故提升为单例（对齐 {@code App} 的既有风格）。</p>
+     */
+    private static volatile SearchSession instance;
+
+    /** 取得进程级单例会话。 */
+    public static SearchSession getInstance() {
+        if (instance == null) {
+            synchronized (SearchSession.class) {
+                if (instance == null) {
+                    instance = new SearchSession(null);
+                }
+            }
+        }
+        return instance;
+    }
+
     private final Object lock = new Object();
 
-    private final SourceViewModel viewModel;
+    /**
+     * 触发搜索所需的目标 ViewModel。
+     *
+     * <p>用 {@link java.lang.ref.WeakReference} 持有：单例会话生命周期长于任何
+     * Activity，若强引用其 ViewModel，SearchActivity 销毁后无法回收（内存泄漏）。
+     * 搜索<b>只在 Activity 活跃期触发</b>（此时 ViewModel 必被强引用持有），
+     * 弱引用不会失效；详情页只<b>读</b>候选池，不需要它。</p>
+     */
+    private java.lang.ref.WeakReference<SourceViewModel> viewModelRef;
 
     private ExecutorService searchExecutorService;
     private ScheduledExecutorService searchTimeoutExecutor;
@@ -131,7 +165,45 @@ public class SearchSession {
     public static final int CANDIDATE_POOL_MAX_TITLES = 40;
 
     public SearchSession(SourceViewModel viewModel) {
-        this.viewModel = viewModel;
+        setViewModel(viewModel);
+    }
+
+    /**
+     * 绑定/解绑触发搜索用的 ViewModel。
+     *
+     * <p>由「搜索发起方」（{@code SearchActivity} 经
+     * {@code SourceViewModel.getSearchSession()}）调用，把自己注册进来 ——
+     * 保证「谁在搜，就用谁的 {@code getSearch} 发请求、结果就回投到谁观察的
+     * LiveData」。</p>
+     *
+     * <p><b>★ 只读方（详情页）绝不能调这个</b>：详情页只读候选池、不发起搜索。
+     * 若它也来注册，会把触发通道换成详情页的 ViewModel，导致后台续跑的搜索
+     * 把结果投进详情页的 {@code searchResult}（无人观察）→ 搜索页不再更新。
+     * 只读方一律用 {@link #getInstance()}。</p>
+     */
+    public void setViewModel(SourceViewModel viewModel) {
+        synchronized (lock) {
+            this.viewModelRef = viewModel == null ? null
+                    : new java.lang.ref.WeakReference<>(viewModel);
+        }
+    }
+
+    /**
+     * 只读获取（不注册触发通道）。
+     *
+     * <p>供详情页这类「只读候选池」的场景使用，语义上等同于
+     * {@link #getInstance()}，单独命名是为了在调用点一眼看出
+     * 「这里不该动触发通道」。</p>
+     */
+    public static SearchSession getShared() {
+        return getInstance();
+    }
+
+    /** 当前可用的触发通道；已被回收或无绑定则返回 null。 */
+    private SourceViewModel currentViewModel() {
+        synchronized (lock) {
+            return viewModelRef == null ? null : viewModelRef.get();
+        }
     }
 
     // ==================== 生命周期 ====================
@@ -280,15 +352,48 @@ public class SearchSession {
         }
     }
 
-    /** 恢复派发（原地续跑，不自增 token、不重跑已完成项）。 */
+    /**
+     * 恢复派发（原地续跑，不自增 token、不重跑已完成项）。
+     *
+     * <p><b>★ 为什么是「补满在途槽」而不是「再发一批 6 个」</b>：</p>
+     *
+     * <p>暂停期间，在途任务完成时会走 {@code scheduleAdvance → startNextTask}，
+     * 但被 {@code dispatchingPaused} 挡下。而它的槽位在 {@code releaseSlot} 里
+     * <b>已经被标记释放</b> —— 即「该位置空出来了，但没人补位」。
+     * 若不区分地一律再发 6 个，会把并发数顶到 6 + 残留空位，
+     * 或在残留空位很多时仍然补不满。</p>
+     *
+     * <p>正确做法：按「已派发 − 已释放 = 真实在途数」，只补足差额。</p>
+     */
     public void resumeDispatch() {
+        String token;
+        int inFlight;
         synchronized (lock) {
             if (!dispatchingPaused) {
                 return;
             }
             dispatchingPaused = false;
+            token = currentSearchToken;
+            inFlight = inFlightCountLocked();
         }
-        startNextBatch(currentSearchToken);
+        // 补满到单批并发数；暂停期间被挡下的推进在这里一次性补齐。
+        int need = SEARCH_THREAD_COUNT - inFlight;
+        for (int i = 0; i < need; i++) {
+            if (!startNextTask(token)) {
+                break;
+            }
+        }
+    }
+
+    /** 真实在途任务数 = 已派发 key − 已释放 key（均在同一把锁内读取）。 */
+    private int inFlightCountLocked() {
+        int released = 0;
+        for (String key : startedSearchKeys) {
+            if (releasedSearchKeys.contains(key)) {
+                released++;
+            }
+        }
+        return startedSearchKeys.size() - released;
     }
 
     /** 彻底取消本轮搜索（用户重新搜索 / 退出搜索页）。 */
@@ -598,6 +703,7 @@ public class SearchSession {
     }
 
     private boolean sourceViewModelSubmit(SearchTask task) {
+        SourceViewModel viewModel = currentViewModel();
         if (viewModel == null) {
             return false;
         }
@@ -677,6 +783,7 @@ public class SearchSession {
                 return;
             }
             try {
+                SourceViewModel viewModel = currentViewModel();
                 if (viewModel != null) {
                     viewModel.getSearch(sourceKey, title, searchToken);
                 }
