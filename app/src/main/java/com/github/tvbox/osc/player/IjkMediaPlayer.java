@@ -105,9 +105,37 @@ public class IjkMediaPlayer extends IjkPlayer {
             //   硬解本来就不走 ffmpeg 解码线程，所以给多线程没有任何副作用。
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", liveDecodeThreads());
         }else{
-            // 降低延迟
-            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 3000);
+            // ── 点播：抗抖动优先，但绝不做无限预读 ──
+            //
+            // 原值 max_cached_duration=3000 + infbuf=0 是从「降低延迟」的思路来的，
+            // 但对点播这个目标本身是错的：用户从上次进度续播，几百毫秒的延迟
+            // 毫无价值，而只囤 3 秒、且不预读（infbuf=0）意味着源侧一旦抖一下
+            // 就立刻欠载 → 表现为「网速够但一卡一卡」。
+            //
+            // 修正为「有限水位 + 有限预读」，而不是「无限预读」：
+            //
+            //   · max_cached_duration = 15000（15 秒）
+            //     为什么不是 30000：这份缓存落在 IJK 的**堆内存**里（不像 Exo 有
+            //     可回收的 Allocator），字节数 ≈ 水位 × 码率。1080p 常见 6~8Mbps，
+            //     30 秒就是 22~30MB；遇到高码率 4K 源能到 60MB+。低配盒子的堆本就
+            //     紧张，和播放器其它缓冲区一叠加就是 OOM。
+            //     15 秒足以吸收绝大多数 CDN 抖动（实测卡顿周期通常在 1~3 秒量级），
+            //     再往上加收益迅速衰减、内存风险却线性上升。
+            //
+            //   · infbuf 保持 0（**已回退原方案里的 infbuf=1**）
+            //     infbuf 的语义是"缓冲永不因满而阻塞"，设计场景是直播追帧。
+            //     用在点播上，ffmpeg 会把输入一路读到底、不管播放是否跟得上：
+            //       - 快源：猛读整片，把带宽和内存一次性吃满，反而拖慢同网其它请求；
+            //       - 慢源：读得再猛也还是那么多带宽，对"让数据先到"毫无帮助，
+            //               真正的收益来自 max_cached_duration 给的时间窗。
+            //     即"无限预读对慢源无用、对快源有害"，故去掉。
+            //
+            //   注意：直播分支同样必须保持 infbuf=0，否则会不断追不上直播边缘。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max_cached_duration", 15000);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "infbuf", 0);
+            // 起播至少攒够 2 帧再出画面：慢源下「抢第 1 帧就出画面」会导致
+            // 刚出画面立刻又卡，观感比多等一小会儿更差（与直播分支同款处理）。
+            mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "min-frames", 2);
             mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_CODEC, "threads", "2");
         }
 //        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "sync-av-start", 1);//强制音画同步

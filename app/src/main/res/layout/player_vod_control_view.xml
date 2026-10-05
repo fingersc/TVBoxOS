@@ -254,7 +254,11 @@
                 android:padding="@dimen/vs_10"
                 android:text="下一集"
                 android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_19" />
+                android:textSize="@dimen/ts_19"
+                android:nextFocusLeft="@id/play_next"/>
+            <!-- ★ 与 screen_display 的 nextFocusRight 对称：左边界同样用"自指"闭合。
+                 否则在「播放」标签(play_label, 不focusable)左侧按左键时，
+                 几何搜索可能把焦点甩到组外的控件上。 -->
 
             <TextView
                 android:id="@+id/play_pre"
@@ -520,7 +524,16 @@
                 android:visibility="visible"
                 android:text="屏显"
                 android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_19"/>
+                android:textSize="@dimen/ts_19"
+                android:nextFocusRight="@id/screen_display"/>
+            <!-- ★ nextFocusRight 指向<b>自己</b>，让"按右键"时焦点停在原地。
+
+                 这是右边界闭合的<b>唯一可靠</b>写法：
+                   · 写 R.id.play_next（左侧控件）→ 焦点跳回最左 + 反向滚动 → 屏显位移；
+                   · 写 @null / View.NO_ID         → 只是放弃"显式指定"，FocusFinder
+                     随后回退到几何搜索，仍会往右找到别的 focusable 控件 → 焦点跑掉并消失。
+                 自指才会让 findUserSetNextFocus 返回自身，从而真正停在原地。
+                 （Java 侧 VodController 亦设置同一项，两处互为保险。） -->
 
             </LinearLayout>
 

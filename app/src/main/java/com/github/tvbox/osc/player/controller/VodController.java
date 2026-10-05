@@ -973,14 +973,28 @@ public class VodController extends BaseController {
             mCastBtn.setVisibility(VISIBLE);
         }
         // ★ 「屏显」是底部按钮组（HorizontalScrollView 内）的最后一个控件，右侧已无兄弟。
-        //   原实现把它的 nextFocusRight 指向 R.id.play_next（「下一集」）——
+        //   这一处曾经踩过两次坑，记录如下，避免以后再改回去：
+        //
+        //   坑一（已修）：原实现把它的 nextFocusRight 指向 R.id.play_next（「下一集」）——
         //   而 play_next 是组内第 2 个控件、位于屏显<b>左侧</b>，等价于：
         //   按右键 → 焦点跳回最左 → ScrollView 为把 play_next 滚进可视区而反向滚动
         //   → 屏显被甩出可视区并在右侧留下错位（真机表现为「屏显向右位移」）。
-        //   正确做法是「右边界闭合」：显式声明右侧无处可去，让系统自行判定。
-        //   配合下方 bindBottomBtnGroupScrollReset() 在按钮显隐变化后复位 scrollX，
-        //   两条一起才能根治（实测仅改此处仍会因滚动残留偶发偏移）。
-        mScreenDisplay.setNextFocusRightId(View.NO_ID);
+        //
+        //   坑二（本次修）：把上面那句简单换成 setNextFocusRightId(View.NO_ID)，
+        //   以为 NO_ID = 「边界闭合」。**这是错的**。看 FocusFinder 源码：
+        //       case FOCUS_RIGHT:
+        //           if (mNextFocusRightId == View.NO_ID) return null;   // ← 只是放弃"显式指定"
+        //           return findViewInsideOutShouldExist(root, mNextFocusRightId);
+        //   NO_ID 只让"用户显式指定"这条路径返回 null，随后 FocusFinder 会**回退到
+        //   几何搜索**（在整个视图树里找右侧最近的 focusable 控件）。本例中右侧确实
+        //   还有可被搜到的控件，于是焦点往右跳走、落到被裁切的区域 → 表现为
+        //   「焦点移到屏显之后还能继续往右，然后消失」。
+        //
+        //   正解：**自指**。显式把 nextFocusRight 指向自己，findUserSetNextFocus 返回
+        //   自身，焦点原地不动 —— 这才是真正的右边界闭合。
+        //   （注意：@null / View.NO_ID 与 @id/自身 语义<b>并不等价</b>，网传"两者等效"
+        //     只在右侧无其它可搜索控件时才成立，不可依赖。）
+        mScreenDisplay.setNextFocusRightId(R.id.screen_display);
         // 「下一集」左焦点不再回指屏显，避免形成「最右↔最左」的反向环路。
         mNextBtn.setNextFocusLeftId(View.NO_ID);
         bindBottomBtnGroupScrollReset();

@@ -43,6 +43,8 @@ import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Cache;
+import okhttp3.ConnectionPool;
+import okhttp3.Dispatcher;
 import okhttp3.Dns;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
@@ -100,6 +102,45 @@ public class OkGoHelper {
         builder.proxySelector(proxySelector());
         builder.proxyAuthenticator(proxyAuthenticator());
 
+        // ── 流媒体连接复用与超时调优 ──
+        //
+        // 这段是针对"网速够但部分站点卡顿"的一项服务端无关优化：所有播放请求
+        // 都经过这个 client（ExoMediaSourceHelper.setOkClient(ItvClient)），
+        // 所以在这里调一次即全局生效。
+        //
+        //   · 连接池
+        //     默认连接池是 5 个空闲连接 / 5 分钟。HLS 播放时每个分片都是一次
+        //     独立 HTTP 请求，若源站是"每片一个连接"的形态，默认池太小会让
+        //     请求排队等复用、甚至频繁新建 TCP（每片都要三次握手 + TLS 协商，
+        //     慢源上这一段往往就是卡顿的元凶）。提到 12 个空闲、保活 5 分钟，
+        //     既覆盖分片并发、又不会长期占着文件描述符。
+        //
+        //   · 超时
+        //     readTimeout 默认 10s 对慢源偏紧：慢源不是"断流"，而是"慢"，
+        //     10 秒内没吐出下一个字节就抛 SocketTimeoutException → Exo 判定
+        //     该分片失败 → 走 HlsErrorHandlingPolicy 重试/跳过 → 观众看到卡顿
+        //     甚至跳片。放宽到 30s 让"慢但有响应"的源有机会把数据送完。
+        //     connectTimeout 保持 15s：连不上就该快速失败并让上层换线，
+        //     拉长只会让用户在"黑屏等起播"上浪费时间。
+        //     writeTimeout 对流媒体无实际意义（请求体为空），保留默认即可。
+        //
+        //   · Dispatcher
+        //     默认 maxRequests=64 / maxRequestsPerHost=5。分片下载是"同一 host
+        //     多请求"，5 的上限会成为瓶颈（尤其在开了后续并行分片能力时）。
+        //     提到 10 —— 不设更高是刻意的：单片源并发过高会互相抢带宽，
+        //     对慢源反而不利（每个连接分到的速率更低，更易触发欠载）。
+        try {
+            builder.connectionPool(new ConnectionPool(12, 5, TimeUnit.MINUTES));
+            builder.connectTimeout(15, TimeUnit.SECONDS);
+            builder.readTimeout(30, TimeUnit.SECONDS);
+            Dispatcher dispatcher = new Dispatcher();
+            dispatcher.setMaxRequests(64);
+            dispatcher.setMaxRequestsPerHost(10);
+            builder.dispatcher(dispatcher);
+        } catch (Throwable th) {
+            // 调优失败不应影响播放：宁可退回默认客户端，也不能让起播挂掉。
+            th.printStackTrace();
+        }
 
         try {
             setOkHttpSsl(builder);
