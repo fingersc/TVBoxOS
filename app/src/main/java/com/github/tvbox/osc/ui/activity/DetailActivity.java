@@ -2971,6 +2971,13 @@ public class DetailActivity extends BaseActivity {
      * 与搜索页（FastActivity/SearchActivity）和播放页（PlayFragment 的起播打点）
      * 用的是同一份数据、同一套权重，因此「切源优先试的站」就是「搜索排前面的站」。
      *
+     * <p><b>★ P1-2 修正说明</b>：上面这句此前是<b>不成立</b>的 —— 搜索页走
+     * {@code snapshotForSearch}（命中 0.35 / 速度 0.45 / 播放 0.20），
+     * 本页走 {@code snapshot}（播放 0.30 / 速度 0.55 / 命中 0.15），
+     * 两套权重口径不同，导致「搜索第 1 名」进详情页可能排到第 5。
+     * 现已统一为<b>播放优先</b>单一口径（见 {@code SourceQualityStore} 类注释），
+     * 本段描述从「声称」变为「事实」。
+     *
      * <p><b>稳定性</b>：用 {@code List.sort}（TimSort，稳定排序）。所有站点在
      * 冷启动时都是中性分 0.5，此时排序结果 == 原始顺序，不会打乱既有行为。
      *
