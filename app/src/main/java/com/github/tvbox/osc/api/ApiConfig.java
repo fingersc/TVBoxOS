@@ -329,6 +329,21 @@ public class ApiConfig {
         return liveChannelGroupList == null || liveChannelGroupList.isEmpty() || !apiUrl.equals(loadedLiveConfigUrl);
     }
 
+    /**
+     * 「当前直播源」上次停留的分组序号 Hawk 键。
+     *
+     * <p><b>★ P1-9-c（v45）：本键此前会无界增长。</b>
+     * 原实现是 {@code HawkConfig.LIVE_GROUP_INDEX + "_" + liveApiUrl} ——
+     * <b>把直播源地址拼进 key</b>，于是每换一次直播源配置就永久新增一个键，
+     * <b>没有任何清理</b>。用户长期换源（或多源轮换测试）会持续堆积。
+     * 而 {@link HawkConfig#LIVE_GROUP_INDEX} 存储的是「该源上次看到第几个分组」，
+     * 语义上<b>只需要当前源的值</b>，旧源的历史值<b>永远用不到</b>。</p>
+     *
+     * <p><b>修法</b>：不引入索引淘汰（那是给「多值并存」场景用的），
+     * 而是记录「上一次写入时用的完整 key」{@link #LIVE_GROUP_INDEX_CURRENT_KEY}，
+     * 一旦当前 key 与之不同（= 换了直播源），
+     * 就把旧 key 删掉 —— 保证 Hawk 里<b>至多只有一条</b> live_group_index* 记录。</p>
+     */
     public static String getLiveGroupIndexKey() {
         String liveApiUrl = Hawk.get(HawkConfig.LIVE_API_URL, "");
         if (liveApiUrl == null || liveApiUrl.length() == 0) {
@@ -337,12 +352,26 @@ public class ApiConfig {
         return HawkConfig.LIVE_GROUP_INDEX + "_" + liveApiUrl;
     }
 
+    /** 记住「上一次 {@link #setLiveGroupIndex} 实际写入的 key」，用于淘汰旧源的键。 */
+    private static final String LIVE_GROUP_INDEX_CURRENT_KEY = "live_group_index__current_key";
+
     public static int getLiveGroupIndex() {
         return Hawk.get(getLiveGroupIndexKey(), 0);
     }
 
     public static void setLiveGroupIndex(int index) {
-        Hawk.put(getLiveGroupIndexKey(), index);
+        String key = getLiveGroupIndexKey();
+        // ★ P1-9-c：换了直播源 → 旧键作废，立即删除，避免 live_group_index_<url> 无界堆积。
+        try {
+            String prev = Hawk.get(LIVE_GROUP_INDEX_CURRENT_KEY, "");
+            if (prev != null && !prev.isEmpty() && !prev.equals(key)) {
+                Hawk.delete(prev);
+            }
+        } catch (Throwable ignored) {
+            // 清理旧键属附加卫生，失败不影响位置记忆本身
+        }
+        Hawk.put(key, index);
+        Hawk.put(LIVE_GROUP_INDEX_CURRENT_KEY, key);
     }
 
     private static final int LOAD_JAR_MAX_RETRY = 1;
