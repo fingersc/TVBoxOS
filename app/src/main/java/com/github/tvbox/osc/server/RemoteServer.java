@@ -66,7 +66,68 @@ public class RemoteServer extends NanoHTTPD {
     public static int serverPort = 9978;
     private boolean isStarted = false;
     private DataReceiver mDataReceiver;
+
+    /**
+     * 净化后的 m3u8 内容（按播放会话隔离）。
+     *
+     * <p><b>★ v43：从单一静态字段改为按会话存放</b>。此前是
+     * {@code public static String m3u8Content}，而 HTTP 端点 {@code /proxyM3u8}
+     * 会<b>无差别返回当前值</b>。当两次播放并发（详情页预览起播与全屏播放交替、
+     * 或快速切源），后一次 {@code processM3u8Content} 会覆盖前一次的内容，
+     * 而先前的播放器仍在向 {@code /proxyM3u8} 拉取 → <b>拿到另一条流的切片列表</b>，
+     * 表现为「画面串到上一部片/上一集」或直接卡住。</p>
+     *
+     * <p>key = 播放会话 key（由 {@code progressKey} 派生，天然含 sourceKey+集号），
+     * value = 该会话净化后的内容。</p>
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> M3U8_CONTENT_BY_SESSION =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 默认（无会话）的 m3u8 内容。
+     *
+     * @deprecated 用 {@link #putM3u8Content(String, String)} /
+     * {@link #getM3u8Content(String)}。保留仅为兼容旧调用方。
+     */
+    @Deprecated
     public static String m3u8Content;
+
+    /** 按会话写入净化后的 m3u8 内容。 */
+    public static void putM3u8Content(String sessionKey, String content) {
+        if (sessionKey == null || sessionKey.isEmpty()) {
+            m3u8Content = content;
+            return;
+        }
+        // 容量保护：正常情况下在播会话只有 1~2 个，超过 8 个说明有会话没被清理，
+        // 直接整体清空（只影响下次请求，不会崩）—— 避免长会话下无界增长。
+        if (M3U8_CONTENT_BY_SESSION.size() > 8) {
+            M3U8_CONTENT_BY_SESSION.clear();
+        }
+        M3U8_CONTENT_BY_SESSION.put(sessionKey, content == null ? "" : content);
+    }
+
+    /**
+     * 按会话读取净化后的 m3u8 内容。
+     *
+     * <p>会话不存在时退回 {@link #m3u8Content}（兼容旧路径：未带会话 key 的请求）。</p>
+     */
+    public static String getM3u8Content(String sessionKey) {
+        if (sessionKey != null && !sessionKey.isEmpty()) {
+            String v = M3U8_CONTENT_BY_SESSION.get(sessionKey);
+            if (v != null) {
+                return v;
+            }
+        }
+        return m3u8Content;
+    }
+
+    /** 会话结束（切源/退出播放）时清掉该会话的内容，及时释放内存。 */
+    public static void clearM3u8Content(String sessionKey) {
+        if (sessionKey != null && !sessionKey.isEmpty()) {
+            M3U8_CONTENT_BY_SESSION.remove(sessionKey);
+        }
+    }
+
     private ArrayList<RequestProcess> getRequestList = new ArrayList<>();
     private ArrayList<RequestProcess> postRequestList = new ArrayList<>();
 
@@ -200,8 +261,13 @@ public class RemoteServer extends NanoHTTPD {
                 } else if (fileName.equals("/media")) {
                     return handleMedia();
                 }  else if (fileName.startsWith("/proxyM3u8")) {
-//                    com.github.tvbox.osc.util.LOG.i("echo-proxyM3u8 length:" + (m3u8Content == null ? 0 : m3u8Content.length()));
-                    return NanoHTTPD.newFixedLengthResponse(Response.Status.OK, "application/vnd.apple.mpegurl", m3u8Content == null ? "" : m3u8Content);
+                    // ★ v43：按会话取内容。路径形如 /proxyM3u8?sk=<sessionKey>；
+                    //   不带 sk 时退回默认字段（兼容旧调用方）。
+                    //   这样并发播放各自拿到自己的流，不会互相串内容。
+                    String sessionKey = session.getParms() == null ? null : session.getParms().get("sk");
+                    String content = getM3u8Content(sessionKey);
+                    return NanoHTTPD.newFixedLengthResponse(Response.Status.OK,
+                            "application/vnd.apple.mpegurl", content == null ? "" : content);
                 }
                  else if (fileName.startsWith("/dash/")) {
                     String dashData = App.getInstance().getDashData();

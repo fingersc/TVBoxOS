@@ -9,6 +9,7 @@ import com.github.catvod.crawler.JsLoader;
 import com.github.tvbox.osc.bean.AbsXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.util.ShowTitleKey;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -168,9 +169,23 @@ public class SearchSession {
         }
     };
 
-    /** 候选池：标题 -> 候选列表。单一真相源，替代原先「打包进 Intent 的快照」。 */
+    /**
+     * 候选池：片名归一化键 -> 候选列表。单一真相源，替代原先「打包进 Intent 的快照」。
+     *
+     * <p><b>★ v43：键改为归一化片名</b>。此前直接用各资源站返回的
+     * {@code video.name.trim()}，而读取方（详情页）用的是 {@code detailFallbackTitle}
+     * —— 后者会在<b>切源后被新源的写法覆盖</b>（{@code vod_name = video.name}）。
+     * 于是「写侧按全站原始写法混合索引、读侧用当前源写法查」，切几次源后命中率骤降，
+     * 表现为「切源数量不随时间增加」。现两侧统一走 {@link ShowTitleKey#normalize}。</p>
+     *
+     * <p><b>★ v43：accessOrder 改为 true</b>。此前第三个参数误写 {@code false}
+     * （插入序 = FIFO），与本类注释声称的 LRU 语义相反 —— 浏览超过上限部片后，
+     * 被淘汰的是「最早插入的」而不是「最久未用的」，最常用的片反而被清掉。
+     * 改为 {@code true} 后 {@code get} 会触发访问序重排，故所有读点必须在
+     * {@code synchronized(lock)} 内（本类已满足）。</p>
+     */
     private final java.util.LinkedHashMap<String, List<Movie.Video>> candidatePool =
-            new java.util.LinkedHashMap<String, List<Movie.Video>>(16, 0.75f, false) {
+            new java.util.LinkedHashMap<String, List<Movie.Video>>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(java.util.Map.Entry<String, List<Movie.Video>> eldest) {
                     return size() > CANDIDATE_POOL_MAX_TITLES;
@@ -602,7 +617,14 @@ public class SearchSession {
                 if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.name)) {
                     continue;
                 }
-                String title = video.name.trim();
+                // ★ v43：键必须归一化 —— 各资源站对同一部片的写法不同
+                //   （【全集】庆余年 / 庆余年 / 庆余年 第一季），而读取方用的是
+                //   会随切源漂移的 detailFallbackTitle。不归一化则两侧口径不同，
+                //   切源后读池大面积落空。归一化规则见 ShowTitleKey。
+                String title = ShowTitleKey.normalize(video.name);
+                if (TextUtils.isEmpty(title)) {
+                    continue;
+                }
                 List<Movie.Video> list = candidatePool.get(title);
                 if (list == null) {
                     list = new ArrayList<>();
@@ -624,13 +646,22 @@ public class SearchSession {
         }
     }
 
-    /** 读取某部片的候选池（只读副本，调用方不得修改）。 */
+    /**
+     * 读取某部片的候选池（只读副本，调用方不得修改）。
+     *
+     * <p>传入的 {@code title} 可以是任意写法（原始 {@code vod_name} 即可），
+     * 内部统一归一化后再查 —— 调用方<b>不需要</b>自己先归一化。</p>
+     */
     public List<Movie.Video> getCandidates(String title) {
         if (title == null) {
             return new ArrayList<>();
         }
+        String key = ShowTitleKey.normalize(title);
+        if (TextUtils.isEmpty(key)) {
+            return new ArrayList<>();
+        }
         synchronized (lock) {
-            List<Movie.Video> list = candidatePool.get(title.trim());
+            List<Movie.Video> list = candidatePool.get(key);
             return list == null ? new ArrayList<Movie.Video>() : new ArrayList<>(list);
         }
     }
@@ -639,8 +670,12 @@ public class SearchSession {
         if (title == null) {
             return 0;
         }
+        String key = ShowTitleKey.normalize(title);
+        if (TextUtils.isEmpty(key)) {
+            return 0;
+        }
         synchronized (lock) {
-            List<Movie.Video> list = candidatePool.get(title.trim());
+            List<Movie.Video> list = candidatePool.get(key);
             return list == null ? 0 : list.size();
         }
     }

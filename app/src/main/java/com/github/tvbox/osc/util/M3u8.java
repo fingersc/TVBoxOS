@@ -46,48 +46,109 @@ public class M3u8 {
     private static final int MAX_FRAME_RATE_AD_BLOCK_SIZE = 12;
     private static final Map<Integer, Set<BigDecimal>> FRAME_RATE_FEATURES = prepareFrameRateFeatures();
 
+    /**
+     * 上次 {@link #purify} 移除的广告片段数。
+     *
+     * @deprecated <b>★ v43 起改用 {@link Result}</b>。本字段是进程级可变静态，
+     * 与 {@code purify()} 的返回值<b>不是原子的一对</b>：两次并发调用（详情页预览
+     * 起播 + 全屏播放交替，或快速切源）会互相覆盖，调用方读到的计数可能属于
+     * 另一次调用。请改用 {@code M3u8.purify(...).adCount}。
+     * 保留仅为了不破坏尚未迁移的调用方；新代码<b>禁止</b>读写它。
+     */
+    @Deprecated
     public static int currentAdCount;
+
+    /**
+     * {@link #purify} 的结果：净化后的内容 + 本次移除的广告片段数。
+     *
+     * <p><b>为什么需要这个类型</b>：原实现把「内容」用返回值传出、
+     * 把「计数」用 {@link #currentAdCount} 静态字段传出，两者分离且非原子。
+     * 并发播放时调用方可能拿到 A 的内容 + B 的计数，进而对错误的流启用代理。
+     * 打包成一个不可变对象后，内容与计数天然绑定同一次调用。</p>
+     */
+    public static final class Result {
+        /** 净化后的 m3u8 内容；失败时为 null。 */
+        public final String content;
+        /** 本次移除的广告片段数。 */
+        public final int adCount;
+
+        Result(String content, int adCount) {
+            this.content = content;
+            this.adCount = adCount;
+        }
+    }
 
     public static boolean isAd(String regex) {
         return regex.contains(TAG_DISCONTINUITY) || regex.contains(TAG_MEDIA_DURATION) || regex.contains(TAG_ENDLIST) || regex.contains(TAG_KEY) || regex.contains(TAG_CUE_OUT) || regex.contains(TAG_CUE_IN) || regex.contains(TAG_DATERANGE) || M3u8.isDouble(regex);
     }
 
+    /**
+     * 净化 m3u8：移除广告片段。
+     *
+     * @deprecated 用 {@link #purifyResult(String, String)} 取代。
+     * 本方法与 {@link #currentAdCount} 配合使用时，内容与计数的对应关系
+     * 在并发场景下不成立。保留是为了兼容尚未迁移的调用方。
+     */
+    @Deprecated
     public static String purify(String tsUrlPre, String m3u8content) {
-        long start = System.currentTimeMillis();
-        currentAdCount = 0;
-        if (null == m3u8content || m3u8content.length() == 0) return null;
-        if (m3u8content.startsWith("\ufeff")) m3u8content = m3u8content.substring(1);
-        if (!m3u8content.startsWith("#EXTM3U")) return null;
-
-        // Count total segments for final safety check
-        int totalSegments = 0;
-        String[] lines = m3u8content.split(m3u8content.contains("\r\n") ? "\r\n" : "\n");
-        for (String line : lines) {
-            if (line.length() > 0 && line.charAt(0) != '#') {
-                totalSegments++;
-            }
-        }
-
-        String result = removeMinorityUrl(tsUrlPre, m3u8content);
-        if (result != null && currentAdCount > 0) result = get(tsUrlPre, result);
-        else result = get(tsUrlPre, m3u8content);
-        result = keepVodEndList(m3u8content, result);
-
-        // Final safety check: if too many segments removed, return original content
-        if (totalSegments > 0 && currentAdCount > totalSegments * 0.5) {
-            LOG.e("echo-fixAdM3u8 ERROR: removed too many segments " + currentAdCount + "/" + totalSegments + ", using original content");
-            currentAdCount = 0;
-            result = m3u8content;
-        }
-        if (currentAdCount > 0 && !isPlayableMediaPlaylist(result)) {
-            LOG.e("echo-fixAdM3u8 ERROR: invalid playlist after ad removal, using original content");
-            currentAdCount = 0;
-            result = m3u8content;
-        }
-
-        long cost = System.currentTimeMillis() - start;
-        return result;
+        return purifyResult(tsUrlPre, m3u8content).content;
     }
+
+    /**
+     * 净化 m3u8，并把「净化后内容 + 移除的广告数」作为<b>一个原子结果</b>返回。
+     *
+     * <p><b>★ v43 新增</b>：整段净化逻辑串行执行（{@link #PURIFY_LOCK}），
+     * 因为内部依赖 {@link #currentAdCount} 这个静态累加器贯穿多个清理阶段
+     * （removeMinorityUrl → get → cleanDecimalPrecisionGroups → cleanFrameRateGroups）。
+     * 不加锁则两次并发调用的计数会串到一起，导致「该不该走代理」「弹几条广告」判断错误。</p>
+     *
+     * <p>返回值的 {@code content} 为 null 表示内容非法（非 m3u8 播放列表），
+     * 调用方应直接放行原始地址。</p>
+     */
+    public static Result purifyResult(String tsUrlPre, String m3u8content) {
+        // ★ 串行化：currentAdCount 是贯穿各阶段的可变静态累加器，
+        //   并发调用会互相污染计数，进而影响「移除超限则回退原内容」的安全判断。
+        synchronized (PURIFY_LOCK) {
+            long start = System.currentTimeMillis();
+            currentAdCount = 0;
+            if (null == m3u8content || m3u8content.length() == 0) return new Result(null, 0);
+            if (m3u8content.startsWith("\ufeff")) m3u8content = m3u8content.substring(1);
+            if (!m3u8content.startsWith("#EXTM3U")) return new Result(null, 0);
+
+            // Count total segments for final safety check
+            int totalSegments = 0;
+            String[] lines = m3u8content.split(m3u8content.contains("\r\n") ? "\r\n" : "\n");
+            for (String line : lines) {
+                if (line.length() > 0 && line.charAt(0) != '#') {
+                    totalSegments++;
+                }
+            }
+
+            String result = removeMinorityUrl(tsUrlPre, m3u8content);
+            if (result != null && currentAdCount > 0) result = get(tsUrlPre, result);
+            else result = get(tsUrlPre, m3u8content);
+            result = keepVodEndList(m3u8content, result);
+
+            // Final safety check: if too many segments removed, return original content
+            if (totalSegments > 0 && currentAdCount > totalSegments * 0.5) {
+                LOG.e("echo-fixAdM3u8 ERROR: removed too many segments " + currentAdCount + "/" + totalSegments + ", using original content");
+                currentAdCount = 0;
+                result = m3u8content;
+            }
+            if (currentAdCount > 0 && !isPlayableMediaPlaylist(result)) {
+                LOG.e("echo-fixAdM3u8 ERROR: invalid playlist after ad removal, using original content");
+                currentAdCount = 0;
+                result = m3u8content;
+            }
+
+            long cost = System.currentTimeMillis() - start;
+            return new Result(result, currentAdCount);
+        }
+    }
+
+    /** 净化过程的串行锁（见 {@link #purifyResult} 说明）。 */
+    private static final Object PURIFY_LOCK = new Object();
+
 
     private static double maxPercent(HashMap<String, Integer> preUrlMap) {
         int maxTimes = 0, totalTimes = 0;

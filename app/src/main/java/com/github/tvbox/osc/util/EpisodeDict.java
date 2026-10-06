@@ -97,7 +97,13 @@ public final class EpisodeDict {
                         String k = keys.next();
                         int v = bd.optInt(k, -1);
                         if (v > 0) {
-                            map.put(k, v);
+                            // ★ v43：把「节目名|日期」的节目名部分归一化后入表。
+                            //   与 lookup() 的归一化口径一致，保证「同一部片无论当前
+                            //   显示名是哪个源的写法」都能命中（详见 ShowTitleKey）。
+                            String nk = normalizeDictKey(k);
+                            if (!TextUtils.isEmpty(nk)) {
+                                map.put(nk, v);
+                            }
                         }
                     }
                 }
@@ -107,6 +113,22 @@ public final class EpisodeDict {
         byDate = map;
         loaded = true;
         return !map.isEmpty();
+    }
+
+    /**
+     * 归一化字典键：{@code 节目名|日期} → {@code 归一化节目名|日期}。
+     *
+     * <p>日期部分原样保留（它本身是规整的 8 位数字），只归一化节目名。</p>
+     */
+    private static String normalizeDictKey(String rawKey) {
+        if (TextUtils.isEmpty(rawKey)) return "";
+        int sep = rawKey.lastIndexOf('|');
+        if (sep <= 0 || sep >= rawKey.length() - 1) {
+            return ShowTitleKey.normalize(rawKey);
+        }
+        String show = rawKey.substring(0, sep);
+        String date = rawKey.substring(sep + 1).trim();
+        return ShowTitleKey.normalize(show) + "|" + date;
     }
 
     /** 是否已加载且有数据。 */
@@ -129,7 +151,10 @@ public final class EpisodeDict {
         if (map == null || map.isEmpty()) {
             return -1;
         }
-        Integer v = map.get(showName.trim() + "|" + date.trim());
+        // ★ v43：用归一化节目名查（表侧 parseJson 也已归一化），
+        //   避免切源后 vod_name 写法变化导致查不到。
+        String key = ShowTitleKey.normalize(showName) + "|" + date.trim();
+        Integer v = map.get(key);
         return v == null ? -1 : v;
     }
 

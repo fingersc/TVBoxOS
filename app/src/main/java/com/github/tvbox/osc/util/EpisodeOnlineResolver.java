@@ -514,16 +514,34 @@ public final class EpisodeOnlineResolver {
 
     // ---------------- 缓存层 ----------------
 
+    /**
+     * 取节目的归一化缓存键。
+     *
+     * <p><b>★ v43：键统一归一化</b>。此前直接用 {@code vod_name.trim()} 作键，
+     * 而 {@code vod_name} 会在<b>切源后被新源写法覆盖</b>（{@code 庆余年} →
+     * {@code 【全集】庆余年}）。键一变，同一部片此前联网查到的「期号↔日期」映射
+     * 就全部作废 —— 表现为「每切一次源就要重新联网付一次阻塞预算」。</p>
+     *
+     * <p>归一化后，同一部片无论当前显示名是哪个源的写法，都命中同一份缓存。</p>
+     */
+    private static String cacheKey(String showName) {
+        return ShowTitleKey.normalize(showName);
+    }
+
     private static Map<String, Integer> getCached(String showName) {
+        String key = cacheKey(showName);
+        if (TextUtils.isEmpty(key)) return null;
         synchronized (LOCK) {
-            return CACHE.get(showName);
+            return CACHE.get(key);
         }
     }
 
     private static void putCache(String showName, Map<String, Integer> map) {
+        String key = cacheKey(showName);
+        if (TextUtils.isEmpty(key)) return;
         synchronized (LOCK) {
             // 简单的容量保护：超过上限时清掉最旧的若干节目（HashMap 无序，按当前迭代顺序淘汰）
-            if (!CACHE.containsKey(showName) && CACHE.size() >= MAX_CACHED_SHOWS) {
+            if (!CACHE.containsKey(key) && CACHE.size() >= MAX_CACHED_SHOWS) {
                 Iterator<String> it = CACHE.keySet().iterator();
                 int drop = Math.max(1, CACHE.size() / 10);
                 while (it.hasNext() && drop > 0) {
@@ -532,7 +550,7 @@ public final class EpisodeOnlineResolver {
                     drop--;
                 }
             }
-            CACHE.put(showName, map);
+            CACHE.put(key, map);
         }
         persistCache();
     }
@@ -561,7 +579,17 @@ public final class EpisodeOnlineResolver {
                         int v = m.optInt(k, -1);
                         if (v > 0) mm.put(k, v);
                     }
-                    CACHE.put(show, mm);
+                    // ★ v43：老版本落盘的键未归一化，此处归一再入内存；
+                    //   同键相遇（旧数据里 【全集】庆余年 与 庆余年 各存一份）时合并，
+                    //   新读到的条目覆盖旧的，避免老缓存被整体丢弃。
+                    String key = cacheKey(show);
+                    if (TextUtils.isEmpty(key)) continue;
+                    Map<String, Integer> exist = CACHE.get(key);
+                    if (exist == null) {
+                        CACHE.put(key, mm);
+                    } else {
+                        exist.putAll(mm);
+                    }
                 }
             }
         } catch (Throwable ignored) {

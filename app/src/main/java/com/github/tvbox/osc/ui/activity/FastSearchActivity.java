@@ -343,7 +343,8 @@ public class FastSearchActivity extends BaseActivity {
         bundle.putString("picture", video.pic);
         bundle.putString(DetailActivity.EXTRA_DETAIL_FALLBACK_TITLE,
                 video.name == null ? "" : video.name.trim());
-        putDetailFallbackCandidates(bundle, video);
+        // ★ P2-4：不再往 Intent 里塞候选快照（见下方已删除方法的说明），
+        //   详情页会凭 EXTRA_DETAIL_FALLBACK_TITLE 回候选池取最新全集。
         jumpActivity(DetailActivity.class, bundle);
     }
 
@@ -901,57 +902,13 @@ public class FastSearchActivity extends BaseActivity {
         finishSearchIfDone();
     }
 
-    private void putDetailFallbackCandidates(Bundle bundle, Movie.Video selectedVideo) {
-        if (bundle == null || selectedVideo == null || TextUtils.isEmpty(selectedVideo.name)) {
-            return;
-        }
-        String title = selectedVideo.name.trim();
-        ArrayList<Movie.Video> candidates = new ArrayList<>();
-        Set<String> keys = new HashSet<>();
-        for (Movie.Video video : detailFallbackSearchResults) {
-            if (video == null || TextUtils.isEmpty(video.id)
-                    || !TextUtils.equals(title, video.name == null ? "" : video.name.trim())) {
-                continue;
-            }
-            String key = (video.sourceKey == null ? "" : video.sourceKey) + "|" + video.id;
-            if (keys.add(key)) {
-                // 只保留 fallback 缓存需要的轻量字段，剥离 urlBean（播放列表），
-                // 避免长剧多候选序列化后 Intent 超过 Binder 1MB 触发 TransactionTooLargeException 崩溃。
-                candidates.add(trimVideoForIntent(video));
-                if (candidates.size() >= 20) {
-                    break;
-                }
-            }
-        }
-        if (!candidates.isEmpty()) {
-            bundle.putSerializable(DetailActivity.EXTRA_DETAIL_FALLBACK_CANDIDATES, candidates);
-        }
-    }
-    
-    private Movie.Video trimVideoForIntent(Movie.Video src) {
-        Movie.Video dst = new Movie.Video();
-        if (src == null) return dst;
-        dst.last = src.last;
-        dst.id = src.id;
-        dst.tid = src.tid;
-        dst.name = src.name;
-        dst.type = src.type;
-        dst.pic = src.pic;
-        dst.lang = src.lang;
-        dst.area = src.area;
-        dst.year = src.year;
-        dst.state = src.state;
-        dst.note = src.note;
-        dst.actor = src.actor;
-        dst.director = src.director;
-        dst.des = src.des;
-        dst.sourceKey = src.sourceKey;
-        dst.tag = src.tag;
-        dst.action = src.action;
-        // urlBean 有意不复制（超大 Playlist 是 Bundle 超限的主要来源）
-        return dst;
-    }
-    
+    // ★ P2-4：putDetailFallbackCandidates / trimVideoForIntent 已删除。
+    //
+    // 这两个方法把「点击搜索结果那一刻的候选快照」（限 20 条、严格 Equals 匹配）
+    // 序列化进 Intent。它已被「只传标题、详情页回候选池取最新全集」的路径取代，
+    // 是后者的**真子集**；保留只会白白承担 TransactionTooLargeException 风险。
+    // 缓存写入现在统一由 DetailActivity 的标题路径 + 后台回流完成。
+
     private void scheduleSearchAdvance(final String sourceKey, final String searchToken) {
         if (searchTimeoutExecutor == null) return;
         searchTimeoutExecutor.schedule(new Runnable() {

@@ -1778,13 +1778,34 @@ public final class EpisodeNameMatcher {
     // 超出上限按插入顺序淘汰最旧的。
     private static final int FACT_LIMIT = 128;
 
+    /**
+     * 跨源事实记忆的写锁。
+     *
+     * <p><b>★ v43：新增</b>。此前三张表（{@code FACT_ORDINAL_TO_DATE} /
+     * {@code FACT_DATE_TO_ORDINAL} / {@code FACT_ORDER}）都是普通集合且<b>无同步</b>：
+     * 写入发生在切源决策的主线程（{@code learnCrossDomainFact}），而遍历发生在
+     * 探路/离线对齐的回调里，两者可并发 → {@code ConcurrentModificationException}
+     * 或 {@code HashMap} 结构损坏。</p>
+     *
+     * <p>调用点外层虽有 {@code catch (Throwable)} 兜住不至于崩溃，但异常会
+     * <b>静默丢掉一次事实记忆</b>，表现为「同一个跨域对齐要反复探路多次」。
+     * 现：容器换 {@link ConcurrentHashMap}（读安全）＋ 复合写操作加锁（一致性）。</p>
+     */
+    private static final Object FACT_LOCK = new Object();
+
     /** key = 归一化期号 + "|" + 分段；value = 该期对应的播出日期 YYYYMMDD。 */
-    private static final Map<String, Integer> FACT_ORDINAL_TO_DATE = new HashMap<>();
+    private static final Map<String, Integer> FACT_ORDINAL_TO_DATE = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** key = 日期 + "|" + 分段；value = 该日期对应的期号。 */
-    private static final Map<String, Integer> FACT_DATE_TO_ORDINAL = new HashMap<>();
+    private static final Map<String, Integer> FACT_DATE_TO_ORDINAL = new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** 记录顺序，用于 FIFO 淘汰。 */
+    /**
+     * 记录顺序，用于 FIFO 淘汰。
+     *
+     * <p>淘汰语义（「删最旧的」）依赖「查顺序 + 改映射」的原子性，
+     * 故所有写操作（{@link #rememberCrossDomainFact} / {@link #clearCrossDomainFacts}）
+     * 都必须在 {@link #FACT_LOCK} 内。</p>
+     */
     private static final List<String> FACT_ORDER = new ArrayList<>();
 
     /** 记忆键前缀：期号命名空间（避免与日期命名空间撞键）。 */
@@ -1811,21 +1832,26 @@ public final class EpisodeNameMatcher {
         int p = normalizePart(part);
         String k1 = factKeyOfOrdinal(ordinal, p);
         String k2 = factKeyOfDate(date, p);
-        // 冲突时以先到为准（先到者来自更早的一次成功对齐，同样可靠）
-        if (!FACT_ORDINAL_TO_DATE.containsKey(k1)) {
-            FACT_ORDINAL_TO_DATE.put(k1, date);
-            FACT_ORDER.add(k1);
-        }
-        if (!FACT_DATE_TO_ORDINAL.containsKey(k2)) {
-            FACT_DATE_TO_ORDINAL.put(k2, ordinal);
-            FACT_ORDER.add(k2);
-        }
-        while (FACT_ORDER.size() > FACT_LIMIT) {
-            String old = FACT_ORDER.remove(0);
-            if (FACT_ORDINAL_TO_DATE.containsKey(old)) {
-                FACT_ORDINAL_TO_DATE.remove(old);
-            } else {
-                FACT_DATE_TO_ORDINAL.remove(old);
+        // ★ v43：查存在性 + 写映射 + 追加顺序 + FIFO 淘汰必须原子。
+        //   否则并发下会出现「已淘汰但仍留在 FACT_ORDER」或反过来，
+        //   让淘汰逻辑删错表（它靠"这个 key 属于哪张表"来分派）。
+        synchronized (FACT_LOCK) {
+            // 冲突时以先到为准（先到者来自更早的一次成功对齐，同样可靠）
+            if (!FACT_ORDINAL_TO_DATE.containsKey(k1)) {
+                FACT_ORDINAL_TO_DATE.put(k1, date);
+                FACT_ORDER.add(k1);
+            }
+            if (!FACT_DATE_TO_ORDINAL.containsKey(k2)) {
+                FACT_DATE_TO_ORDINAL.put(k2, ordinal);
+                FACT_ORDER.add(k2);
+            }
+            while (FACT_ORDER.size() > FACT_LIMIT) {
+                String old = FACT_ORDER.remove(0);
+                if (FACT_ORDINAL_TO_DATE.containsKey(old)) {
+                    FACT_ORDINAL_TO_DATE.remove(old);
+                } else {
+                    FACT_DATE_TO_ORDINAL.remove(old);
+                }
             }
         }
     }
@@ -1850,9 +1876,13 @@ public final class EpisodeNameMatcher {
 
     /** 清空跨源事实记忆（切源列表整体变化时调用，避免陈旧事实干扰）。 */
     public static void clearCrossDomainFacts() {
-        FACT_ORDINAL_TO_DATE.clear();
-        FACT_DATE_TO_ORDINAL.clear();
-        FACT_ORDER.clear();
+        // ★ v43：清空同样要进锁 —— 否则与 rememberCrossDomainFact 并发时
+        //   可能出现「表已清空但 FACT_ORDER 仍留着旧 key」的不一致状态。
+        synchronized (FACT_LOCK) {
+            FACT_ORDINAL_TO_DATE.clear();
+            FACT_DATE_TO_ORDINAL.clear();
+            FACT_ORDER.clear();
+        }
     }
 
     /**
@@ -2601,8 +2631,8 @@ public final class EpisodeNameMatcher {
     }
 
     /**
-     * 按"期望播出日"落位：首播日 + 7×(N-1) 天为第 N 期的期望播出日，
-     * 在目标列表里找日期最接近（±{@link #CLUSTER_TOLERANCE_DAYS} 天）、
+     * 按"期望播出日"落位：首播日 + 节拍×(N-1) 天为第 N 期的期望播出日，
+     * 在目标列表里找日期最接近（容差随节拍收紧，见方法内 {@code tol}）、
      * 同分段、且为正片的条目。
      *
      * <p>为什么需要它：目标源把集名写成"第YYYYMMDD期"式或纯日期式时，
@@ -2743,8 +2773,15 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         return -1;
     }
 
-    /** 周更快照校验容差（天）：落点/当前集日期与期望播出日的最大偏差。 */
-    private static final int CLUSTER_TOLERANCE_DAYS = 3;
+    /*
+     * ★ P2-6：原 `CLUSTER_TOLERANCE_DAYS = 3` 常量已删除。
+     *
+     * 它是「周更快照校验容差」的固定值，但落点匹配现在改用**随节拍收紧**的
+     * 动态容差（见 findIndexByExpectedDay 里的
+     * `tol = period <= 3 ? 0 : Math.max(1, period / 4)`）——
+     * 日更/周双更要求精确命中，长节拍才放宽。固定 3 天的旧值已被取代，
+     * 留着只会误导：既无人引用，其 javadoc 描述的也是过时行为。
+     */
 
     /**
      * 计算第 {@code rank} 个簇的期望播出日（天序数）：首簇日期 + 节拍 × rank。

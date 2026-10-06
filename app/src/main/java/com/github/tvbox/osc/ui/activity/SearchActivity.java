@@ -1067,36 +1067,13 @@ public class SearchActivity extends BaseActivity {
         return session().getCandidates(title);
     }
 
-    /**
-     * 把视频裁成「只保留候选池需要的轻量字段」，剥离 {@code urlBean}。
-     *
-     * <p>旧的 Intent 打包路径已废弃（候选池改为内存单一真相源），但此方法仍被
-     * 其它路径复用（如候选池落盘前的瘦身），故保留。</p>
-     */
-    private Movie.Video trimVideoForIntent(Movie.Video src) {
-        Movie.Video dst = new Movie.Video();
-        if (src == null) return dst;
-        dst.last = src.last;
-        dst.id = src.id;
-        dst.tid = src.tid;
-        dst.name = src.name;
-        dst.type = src.type;
-        dst.pic = src.pic;
-        dst.lang = src.lang;
-        dst.area = src.area;
-        dst.year = src.year;
-        dst.state = src.state;
-        dst.note = src.note;
-        dst.actor = src.actor;
-        dst.director = src.director;
-        dst.des = src.des;
-        dst.sourceKey = src.sourceKey;
-        dst.tag = src.tag;
-        dst.action = src.action;
-        // urlBean 有意不复制（超大 Playlist 是 Bundle 超限的主要来源）
-        return dst;
-    }
-    
+    // ★ P2-4 附带：trimVideoForIntent 已删除。
+    //
+    // 它原本服务「把候选池裁成轻量字段再塞进 Intent」这条路径。该路径已废弃
+    // （候选池改为 SearchSession 内存单一真相源，只传标题作读取 key），
+    // 全库已无任何调用点 —— 原 javadoc 声称「仍被其它路径复用」是不实的，
+    // 实测 grep 零命中。留着只会误导后续维护者，故删除。
+
     // ===== 以下派发/调度/代际逻辑已整体迁入 SearchSession =====
     // 原 scheduleSearchAdvance / scheduleSearchTimeout / submitSearchTask /
     // createSearchExecutor / startNextSearchBatch / startNextSearchTask /

@@ -2042,14 +2042,42 @@ public class VodController extends BaseController {
 
     private void processM3u8Content(String url, String content, HashMap<String, String> headers) {
         String basePath = getBasePath(url);
-        RemoteServer.m3u8Content = M3u8.purify(basePath, content);
-        if (RemoteServer.m3u8Content == null || M3u8.currentAdCount==0) {
+        // ★ v43：改用原子结果 —— 内容与广告计数来自同一次净化调用，
+        //   不再读 M3u8.currentAdCount 这个会被并发覆盖的静态字段。
+        M3u8.Result purified = M3u8.purifyResult(basePath, content);
+        // ★ v43：按播放会话存放净化内容，避免并发播放（预览+全屏/快速切源）
+        //   互相覆盖 RemoteServer 里的单一静态字段导致画面串流。
+        //   会话 key 由本次流的 URL 派生：同一集在不同源/线路地址都不同，
+        //   天然区分「并发的两条流」，且不需要引入新状态。
+        String sessionKey = m3u8SessionKey(url);
+        RemoteServer.putM3u8Content(sessionKey, purified.content);
+        if (purified.content == null || purified.adCount == 0) {
             listener.startPlayUrl(url, headers);
         } else {
             String proxyUrl = ControlManager.get().getAddress(true) + "proxyM3u8";
+            if (sessionKey.length() > 0) {
+                proxyUrl = proxyUrl + "?sk=" + android.net.Uri.encode(sessionKey);
+            }
             listener.onM3u8ProxyUrl(proxyUrl, url);
             listener.startPlayUrl(proxyUrl, headers);
-            Toast.makeText(getContext(), "已移除视频广告 "+M3u8.currentAdCount+" 条", Toast.LENGTH_SHORT).show();
+            Toast.makeText(getContext(), "已移除视频广告 " + purified.adCount + " 条", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
+     * 由流地址派生 m3u8 代理会话 key。
+     *
+     * <p>用 MD5 压缩长度，避免作为 query 参数过长；URL 为空时返回空串，
+     * 此时退回「无会话」行为（兼容旧路径）。</p>
+     */
+    private String m3u8SessionKey(String url) {
+        if (url == null || url.isEmpty()) {
+            return "";
+        }
+        try {
+            return com.github.tvbox.osc.util.MD5.string2MD5(url);
+        } catch (Throwable th) {
+            return "";
         }
     }
 

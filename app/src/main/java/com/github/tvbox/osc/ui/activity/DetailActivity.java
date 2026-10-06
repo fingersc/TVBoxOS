@@ -58,6 +58,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.SearchHelper;
+import com.github.tvbox.osc.util.ShowTitleKey;
 import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
 import com.github.tvbox.osc.viewmodel.SearchSession;
@@ -105,15 +106,17 @@ import java.util.Comparator;
 public class DetailActivity extends BaseActivity {
     private static final String STATE_FULL_WINDOWS = "detail_full_windows";
     private static final String DETAIL_FALLBACK_SEARCH_TAG = "detail_fallback_search";
-    public static final String EXTRA_DETAIL_FALLBACK_CANDIDATES = "detailFallbackCandidates";
+    // ★ P2-4：EXTRA_DETAIL_FALLBACK_CANDIDATES 已删除。旧的「候选快照」Intent 通道
+    //   （限 20 条、严格 Equals 匹配、序列化后可能超 Binder 1MB）已被下方标题路径取代，
+    //   是后者的真子集，故读写两侧一并移除，彻底消除 TransactionTooLargeException 风险面。
     /**
      * 候选池读取键（标题）。
      *
-     * <p>与 {@link #EXTRA_DETAIL_FALLBACK_CANDIDATES} 的区别：旧的候选列表是
-     * 「点击搜索结果那一刻的快照」，而聚合搜索当时仍在分批跑，快照必然残缺，
-     * 表现为「切源只有两三个站，返回一趟再进才变多」。</p>
+     * <p>取代了旧的「候选快照」通道：旧通道传的是「点击搜索结果那一刻的快照」，
+     * 而聚合搜索当时仍在分批跑，快照必然残缺，表现为「切源只有两三个站，
+     * 返回一趟再进才变多」。</p>
      *
-     * <p>现在改为只传一个标题，详情页凭它去
+     * <p>现在只传一个标题，详情页凭它去
      * {@code SourceViewModel.getSearchSession()} 的候选池读取<b>当前最新</b>集合。
      * 池子由搜索会话单一持有、边搜边补，因此进详情页时看到的就是完整候选，
      * 且后续新增的也会自然可见。</p>
@@ -1291,17 +1294,21 @@ public class DetailActivity extends BaseActivity {
             vod_name=bundle.getString("title", "");
             vod_picture=bundle.getString("picture", "");
             fromCollect = bundle.getBoolean("collect", false);
-            Object fallbackCandidates = bundle.getSerializable(EXTRA_DETAIL_FALLBACK_CANDIDATES);
-            if (fallbackCandidates instanceof ArrayList) {
-                // 兼容旧路径（其它入口若仍打包快照，照常消费）
-                cacheDetailFallbackCandidates(vod_name, (ArrayList<Movie.Video>) fallbackCandidates);
-            }
+            // ★ P2-4：旧的「候选快照」Intent 通道已移除。
+            //   它是「点击搜索结果那一刻的残缺快照」（聚合搜索仍在分批跑），
+            //   且限 20 条、用严格 Equals 匹配，是下方标题路径的**真子集**。
+            //   保留它只会白白承担 TransactionTooLargeException 风险，
+            //   故写入侧（FastSearchActivity.putDetailFallbackCandidates）与
+            //   此处读取侧一并删除；兼容性无损失 —— 标题路径拿到的永远是更全的集合。
             // ★ 新路径：从搜索会话的单一候选池读取最新集合（无快照残缺问题）
             String fallbackTitle = bundle.getString(EXTRA_DETAIL_FALLBACK_TITLE, "");
             if (!TextUtils.isEmpty(fallbackTitle)) {
                 List<Movie.Video> poolCandidates = SearchSession.getShared().getCandidates(fallbackTitle);
                 if (!poolCandidates.isEmpty()) {
-                    cacheDetailFallbackCandidates(vod_name, poolCandidates);
+                    // 同上：进来那一刻读到的池子是既有结果，不算「新命中」。
+                    // 真正的「新命中」由 refreshFallbackCandidatesFromSession（切源前）
+                    // 与 onDetailFallbackSearchResult（后台回流）置脏。
+                    cacheDetailFallbackCandidates(vod_name, poolCandidates, false);
                 }
             }
             loadDetail(bundle.getString("id", null), bundle.getString("sourceKey", ""));
@@ -1824,13 +1831,28 @@ public class DetailActivity extends BaseActivity {
                 // 冷启动：所有源都是中性分，排序不会改变任何顺序，省下这轮 O(n log n)
                 return keys;
             }
+            // ★ P2-2：把显示名一次性预取成 Map，避免比较器内 O(n log n) 次
+            //   ApiConfig.get().getSource() 查表（每次比较都要查两遍）。
+            final Map<String, String> nameByKey = new LinkedHashMap<>(keys.size() * 2);
+            for (String k : keys) {
+                nameByKey.put(k, detailFallbackDisplayName(k));
+            }
             java.util.Collections.sort(keys, new Comparator<String>() {
                 @Override
                 public int compare(String a, String b) {
-                    String na = detailFallbackDisplayName(a);
-                    String nb = detailFallbackDisplayName(b);
                     int byQuality = Double.compare(snapshot.get(b), snapshot.get(a));
-                    return byQuality != 0 ? byQuality : na.compareTo(nb);
+                    if (byQuality != 0) {
+                        return byQuality;
+                    }
+                    String na = nameByKey.get(a);
+                    String nb = nameByKey.get(b);
+                    if (na == null) {
+                        na = "";
+                    }
+                    if (nb == null) {
+                        nb = "";
+                    }
+                    return na.compareTo(nb);
                 }
             });
         } catch (Throwable th) {
@@ -2559,18 +2581,10 @@ public class DetailActivity extends BaseActivity {
      *         避免所有此类片子都归一到 "" 而互相串味
      */
     private String normalizeFallbackTitle(String title) {
-        if (TextUtils.isEmpty(title)) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < title.length(); i++) {
-            char c = title.charAt(i);
-            if (Character.isLetterOrDigit(c) || Character.isIdeographic(c)) {
-                sb.append(Character.toLowerCase(c));
-            }
-        }
-        String result = sb.toString();
-        return TextUtils.isEmpty(result) ? title.trim() : result;
+        // ★ v43：逻辑已提到公共工具 ShowTitleKey，供 SearchSession 候选池、
+        //   EpisodeOnlineResolver 缓存、EpisodeDict 字典三处共用同一口径。
+        //   本方法保留为薄转发，避免改动大量既有调用点。
+        return ShowTitleKey.normalize(title);
     }
 
     /**
@@ -2586,17 +2600,7 @@ public class DetailActivity extends BaseActivity {
      * 依然会被区分开，不会误把别的片切进来。</p>
      */
     private boolean isSameFallbackTitle(String title, String name) {
-        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(name)) {
-            return false;
-        }
-        String t = title.trim();
-        String n = name.trim();
-        if (t.equals(n)) {
-            return true;
-        }
-        String nt = normalizeFallbackTitle(t);
-        String nn = normalizeFallbackTitle(n);
-        return !TextUtils.isEmpty(nt) && nt.equals(nn);
+        return ShowTitleKey.same(title, name);
     }
 
 
@@ -2814,7 +2818,16 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
-    /** 从 Hawk 恢复候选池（带 24h TTL）。 */
+    /**
+     * 从 Hawk 恢复候选池（带 24h TTL）。
+     *
+     * <p><b>★ v43：恢复不再置脏</b>。此前逐条走 {@link #cacheDetailFallbackCandidate}
+     * 会把 {@code detailFallbackCacheDirty} 置真 → 紧接着的持久化把
+     * {@code savedAt} 刷新成「现在」→ <b>TTL 被无限续期</b>，过期的站点候选
+     * （该片已下架）被长期保留，切源反复切到「详情能出但列表为空」的站。
+     * 现在恢复路径直接建列表并放入缓存，<b>不碰 dirty 标志</b> ——
+     * 只有本轮真的搜到新候选才值得回写。</p>
+     */
     private void restoreDetailFallbackCache(String title) {
         title = title == null ? "" : title.trim();
         if (TextUtils.isEmpty(title)) {
@@ -2829,15 +2842,39 @@ public class DetailActivity extends BaseActivity {
                 Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + title);
                 return;
             }
+            List<Movie.Video> restored = new ArrayList<>(box.entries.size());
+            Set<String> seenKeys = new HashSet<>(Math.max(16, box.entries.size() * 2));
             for (String[] e : box.entries) {
                 if (e == null || e.length < 2 || TextUtils.isEmpty(e[0]) || TextUtils.isEmpty(e[1])) {
+                    continue;
+                }
+                String entryKey = getDetailFallbackKey(e[0], e[1]);
+                if (!seenKeys.add(entryKey)) {
                     continue;
                 }
                 Movie.Video v = new Movie.Video();
                 v.sourceKey = e[0];
                 v.id = e[1];
                 v.name = e.length > 2 && e[2] != null ? e[2] : title;
-                cacheDetailFallbackCandidate(v);
+                restored.add(v);
+            }
+            if (restored.isEmpty()) {
+                return;
+            }
+            // 并入内存缓存：与已有条目按 key 增量合并，不置 dirty（见方法注释）。
+            List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+            if (cachedCandidates == null) {
+                detailFallbackCache.put(title, restored);
+            } else {
+                Set<String> existing = new HashSet<>(Math.max(16, cachedCandidates.size() * 2));
+                for (Movie.Video c : cachedCandidates) {
+                    existing.add(getDetailFallbackKey(c.sourceKey, c.id));
+                }
+                for (Movie.Video v : restored) {
+                    if (existing.add(getDetailFallbackKey(v.sourceKey, v.id))) {
+                        cachedCandidates.add(v);
+                    }
+                }
             }
         } catch (Throwable th) {
             LOG.e("restoreDetailFallbackCache fail: " + th);
@@ -3027,7 +3064,27 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
+    /**
+     * 把一批候选并入本地缓存（按 sourceKey+id 增量去重）。
+     *
+     * <p><b>★ v43：新增 {@code markDirty} 参数</b>。此前本方法总是把
+     * {@code detailFallbackCacheDirty} 置真，导致<b>从 Hawk 恢复缓存时也会置脏</b>
+     * —— 恢复→置脏→下次 {@code persistDetailFallbackCache} 回写并刷新时间戳，
+     * 于是 TTL 被无限续期，早已下架该片的站点候选被长期保留，
+     * 切源时反复切到「详情能出但列表为空」的站。</p>
+     *
+     * <p>现在「恢复到内存」（{@code markDirty=false}）与「搜索新命中」
+     * （{@code markDirty=true}）语义分开。</p>
+     *
+     * <p><b>★ v43：去重改为 Set 索引</b>。原实现对每条候选线性扫描已缓存列表，
+     * 是 O(n²)；候选池可达「40 部片 × 每片数十条」，且跑在主线程。改为维护
+     * {@code Set<sourceKey|id>} 后降到 O(n)。</p>
+     */
     private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates) {
+        cacheDetailFallbackCandidates(title, candidates, true);
+    }
+
+    private void cacheDetailFallbackCandidates(String title, List<Movie.Video> candidates, boolean markDirty) {
         title = title == null ? "" : title.trim();
         if (TextUtils.isEmpty(title) || candidates == null || candidates.isEmpty()) {
             return;
@@ -3037,22 +3094,22 @@ public class DetailActivity extends BaseActivity {
             cachedCandidates = new ArrayList<>();
             detailFallbackCache.put(title, cachedCandidates);
         }
+        // 一次性建立已有候选的 key 索引，避免逐条线性扫描（O(n²) → O(n)）。
+        Set<String> existingKeys = new HashSet<>(Math.max(16, cachedCandidates.size() * 2));
+        for (Movie.Video cachedVideo : cachedCandidates) {
+            existingKeys.add(getDetailFallbackKey(cachedVideo.sourceKey, cachedVideo.id));
+        }
         for (Movie.Video video : candidates) {
             if (video == null
                     || TextUtils.isEmpty(video.id) || !isSameFallbackTitle(title, video.name)) {
                 continue;
             }
             String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
-            boolean exists = false;
-            for (Movie.Video cachedVideo : cachedCandidates) {
-                if (candidateKey.equals(getDetailFallbackKey(cachedVideo.sourceKey, cachedVideo.id))) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
+            if (existingKeys.add(candidateKey)) {
                 cachedCandidates.add(video);
-                detailFallbackCacheDirty = true;
+                if (markDirty) {
+                    detailFallbackCacheDirty = true;
+                }
             }
         }
     }
@@ -3233,12 +3290,19 @@ public class DetailActivity extends BaseActivity {
      * 内存里堆积成百上千条完整 {@code Movie.Video}（含简介全文），
      * 对 2GB 设备是不必要的风险。</p>
      *
-     * <p>现改为 {@link LinkedHashMap} + {@code removeEldestEntry}，
-     * 上限与落盘层 {@code FALLBACK_CACHE_MAX_ENTRIES = 40} 对齐
-     * （插入顺序即访问顺序，超限淘汰最旧的片名）。</p>
+     * <p><b>★ v43：accessOrder 改为 true</b>。此前第三个参数误写 {@code false}
+     * （插入序 = FIFO），与本注释声称的 LRU 语义相反 —— 连续浏览超过 40 部片后，
+     * 被淘汰的是「最早插入的」而不是「最久未用的」，用户最近常看的片反而先被清掉，
+     * 表现为「之前切过源的片，过一会儿回来切源池又变空」。
+     * 改为 {@code true} 后 {@code get} 会触发访问序重排。</p>
+     *
+     * <p><b>访问线程</b>：本结构目前<b>仅被主线程访问</b>（切源状态机跑在主线程，
+     * 详见 {@code detailFallbackSearchResult.observe(this, ...)} 的主线程投递保证）。
+     * 若将来把持久化 I/O 移出主线程（见 P2-3），<b>必须同时</b>做不可变快照或加锁，
+     * 否则会出现 {@code ConcurrentModificationException}。</p>
      */
     private final LinkedHashMap<String, List<Movie.Video>> detailFallbackCache =
-            new LinkedHashMap<String, List<Movie.Video>>(16, 0.75f, false) {
+            new LinkedHashMap<String, List<Movie.Video>>(16, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(java.util.Map.Entry<String, List<Movie.Video>> eldest) {
                     return size() > FALLBACK_CACHE_MAX_ENTRIES;

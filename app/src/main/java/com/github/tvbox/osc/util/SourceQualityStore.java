@@ -28,6 +28,15 @@ public class SourceQualityStore {
 
     private static final String KEY_PREFIX = "fb_stat_";
 
+    /**
+     * 统计读改写的全局锁。
+     *
+     * <p>锁粒度取全局而非「按 sourceKey 分段」：本类的写操作只在
+     * 「一次搜索/一次起播结算」时发生（低频），而每次写只是几次 Hawk 读写。
+     * 全局锁的争用开销远小于分段锁的实现复杂度，且彻底消除跨 key 的死锁风险。</p>
+     */
+    private static final Object STAT_LOCK = new Object();
+
     // ===== 权重配置 =====
 
     /** 搜索命中率的权重（按要求调低：命中率不代表质量）。 */
@@ -100,14 +109,20 @@ public class SourceQualityStore {
             return;
         }
         try {
-            Stat stat = read(sourceKey);
-            if (hit) {
-                stat.searchHit++;
-            } else {
-                stat.searchFail++;
+            // ★ v43：read-modify-write 必须整体加锁。
+            //   此前是「读 → 改 → 写」三步无锁，而搜索是多线程并发（单批 6 路），
+            //   详情页探路的 recordSearch 与播放页的 recordPlay 完全可能同时落到
+            //   同一个源上 → 后写覆盖先写，统计静默丢失（让质量分越用越不准）。
+            synchronized (STAT_LOCK) {
+                Stat stat = read(sourceKey);
+                if (hit) {
+                    stat.searchHit++;
+                } else {
+                    stat.searchFail++;
+                }
+                stat.searchTotalMs += Math.max(0L, elapsedMs);
+                write(sourceKey, stat);
             }
-            stat.searchTotalMs += Math.max(0L, elapsedMs);
-            write(sourceKey, stat);
         } catch (Throwable th) {
             // 忽略：统计失败不应影响主流程
         }
@@ -124,14 +139,17 @@ public class SourceQualityStore {
             return;
         }
         try {
-            Stat stat = read(sourceKey);
-            if (ok) {
-                stat.playOk++;
-                stat.firstFrameTotalMs += Math.max(0L, firstFrameMs);
-            } else {
-                stat.playFail++;
+            // ★ v43：同 recordSearch，read-modify-write 整体加锁。
+            synchronized (STAT_LOCK) {
+                Stat stat = read(sourceKey);
+                if (ok) {
+                    stat.playOk++;
+                    stat.firstFrameTotalMs += Math.max(0L, firstFrameMs);
+                } else {
+                    stat.playFail++;
+                }
+                write(sourceKey, stat);
             }
-            write(sourceKey, stat);
         } catch (Throwable th) {
             // 忽略
         }
