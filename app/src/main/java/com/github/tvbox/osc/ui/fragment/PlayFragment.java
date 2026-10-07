@@ -1744,6 +1744,12 @@ public class PlayFragment extends BaseLazyFragment {
         stopLoadWebView(true);
         stopParse();
         mController.stopOther();
+        // ★ 兜底：视图销毁后，任何仍排队的延迟消息（解析超时 / 停滞检查 / 换线超时）
+        //   一律作废。它们的 Runnable 经匿名 Callback 持有本 Fragment，
+        //   即使 Fragment 已 remove 也会照常投递，只能在已置空的 mVideoView
+        //   与已 detach 的 UI 上乱碰 —— 「一退页面就闪退」的根源。
+        //   放在最后：前面的 cancelPlayTimeout() / stopParse() 还要用 mHandler。
+        if (mHandler != null) mHandler.removeCallbacksAndMessages(null);
     }
 
     private VodInfo mVodInfo;
@@ -1885,6 +1891,16 @@ public class PlayFragment extends BaseLazyFragment {
         // 需要再次定位入口时，用 TAG「TVBox-switch」的切源日志即可（不受 release 门控）。
         LOG.sw("[FB] tryNextLineIfEnabled retry=" + autoRetryCount
                 + " allowLine=" + allowAutoSwitchLine + " triedLines=" + triedLineFlags.size());
+        // ★ 视图已销毁 → 一律不做换线路/换源。
+        //   换线路的终点是 play()，而 play() 要操作 mVideoView（已置空）；
+        //   这里统一收口，任何调用方（超时/停滞/失败/自动重试）都拦得住。
+        if (mVideoView == null) {
+            autoRetryCount = 0;
+            allowSwitchPlayer = true;
+            hasAutoSwitchedPlayer = false;
+            triedLineFlags.clear();
+            return false;
+        }
         restoreAutoSwitchedPlayer();
         if (allowAutoSwitchLine && Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true)) return tryNextLine();
         LOG.i("echo-autoRetry line switching disabled");
@@ -2441,6 +2457,7 @@ public class PlayFragment extends BaseLazyFragment {
         if (TextUtils.isEmpty(showName)) return;
         final String date = EpisodeDict.extractDate(currentName);
         if (TextUtils.isEmpty(date)) return;
+        final long scheduledAtMs = System.currentTimeMillis();
         EpisodeOnlineResolver.resolveAsync(showName, date, parseThreadPool, new EpisodeOnlineResolver.Callback() {
             @Override
             public void onResult(final int episode) {
@@ -2451,7 +2468,7 @@ public class PlayFragment extends BaseLazyFragment {
                     idx = EpisodeNameMatcher.findIndexByDate(date, targetNames, currentName);
                 }
                 if (idx < 0) return;
-                applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, idx);
+                applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, idx, scheduledAtMs);
             }
         });
     }
@@ -2461,9 +2478,14 @@ public class PlayFragment extends BaseLazyFragment {
      *
      * <p>防串台校验：只有仍停留在本次切源落地的位置（线路与下标都未变）时才改写；
      * 用户已手动切线路或选集则丢弃本次结果。</p>
+     *
+     * <p><b>与 DetailActivity 侧保持同一套语义</b>：结果迟到<b>不丢弃</b>，
+     * 只要用户没动过就应用并重播 —— 项目决策是「正确性优先于无感」，
+     * 宁可跳一下也要落到正确的集。唯一例外是迟到超过
+     * {@link EpisodeOnlineResolver#ASYNC_APPLY_DEADLINE_MS}（防病态延迟）。</p>
      */
     private void applyOnlineResolvedIndex(final String targetFlag, final List<VodInfo.VodSeries> targetList,
-                                          final int landedIndex, final int index) {
+                                          final int landedIndex, final int index, final long scheduledAtMs) {
         if (getActivity() == null) return;
         getActivity().runOnUiThread(new Runnable() {
             @Override
@@ -2471,7 +2493,26 @@ public class PlayFragment extends BaseLazyFragment {
                 if (mVodInfo == null || targetList == null || index < 0 || index >= targetList.size()) return;
                 if (!TextUtils.equals(mVodInfo.playFlag, targetFlag)) return;
                 if (mVodInfo.playIndex != landedIndex) return;
+                // 安全网：迟到过久（网络重试等异常）才放弃，避免用户看了很久被突然拽走。
+                // 与 DetailActivity.applyOnlineResolvedIndex 同源（取值见 EpisodeOnlineResolver）。
+                if (scheduledAtMs > 0
+                        && System.currentTimeMillis() - scheduledAtMs
+                        > EpisodeOnlineResolver.ASYNC_APPLY_DEADLINE_MS) {
+                    LOG.sw("[FB] onlineBackfill drop(stale) -> " + targetFlag + "/" + index);
+                    return;
+                }
+                final boolean wasStarted = isPlaybackStarted();
                 mVodInfo.playIndex = index;
+                LOG.sw("[FB] onlineBackfill applied -> " + targetFlag + "/" + index
+                        + " name=" + targetList.get(index).name + " wasStarted=" + wasStarted);
+                // 已在播时会有一次可见的跳集，配一句提示让它可被理解
+                if (wasStarted && getContext() != null) {
+                    try {
+                        Toast.makeText(getContext(),
+                                "已校正到 " + targetList.get(index).name, Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {
+                    }
+                }
                 try {
                     playUrl(targetList.get(index).url, null);
                 } catch (Throwable ignored) {
@@ -2574,7 +2615,10 @@ public class PlayFragment extends BaseLazyFragment {
         mController.stopOther();
         resetDanmuState();
         clearLyricView();
-        mVideoView.clearArtwork();
+        // ★ 判空：本方法可能在「视图已销毁」之后被延迟消息间接触发
+        //   （onDestroyView 已把 mVideoView 置空）。原实现这一行漏了判空，
+        //   而紧邻的下一行却有 —— 一旦命中就是 NPE 直接崩回首页。
+        if (mVideoView != null) mVideoView.clearArtwork();
         if(mVideoView!=null) {
             if (reusePlayer) {
                 long previousPosition = mVideoView.getCurrentPosition();
@@ -3063,6 +3107,15 @@ public class PlayFragment extends BaseLazyFragment {
      * 因此不会误伤慢站点（慢站点在这段时间里通常会先探到地址）。
      */
     void handleParseStallCheck() {
+        // ★ 视图已销毁 → 本检查作废。
+        //   本检查是"解析停滞就换线路"的兜底，必然要重建播放器；
+        //   视图没了就没有可切的线路，必须直接退出。
+        //   原实现没有这个守卫，而它下面的第三个判断写成
+        //   `mVideoView != null && ...` —— 于是 mVideoView == null 时**反而不返回**，
+        //   null 被当成"没在播"，一路走到 tryNextLineIfEnabled → tryNextLine → play()，
+        //   在已置空的 mVideoView 上取字段 → NPE（实测：解析开始约 5s 后触发，
+        //   正好是 PARSE_STALL_TIMEOUT_MS，崩溃日志里它在 tryNextLine 之前最后一条）。
+        if (mVideoView == null) return;
         // 已经探到可播地址 → 解析成功，本次检查作废
         if (loadFoundCount.get() > 0) {
             return;
@@ -3090,6 +3143,11 @@ public class PlayFragment extends BaseLazyFragment {
 
     void stopParse() {
         mHandler.removeMessages(MSG_PARSE_TIMEOUT);
+        // ★ MSG_PARSE_STALL_CHECK 同属"解析"生命周期，必须一并作废。
+        //   此前只清了 MSG_PARSE_TIMEOUT，于是它成了唯一能活过 onDestroyView 的消息：
+        //   视图销毁（mVideoView 置空）后仍会按时投递，在死 Fragment 上执行换线路。
+        //   doParse() 里的调用顺序是 stopParse() → scheduleParseStallCheck()，不会误伤。
+        mHandler.removeMessages(MSG_PARSE_STALL_CHECK);
         stopLoadWebView(false);
         OkGo.getInstance().cancelTag("play");
         OkGo.getInstance().cancelTag("json_jx");

@@ -1136,6 +1136,19 @@ public class DetailActivity extends BaseActivity {
                             // 否则会把 remap 算对的精确下标覆盖成"就近/裸下标"结果
                             restoreDetailFallbackEpisode();
                         }
+                        // ★ v47 异步补位 —— 准备阶段。
+                        //   本次跨域换算若因「主线程禁止同步联网」被放弃（见
+                        //   tryResolveCrossDomainNow），落点就只剩"按序兜底"这一猜，
+                        //   需要在 jumpToPlay() 之后交给异步通道补正。
+                        //   ⚠ 旧源集名必须**在此刻**抓：紧接的 resetDetailFallbackKeepCache()
+                        //   会走 resetDetailFallback(true) 把 detailFallbackEpisode 快照清空。
+                        final String backfillFromName =
+                                (detailFallbackEpisode != null && !TextUtils.isEmpty(detailFallbackEpisode.name))
+                                        ? detailFallbackEpisode.name
+                                        : (fallbackFromValid ? fallbackFromName : "");
+                        // 读后即清：避免陈旧标志外溢到下一次落点
+                        final boolean backfillNeeded = crossDomainSyncSkipped;
+                        crossDomainSyncSkipped = false;
                         // 切源成功：保留候选池与仍在跑的批处理，只复位本轮状态机。
                         // 用 resetDetailFallback() 会 cancelTag 把批处理掐死，
                         // 导致缓存永远只有第一个源 → 下次点击只能切回它。
@@ -1216,6 +1229,17 @@ public class DetailActivity extends BaseActivity {
                             llPlayerFragmentContainer.setVisibility(View.VISIBLE);
                             llPlayerFragmentContainerBlock.setVisibility(View.VISIBLE);
                             toggleSubtitleTextSize();
+                        }
+                        // ★ v47 异步补位 —— 触发点。
+                        //   放在 jumpToPlay() 之后：此刻 playFlag / playIndex 才是最终落点，
+                        //   而且"是否已起播"可以被 applyOnlineResolvedIndex 判到。
+                        //   其余门控（在线开关 / 必须跨域 / 当前名须含日期 / 目标列表≥2）
+                        //   全部由 tryOnlineCrossDomainResolve 自己承担，此处只答"该不该补"。
+                        if (backfillNeeded && !TextUtils.isEmpty(backfillFromName)) {
+                            LOG.sw("[FB] onlineBackfill schedule from=" + backfillFromName
+                                    + " -> " + vodInfo.playFlag + "/" + vodInfo.playIndex);
+                            tryOnlineCrossDomainResolve(backfillFromName, vodInfo.playFlag,
+                                    playingSeriesList, vodInfo.playIndex);
                         }
                         // startQuickSearch();
                     } else {
@@ -3380,7 +3404,28 @@ public class DetailActivity extends BaseActivity {
     private int fallbackFromIndex = -1;
     private String fallbackFromName = "";
     private boolean fallbackFromValid = false;
-    
+
+    /**
+     * ★ v47：本次跨域换算是否因「主线程禁止同步联网」而被主动放弃。
+     *
+     * <p>{@link #tryResolveCrossDomainNow} 里的联网是可阻塞调用（EpisodeOnlineResolver
+     * 的三个 {@code *Within} 内部是 {@code future.get}，其 Javadoc 明写「禁止在主线程调用」），
+     * 因此主线程一律直接放弃。放弃之后落点只剩「按序兜底」这一猜，
+     * 需要由异步通道（{@link #tryOnlineCrossDomainResolve}）在落点之后补正。</p>
+     *
+     * <p>本标志就是「需不需要补位」的判据 —— 比 {@code isMatchTrusted} 更贴合：
+     * 后者只对「当前集名带<b>期号</b>」有意义，而这条路径的当前集名带的是<b>日期</b>
+     * （{@code leadingOrdinalOf} 遇日期恒返回 -1），会被判成"可信"而把补位全部掐掉。</p>
+     */
+    private boolean crossDomainSyncSkipped = false;
+
+    /**
+     * ★ 补位结果的最长可应用延迟 —— 取值集中在
+     * {@link EpisodeOnlineResolver#ASYNC_APPLY_DEADLINE_MS}（与 PlayFragment 共用一份），
+     * 调参只改那一处。
+     */
+    private static final long BACKFILL_MAX_APPLY_DELAY_MS = EpisodeOnlineResolver.ASYNC_APPLY_DEADLINE_MS;
+
     private boolean detailFallbackActive;
     private boolean detailFallbackSearching;
     private boolean detailFallbackSearchCollecting;
@@ -4039,6 +4084,16 @@ public class DetailActivity extends BaseActivity {
     private int tryResolveCrossDomainNow(String currentName, List<String> targetNames) {
         try {
             if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return -1;
+            // ★ v47：主线程不做同步联网换算 —— 它是 future.get 阻塞调用（见
+            //   EpisodeOnlineResolver 的 isMainThread 守卫与其类注释「查询必须在后台线程调用」）。
+            //   本方法的实际调用链含 detailResult 的 LiveData 观察者（主线程），
+            //   基线曾因此实测独占主线程 2528ms→7355ms（MIUI Scout WARNING→HANG）。
+            //   这里**主动放弃并记下标志**，落点之后由 tryOnlineCrossDomainResolve 异步补正；
+            //   顺带省掉一次「必然被底层守卫拒绝」的无效调用。
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                crossDomainSyncSkipped = true;
+                return -1;
+            }
             String showName = vod_name == null ? "" : vod_name.trim();
             if (TextUtils.isEmpty(showName)) return -1;
 
@@ -4220,6 +4275,7 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(date)) return;
         final Executor executor = detailFallbackSearchExecutor != null
                 ? detailFallbackSearchExecutor : searchExecutorService;
+        final long scheduledAtMs = System.currentTimeMillis();
         EpisodeOnlineResolver.resolveAsync(showName, date, executor, new EpisodeOnlineResolver.Callback() {
             @Override
             public void onResult(final int episode) {
@@ -4235,7 +4291,7 @@ public class DetailActivity extends BaseActivity {
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, resolved);
+                        applyOnlineResolvedIndex(targetFlag, targetList, landedIndex, resolved, scheduledAtMs);
                     }
                 });
             }
@@ -4250,11 +4306,28 @@ public class DetailActivity extends BaseActivity {
      * 用户若已手动切线路或选集，说明他已有新意图，本次异步结果一律丢弃。</p>
      */
     private void applyOnlineResolvedIndex(String targetFlag, List<VodInfo.VodSeries> targetList,
-                                          int landedIndex, int index) {
+                                          int landedIndex, int index, long scheduledAtMs) {
         if (isFinishing()) return;
         if (vodInfo == null || targetList == null || index < 0 || index >= targetList.size()) return;
         if (!TextUtils.equals(vodInfo.playFlag, targetFlag)) return;
         if (vodInfo.playIndex != landedIndex) return;
+
+        // ★ 迟到的结果**不再丢弃** —— 只要用户还停在本次落点上（上面两条校验），
+        //   就应用并重驱。
+        //
+        //   为什么不再"已起播就丢弃"：切源的锚点取自**实际播放对象**
+        //   （captureLivePlaybackSnapshot 用的是 previewVodInfo，不是 vodInfo），
+        //   丢弃等于让"错的那一集"继续既当播放内容、又当下一次切源的锚点，
+        //   错误会一路带下去。用户明确表态：只要最终落到正确的集，
+        //   中间跳一下可以接受。
+        //
+        //   只留一条安全网：迟到过久（网络重试等异常）才放弃，
+        //   避免用户已经看了很久才被突然拽走。
+        if (scheduledAtMs > 0 && System.currentTimeMillis() - scheduledAtMs > BACKFILL_MAX_APPLY_DELAY_MS) {
+            LOG.sw("[FB] onlineBackfill drop(stale) -> " + targetFlag + "/" + index);
+            return;
+        }
+        final boolean wasPlaying = isPreviewPlaying();
 
         vodInfo.playIndex = index;
         for (int i = 0; i < targetList.size(); i++) {
@@ -4264,6 +4337,34 @@ public class DetailActivity extends BaseActivity {
         routeSwitchSeries = targetList.get(index);
         seriesAdapter.notifyDataSetChanged();
         setTvPlayUrl(targetList.get(index).url);
+        LOG.sw("[FB] onlineBackfill applied -> " + targetFlag + "/" + index
+                + " name=" + targetList.get(index).name + " wasPlaying=" + wasPlaying);
+        // 重驱播放，让画面真正落到修正后的那一集。
+        // 已在播时会看到一次跳动 —— 这是刻意接受的代价：落到正确的集之后，
+        // 播放内容与后续切源的锚点才同时变对。
+        if (wasPlaying) {
+            Toast.makeText(DetailActivity.this,
+                    "已校正到 " + targetList.get(index).name, Toast.LENGTH_SHORT).show();
+        }
+        jumpToPlay();
+    }
+
+    /**
+     * 预览播放器是否已经在播。
+     *
+     * <p>现在只用来决定「校正时要不要给用户一个 Toast 说明」——
+     * 起播后再校正会有一次可见的跳动，配一句话说明就不会显得莫名其妙。
+     * <b>不再用它决定要不要应用补位</b>（见 {@link #applyOnlineResolvedIndex}）。</p>
+     *
+     * <p>判不出时返回 true —— 宁可多弹一句说明，也不要让用户面对无解释的跳动。</p>
+     */
+    private boolean isPreviewPlaying() {
+        try {
+            if (playFragment == null) return false;
+            return playFragment.getPlayer() != null && playFragment.getPlayer().isPlaying();
+        } catch (Throwable th) {
+            return true;
+        }
     }
 
     private int indexOfSeries(List<VodInfo.VodSeries> list, VodInfo.VodSeries series) {

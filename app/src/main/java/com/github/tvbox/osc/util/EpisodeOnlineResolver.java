@@ -55,6 +55,45 @@ public final class EpisodeOnlineResolver {
     private EpisodeOnlineResolver() {
     }
 
+    /**
+     * 「异步结果可应用截止期」（毫秒）—— 供调用方判定一个迟到的查询结果还要不要落地。
+     *
+     * <p><b>这是什么</b>：异步查询（{@link #resolveAsync}）回来后，调用方除了做
+     * 「用户是否已手动改动」的防串台校验，还应当判一次"迟到多久"。本文只是
+     * <b>唯一权威取值</b>，两个调用方（{@code DetailActivity} / {@code PlayFragment}）
+     * 都引用它，避免各写一份、日后只调一处造成行为不一致。</p>
+     *
+     * <p><b>为什么是 20s 而不是更短</b>：这不是"起播就不准改"，而是**防病态延迟**。
+     * 项目决策是「正确性优先于无感」—— 只要最终能落到正确的集，
+     * 用户可接受一次可见的跳动（并配一句提示说明）。正常延迟远小于此
+     * （单次查询实测中位约 800ms），20s 已能覆盖多次 HTTP 重试的极端情形；
+     * 超过它通常意味着网络栈异常，此时用户已看了很久，不应再被拽走。</p>
+     *
+     * <p><b>调参只改这一处</b>。</p>
+     */
+    public static final long ASYNC_APPLY_DEADLINE_MS = 20_000L;
+
+    /**
+     * 主线程守卫 —— 本类"有限等待"方法（{@code resolveWithin} /
+     * {@code resolveDateWithin} / {@code resolveDatesWithin}）内部是
+     * {@code future.get(timeoutMs)}，会<b>阻塞调用线程</b>。
+     *
+     * <p>本类注释早已写明「查询必须在后台线程调用」，但这条契约此前只靠调用方自觉。
+     * 实测事故（红米 + MIUI Scout 精确抓取）：{@code DetailActivity} 兜底切源的
+     * LiveData 观察者（主线程）→ {@code restoreDetailFallbackEpisode()} →
+     * {@code findMatchingEpisodeIndex()} → {@code tryResolveCrossDomainNow()} →
+     * 本类，单条 LiveData 消息独占主线程 <b>2528ms → 5029ms → 7355ms</b>
+     * （Scout 依次报 APP_SCOUT_WARNING / APP_SCOUT_HANG），
+     * 用户侧表现为「点开一个视频后整页转圈数秒」。</p>
+     *
+     * <p>因此这里统一收口：主线程一律立刻放弃联网换算，返回"查不到"，
+     * 由调用方的本地兜底与既有异步通道（{@code tryOnlineCrossDomainResolve}）接手。
+     * 缓存命中的分支不受影响（纯内存读，零阻塞）。</p>
+     */
+    private static boolean isMainThread() {
+        return android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+    }
+
     /** 设置缓存目录（App 私有目录），用于跨会话持久化，避免重复联网。 */
     public static void init(File dir) {
         cacheDir = dir;
@@ -205,6 +244,8 @@ public final class EpisodeOnlineResolver {
                 }
             }
         }
+        // ★ 主线程禁止阻塞等待（见 isMainThread()）；缓存未命中就直接放弃，交调用方本地兜底
+        if (isMainThread()) return "";
         java.util.concurrent.ExecutorService pool = null;
         try {
             pool = java.util.concurrent.Executors.newSingleThreadExecutor();
@@ -259,6 +300,8 @@ public final class EpisodeOnlineResolver {
                 return v;
             }
         }
+        // ★ 主线程禁止阻塞等待（见 isMainThread()）；缓存未命中就直接放弃，交调用方本地兜底
+        if (isMainThread()) return -1;
         java.util.concurrent.ExecutorService pool = null;
         try {
             pool = java.util.concurrent.Executors.newSingleThreadExecutor();
@@ -305,6 +348,8 @@ public final class EpisodeOnlineResolver {
         if (TextUtils.isEmpty(showName) || targetEpisode <= 0) {
             return empty;
         }
+        // ★ 主线程禁止阻塞等待（见 isMainThread()）；缓存未命中就直接放弃，交调用方本地兜底
+        if (isMainThread()) return empty;
         java.util.concurrent.ExecutorService pool = null;
         try {
             pool = java.util.concurrent.Executors.newSingleThreadExecutor();
