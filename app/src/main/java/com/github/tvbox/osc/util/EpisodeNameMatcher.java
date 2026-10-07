@@ -458,6 +458,52 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * 「日期 + 期号」混合式名字 → 去掉日期后的<b>期数式形态</b>；非此形态返回 {@code null}。
+     *
+     * <p><b>为什么需要它</b>：采集源普遍存在 {@code 20260906第2期上} 这种"日期打头、
+     * 期号分段跟在后面"的写法（实测最大资源整库如此：{@code 20260830第1期下}、
+     * {@code 20260906第2期上}、{@code 20260927第5期中} …）。而 {@link #parse} 是
+     * <b>日期优先</b>，会把整名判成日期域，于是所有期数域机器（同域精确匹配、
+     * {@code findIndexByEpisode} 等）<b>全部被绕开</b>，只剩跨域换算或裸下标兜底 ——
+     * 实测因此发生过「{@code 20260906第2期上} 切到 {@code 加更版第2期}」的错切。</p>
+     *
+     * <p>可是名字里本来就带着与目标源<b>完全同形</b>的 {@code 第2期上}，
+     * 这属于<b>确定性证据</b>，应当优先使用，而不是退化成跨域猜测。
+     * 本方法就是把这份证据取出来的入口。</p>
+     *
+     * @param name 原始集名
+     * @return 去日期后的期数式名（如 {@code 第2期上}）；不是混合式则返回 {@code null}
+     */
+    public static String hybridOrdinalForm(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return null;
+        }
+        int d = dateOf(name);
+        if (d <= 0) {
+            return null;                       // 不含日期 → 不是混合式
+        }
+        String ds = String.valueOf(d);
+        if (ds.length() != 8) {
+            return null;
+        }
+        int at = name.indexOf(ds);
+        if (at < 0) {
+            return null;                       // 名字里是"2026-09-06"这类分隔式，不处理
+        }
+        String rest = (name.substring(0, at) + name.substring(at + ds.length())).trim();
+        if (TextUtils.isEmpty(rest) || rest.equals(name)) {
+            return null;
+        }
+        if (dateOf(rest) > 0) {
+            return null;                       // 去掉一个日期后还有日期 → 不是本形态
+        }
+        if (extractOrdinal(rest) <= 0) {
+            return null;                       // 去完解不出期号 → 取出来也没用
+        }
+        return rest;
+    }
+
+    /**
      * 跨域安全的"定位可信"判定：把期望集名与实际集名对齐，<b>允许跨域</b>。
      *
      * <p>切源时的守卫需要回答："新源定位到的这一集，是不是我想去的那一集？"

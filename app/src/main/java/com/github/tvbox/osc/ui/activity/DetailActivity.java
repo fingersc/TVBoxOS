@@ -2108,11 +2108,21 @@ public class DetailActivity extends BaseActivity {
         }
         String actualName = getSeriesNameSafely(actual, actual.playFlag, actual.playIndex);
         String targetName = getSeriesNameSafely(vodInfo, vodInfo.playFlag, actual.playIndex);
-        // ★ 跨域安全：期数式与日期式的 extractEpisodeNumber 量纲不同，
-        //   直接比数值必然"不相同"，会把本来正确的跨域同集判定为错位而拒绝采纳下标。
-        //   positionTrustedAcrossDomain 跨域一律放行，同域才严格比序号。
-        if (!EpisodeNameMatcher.positionTrustedAcrossDomain(actualName, targetName)) {
-            // 下标同名不同集 → 说明两源集序不一致，不能用下标搬
+        // ★ 跨源采纳裸下标的前提是「两侧该下标确实指向同一集」—— 本方法开头的注释
+        //   就是这么写的（"否则会把新源刚按内容重定位好的下标覆盖错"）。
+        //   但原实现用的守卫 positionTrustedAcrossDomain 是为**播放时间迁移**设计的，
+        //   它对跨域**一律放行**（跨域数值不可比，放行是为了"切对集却丢时间"）。
+        //   拿它当"下标可否采纳"的守卫属于错配：
+        //
+        //   实测《我家那闺女2026》旧源=最大资源 / 新源=豪华：
+        //     旧源 idx16 = 20260906第2期上   新源 idx16 = 加更版第2期
+        //   两侧在**同一期内「上/下」的排列顺序相反**（旧源 下→上，新源 上→下），
+        //   裸下标必然错位；而跨域放行让这个错位畅通无阻
+        //   ⇒ 用户可见的现象就是「第2期上 切到了 加更版第2期」。
+        //
+        //   改为要求**内容级同集证据**（sameEpisode：同名、或同域 score≥80、或同日期同分段）。
+        //   无证据就不搬 —— 保留 restoreDetailFallbackEpisode 按内容定位的结果。
+        if (!EpisodeNameMatcher.sameEpisode(actualName, targetName)) {
             return;
         }
         vodInfo.playIndex = actual.playIndex;
@@ -3992,6 +4002,29 @@ public class DetailActivity extends BaseActivity {
         int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
         if (matchedIndex >= 0) {
             return matchedIndex;
+        }
+
+        // ---------- 第1.2层：日期+期号混合式名的"期数式"直配 ----------
+        // 采集源普遍有 `20260906第2期上`（日期打头 + 期号 + 分段）这种写法，
+        // 最大资源整库如此。parse 是日期优先 ⇒ 整名被判成日期域 ⇒ 上面第1层的
+        // 同域匹配直接被 gating 掉（实测 score 全 0、findIndex 返回 -1），
+        // 只能退化到跨域换算或裸下标兜底 —— 曾实测切到「加更版第2期」。
+        // 但名字里本来就带着与目标源**完全同形**的 `第2期上` —— 确定性证据，必须先试。
+        //
+        // ★ 只做确定性命中，这一层排在很前面，必须零误判：
+        //   ① 提取出的形态必须带**显式分段**（上/中/下）—— 分段是唯一能把
+        //      「第2期上 / 第2期下 / 加更版第2期」区分开的判据（三者期号都是 2）；
+        //   ② 目标列表里必须存在与之**完全同名**的一条 —— 不用模糊打分，
+        //      因为实测 `企划第2期` 会被模糊匹配到诱饵 `第2期`、
+        //      `大放送第1期` 会被匹配到 `第1期`、`第4期` 会撞上孤立诱饵 `第4期`。
+        //   两条同时满足才采纳；否则原样放行给下面的层处理（零回归风险）。
+        String ordinalForm = EpisodeNameMatcher.hybridOrdinalForm(currentName);
+        if (!TextUtils.isEmpty(ordinalForm)
+                && EpisodeNameMatcher.extractPart(ordinalForm) != EpisodeNameMatcher.PART_NONE) {
+            int exactForm = targetNames.indexOf(ordinalForm);
+            if (exactForm >= 0) {
+                return exactForm;
+            }
         }
 
         // ---------- 第1.5层：同日期多段的组内位置对齐 ----------

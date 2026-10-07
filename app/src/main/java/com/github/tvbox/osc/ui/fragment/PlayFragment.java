@@ -2238,6 +2238,22 @@ public class PlayFragment extends BaseLazyFragment {
             return matchedIndex;
         }
 
+        // ---------- 第1.2层：日期+期号混合式名的"期数式"直配 ----------
+        // 与 DetailActivity 侧同源同序（改一处必须改另一处）。
+        // `20260906第2期上` 这类"日期打头 + 期号 + 分段"的名字，parse 日期优先会
+        // 把整名判成日期域，上面的同域匹配被 gating 掉；但名字里本就带着与目标源
+        // 完全同形的 `第2期上` —— 确定性证据，必须先试（纯本地、零延迟）。
+        // 只做确定性命中：①形态带显式分段 ②目标列表存在完全同名的一条。
+        // 见 DetailActivity 同层的详细说明（模糊匹配会撞诱饵，不可用）。
+        String ordinalForm = EpisodeNameMatcher.hybridOrdinalForm(currentName);
+        if (!TextUtils.isEmpty(ordinalForm)
+                && EpisodeNameMatcher.extractPart(ordinalForm) != EpisodeNameMatcher.PART_NONE) {
+            int exactForm = targetNames.indexOf(ordinalForm);
+            if (exactForm >= 0) {
+                return exactForm;
+            }
+        }
+
         // ---------- 第1.5层：同日期多段的组内位置对齐 ----------
         // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
         // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
