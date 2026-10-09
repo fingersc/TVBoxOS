@@ -13,6 +13,7 @@ import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
 import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.ImgUtil;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.PlayerHelper;
@@ -94,6 +95,24 @@ public class App extends MultiDexApplication {
     public void onTerminate() {
         super.onTerminate();
         JsLoader.destroy();
+    }
+
+    // ★ 内存告急时主动让出「文字兜底图」缓存。
+    //   原实现全仓没有任何 onTrimMemory / onLowMemory 钩子：Glide 自己会响应系统回调
+    //   裁剪它的缓存，而 ImgUtil.drawableCache 不会 —— 系统越紧张它越一毛不拔，
+    //   最后反而成了把进程推向 OOM / LMK 的那一份。兜底图重建成本极低，直接整体丢弃。
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            ImgUtil.trimMemory();
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        ImgUtil.trimMemory();
     }
 
 

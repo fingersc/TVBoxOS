@@ -35,14 +35,20 @@ public class ConfirmClearDialog extends BaseDialog {
                 // if removing all Favorites
                 if (type == "Collect") {
                     List<VodCollect> vodInfoList = new ArrayList<>();
-                    CollectActivity.collectAdapter.setNewData(vodInfoList);
-                    CollectActivity.collectAdapter.notifyDataSetChanged();
+                    // ★ 收藏页 onDestroy 已把静态 Adapter 置 null（防泄漏）。
+                    //   此时只要保证「数据照删」，刷新界面跳过即可，否则是 NPE。
+                    if (CollectActivity.collectAdapter != null) {
+                        CollectActivity.collectAdapter.setNewData(vodInfoList);
+                        CollectActivity.collectAdapter.notifyDataSetChanged();
+                    }
                     RoomDataManger.deleteVodCollectAll();
                     // if removing all History
                 } else if (type == "History") {
                     List<VodInfo> vodInfoList = new ArrayList<>();
-                    HistoryActivity.historyAdapter.setNewData(vodInfoList);
-                    HistoryActivity.historyAdapter.notifyDataSetChanged();
+                    if (HistoryActivity.historyAdapter != null) {
+                        HistoryActivity.historyAdapter.setNewData(vodInfoList);
+                        HistoryActivity.historyAdapter.notifyDataSetChanged();
+                    }
                     RoomDataManger.deleteVodRecordAll();
                 }
 

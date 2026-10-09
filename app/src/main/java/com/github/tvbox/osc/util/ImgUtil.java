@@ -37,13 +37,40 @@ import org.json.JSONObject;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Random;
 
 import me.jessyan.autosize.utils.AutoSizeUtils;
 
 public class ImgUtil {
-    private static final Map<String, Drawable> drawableCache = new HashMap<>();
+    /**
+     * 文字兜底图缓存的条目上限（配合「首字 key」使用，见 {@link #createTextDrawable}）。
+     *
+     * <p>原实现是<b>无上限的 HashMap</b>，且 key 用的是<b>完整片名</b>，而 value 是一张
+     * 与海报同尺寸的 ARGB_8888 位图（1920×1080 盒子上：首页一张约 0.69 MB、
+     * 详情页一张约 1.03 MB）。更要命的是 {@code load()} 里<b>无条件</b>先建兜底图
+     * ——哪怕海报 URL 正常、图片加载成功，也会为每个见过的片名留一张常驻位图。
+     * 全仓唯一的清理点是 {@code PlayFragment.play()}，<b>不起播就永远不清</b>；
+     * 「搜索 → 进详情看简介 → 不感兴趣退出 → 再搜下一部」这种用法全程不起播，
+     * 一个会话就能堆到几百 MB，最后 Bitmap.createBitmap 分配失败抛 OOM、或被 LMK 杀进程
+     * （表现都是"用着用着突然回到首页"）。
+     *
+     * <p>修法两条：① key 从「完整片名」降为「首字」（位图上本来就只画首字，key 与内容对齐）；
+     * ② 容器换成 access-order 的 LinkedHashMap 并限制条目数。叠加后最坏占用
+     * ≈ 32 × 0.69 MB ≈ 22 MB，且<b>不再随时间增长</b>。
+     */
+    private static final int MAX_CACHE_ENTRIES = 32;
+
+    private static final Map<String, Drawable> drawableCache = new LinkedHashMap<String, Drawable>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Drawable> eldest) {
+            // 只丢弃引用，不 recycle 位图：被淘汰的 Drawable 可能仍挂在某个 ImageView 上，
+            // 回收会直接引发 "Canvas: trying to use a recycled bitmap" 崩溃。
+            // Android 8+ 由 NativeAllocationRegistry 在 GC 时回收像素内存，丢引用即可。
+            return size() > MAX_CACHE_ENTRIES;
+        }
+    };
     public static int defaultWidth = 244;
     public static int defaultHeight = 320;
 
@@ -190,8 +217,11 @@ public class ImgUtil {
         if (width <= 0) width = 180;
         if (height <= 0) height = 240;
         if (cornerRadius <= 0) cornerRadius = 1;
-        String key = text + "_" + width + "x" + height + "_" + (int) cornerRadius;
+        // ★ key 必须与实际画上去的内容对齐：位图上只画首字，就用首字做 key。
+        //   旧实现用完整片名做 key —— 一万部片子就是一万张位图，可画出来的东西毫无区别
+        //   （同首字、同尺寸、同圆角的兜底图长完全一样），纯属白占内存。
         text = text.substring(0, 1);
+        String key = text + "_" + width + "x" + height + "_" + (int) cornerRadius;
         if (drawableCache.containsKey(key)) return drawableCache.get(key);
         int randomColor = getRandomColor();
         Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
@@ -237,6 +267,17 @@ public class ImgUtil {
 
     public static void clearCache() {
         drawableCache.clear();
+    }
+
+    /**
+     * 系统内存告急时由 {@code App.onTrimMemory / onLowMemory} 调用。
+     *
+     * <p>兜底图的重建成本极低（建一张位图 + 画个圆角矩形 + 写一个字），
+     * 内存紧张时整体丢弃最划算。原实现是全仓唯一<b>不响应任何内存回调</b>的缓存
+     * （Glide 自己会响应，这个 Map 不会），系统越紧张它越一毛不拔。
+     */
+    public static void trimMemory() {
+        clearCache();
     }
 
     public static void clearMemoryCache() {

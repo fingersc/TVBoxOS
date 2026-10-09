@@ -173,6 +173,11 @@ public class CollectActivity extends BaseActivity {
     protected void onDestroy() {
         super.onDestroy();
         EventBus.getDefault().unregister(this);
+        // ★ 静态字段持 Adapter = 间接持住整个 Activity（Adapter 里有 mContext）与它的 View 树，
+        //   原来只解注册 EventBus、从不置 null ⇒ 每次进出收藏页都白留一份在内存里。
+        //   置 null 后：下一次 onCreate 会重新 new，功能不受影响（唯一的外部引用
+        //   ConfirmClearDialog 已加判空）。
+        collectAdapter = null;
     }
 
     @Override

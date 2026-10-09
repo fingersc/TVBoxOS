@@ -188,6 +188,9 @@ public class HistoryActivity extends BaseActivity {
     protected void onDestroy() {
         super.onDestroy();
         EventBus.getDefault().unregister(this);
+        // ★ 同上（CollectActivity）：静态字段持 Adapter 会间接持住 Activity 与 View 树，
+        //   不置 null 就每次进出历史页都白留一份。
+        historyAdapter = null;
     }
 
     @Override

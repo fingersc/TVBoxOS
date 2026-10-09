@@ -159,6 +159,11 @@ public class LivePlayActivity extends BaseActivity {
     /** 上一次已处理过的播放状态；用于挡住同一状态被反复投递（直播抖动场景每秒十几次）。 */
     private int lastHandledPlayState = -1;
     private boolean exitingLivePlay = false;
+    // ★ 退出直播的二次确认：第一次按返回只提示，2 秒内再按一次才真的回首页。
+    //   直播页是最容易误触返回的场景（遥控器拿在手里、注意力在画面上），
+    //   而一旦退出就要重新选台、重新缓冲。窗口值与 HomeActivity 的退出确认保持一致（2000ms）。
+    private long mLiveBackConfirmTime = 0L;
+    private static final long LIVE_BACK_CONFIRM_WINDOW_MS = 2000L;
     private static final long EPG_LOAD_DELAY = 1200L;
     private static final int RESOLUTION_INFO_MAX_RETRY = 10;
     private static final long RESOLUTION_INFO_RETRY_DELAY = 300L;
@@ -1240,6 +1245,17 @@ public class LivePlayActivity extends BaseActivity {
             isBack= false;
             playPreSource();
         }else {
+            // ★ 退出直播需要按两次返回：第一次仅提示。
+            //   注意 exitingLivePlay 只在「确认退出」时才置 true ——
+            //   它被 onPause() 用来跳过 mVideoView.pause()，提前置位会让播放器在
+            //   提示期间仍处于"已判定退出"的状态，属于把副作用提前了。
+            long now = System.currentTimeMillis();
+            if (now - mLiveBackConfirmTime > LIVE_BACK_CONFIRM_WINDOW_MS) {
+                mLiveBackConfirmTime = now;
+                Toast.makeText(LivePlayActivity.this, "再按一次返回键退出直播", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            mLiveBackConfirmTime = 0L;
             mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
             mHandler.removeCallbacks(mUpdateNetSpeedRun);
             exitingLivePlay = true;

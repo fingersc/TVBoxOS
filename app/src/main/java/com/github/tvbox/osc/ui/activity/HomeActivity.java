@@ -622,7 +622,10 @@ public class HomeActivity extends BaseActivity {
         // 如果处于 VOD 删除模式，则退出该模式并刷新界面
         if (HawkConfig.hotVodDelete) {
             HawkConfig.hotVodDelete = false;
-            UserFragment.homeHotVodAdapter.notifyDataSetChanged();
+            // ★ UserFragment.onDestroy 已把该静态字段置 null（避免持有旧 Fragment 的 View 树）
+            if (UserFragment.homeHotVodAdapter != null) {
+                UserFragment.homeHotVodAdapter.notifyDataSetChanged();
+            }
             return;
         }
 
@@ -649,7 +652,10 @@ public class HomeActivity extends BaseActivity {
             } else {
                 doExit();
             }
-        } else if (baseLazyFragment instanceof UserFragment && UserFragment.tvHotList.canScrollVertically(-1)) {
+        } else if (baseLazyFragment instanceof UserFragment
+                // ★ 同上：tvHotList 在 UserFragment.onDestroy 里置 null，这里必须判空，
+                //   否则走到分支里就是 NPE（原来是靠"它永远不会为 null"这个假设撑着）
+                && UserFragment.tvHotList != null && UserFragment.tvHotList.canScrollVertically(-1)) {
             // 如果 UserFragment 列表可以向上滚动，则滚动到顶部
             UserFragment.tvHotList.scrollToPosition(0);
             this.mGridView.setSelection(0);

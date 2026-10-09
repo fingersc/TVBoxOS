@@ -395,5 +395,11 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
     public void onDestroy() {
         super.onDestroy();
         EventBus.getDefault().unregister(this);
+        // ★ homeHotVodAdapter 持 mContext；tvHotList 更是直接持住 RecyclerView 整棵 View 树
+        //   （连同它上面正在显示的十几张海报 Drawable）。二者都是静态字段，原来从不置 null
+        //   ⇒ 首页 Fragment 一重建，旧的就永久滞留。置 null 释放；外部引用（HomeActivity）
+        //   已全部加判空。
+        homeHotVodAdapter = null;
+        tvHotList = null;
     }
 }
