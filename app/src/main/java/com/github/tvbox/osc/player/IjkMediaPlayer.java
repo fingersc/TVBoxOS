@@ -42,6 +42,36 @@ public class IjkMediaPlayer extends IjkPlayer {
         memory = AudioTrackMemory.getInstance(context);
     }
 
+    /**
+     * 先<b>同步</b>掐掉音频输出，再交给父类异步回收 native 资源。
+     *
+     * <p><b>为什么必须覆写：</b>父类 {@code IjkPlayer.release()} 是「异步 + 吞异常」的 ——
+     * 摘掉各类 listener 之后，它开一个线程去调 native {@code release()}，主线程立刻返回；
+     * 那个线程里抛出的任何异常都被 {@code printStackTrace()} 吞掉，上层既收不到通知、
+     * 也没有重试的机会。native 那一次释放一旦失败或卡住，播放器就<strong>继续出声</strong>，
+     * 而 Java 侧的引用此时已被置空，再也没有人能去停它 —— 只能等进程被杀。</p>
+     *
+     * <p><b>实测对应现象：</b>「看半小时直播，退出回到首页，声音还在」。
+     * 残留的那一路播的是同一个频道同一个 URL，被当前正在播的那一路盖着，
+     * 平时听不出来；等退出时当前这路被 release 掉，残留的那路才暴露出来。</p>
+     *
+     * <p><b>为什么不用父类的 {@code stop()}：</b>它在状态不对时会回调
+     * {@code mPlayerEventListener.onError()}，退出 / 换源时那会误触发一次失败重试。
+     * 这里直接操作原生播放器，副作用不外溢。</p>
+     */
+    @Override
+    public void release() {
+        try {
+            if (mMediaPlayer != null) {
+                // 同步调用：音频输出当场停掉；之后 native 释放即便失败也不会再有声音
+                mMediaPlayer.stop();
+            }
+        } catch (Throwable ignored) {
+            // 状态不对时 native 会抛 IllegalStateException，不影响后续回收
+        }
+        super.release();
+    }
+
     @Override
     public void setOptions() {
         super.setOptions();

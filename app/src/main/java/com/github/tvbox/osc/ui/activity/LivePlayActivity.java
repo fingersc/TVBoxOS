@@ -1450,7 +1450,24 @@ public class LivePlayActivity extends BaseActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        if (mVideoView != null && !exitingLivePlay) {
+        // ★ 这里曾经有 `!exitingLivePlay` 这个前置条件，它是「退出到首页声音还在」的
+        //   直接原因之一：退出时 onBackPressed() 会先把 exitingLivePlay 置成 true，
+        //   于是退出这一次必然跳过 pause —— 音频输出没被同步停掉，全靠后面的
+        //   release() 去兜底。而这个兜底是不可靠的：IJK 的 release 是「异步 + 吞异常」
+        //   的（详见 IjkMediaPlayer.release() 的注释），native 那边一旦失败或卡住，
+        //   声音就一直响，Java 层还永远收不到通知。
+        //
+        //   点播侧 PlayFragment.onPause() 早就因同一个问题修过（改成无条件 pause），
+        //   直播侧一直还是旧写法 —— 这也是点播从不出现这个现象的原因：先同步停掉
+        //   音频再 release，异步 release 就算失败也听不见。
+        //
+        //   这里与点播侧对齐：无条件暂停。pause() 是同步的，立即停音频输出；
+        //   之后 release() 照常执行（release 的守卫是 !isInIdleState()，
+        //   PAUSED 不是 IDLE，不会被跳过）。
+        //
+        //   注：exitingLivePlay 去掉这个读点之后只剩下「置 true / onResume 置 false」，
+        //   不再参与任何判断，保留它仅为避免牵动别处。
+        if (mVideoView != null) {
             mVideoView.pause();
         }
     }
@@ -1461,6 +1478,14 @@ public class LivePlayActivity extends BaseActivity {
         Hawk.put(HawkConfig.PLAYER_IS_LIVE, false);
         hideSwitchChannelSnapshot();
         if (mVideoView != null) {
+            // 双保险：release 之前再同步停一次音频输出。
+            // 正常退出时 onPause() 已经 pause 过了；这条覆盖的是没走 onPause 的路径
+            // （Activity 被直接 finish / 系统回收）。pause() 内部有状态守卫，重复调用无害。
+            try {
+                mVideoView.pause();
+            } catch (Throwable ignored) {
+                // 播放器已处于异常态时可能抛，不能让它挡住后面的 release
+            }
             mVideoView.release();
             mVideoView = null;
         }
