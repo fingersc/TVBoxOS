@@ -201,6 +201,45 @@ public class PlayFragment extends BaseLazyFragment {
     private long lastHiddenChangeMs;
     /** 分片可见性变化的防抖窗口：小于该间隔的 隐藏→显示 视为同一次抖动，不做恢复。 */
     private static final long HIDDEN_CHANGE_DEBOUNCE_MS = 300L;
+
+    /**
+     * ★ onPause 之后延迟多久才真正暂停播放。
+     *
+     * <p>要解决的问题：Android TV 上播放过程中，系统覆盖层闪现、其它应用短暂抢占
+     * 前台、HDMI-CEC 事件等都会让 Activity 走一遍 onPause → onResume。而 onPause
+     * 会 pause 播放器，画面上随之闪一次暂停浮层（{@code vod_control_pause}，
+     * 该浮层只在 STATE_PAUSED 显示），紧接着又被 onResume 播起来 ——
+     * 表现为「一瞬间暂停画面闪过，但不影响继续播放」。</p>
+     *
+     * <p>改成延迟确认：失焦短于这个窗口就不算真的离开，<b>根本不暂停</b>；
+     * 真的切后台 / 退出时，延迟到期照样暂停；而退出路径另有
+     * {@link #onDestroyView()} 的 release() 兜底，声音不会因此残留。</p>
+     */
+    private static final long PAUSE_CONFIRM_DELAY_MS = 300L;
+
+    /** 落盘节流：距上次保存不足该间隔、且位置变化不足 {@link #PROGRESS_SAVE_MIN_DELTA_MS} 就不重复写库。 */
+    private static final long PROGRESS_SAVE_MIN_INTERVAL_MS = 1_000L;
+    /** 落盘节流的最小位置变化。 */
+    private static final long PROGRESS_SAVE_MIN_DELTA_MS = 5_000L;
+    /** 上次落盘的时间戳与位置，仅用于节流判定。 */
+    private long lastProgressSaveMs = 0L;
+    private long lastProgressSavePos = -1L;
+
+    /** 延迟确认的暂停动作：只有失焦持续超过 {@link #PAUSE_CONFIRM_DELAY_MS} 才会执行。 */
+    private final Runnable deferredPauseRun = new Runnable() {
+        @Override
+        public void run() {
+            if (mVideoView != null && !hasAudioOnlyPlayback()) {
+                // ★ 时间戳必须在这里打，不能提前到 onPause：
+                //   这个时间窗用于把随后到达的 STATE_PAUSED 与「用户主动暂停」区分开，
+                //   提前打会让窗口在真正暂停之前就过期，导致误判成用户暂停
+                //   （后果：回到前台不再自动续播）。
+                lastProgrammaticPauseMs = System.currentTimeMillis();
+                mVideoView.pause();
+            }
+        }
+    };
+
     private boolean reusePlayerOnSwitch;
     private boolean releasePlayerOnSwitch;
     private boolean previewMode;
@@ -310,6 +349,56 @@ public class PlayFragment extends BaseLazyFragment {
             }
         } catch (Throwable th) {
             th.printStackTrace();
+        }
+    }
+
+    /**
+     * 中断（退出 / 切后台）时的落盘，带节流。
+     *
+     * <p>与 {@link #saveCurrentProgressNow()} 的区别：那个是无条件落盘，用在
+     * 「这一轮播放确定结束」的入口（detach / hidden / destroyView）；这个用在
+     * {@link #onPause()}，而 onPause 会被<b>系统瞬时抢焦点</b>反复触发
+     * （覆盖层闪现 / 其它应用短暂前台 / HDMI-CEC）。本项目数据库开了
+     * {@code allowMainThreadQueries}，写盘就发生在主线程 —— 抖动期间位置几乎没变，
+     * 每次都同步写同一个值只是白白拖慢主线程。</p>
+     *
+     * <p>节流不影响正确性：真正的退出还有 {@link #onDestroyView()} 那次
+     * 无条件落盘兜底，退出时刻的位置照样会被记下。</p>
+     */
+    private void saveProgressOnInterrupt() {
+        try {
+            if (mVideoView == null) return;
+            long pos = mVideoView.getCurrentPosition();
+            // ★ 位置取不到就绝不写：PlayProgressManager 对 position<=0 的语义是
+            //   「删除该集记忆」，拿 0 覆盖会把已有进度抹掉。
+            if (pos <= 0) return;
+            long now = System.currentTimeMillis();
+            if (lastProgressSavePos >= 0
+                    && now - lastProgressSaveMs < PROGRESS_SAVE_MIN_INTERVAL_MS
+                    && Math.abs(pos - lastProgressSavePos) < PROGRESS_SAVE_MIN_DELTA_MS) {
+                return;
+            }
+            lastProgressSaveMs = now;
+            lastProgressSavePos = pos;
+            if (!TextUtils.isEmpty(pkVodId)) {
+                PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, pos);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
+    /**
+     * 撤销 onPause / onHiddenChanged 排下的「延迟确认暂停」。
+     *
+     * <p>凡是会自己接管播放器状态的入口（回到前台、页面切走、Activity 销毁）都要先撤销，
+     * 否则那个延迟任务会在这些入口执行完之后才落地，在已经暂停 / 已经释放的播放器上
+     * 再 pause 一次 —— 虽然 dkplayer 的 pause() 有 isInPlaybackState() 守卫不会出错，
+     * 但会盖掉「用户已手动暂停」之类的状态，属于无谓的竞态。</p>
+     */
+    private void cancelDeferredPause() {
+        if (mHandler != null) {
+            mHandler.removeCallbacks(deferredPauseRun);
         }
     }
 
@@ -1509,6 +1598,7 @@ public class PlayFragment extends BaseLazyFragment {
      * 只做一件事：停。</p>
      */
     public void stopPlaybackForDetach() {
+        cancelDeferredPause();
         if (mVideoView == null) return;
         // 宿主 Activity 要销毁了 —— 先把实时进度落盘，再去停播放器。
         // 这里保存而非依赖 release() 内部的 saveProgress()：release() 里那次用的是
@@ -1696,11 +1786,24 @@ public class PlayFragment extends BaseLazyFragment {
         //   onPause 是除「进程被强杀」之外必然会执行的一道关卡，在这里先落盘。
         //   必须在 pause() 之前调用：暂停后 getCurrentPosition() 虽仍可读，
         //   但越早取越接近用户实际看到的画面。
-        saveCurrentProgressNow();
-        if (mVideoView != null && !hasAudioOnlyPlayback()) {
-            // 程序化暂停，先打时间戳，避免随后的 STATE_PAUSED 被误记为用户意图。
-            lastProgrammaticPauseMs = System.currentTimeMillis();
-            mVideoView.pause();
+        //
+        // ★ 这里用节流版：系统瞬时抢焦点会让 onPause/onResume 反复触发，
+        //   每次都同步写库（本项目开了 allowMainThreadQueries，写盘就发生在主线程）
+        //   会白白拖慢主线程。抖动期间位置几乎没变，重复写同一个值没有意义。
+        //   真正的退出由 onDestroyView() 那次无条件落盘兜底，不会漏记。
+        saveProgressOnInterrupt();
+        // ★ 不立即暂停，改成「延迟确认」。
+        //
+        //   播放过程中 Activity 会被系统短暂抢走焦点（覆盖层闪现 / 其它应用短暂前台 /
+        //   HDMI-CEC），随即又 onResume。若在这里直接 pause，画面上会闪一次暂停浮层
+        //   （vod_control_pause 只在 STATE_PAUSED 显示），紧接着又被 onResume 播起来 ——
+        //   「一瞬间暂停画面闪过」即由此而来，属于上游既有行为，与设备无关。
+        //
+        //   延迟确认后，短于窗口的抖动根本不会暂停；真的切后台则延迟到期照常暂停；
+        //   退出场景另有 onDestroyView() 的 release() 兜底，不会把声音留在后台。
+        if (mHandler != null) {
+            mHandler.removeCallbacks(deferredPauseRun);
+            mHandler.postDelayed(deferredPauseRun, PAUSE_CONFIRM_DELAY_MS);
         }
         LOG.i("echo-lifecycle onPause userPaused=" + userPaused + " exitingPreview=" + exitingPreview);
     }
@@ -1708,6 +1811,12 @@ public class PlayFragment extends BaseLazyFragment {
     @Override
     public void onResume() {
         super.onResume();
+        // ★ 回到前台 → 撤销 onPause 排下的「延迟确认暂停」。
+        //   抖动窗口内回来时它还没执行，取消后播放器从未暂停，画面不会闪那一下；
+        //   若已经暂停过（超过窗口），下面的 resume() 会照常把它播回来。
+        if (mHandler != null) {
+            mHandler.removeCallbacks(deferredPauseRun);
+        }
         exitingPreview = false;
         // ★ 关键闸门：用户主动暂停过 → 回到前台也不恢复播放，保持暂停画面。
         // 之前这里无条件 resume()，导致「暂停 → 回桌面 → 切回来自动播放」。
@@ -1726,13 +1835,25 @@ public class PlayFragment extends BaseLazyFragment {
         boolean tooFast = now - lastHiddenChangeMs < HIDDEN_CHANGE_DEBOUNCE_MS;
         lastHiddenChangeMs = now;
         if (hidden) {
-            if (mVideoView != null) {
-                // ★ 标记这次暂停是「可见性变化」引起，不是用户意图，
-                // 否则 STATE_PAUSED 回调会把它误判成用户主动暂停。
-                lastProgrammaticPauseMs = System.currentTimeMillis();
-                mVideoView.pause();
+            // ★ 隐藏侧改为与 onPause 同一套「延迟确认」，不再隐藏即暂停。
+            //
+            //   原实现两侧不对称：隐藏侧无条件立即暂停，恢复侧却带 tooFast 防抖。
+            //   一旦「隐藏 → 显示」的间隔小于防抖窗口，就会出现
+            //   **暂停了但恢复被跳过**，画面永久卡住（只能手动按播放）。
+            //   改成延迟确认后：短于窗口的隐藏根本不暂停，显示时自然无需恢复；
+            //   超过窗口则延迟到期照常暂停，显示时由下面的 resume() 播回来。
+            //
+            //   注：当前全仓没有对 PlayFragment 做过 FragmentTransaction 的
+            //   show()/hide()（只有 add/remove），本方法实际不会触发；
+            //   此处修的是对称性隐患，避免将来一旦启用就直接踩坑。
+            if (mHandler != null) {
+                mHandler.removeCallbacks(deferredPauseRun);
+                mHandler.postDelayed(deferredPauseRun, HIDDEN_CHANGE_DEBOUNCE_MS);
             }
         } else {
+            if (mHandler != null) {
+                mHandler.removeCallbacks(deferredPauseRun);
+            }
             if (mVideoView != null && !userPaused && !tooFast) {
                 mVideoView.resume();
             }
@@ -1742,6 +1863,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     @Override
     public void onDestroyView() {
+        cancelDeferredPause();
         audioPlayback = false;
         switchingPlayback = false;
         MusicPlaybackService.stop(getContext(), this);
@@ -2933,6 +3055,7 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     public void pauseForHidden() {
+        cancelDeferredPause();
         cancelPlayTimeout();
         // 注意：这里【不能】记为播放失败。
         // pauseForHidden 是「页面切走/预览收起」触发的，属于正常的中断，
