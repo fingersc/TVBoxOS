@@ -1064,7 +1064,8 @@ public class ApiConfig {
         initLiveSettings();
         Hawk.put(HawkConfig.LIVE_GROUP_LIST, new JsonArray());
         Hawk.put(HawkConfig.EPG_URL, extractLiveTextEpg(content));
-        Hawk.put(HawkConfig.LIVE_PLAY_TYPE, Hawk.get(HawkConfig.PLAY_TYPE, 2));
+        // v57：不再用点播播放器设置覆盖 LIVE_PLAY_TYPE —— 直播用哪个引擎只由用户自己在直播里选，
+        // 没有选过就是 EXO（见 LivePlayerManager#init）。
         Hawk.put(HawkConfig.LIVE_WEB_HEADER, null);
         JsonArray livesArray = TxtSubscribe.parseToJsonArray(content);
         loadLives(livesArray);
@@ -1150,7 +1151,8 @@ public class ApiConfig {
         ArrayList<ArrayList<String>> itemsArrayList = new ArrayList<>();
         ArrayList<String> sourceItems = new ArrayList<>();
         ArrayList<String> scaleItems = new ArrayList<>(Arrays.asList("默认", "16:9", "4:3", "填充", "原始", "裁剪"));
-        ArrayList<String> playerDecoderItems = new ArrayList<>(Arrays.asList("ijk硬解", "ijk软解", "exo"));
+        // ★ 顺序与 LivePlayerManager#getLivePlayerType 的下标必须一致：0=exo 1=ijk硬解 2=ijk软解
+        ArrayList<String> playerDecoderItems = new ArrayList<>(Arrays.asList("exo", "ijk硬解", "ijk软解"));
         ArrayList<String> timeoutItems = new ArrayList<>(Arrays.asList("5s", "10s", "15s", "20s", "25s", "30s"));
         ArrayList<String> personalSettingItems = new ArrayList<>(Arrays.asList("显示时间", "显示网速", "换台反转", "跨选分类"));
         ArrayList<String> yumItems = new ArrayList<>();
@@ -1410,13 +1412,9 @@ public class ApiConfig {
             }else {
                 Hawk.put(HawkConfig.EPG_URL,"");
             }
-            //直播播放器类型
-            if(livesOBJ.has("playerType")){
-                String livePlayType =livesOBJ.get("playerType").getAsString();
-                Hawk.put(HawkConfig.LIVE_PLAY_TYPE,livePlayType);
-            }else {
-                Hawk.put(HawkConfig.LIVE_PLAY_TYPE,Hawk.get(HawkConfig.PLAY_TYPE, 2));
-            }
+            // v57：这里原本会用下发配置的 playerType（没有则抄点播 PLAY_TYPE）去覆盖
+            // LIVE_PLAY_TYPE。现在移除：直播用哪个引擎只认用户在直播面板里的手动选择，
+            // 没选过就是 EXO（见 LivePlayerManager#init）。playerType 字段本身不再使用。
             //设置UA
             if(livesOBJ.has("timeout")){
                 int timeout = Math.max(5, Math.min(30, livesOBJ.get("timeout").getAsInt()));

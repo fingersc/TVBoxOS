@@ -21,6 +21,8 @@ public class HawkConfig {
     public static final String IJK_CODEC = "ijk_codec";
     public static final String PLAY_TYPE = "play_type";//1 ijk 2 exo 10 MXPlayer
     public static final String LIVE_PLAY_TYPE = "live_play_type";//1 ijk 2 exo 10 MXPlayer
+    /** v57 一次性开关：已把直播默认播放引擎复位成 EXO，见 LivePlayerManager#resetDefaultOnce */
+    public static final String LIVE_PLAY_TYPE_RESET_EXO_V57 = "live_play_type_reset_exo_v57";
     public static final String PLAY_RENDER = "play_render"; //0 texture 2
     public static final String PLAY_SCALE = "play_scale"; //0 texture 2
     public static final String LIVE_PLAY_SCALE = "live_play_scale";
