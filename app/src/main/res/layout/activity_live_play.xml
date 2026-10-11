@@ -362,7 +362,7 @@
 			android:gravity="center"
 			android:includeFontPadding="false"
 			android:textColor="#99FFFFFF"
-			android:textSize="22mm"
+			android:textSize="@dimen/ts_18"
 			android:visibility="gone"
 			tools:text="968bps"
 			tools:ignore="RtlCompat" />
@@ -733,38 +733,6 @@
 			android:paddingLeft="20px" />
 	</RelativeLayout>
 
-	<RelativeLayout
-		android:layout_gravity="center|right|top"
-		android:id="@+id/ll_right_top_loading"
-		android:background="@drawable/shape_user_search"
-		android:layout_width="@dimen/vs_240"
-		android:layout_height="@dimen/vs_70"
-		android:layout_marginTop="25mm"
-		android:layout_marginRight="25mm"
-		android:minWidth="270px">
-		<ImageView
-			android:id="@+id/iv_circle_bg"
-			android:layout_width="@dimen/vs_40"
-			android:layout_height="@dimen/vs_40"
-			android:layout_alignParentRight="true"
-			android:layout_centerVertical="true"
-			android:layout_marginRight="@dimen/vs_10"
-			android:src="@drawable/app_icon" />
-		<com.github.tvbox.osc.ui.tv.widget.MarqueeTextView
-			android:id="@+id/tv_right_top_channel_name"
-			android:layout_width="@dimen/vs_150"
-			android:layout_height="wrap_content"
-			android:ellipsize="marquee"
-			android:gravity="center"
-			android:marqueeRepeatLimit="marquee_forever"
-			android:singleLine="true"
-			android:text="测试频道"
-			android:textColor="#FFFCFFFF"
-			android:textSize="@dimen/vs_28"
-			android:layout_toLeftOf="@id/iv_circle_bg"
-			android:layout_centerVertical="true"
-			android:layout_marginRight="10dp" />
-	</RelativeLayout>
 
 	<RelativeLayout
 		android:id="@+id/backcontroller"
