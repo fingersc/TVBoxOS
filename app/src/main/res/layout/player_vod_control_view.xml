@@ -103,7 +103,7 @@
                     android:maxLines="1"
                     android:tag="vod_control_pause_time"
                     android:text="0Gbs"
-                    android:textColor="#B3FFFFFF"
+                    android:textColor="#99FFFFFF"
                     android:textSize="@dimen/ts_18"
                     tools:ignore="RtlSymmetry" />
 
@@ -155,7 +155,7 @@
                 android:paddingBottom="@dimen/vs_5"
                 android:tag="vod_control_pause_time"
                 android:text="@string/_0kb_s"
-                android:textColor="#B3FFFFFF"
+                android:textColor="#99FFFFFF"
                 android:textSize="@dimen/ts_18"
                 android:visibility="gone"
                 tools:ignore="RtlSymmetry" />

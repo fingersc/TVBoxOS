@@ -361,7 +361,7 @@
 			android:background="@android:color/transparent"
 			android:gravity="center"
 			android:includeFontPadding="false"
-			android:textColor="@android:color/white"
+			android:textColor="#99FFFFFF"
 			android:textSize="22mm"
 			android:visibility="gone"
 			tools:text="968bps"
@@ -614,7 +614,7 @@
 			android:paddingTop="3dp"
 			android:paddingRight="8dp"
 			android:paddingBottom="3dp"
-			android:textColor="#CCFFFFFF"
+			android:textColor="@android:color/white"
 			android:textSize="@dimen/ts_20" />
 		<TextView
 			android:id="@+id/tvResolution"
@@ -631,7 +631,7 @@
 			android:paddingTop="3dp"
 			android:paddingRight="8dp"
 			android:paddingBottom="3dp"
-			android:textColor="#CCFFFFFF"
+			android:textColor="@android:color/white"
 			android:textSize="@dimen/ts_20"
 			android:visibility="gone"
 			tools:text="1920 x 1080" />
