@@ -1510,6 +1510,10 @@ public class PlayFragment extends BaseLazyFragment {
      */
     public void stopPlaybackForDetach() {
         if (mVideoView == null) return;
+        // 宿主 Activity 要销毁了 —— 先把实时进度落盘，再去停播放器。
+        // 这里保存而非依赖 release() 内部的 saveProgress()：release() 里那次用的是
+        // VideoView 缓存的 mCurrentPosition，而这才是当前的真实位置。
+        saveCurrentProgressNow();
         try {
             lastProgrammaticPauseMs = System.currentTimeMillis();
             mVideoView.pause();
@@ -1677,6 +1681,22 @@ public class PlayFragment extends BaseLazyFragment {
         //   时间窗口语义 —— 退出预览引起的那次 STATE_PAUSED 会落在窗口内被自然忽略，
         //   无需在暂停路径上看 exitingPreview。这样暂停与否只取决于「是否在播」，
         //   不会因为一个标记的残留而失效。
+        // ★ 退出 / 切后台时，先把手上的实时进度落盘，再去暂停。
+        //
+        //   进度原本只在 VideoView.release() 内部的 saveProgress() 才写库，
+        //   而 release() 挂在 onDestroyView 上。只要进程没能正常走完销毁流程，
+        //   这一整段的观看位置就彻底丢失，下次打开读到的还是上一次保存的旧值 ——
+        //   典型表现：「播放中直接退出（然后清理后台）」以后，时间点回退到上一次。
+        //
+        //   走不到 onDestroy 的场景比想象中多：
+        //     · 用户在最近任务里划掉应用 → 系统直接杀进程，无任何生命周期回调；
+        //     · HomeActivity 退出时先 finishAllActivity() 再 killProcess()+exit(0)，
+        //       而 finish() 是异步的，onDestroy 常常来不及执行就被杀掉；
+        //     · 设备断电 / 强制关机。
+        //   onPause 是除「进程被强杀」之外必然会执行的一道关卡，在这里先落盘。
+        //   必须在 pause() 之前调用：暂停后 getCurrentPosition() 虽仍可读，
+        //   但越早取越接近用户实际看到的画面。
+        saveCurrentProgressNow();
         if (mVideoView != null && !hasAudioOnlyPlayback()) {
             // 程序化暂停，先打时间戳，避免随后的 STATE_PAUSED 被误记为用户意图。
             lastProgrammaticPauseMs = System.currentTimeMillis();
@@ -1738,6 +1758,10 @@ public class PlayFragment extends BaseLazyFragment {
             danmuLoadController = null;
         }
         if (mVideoView != null) {
+            // 最后一道：release() 内部的 saveProgress() 用的是 VideoView 缓存的
+            // mCurrentPosition（只在 getCurrentPosition() 被调用时更新），
+            // 这里先按真实位置落一次盘，再释放。
+            saveCurrentProgressNow();
             mVideoView.release();
             mVideoView = null;
         }
@@ -2919,6 +2943,8 @@ public class PlayFragment extends BaseLazyFragment {
         stopParse();
         playbackStarted = false;
         if (mVideoView != null) {
+            // 页面切走前先落盘：下面紧接着就要 release()，那次保存用的是缓存位置
+            saveCurrentProgressNow();
             // 页面切走引起的暂停，不是用户意图 —— 打时间戳避免被误记。
             lastProgrammaticPauseMs = System.currentTimeMillis();
             mVideoView.pause();
