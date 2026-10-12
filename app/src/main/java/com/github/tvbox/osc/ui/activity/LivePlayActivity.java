@@ -191,6 +191,28 @@ public class LivePlayActivity extends BaseActivity {
      * <p>上限 2 次 = 最多三种组合：原播放器 → 另一个硬解引擎 → 软解兜底。
      * 软解放最后，保证「优先硬解」不被一次失败就推翻。</p>
      */
+    /**
+     * 失焦后延迟多久才真的暂停画面。
+     *
+     * <p>与点播 {@code PlayFragment#PAUSE_CONFIRM_DELAY_MS} 同值，两侧口径一致。</p>
+     *
+     * <p>要解决的问题：Android TV 上播放过程中，系统覆盖层闪现、其它应用短暂抢占
+     * 前台、HDMI-CEC 事件等都会让 Activity 走一遍 {@code onPause → onResume}。
+     * 而 onPause 会 pause 播放器：直播没有暂停浮层（LiveController 里没有任何
+     * pause/resume/start 调用），所以表现不是「暂停图标闪现」，而是画面实实在在
+     * 定住一下，回来还要重新拉流 —— 比点播更明显。</p>
+     */
+    private static final long LIVE_PAUSE_CONFIRM_DELAY_MS = 300L;
+    /** 是否由生命周期（而非用户手动）暂停过；决定回到前台时要不要自动续播。 */
+    private boolean livePausedByLifecycle = false;
+    /** 延迟确认的暂停动作：只有失焦持续超过 {@link #LIVE_PAUSE_CONFIRM_DELAY_MS} 才执行。 */
+    private final Runnable mLivePauseRun = new Runnable() {
+        @Override
+        public void run() {
+            pauseForLifecycleLeave();
+        }
+    };
+
     private int livePlayerFailoverStep = 0;
     private static final int LIVE_PLAYER_MAX_FAILOVER = 2;
     /**
@@ -1230,9 +1252,12 @@ public class LivePlayActivity extends BaseActivity {
             playPreSource();
         }else {
             // ★ 退出直播需要按两次返回：第一次仅提示。
-            //   注意 exitingLivePlay 只在「确认退出」时才置 true ——
-            //   它被 onPause() 用来跳过 mVideoView.pause()，提前置位会让播放器在
-            //   提示期间仍处于"已判定退出"的状态，属于把副作用提前了。
+            //   注意 exitingLivePlay 只在「确认退出」时才置 true —— 提前置位会让播放器在
+            //   提示期间就处于"已判定退出"的状态，属于把副作用提前了。
+            //
+            //   注：v50 之前它确实被 onPause() 当作「跳过 pause()」的判据；v50 起 onPause
+            //   不再读它，v58 起 onPause 只排一个延迟任务、真正的暂停落在 onStop 里。
+            //   也就是说它现在纯粹是「正在退出」的标记，不再参与任何播放控制判断。
             long now = System.currentTimeMillis();
             if (now - mLiveBackConfirmTime > LIVE_BACK_CONFIRM_WINDOW_MS) {
                 mLiveBackConfirmTime = now;
@@ -1424,35 +1449,59 @@ public class LivePlayActivity extends BaseActivity {
     protected void onResume() {
         super.onResume();
         exitingLivePlay = false;
-        if (mVideoView != null) {
+        // 抖动期间回来：延迟任务还没执行，画面从头到尾没停过，撤掉即可。
+        // （onStop 那条确定路径不走这里，它已经真暂停过了。）
+        mHandler.removeCallbacks(mLivePauseRun);
+        if (mVideoView != null && livePausedByLifecycle) {
+            livePausedByLifecycle = false;
             mVideoView.resume();
         }
     }
 
 
+    /**
+     * 生命周期导致的暂停：只有真的在播才动，并记下「这次是我们停的」，
+     * 供 {@link #onResume()} 判断要不要自动续播。
+     *
+     * <p>判 {@code isPlaying()} 而不是只判非空：起播中 / 缓冲中 / 已暂停等状态下
+     * 没必要插一脚，更重要的是<b>不能把用户自己在时移里按的暂停</b>记成「我们停的」，
+     * 否则回到前台会被莫名其妙播起来。</p>
+     */
+    private void pauseForLifecycleLeave() {
+        if (mVideoView != null && mVideoView.isPlaying()) {
+            livePausedByLifecycle = true;
+            mVideoView.pause();
+        }
+    }
+
     @Override
     protected void onPause() {
         super.onPause();
-        // ★ 这里曾经有 `!exitingLivePlay` 这个前置条件，它是「退出到首页声音还在」的
+        // ★ v50：这里曾经有 `!exitingLivePlay` 这个前置条件，它是「退出到首页声音还在」的
         //   直接原因之一：退出时 onBackPressed() 会先把 exitingLivePlay 置成 true，
         //   于是退出这一次必然跳过 pause —— 音频输出没被同步停掉，全靠后面的
         //   release() 去兜底。而这个兜底是不可靠的：IJK 的 release 是「异步 + 吞异常」
         //   的（详见 IjkMediaPlayer.release() 的注释），native 那边一旦失败或卡住，
         //   声音就一直响，Java 层还永远收不到通知。
         //
-        //   点播侧 PlayFragment.onPause() 早就因同一个问题修过（改成无条件 pause），
-        //   直播侧一直还是旧写法 —— 这也是点播从不出现这个现象的原因：先同步停掉
-        //   音频再 release，异步 release 就算失败也听不见。
+        // ★ v58：无条件暂停仍然保留，但不再「见风就是雨」—— 改成延迟确认。
+        //   覆盖层闪现、其它应用短暂抢前台、HDMI-CEC 都会让 Activity 走一遍
+        //   onPause → onResume，画面却被实实在在停了一次。失焦短于确认窗口就
+        //   根本不暂停；真的离开则由 onStop() 立即暂停，v50 那条修复一步不差。
+        mHandler.postDelayed(mLivePauseRun, LIVE_PAUSE_CONFIRM_DELAY_MS);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // ★ Activity 确定不可见：不用再等确认窗口，立即同步停掉。
         //
-        //   这里与点播侧对齐：无条件暂停。pause() 是同步的，立即停音频输出；
-        //   之后 release() 照常执行（release 的守卫是 !isInIdleState()，
-        //   PAUSED 不是 IDLE，不会被跳过）。
-        //
-        //   注：exitingLivePlay 去掉这个读点之后只剩下「置 true / onResume 置 false」，
-        //   不再参与任何判断，保留它仅为避免牵动别处。
-        if (mVideoView != null) {
-            mVideoView.pause();
-        }
+        //   这一条是 v50「退出到首页声音还在」的执行点：退出（返回键 → finish）、
+        //   切后台、息屏都必然经过 onStop，音频在 release 之前就被同步掐断，
+        //   release 的守卫是 !isInIdleState()（PAUSED 不是 IDLE），不会被跳过。
+        //   onDestroy() 里还有一次 try{pause()} + release() 兜底，退出路径双保险。
+        mHandler.removeCallbacks(mLivePauseRun);
+        pauseForLifecycleLeave();
     }
 
     @Override
