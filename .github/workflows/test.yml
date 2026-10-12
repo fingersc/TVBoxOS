@@ -69,6 +69,24 @@ jobs:
           else
             sed -i "/jitpack.io/a\        maven { url 'https://o0halflife0o.github.io/crosswalk/releases/crosswalk/android/maven2' }" build.gradle
           fi
+          echo '递增VersionCode —— 覆盖安装必需'
+          # 上游源码把 versionCode 写死成 1，而这里只改 versionName（tag 日期串），
+          # 于是每次构建出来的 APK 版本号完全相同。小米盒子 / 小米电视的安装器
+          # 在 versionCode 没有递增时会直接拒绝覆盖安装（表现为「应用未安装」或
+          # 必须先卸载旧版）。这里用「提交时间戳 / 10」当版本号：
+          #   · 上游一更新，提交时间就变新，版本号严格单调递增；
+          #   · 同一 commit 重跑（rebuild）版本号保持不变，便于复现；
+          #   · versionCode 上限是 2147483647，时间戳/10 约 1.8 亿，远在上限内。
+          #     （千万别写成 yyMMddHHmm —— 那是 26 亿，超 int 上限，AGP 直接报错。）
+          CT=$(git log --pretty=format:%ct ${{ env.commitS }} -1 2>/dev/null)
+          if ! [[ "$CT" =~ ^[0-9]+$ ]]; then
+            # 取不到提交时间时兜底用当前时间，绝不留下空的 versionCode
+            CT=$(date +%s)
+          fi
+          VC=$(( CT / 10 ))
+          echo "versionCode=$VC (commitTime=$CT)"
+          sed -i "s/\bversionCode[[:space:]]\+[0-9]\+/versionCode $VC/" app/build.gradle
+          grep -n 'versionCode' app/build.gradle || true
       - name: Compress Source Code
         if: ${{ env.commit }}
         working-directory: TVBoxOSC
@@ -122,6 +140,18 @@ jobs:
             mv "$file" "apk/$new_base"
           done
           mv sourceCode-${{ env.commitS }}.* apk/
+      - name: Show Apk Version And Signature
+        if: ${{ env.commit }}
+        working-directory: TVBoxOSC
+        run: |
+          # 排查「每次都要先卸载才能装」的两条线索，直接打到运行日志里：
+          #   1) versionCode 是否递增（小米设备安装器据此决定是否允许覆盖）
+          #   2) 签名指纹是否每次一致（不一致则必然只能卸载重装）
+          for f in apk/*.apk; do
+            echo "== $(basename "$f")"
+            unzip -p "$f" AndroidManifest.xml >/dev/null 2>&1 || true
+            keytool -printcert -jarfile "$f" 2>/dev/null | grep -E 'Owner|SHA1|SHA256' || echo '  (签名读取失败)'
+          done
       - name: Release Note
         if: ${{ env.commit }}
         working-directory: TVBoxOSC
