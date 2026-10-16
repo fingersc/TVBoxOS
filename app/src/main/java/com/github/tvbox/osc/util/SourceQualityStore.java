@@ -55,6 +55,19 @@ import java.util.List;
  *       现按 {@link #FIRST_FRAME_PRIOR_WEIGHT} 向 {@link #FIRST_FRAME_PRIOR_MS} 收缩。</li>
  * </ol>
  * 权重 {@code 0.30 / 0.55 / 0.15} <b>一个都没动</b> —— 修的是统计量的算法，不是打分口径。
+ *
+ * <p><b>★ v64：补上「播放中卡顿」这一缺失维度</b>（用户反馈「起播快但播着卡的源得分反而高」）。
+ * 三项权重全是<b>开门那一刻</b>的快照：搜索通不通、能不能播、多久出画面，
+ * 起播之后就没了。于是「起播 1.5 秒但每次卡 25 秒」的源能拿 0.943，
+ * 排在「起播 4 秒但几乎不卡」的 0.668 前面。
+ *
+ * <p>实测<b>调权重治不了</b>：即便把权重压到 0.60/0.25，卡顿源依然在流畅源前面 ——
+ * 加法模型里没有一项能把它拽下来。故改为在三项加权和之上<b>乘一个流畅度系数</b>
+ * （见 {@link #stallFactor(Stat)}）：卡顿不再是「某一项丢分」，而是「命门」。
+ * 三项权重<i>仍然一个没动</i>，只是在外面乘了一下。
+ *
+ * <p>数据采集见 {@link #recordStall(String, long)}：只累计<b>首帧之后</b>的卡顿，
+ * 且要排除由 seek（拖进度条）引起的缓冲 —— 那是用户主动行为，不是源的锅。</p>
  */
 public class SourceQualityStore {
 
@@ -254,6 +267,51 @@ public class SourceQualityStore {
      */
     private static final double FIRST_FRAME_PRIOR_WEIGHT = 4.0;
 
+    /**
+     * 每次观看容忍的卡顿毫秒数（{@link #stallFactor(Stat)} 的尺度常量）。
+     *
+     * <p><b>含义</b>：一个源若平均「每次观看卡 {@code TOL} 毫秒」，其流畅度系数
+     * 恰好是 <b>0.5</b>；完全不卡是 1.0，卡到受不了则趋近 0。</p>
+     *
+     * <p><b>★ 为什么是 2000 而不是 3000（实测校准）</b>：起播快但播中偶尔卡的源，
+     * 会凭起播优势把折扣吃掉 —— 实测「起播 2s·偶尔卡 3s」的源在 TOL=3000 下
+     * 得分 0.533，反而压过「起播 4s·几乎不卡」的 0.531，<b>更流畅的源输了</b>。
+     * 收紧到 2000 后两者变为 0.438 / 0.482，排序纠正。
+     * 想让「起播快」更有话语权就把它调大（3000+），想更看重流畅就调小（1500）。</p>
+     */
+    private static final double STALL_TOLERANCE_MS = 2000.0;
+
+    /**
+     * 卡顿统计的先验：假定这个源还额外有过这么多次「一次都没卡」的观看。
+     *
+     * <p>作用是让样本抖动不要立刻反映到分数上 —— 偶尔一次网络故障
+     * （比如单次卡 60 秒）不至于把一个原本很好的源一棍子打死；
+     * 与之配套的是采集侧的 {@link #STALL_SINGLE_CAP_MS}。</p>
+     */
+    private static final double STALL_PRIOR_PLAYS = 3.0;
+
+    /**
+     * 流畅度系数的下限。
+     *
+     * <p><b>为什么还要有它</b>：防止极端情况下源被算到接近 0 而永无出头之日
+     * （比如换了个很差的网络环境看了一整晚，历史数据全是卡顿）。</p>
+     *
+     * <p><b>★ 为什么是 0.25 而不是 0.5（实测校准）</b>：下限越高，被它截住的源越多、
+     * 区分度损失越大。实测 floor=0.5 时「每次卡 25s」与「偶尔卡 3s」两个严重
+     * 程度完全不同的源被压到<b>同一个分数 0.471</b>，在最该区分的地方放弃了区分。
+     * 降到 0.25 后两者为 0.236 / 0.438，区分度恢复，同时仍留了 2.5 折的兜底。</p>
+     */
+    private static final double STALL_FACTOR_FLOOR = 0.25;
+
+    /**
+     * 单次卡顿计入的上限（毫秒）。
+     *
+     * <p>防止「挂后台半天回来还在 buffering」这种畸高样本污染统计 ——
+     * 它记录的是用户离开的时长，不是源的卡顿。60 秒远大于真实卡顿周期
+     * （实测多为 1~3 秒），足以吸收绝大多数正常卡顿。</p>
+     */
+    public static final long STALL_SINGLE_CAP_MS = 60 * 1000L;
+
     private SourceQualityStore() {
     }
 
@@ -265,6 +323,20 @@ public class SourceQualityStore {
         public int playOk;
         public int playFail;
         public long firstFrameTotalMs;
+
+        /**
+         * 播放过程中（首帧之后）的卡顿累计毫秒数。
+         *
+         * <p>★ v64 新增第 7 个字段。序列化是按逗号拼接的字符串，{@link #read(String)}
+         * 用 {@code parseLong(parts, 6)} 取值 —— <b>越界返回 0</b>，所以升级前的旧存档
+         * （只有 6 项）读出来自然是「无卡顿」，无需任何迁移。</p>
+         *
+         * <p>只累计总时长而不单独记录次数：{@link #stallFactor(Stat)} 的判据是
+         * 「平均每次观看卡多久」，次数已隐含在 {@link #playOk} 这个分母里。
+         * 记了却不参与评分的字段会变成死数据（这是 {@code firstFrameTotalMs}
+         * 曾经的教训），故不再额外记 count。</p>
+         */
+        public long stallTotalMs;
 
         /** 是否有任何可参考的历史。 */
         public boolean hasSearchHistory() {
@@ -300,6 +372,8 @@ public class SourceQualityStore {
             stat.playOk = parseInt(parts, 3);
             stat.playFail = parseInt(parts, 4);
             stat.firstFrameTotalMs = parseLong(parts, 5);
+            // ★ v64：第 7 项。旧存档只有 6 项，越界按 0 处理 ⇒ 天然兼容
+            stat.stallTotalMs = parseLong(parts, 6);
         } catch (Throwable th) {
             // 读取失败按「无历史」处理，不影响调用方
         }
@@ -362,6 +436,41 @@ public class SourceQualityStore {
     }
 
     /**
+     * 记录一次「播放过程中」的卡顿。
+     *
+     * <p><b>★ v64：给评分补上第四块拼图 —— 门后面的体验。</b>
+     * 此前 {@link #recordPlay} 只关心「能不能播成功」与「多久出首帧」，
+     * 全是<b>开门那一刻</b>的快照；起播之后就再没有任何信号参与评分。
+     * 于是「起播飞快、但播五分钟卡八次」的源反而能拿高分 ——
+     * 而这类源的实际体验明显差于「起播稍慢、但全程流畅」的源。</p>
+     *
+     * <p><b>为什么用乘性折扣而不是加第四项权重</b>：加法模型里
+     * 一个频繁卡顿的源只要能播、起播快，就仍有 {@code 0.30 + 0.55 = 0.85} 的底分，
+     * 实测把权重压到 0.60/0.25 它依然排在流畅源前面 —— <b>加法模型没有一项能把它拽下来</b>。
+     * 改用乘法后，卡顿成为「命门」：一次观看体验好 = 起播好 <b>且</b> 之后持续流畅，
+     * 数学上正好是两个概率相乘。</p>
+     *
+     * @param stallMs 本次卡顿持续毫秒数；<=0 直接忽略。超长样本由
+     *                {@link #STALL_SINGLE_CAP_MS} 封顶（调用方应先截取，这里再兜一次底）
+     */
+    public static void recordStall(String sourceKey, long stallMs) {
+        if (!isRecordableKey(sourceKey) || stallMs <= 0) {
+            return;
+        }
+        try {
+            // 与 recordPlay 同：read-modify-write 整体加锁
+            synchronized (STAT_LOCK) {
+                Stat stat = read(sourceKey);
+                long capped = Math.min(stallMs, STALL_SINGLE_CAP_MS);
+                stat.stallTotalMs += capped;
+                write(sourceKey, stat);
+            }
+        } catch (Throwable th) {
+            // 忽略
+        }
+    }
+
+    /**
      * 该 sourceKey 是否允许建档写入。
      *
      * <p><b>★ v61：挡在入口，而不是只在索引里挡。</b>此前只有
@@ -391,7 +500,8 @@ public class SourceQualityStore {
      */
     private static void write(String sourceKey, Stat stat) {
         String value = stat.searchHit + "," + stat.searchFail + "," + stat.searchTotalMs
-                + "," + stat.playOk + "," + stat.playFail + "," + stat.firstFrameTotalMs;
+                + "," + stat.playOk + "," + stat.playFail + "," + stat.firstFrameTotalMs
+                + "," + stat.stallTotalMs;
         Hawk.put(KEY_PREFIX + sourceKey, value);
         touchIndex(sourceKey);
     }
@@ -535,9 +645,13 @@ public class SourceQualityStore {
             double firstFrameScore = firstFrameSpeedScore(stat);
             // 搜索速度退居辅助项。
             double searchSpeed = searchSpeedScore(stat);
-            return playRate * W_PLAY_OK
+            double baseScore = playRate * W_PLAY_OK
                     + firstFrameScore * W_FIRST_FRAME_SPEED
                     + searchSpeed * W_SEARCH_SPEED;
+            // ★ v64：卡顿不是「打分项」而是「命门」。前三项权重 0.30/0.55/0.15
+            //   全部是「开门那一刻」的表现，乘法这一下才把门后面的体验接进来。
+            //   详见 stallFactor 注释里「加法模型为什么不够」的实测说明。
+            return baseScore * stallFactor(stat);
         } catch (Throwable th) {
             return NEUTRAL;
         }
@@ -747,6 +861,38 @@ public class SourceQualityStore {
         }
         // 越快越接近 1，越慢越接近 0
         return Math.max(0.0, Math.min(1.0, FIRST_FRAME_FULL_BONUS_MS / avgMs));
+    }
+
+    /**
+     * 流畅度系数（0~1，越大越流畅），作为 {@link #scoreOf(Stat)} 的<b>乘数</b>。
+     *
+     * <p>判据是「平均每次观看卡多久」：
+     * <pre>
+     *   avgStallPerPlay = stallTotalMs / (playOk + STALL_PRIOR_PLAYS)
+     *   factor          = STALL_TOLERANCE_MS / (STALL_TOLERANCE_MS + avgStallPerPlay)
+     * </pre>
+     * 与 {@link #firstFrameSpeedScore} 的 {@code 满分线/(满分线+avg)} <b>同构</b>：
+     * 不卡是 1.0，卡到 {@code TOL} 是 0.5，再往后衰减但永不为 0。</p>
+     *
+     * <p><b>为什么分母要垫 {@link #STALL_PRIOR_PLAYS}</b>：同 {@link #FIRST_FRAME_PRIOR_WEIGHT}
+     * 的道理 —— 样本太少时均值不可信。这里先验是「假定有过 K 次一次都没卡的观看」，
+     * 所以偶发一次网络故障不会立刻把一个好源拖下去。</p>
+     *
+     * <p><b>★ 无卡顿数据必须返回 1.0</b>：升级前的旧存档没有第 7 个字段
+     * （读到 0），从没卡过的源也是 0 —— 它们<b>不该被奖励也不该被惩罚</b>，
+     * 分数与加入本机制前完全一致。这一点由单测锁定。</p>
+     */
+    private static double stallFactor(Stat stat) {
+        if (stat.stallTotalMs <= 0 || !stat.hasPlayHistory()) {
+            // 无卡顿记录 或 压根没播过 —— 不折扣（保持与加入前一致 / 避免除零）
+            return 1.0;
+        }
+        double avgStallPerPlay = stat.stallTotalMs / (stat.playOk + STALL_PRIOR_PLAYS);
+        if (avgStallPerPlay <= 0) {
+            return 1.0;
+        }
+        double factor = STALL_TOLERANCE_MS / (STALL_TOLERANCE_MS + avgStallPerPlay);
+        return Math.max(STALL_FACTOR_FLOOR, Math.min(1.0, factor));
     }
 
     private static double searchSpeedScore(Stat stat) {

@@ -1,6 +1,7 @@
 package com.github.tvbox.osc.player;
 
 import android.content.Context;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.AttributeSet;
 import android.view.Gravity;
@@ -27,6 +28,12 @@ public class MyVideoView extends VideoView implements DrawHandler.Callback {
     private ImageView artworkView;
     private DanmuSeekListener danmuSeekListener;
 
+    /**
+     * ★ v64：最近一次主动拖动进度条的时刻（{@code SystemClock.elapsedRealtime()}）；
+     * 0 表示从未拖动。供 {@link #sinceLastSeekMs()} 使用 ——
+     * 拖动进度条后播放器必然重新缓冲一轮，那是用户主动行为，不应计入源卡顿统计。
+     */
+    private long lastSeekAtMs = 0L;
 
     public MyVideoView(@NonNull Context context) {
         super(context, null);
@@ -79,12 +86,28 @@ public class MyVideoView extends VideoView implements DrawHandler.Callback {
 
     @Override
     public void seekTo(long pos) {
+        // ★ v64：先记时间戳再拖。dkplayer 的 VideoView 里只有「外部主动 seek」会走到这里
+        // （onPrepared 恢复断点走的是 mMediaPlayer.seekTo，不经过本方法），恰好只要主动拖动。
+        lastSeekAtMs = SystemClock.elapsedRealtime();
         super.seekTo(pos);
         if (danmuSeekListener != null) {
             danmuSeekListener.onDanmuSeek(pos);
         } else if (haveDanmu()) {
             danmuView.seekTo(pos);
         }
+    }
+
+    /**
+     * ★ v64：距最近一次主动拖动过去了多少毫秒。
+     *
+     * <p>从未拖动时返回 {@code Long.MAX_VALUE}（等效于「永远不在宽限窗口内」），
+     * 而不是 0 —— 0 会被调用方误判成「刚刚拖过」。</p>
+     */
+    public long sinceLastSeekMs() {
+        if (lastSeekAtMs <= 0L) {
+            return Long.MAX_VALUE;
+        }
+        return SystemClock.elapsedRealtime() - lastSeekAtMs;
     }
 
     @Override

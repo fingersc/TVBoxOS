@@ -12,6 +12,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -465,6 +466,7 @@ public class PlayFragment extends BaseLazyFragment {
         mVideoView.addOnStateChangeListener(new VideoView.SimpleOnStateChangeListener() {
             @Override
             public void onPlayStateChanged(int playState) {
+                trackPlayStall(playState);
                 if (webPlayUrl != null && isStartedPlayState(playState)) {
                     markPlaybackStarted();
                     hideTipOnUiThread();
@@ -1974,6 +1976,30 @@ public class PlayFragment extends BaseLazyFragment {
     private int autoSwitchedPlayerType = -1;
     private boolean allowAutoSwitchLine = true;
     private boolean playbackStarted = false;
+
+    /**
+     * ★ v64：卡顿统计闸门 —— 只有<b>真正出过画面</b>（{@code STATE_PLAYING}，
+     * 由 "渲染开始" 触发）之后才统计播放中卡顿。
+     *
+     * <p>不能直接用 {@link #playbackStarted}：后者由 {@link #isStartedPlayState}
+     * 触发，而它把 {@code STATE_PREPARED / STATE_BUFFERED} 也算进去
+     * —— 那时画面还没出来，这段等待已经计入 {@code firstFrameMs} 了，
+     * 再记一次卡顿就是<b>重复扣分</b>。</p>
+     */
+    private boolean stallGateOpen = false;
+
+    /**
+     * ★ v64：本次卡顿的开始时刻（elapsedRealtime）；&lt;0 表示当前没在卡顿。
+     *
+     * <p>哨兵取 -1 而不是 0：{@code SystemClock.elapsedRealtime()} 在设备刚启动时
+     * 就是 0，若用 0 当哨兵，「卡顿恰好从 0 时刻开始」会被误判成「没在卡顿」
+     * —— 重复 BUFFERING 会重置计时、结算入口会把它当空直接跳过（丢样本）。</p>
+     */
+    private long stallStartAtMs = -1L;
+
+    /** ★ v64：卡顿开始那一刻的源 key —— 卡顿期间可能已经切源，结账要对真实源头记账。 */
+    private String stallSourceKey = null;
+
     private long playTimeoutBasePosition = 0;
     private java.util.Set<String> triedLineFlags = new java.util.HashSet<>();  // 记录已尝试过的线路
 
@@ -2767,7 +2793,11 @@ public class PlayFragment extends BaseLazyFragment {
         mController.setTitle(playTitleInfo);
 
         stopParse();
+        // ★ v64：新一轮开始前先把上一轮没结算的卡顿记账 ——
+        //   用户往往正是因为卡了才切源/换线路走的，这种样本恰恰最值得记。
+        settlePendingStall();
         playbackStarted = false;
+        stallGateOpen = false;
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3063,8 +3093,10 @@ public class PlayFragment extends BaseLazyFragment {
         // 进而让切源选站和搜索排序依据的数据越用越不准。
         // 未结算的计时直接作废即可（不写任何统计）。
         discardPlayQualityTimer();
+        settlePendingStall();
         stopParse();
         playbackStarted = false;
+        stallGateOpen = false;
         if (mVideoView != null) {
             // 页面切走前先落盘：下面紧接着就要 release()，那次保存用的是缓存位置
             saveCurrentProgressNow();
@@ -3220,6 +3252,78 @@ public class PlayFragment extends BaseLazyFragment {
         }
     }
 
+    /**
+     * ★ v64：统计「播放过程中的卡顿」。
+     *
+     * <p><b>为什么要补这个</b>：SourceQualityStore 此前只有三项（成功率 / 起播速度 /
+     * 搜索速度），全是<b>开门那一刻</b>的快照。起播之后无论卡成什么样都不影响分数，
+     * 于是「起播飞快但播五分钟卡八次」的源能压过「起播稍慢但全程流畅」的源。
+     * 这里把「门后面的体验」补上。</p>
+     *
+     * <p><b>判定为一次卡顿需要同时满足三个条件</b>：
+     * <ol>
+     *   <li><b>已经出过画面</b>（{@link #stallGateOpen}）：首帧之前的等待已经计入
+     *       {@code firstFrameMs}，不能再算一遍（见该字段注释）。</li>
+     *   <li><b>不是 seek 引起的</b>：见 {@link #STALL_SEEK_GRACE_MS}。</li>
+     *   <li><b>短抖动不算</b>：{@code STATE_BUFFERING} 已经在
+     *       {@code VideoView} 里过了 300ms 防抖才上报（见那里
+     *       {@code BUFFERING_DEBOUNCE_MS} 的注释），所以不需要在这里再做一次。</li>
+     * </ol>
+     */
+    private void trackPlayStall(int playState) {
+        try {
+            if (playState == VideoView.STATE_PLAYING) {
+                // 开始渲染 = 出画面了。此后才允许统计卡顿。
+                stallGateOpen = true;
+                settlePendingStall();          // 保险：能播就说明卡顿已经结束
+                return;
+            }
+            if (playState == VideoView.STATE_ERROR || playState == VideoView.STATE_IDLE) {
+                // 卡到报错 / 播放器释放：把没结算的那次补记上
+                // （用户往往正是因为卡了才退出的，这种样本最该被记录）
+                settlePendingStall();
+                stallGateOpen = false;
+                return;
+            }
+            if (!stallGateOpen) {
+                return;
+            }
+            if (playState == VideoView.STATE_BUFFERING) {
+                if (stallStartAtMs >= 0) {
+                    return;                     // 已经在卡顿中，不重复计时
+                }
+                if (mVideoView != null
+                        && mVideoView.sinceLastSeekMs() < STALL_SEEK_GRACE_MS) {
+                    LOG.i("[PQ] stall skipped: just seeked");
+                    return;
+                }
+                stallStartAtMs = SystemClock.elapsedRealtime();
+                stallSourceKey = sourceKey;
+            } else if (playState == VideoView.STATE_BUFFERED) {
+                settlePendingStall();
+            }
+        } catch (Throwable th) {
+            LOG.e("[PQ] trackPlayStall fail: " + th);
+        }
+    }
+
+    /** 结算一次已完成的卡顿（当前没在卡顿则什么都不做）。 */
+    private void settlePendingStall() {
+        if (stallStartAtMs < 0) {
+            return;
+        }
+        long ms = SystemClock.elapsedRealtime() - stallStartAtMs;
+        stallStartAtMs = -1L;
+        String key = stallSourceKey;
+        stallSourceKey = null;
+        if (TextUtils.isEmpty(key) || ms <= 0) {
+            return;
+        }
+        // 单次封顶在 recordStall 内部做（避免「挂后台半天回来还在转」的畸高样本）
+        SourceQualityStore.recordStall(key, ms);
+        LOG.i("[PQ] stall " + key + " " + ms + "ms");
+    }
+
     /** 超过这个耗时就认为不是正常的起播等待（例如应用被切到后台），不计入统计。 */
     private static final long PLAY_QUALITY_MAX_VALID_MS = 120 * 1000L;
 
@@ -3236,6 +3340,17 @@ public class PlayFragment extends BaseLazyFragment {
      * 有明确结论，不受此约束。要调松紧改这一个常量即可。</p>
      */
     private static final long PLAY_QUALITY_ABANDON_MIN_MS = 1200L;
+
+    /**
+     * ★ v64：seek（拖进度条）之后这么久内的 buffering 不计为卡顿。
+     *
+     * <p>拖动进度条后播放器<b>必然</b>重新缓冲一轮，那是用户主动行为的结果，
+     * 不是源卡了。不排除的话，看剧时多拖几次就把这个源的卡顿分扣没了。</p>
+     *
+     * <p>取 2 秒：够覆盖 seek 后重新拉取到恢复播放的正常耗时，
+     * 又不至于把「拖到新位置后真的卡了」也一并吃掉。</p>
+     */
+    private static final long STALL_SEEK_GRACE_MS = 2000L;
 
     boolean isPlaybackStarted() {
         if (playbackStarted) return true;
