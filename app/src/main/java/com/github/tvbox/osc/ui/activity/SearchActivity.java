@@ -841,6 +841,18 @@ public class SearchActivity extends BaseActivity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
 
+    /**
+     * 本轮搜索共用的源质量快照。
+     *
+     * <p><b>★ v63 P3</b>：发起搜索时建一次（覆盖本轮全部源），之后每批结果复用。
+     * 此前每 200ms flush 一批就重建一次快照 —— 实测 30 源每批 30 次 Hawk 读，
+     * 一轮搜索累计上千次，而分数在几秒内几乎不变。</p>
+     *
+     * <p>生命周期：<b>仅本轮有效</b>。新一轮 {@link #searchResult()} 开头置 null，
+     * 因此不会长期吃到过期分数；一轮之内不更新，反而让批次间的排序口径一致。</p>
+     */
+    private SourceQualityStore.Snapshot roundSnapshot = null;
+
     /** 本轮搜索结果里「片名高位匹配」的集合（仅本 Activity 用于展示，候选池已由 session 持有）。 */
     private final List<Movie.Video> detailFallbackSearchResults = new ArrayList<>();
     private final List<List<Movie.Video>> folderHistory = new ArrayList<>();
@@ -855,6 +867,8 @@ public class SearchActivity extends BaseActivity {
      */
     private void searchResult() {
         pendingResultBuffer.clear();
+        // ★ v63 P3：新一轮搜索，上一轮的分数快照作废（保证只用本轮的分数）
+        roundSnapshot = null;
         flushScheduled = false;
         mainHandler.removeCallbacksAndMessages(null);
         searchAdapter.setNewData(new ArrayList<>());
@@ -881,7 +895,8 @@ public class SearchActivity extends BaseActivity {
         }
         // 按源质量重排下发顺序：好源先搜、先出结果。
         // 冷启动（无统计数据）时得分相同，稳定排序保持原始顺序，与改动前一致。
-        sortSourceBeansByQuality(filtered);
+        // ★ v63 P3：接住本轮快照，后续每批结果排序直接复用（不再每批重建）。
+        roundSnapshot = sortSourceBeansByQuality(filtered);
         if (filtered.isEmpty()) {
             Toast.makeText(mContext, "没有指定搜索源", Toast.LENGTH_SHORT).show();
             showEmpty();
@@ -940,10 +955,13 @@ public class SearchActivity extends BaseActivity {
         }
         try {
             List<Movie.Video> copy = new ArrayList<>(data);
-            // ★ 先批量取分，比较器内不再读 Hawk（否则 O(n log n) 次读会卡列表）
+            // ★ v63 P3：优先复用「本轮」已建好的快照（0 次 Hawk 读）。
+            //   本轮快照缺失时（例如外部直接调本方法）才临时建一份。
+            //   先批量取分，比较器内不再读 Hawk（否则 O(n log n) 次读会卡列表）
             SourceQualityStore.Snapshot snapshot =
-                    SourceQualityStore.snapshotForSearch(collectSourceKeys(copy));
-            if (snapshot.isEmpty()) {
+                    roundSnapshot != null ? roundSnapshot
+                            : SourceQualityStore.snapshotForSearch(collectSourceKeys(copy));
+            if (!snapshot.hasAnyHistory()) {
                 // 冷启动：一条历史都没有，全是中性分，排序不会改变顺序 —— 直接跳过
                 return data;
             }
@@ -971,10 +989,12 @@ public class SearchActivity extends BaseActivity {
      * <p>注：搜索任务对象（{@code SearchTask}）与派发顺序已迁入
      * {@link SearchSession}，排序改为直接作用于 {@link SourceBean}，
      * 排序语义与原先完全一致。</p>
+     *
+     * @return 本次排序用的快照（供本轮各批结果复用）；源数不足 / 异常时为 {@code null}
      */
-    private void sortSourceBeansByQuality(List<SourceBean> beans) {
+    private SourceQualityStore.Snapshot sortSourceBeansByQuality(List<SourceBean> beans) {
         if (beans == null || beans.size() <= 1) {
-            return;
+            return null;
         }
         try {
             List<String> keys = new ArrayList<>(beans.size());
@@ -984,8 +1004,10 @@ public class SearchActivity extends BaseActivity {
                 }
             }
             final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshotForSearch(keys);
-            if (snapshot.isEmpty()) {
-                return;
+            if (!snapshot.hasAnyHistory()) {
+                // 冷启动：无可参考历史，保持原下发顺序。
+                // ★ v63：仍返回快照（全中性分），本轮各批结果复用它即可零读取判定。
+                return snapshot;
             }
             Collections.sort(beans, new Comparator<SourceBean>() {
                 @Override
@@ -995,8 +1017,10 @@ public class SearchActivity extends BaseActivity {
                     return Double.compare(snapshot.get(kb), snapshot.get(ka));
                 }
             });
+            return snapshot;
         } catch (Throwable th) {
             LOG.e("sortSourceBeansByQuality fail: " + th);
+            return null;
         }
     }
 

@@ -1851,7 +1851,7 @@ public class DetailActivity extends BaseActivity {
         // 质量分降序；同分按显示名升序，保证顺序稳定可复现
         try {
             final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshot(keys);
-            if (snapshot.isEmpty()) {
+            if (!snapshot.hasAnyHistory()) {
                 // 冷启动：所有源都是中性分，排序不会改变任何顺序，省下这轮 O(n log n)
                 return keys;
             }
@@ -1970,12 +1970,13 @@ public class DetailActivity extends BaseActivity {
         //
         // 排序必须稳定：同分（含全部无历史的中性分 0.5）保持 ApiConfig 原序不变，
         // 否则每次排序结果都可能不同，「一圈」的轮转顺序就失去可预测性。
-        sortDetailFallbackSourceOrderByQuality();
+        // ★ v63 P1：接住排序时建的快照，探路直接复用（省掉 n 次重复读取）
+        SourceQualityStore.Snapshot fbSnapshot = sortDetailFallbackSourceOrderByQuality();
         // ★ 探路要单独朝「最稳的站」打一枪，就必须把它从批次队列里摘掉：
         //   否则同一个站点会被搜两次（探路一次 + 批处理一次），白扔一个请求不说，
         //   还让最稳的那个站重复占用一个并发名额。探路没命中时再补回队尾（见
         //   requeueProbeSource），不会因此漏掉该站。
-        String probeKey = pickBestProbeSource();
+        String probeKey = pickBestProbeSource(fbSnapshot);
         if (!TextUtils.isEmpty(probeKey)) {
             detailFallbackSourceOrder.remove(probeKey);
         }
@@ -2973,8 +2974,16 @@ public class DetailActivity extends BaseActivity {
      *
      * 其余情况按历史命中率取最优；全部无历史时自然落到列表里第一个非当前源
      * （不做人为轮换 —— 保持选择可预测，切源顺序才稳定）。
+     *
+     * @param snapshot {@link #sortDetailFallbackSourceOrderByQuality()} 返回的快照。
+     *                 非 null 时直接复用（<b>0 次 Hawk 读</b>）；null（源数不足或
+     *                 排序异常）时回退逐条 {@link #detailFallbackSourceScore}。
+     *
+     * <p><b>★ v63 P1</b>：排序后「最高分」就是 {@code detailFallbackSourceOrder}
+     * 的第一个合格项，探路本不需要再算一遍分数。此前这里对每个源单独
+     * {@code score()}，与建快照的那 n 次读取完全重复（实测 100 源多读 100 次）。</p>
      */
-    private String pickBestProbeSource() {
+    private String pickBestProbeSource(SourceQualityStore.Snapshot snapshot) {
         String best = "";
         double bestScore = -1;
         for (String key : detailFallbackSourceOrder) {
@@ -2985,7 +2994,7 @@ public class DetailActivity extends BaseActivity {
             if (bean == null || !bean.isSearchable()) {
                 continue;
             }
-            double score = detailFallbackSourceScore(key);
+            double score = snapshot != null ? snapshot.get(key) : detailFallbackSourceScore(key);
             if (score > bestScore) {
                 bestScore = score;
                 best = key;
@@ -3017,17 +3026,24 @@ public class DetailActivity extends BaseActivity {
      *
      * <p><b>性能</b>：一次性批量取分（{@code snapshot}），比较器内不再逐次读 Hawk。
      * 源数量在百级，排序开销可忽略。
+     *
+     * <p><b>★ v63 P1：返回本次快照</b>，供 {@link #pickBestProbeSource} 复用。
+     * 此前探路要再对每个源调一次 {@code score()}，与这里完全重复的 n 次读取
+     * （实测 100 源：切源一次共 200 次读，其中 100 次是白读的）。
+     *
+     * @return 本次排序用的快照；源数不足 / 异常时为 {@code null}（调用方回退原逻辑）
      */
-    private void sortDetailFallbackSourceOrderByQuality() {
+    private SourceQualityStore.Snapshot sortDetailFallbackSourceOrderByQuality() {
         if (detailFallbackSourceOrder.size() <= 1) {
-            return;
+            return null;
         }
         try {
             final SourceQualityStore.Snapshot snapshot =
                     SourceQualityStore.snapshot(detailFallbackSourceOrder);
-            if (snapshot.isEmpty()) {
-                // 冷启动：全是中性分，排序结果 == 原顺序，直接省掉这一轮
-                return;
+            if (!snapshot.hasAnyHistory()) {
+                // 冷启动：全是中性分，排序结果 == 原顺序，直接省掉这一轮。
+                // ★ v63：仍然返回快照 —— 分数虽全为中性，但探路复用它即可零读取完成。
+                return snapshot;
             }
             java.util.Collections.sort(detailFallbackSourceOrder,
                     new Comparator<String>() {
@@ -3040,9 +3056,11 @@ public class DetailActivity extends BaseActivity {
                     });
             LOG.i("[FB] sourceOrder sorted by quality, n=" + detailFallbackSourceOrder.size()
                     + " head=" + detailFallbackSourceOrder.subList(0, Math.min(3, detailFallbackSourceOrder.size())));
+            return snapshot;
         } catch (Throwable th) {
             // 排序失败不影响主流程：保持原序（等价于「无质量数据」的冷启动行为）
             LOG.e("sortDetailFallbackSourceOrderByQuality fail: " + th);
+            return null;
         }
     }
 

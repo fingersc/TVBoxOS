@@ -40,6 +40,21 @@ import java.util.List;
  * <p><b>键规模上限（P1-9-b）</b>：统计键不再无界增长 ——
  * 另有 {@link #KEY_INDEX} 维护写入顺序，超出 {@link #MAX_ENTRIES} 个源即淘汰最旧的。
  * 详见 {@link #KEY_INDEX} 与 {@link #touchIndex(String)}。
+ *
+ * <p><b>★ v61：排序稳定性修复（用户反馈「同一个源播不同片，速度差很多」）</b>
+ * —— 起播耗时是「源 × 具体视频」的高方差结果，不是源的稳定属性，
+ * 而原实现用算术平均直接喂给权重最高的 0.55，把噪声当成了信号：
+ * <ol>
+ *   <li><b>分母污染</b>：均值的分母原本是 {@code playOk + playFail}，而失败样本
+ *       从未贡献过耗时 ⇒ <b>失败越多，平均起播显得越快</b>，在最高权重项上奖励失败。
+ *       现改为只按成功样本求平均（见 {@link #firstFrameSpeedScore}）。</li>
+ *   <li><b>离群值无抵抗</b>：9 次 2 秒 + 1 次换片卡 60 秒，均值就被拉到 7.8 秒。
+ *       现对单个样本封顶 {@link #FIRST_FRAME_SAMPLE_CAP_MS}（15 秒），
+ *       偶发卡顿只按 15 秒计，不再抹掉其余的正常表现。</li>
+ *   <li><b>小样本过度自信</b>：只成功过 1 次的新源拿满分，压过累积几十次样本的老源。
+ *       现按 {@link #FIRST_FRAME_PRIOR_WEIGHT} 向 {@link #FIRST_FRAME_PRIOR_MS} 收缩。</li>
+ * </ol>
+ * 权重 {@code 0.30 / 0.55 / 0.15} <b>一个都没动</b> —— 修的是统计量的算法，不是打分口径。
  */
 public class SourceQualityStore {
 
@@ -93,6 +108,39 @@ public class SourceQualityStore {
      * 宁可这个源不参与淘汰统计，也不能让索引被污染。</p>
      */
     private static final String RESERVED_INDEX_NAME = "index";
+
+    /**
+     * 索引的内存镜像（v61，流畅性）。
+     *
+     * <p><b>为什么要它</b>：原实现每记一次 {@code recordSearch}/{@code recordPlay} 都要
+     * 「{@code Hawk.get} 整个索引 → remove+add → {@code Hawk.put} 整个索引」。
+     * 一次聚合搜索几十上百个源，就是几十上百次 <b>200 元素 List 的序列化 + 反序列化</b>，
+     * 全部发生在搜索回调线程上、且持有 {@link #STAT_LOCK}。</p>
+     *
+     * <p>更关键的是 {@code Hawk.put} 底层是 {@code SharedPreferences.apply()}：
+     * 每次 apply 都会排一个异步写盘任务，而 Android 在 Activity stop / service 销毁时
+     * 会用 {@code QueuedWork} <b>在主线程等待这批任务跑完</b>。
+     * 搜索期间攒下上百个待写任务，就可能在页面切换时集中 flush、拖住主线程。</p>
+     *
+     * <p><b>做法</b>：索引载入一次后留在内存；只有「第一次见到某个源」才追加并落盘。
+     * 稳定期（源集合不变）索引写入次数从「每个源每次记录」降到 <b>0</b>。</p>
+     *
+     * <p><b>取舍：严格 LRU → FIFO</b>。原实现把每次写入的源挪到索引尾部（最近使用），
+     * 淘汰最久未用的；现在只在首次建档时追加，淘汰的是<b>最早建档</b>的。
+     * 差别只在超过 {@link #MAX_ENTRIES}=200 个源时才体现，
+     * 而限界的目的（不让 {@code fb_stat_*} 无界增长）两者都达得到 ——
+     * 用这点精度换掉每轮上百次全量序列化是划算的。</p>
+     *
+     * <p><b>前提：单进程</b>。本 App 的 AndroidManifest 没有任何
+     * {@code android:process}，因此静态缓存与磁盘不会跨进程打架。
+     * 若将来引入多进程，这里必须改成每次重新读（或改用支持多进程的存储）。</p>
+     *
+     * <p>仅在 {@link #STAT_LOCK} 内访问。</p>
+     */
+    private static final List<String> INDEX_CACHE = new ArrayList<>();
+
+    /** {@link #INDEX_CACHE} 是否已从 Hawk 载入过。同锁保护。 */
+    private static boolean indexCacheLoaded = false;
 
     /**
      * 统计读改写的全局锁。
@@ -151,6 +199,61 @@ public class SourceQualityStore {
      */
     private static final double FIRST_FRAME_FULL_BONUS_MS = 2000.0;
 
+    /**
+     * 单个起播样本计入总和时的上限（毫秒）。
+     *
+     * <p><b>为什么必须截断（用户实测反馈，v61）</b>：起播耗时<b>不是源的稳定属性</b>，
+     * 而是「源 × 具体视频」的结果 —— 同一个源播 A 片 2 秒出画面，换 B 片可能卡 60 秒
+     * （线路不同、CDN 命中不同、片源冷热不同）。而这里存的是<b>耗时总和</b>，
+     * 评分用的是<b>算术平均值</b>，均值对离群值毫无抵抗力：</p>
+     *
+     * <pre>
+     *   源 G：9 次 2 秒 + 换片时 1 次卡 60 秒
+     *         不截断 → 均值 7.8s  → 速度分 0.256（被打残）
+     *         截断后 → 均值 3.3s  → 速度分 0.606（符合"通常 2 秒"的真实体验）
+     *   源 H：稳定 3 秒            → 均值 3.0s  → 速度分 0.667
+     * </pre>
+     *
+     * <p>截断后 G/H 的得分比从 <b>0.71 回到 0.97</b>：一次偶发卡顿不再抹掉九次好成绩。</p>
+     *
+     * <p><b>取值依据</b>：实测 {@code firstFrame} 样本最大 6745ms（n=11，中位数 4381ms），
+     * 取 <b>15 秒</b> ≈ 实测最大值的 2.2 倍 —— 既能挡住"偶发的几十秒卡顿"，
+     * 又不会把「真的每次都慢」的源粉饰成中等（那种源每次都接近上限，均值依然高）。
+     * 若定得太低（比如 5 秒），一个稳定 8 秒的慢源会被算成 5 秒，反而被美化。</p>
+     *
+     * <p><b>注意</b>：截断发生在<b>写入时</b>，因此历史存档里已有的超长样本不会被追溯修正，
+     * 只会随新样本累积被逐步稀释。这是刻意接受的代价 —— 改存档格式的风险远大于这点误差。</p>
+     */
+    private static final long FIRST_FRAME_SAMPLE_CAP_MS = 15000L;
+
+    /**
+     * 起播耗时的先验值（毫秒）—— 小样本收缩时"假装见过"的那个中等水平。
+     *
+     * <p>取 <b>4000ms</b>，对应实测中位数 4381ms（见
+     * {@link #FIRST_FRAME_FULL_BONUS_MS} 的实测样本）。含义是：
+     * 在没有任何证据前，假定一个源的出画面速度是"中等"。</p>
+     */
+    private static final double FIRST_FRAME_PRIOR_MS = 4000.0;
+
+    /**
+     * 先验的等效样本数（收缩强度）。
+     *
+     * <p>评分时按 {@code (实际总和 + 先验值 × K) / (实际样本数 + K)} 求平均，
+     * 相当于给每个源预先垫了 K 次"中等水平"的观测。</p>
+     *
+     * <p><b>为什么需要它</b>：起播耗时在源内波动很大（见
+     * {@link #FIRST_FRAME_SAMPLE_CAP_MS}），一两次观测几乎说明不了问题。
+     * 不收缩的话，只成功过 1 次（哪怕 2 秒）的新源就会拿到<b>满分</b>，
+     * 直接压过累积了几十次样本的老源 —— 排序因此抖动、且不信任历史。</p>
+     *
+     * <p><b>K 的取舍（一个常量，随时可调）</b>：
+     * K 越大 → 越信任先验、单次新观测对排序的冲击越小（<b>越稳</b>），
+     * 但源与源之间的区分度也越低（极端情况是所有源都挤在中性分）。
+     * 取 <b>K = 4</b>：既能挡住"1 次样本拿满分"，又不会让 10 次以上样本的老源
+     * 被先验明显拉偏（n=10 时先验只占 4/14 ≈ 29%）。</p>
+     */
+    private static final double FIRST_FRAME_PRIOR_WEIGHT = 4.0;
+
     private SourceQualityStore() {
     }
 
@@ -205,7 +308,7 @@ public class SourceQualityStore {
 
     /** 记录一次搜索结果。 */
     public static void recordSearch(String sourceKey, boolean hit, long elapsedMs) {
-        if (TextUtils.isEmpty(sourceKey)) {
+        if (!isRecordableKey(sourceKey)) {
             return;
         }
         try {
@@ -235,7 +338,7 @@ public class SourceQualityStore {
      * @param firstFrameMs 起播耗时（拿到地址到首帧）
      */
     public static void recordPlay(String sourceKey, boolean ok, long firstFrameMs) {
-        if (TextUtils.isEmpty(sourceKey)) {
+        if (!isRecordableKey(sourceKey)) {
             return;
         }
         try {
@@ -244,7 +347,10 @@ public class SourceQualityStore {
                 Stat stat = read(sourceKey);
                 if (ok) {
                     stat.playOk++;
-                    stat.firstFrameTotalMs += Math.max(0L, firstFrameMs);
+                    // ★ v61：单次样本封顶（理由见 FIRST_FRAME_SAMPLE_CAP_MS）。
+                    //   换片偶发卡顿只按 15s 计，不让它抹掉这个源其余的正常表现。
+                    long capped = Math.min(Math.max(0L, firstFrameMs), FIRST_FRAME_SAMPLE_CAP_MS);
+                    stat.firstFrameTotalMs += capped;
                 } else {
                     stat.playFail++;
                 }
@@ -253,6 +359,25 @@ public class SourceQualityStore {
         } catch (Throwable th) {
             // 忽略
         }
+    }
+
+    /**
+     * 该 sourceKey 是否允许建档写入。
+     *
+     * <p><b>★ v61：挡在入口，而不是只在索引里挡。</b>此前只有
+     * {@link #touchIndex} 跳过 {@link #RESERVED_INDEX_NAME}，但 {@link #write} 是
+     * <b>先写统计值、再调 touchIndex</b> —— 于是当某个源的 key 恰好等于
+     * {@code "index"} 时，它的统计字符串会<b>直接覆盖掉整个索引列表</b>，
+     * 而 touchIndex 又因保留名判断直接 return，不会把索引写回来。
+     * 结果是索引永久损坏：淘汰机制失效，{@code fb_stat_*} 键重新变成无界增长 ——
+     * 正是 {@link #KEY_INDEX} 存在的初衷被自己绕过了。</p>
+     *
+     * <p>把判断提到两个 {@code record*} 入口，这个源就不会有任何写入，
+     * 索引与统计都不会被污染。代价是它不参与质量排序（按中性分处理），
+     * 这远好过把淘汰机制整个弄坏。</p>
+     */
+    private static boolean isRecordableKey(String sourceKey) {
+        return !TextUtils.isEmpty(sourceKey) && !RESERVED_INDEX_NAME.equals(sourceKey);
     }
 
     /**
@@ -272,6 +397,68 @@ public class SourceQualityStore {
     }
 
     /**
+     * 确保索引内存镜像 {@link #INDEX_CACHE} 已从 Hawk 载入（幂等）。
+     *
+     * <p>★ v63：原载入逻辑内联在 {@link #touchIndex(String)} 里；新增
+     * {@link #hasAnyStatHistoryGlobal()} 也要用到它，抽出来避免同一段逻辑
+     * 在两个地方各自漂移（「同一策略值出现在两个类」的教训）。</p>
+     *
+     * <p>调用方必须已持有 {@link #STAT_LOCK}。</p>
+     */
+    private static void ensureIndexCacheLoaded() {
+        if (indexCacheLoaded) {
+            return;
+        }
+        indexCacheLoaded = true;
+        List<String> raw = Hawk.get(KEY_INDEX);
+        if (raw != null) {
+            for (String s : raw) {
+                // 兼容历史脏数据：Hawk 里可能存的不是 List（类型串用），逐项判空
+                if (s != null && !s.isEmpty() && !INDEX_CACHE.contains(s)) {
+                    INDEX_CACHE.add(s);
+                }
+            }
+        }
+    }
+
+    /**
+     * 全局是否<b>从未</b>写入过任何一条统计。
+     *
+     * <p><b>★ v63 P2：建快照前先问一次。</b>此前 {@link #buildSnapshot} 要把
+     * 每个源都读一遍（O(n) 次 Hawk 读）才能判定「这批里有没有历史」；
+     * 冷启动（首次安装、一条统计都没有）时这 n 次读取<span>全是白跑</span> ——
+     * 读出来都是空串，最后照样返回全中性分。</p>
+     *
+     * <p>判据：索引 {@link #KEY_INDEX} 为空 ⇔ 从未有源被登记过 ⇔ 不可能存在任何历史。
+     * 索引已在内存镜像里时本方法<b>零磁盘读取</b>。</p>
+     *
+     * <p><b>保守策略</b>：判断不了（异常、读不到索引）一律返回 {@code true}，
+     * 走原来的逐条读取路径 —— 宁可多读，也绝不改变结果。</p>
+     *
+     * <p>注：本结论只用于「省读取」，不用于判定单个源的分数；
+     * 单个源有无历史仍以 {@code Stat.hasAnyHistory()} 为准。</p>
+     */
+    private static boolean hasAnyStatHistoryGlobal() {
+        try {
+            synchronized (STAT_LOCK) {
+                ensureIndexCacheLoaded();
+                return !INDEX_CACHE.isEmpty();
+            }
+        } catch (Throwable ignored) {
+            // 判断不了就按「有历史」处理：走原路径，行为与改动前完全一致
+            try {
+                synchronized (STAT_LOCK) {
+                    INDEX_CACHE.clear();
+                    indexCacheLoaded = false;
+                }
+            } catch (Throwable ignored2) {
+                // 清理失败也不影响：下次调用会重新载入
+            }
+            return true;
+        }
+    }
+
+    /**
      * 把 {@code sourceKey} 标记为「最近使用」，并淘汰超限的最旧键。
      *
      * <p>索引以 {@code List<String>}（即 {@code Hawk.get(KEY_INDEX)}）存放，
@@ -285,32 +472,27 @@ public class SourceQualityStore {
      */
     private static void touchIndex(String sourceKey) {
         try {
-            if (TextUtils.isEmpty(sourceKey)) {
+            if (!isRecordableKey(sourceKey)) {
                 return;
             }
-            // 防同键冲突：真实源 key 恰好叫 "index" 时不参与索引维护（见 RESERVED_INDEX_NAME）
-            if (RESERVED_INDEX_NAME.equals(sourceKey)) {
+            ensureIndexCacheLoaded();
+            // ★ v61：已登记过的源直接返回，不再重写索引（见下方 INDEX_CACHE 说明）。
+            //   原实现是「remove + add」（严格 LRU），每个源每次记录都要全量重写一遍索引。
+            if (INDEX_CACHE.contains(sourceKey)) {
                 return;
             }
-            List<String> index = new ArrayList<>();
-            List<String> raw = Hawk.get(KEY_INDEX);
-            if (raw != null) {
-                for (String s : raw) {
-                    // 兼容历史脏数据：Hawk 里可能存的不是 List（类型串用），逐项判空
-                    if (s != null && !s.isEmpty() && !index.contains(s)) {
-                        index.add(s);
-                    }
-                }
-            }
-            index.remove(sourceKey);
-            index.add(sourceKey);
-            while (index.size() > MAX_ENTRIES) {
-                String oldest = index.remove(0);
+            INDEX_CACHE.add(sourceKey);
+            while (INDEX_CACHE.size() > MAX_ENTRIES) {
+                String oldest = INDEX_CACHE.remove(0);
                 Hawk.delete(KEY_PREFIX + oldest);
             }
-            Hawk.put(KEY_INDEX, index);
+            // 传副本：避免把内部容器交给外部长期持有
+            Hawk.put(KEY_INDEX, new ArrayList<>(INDEX_CACHE));
         } catch (Throwable ignored) {
-            // 索引维护失败不影响统计读写（核心功能优先）
+            // 索引维护失败不影响统计读写（核心功能优先）。
+            // 丢弃内存镜像，下次调用重新从 Hawk 载入，避免缓存与磁盘长期不一致。
+            INDEX_CACHE.clear();
+            indexCacheLoaded = false;
         }
     }
 
@@ -333,7 +515,15 @@ public class SourceQualityStore {
      */
     public static double score(String sourceKey) {
         try {
-            Stat stat = read(sourceKey);
+            return scoreOf(read(sourceKey));
+        } catch (Throwable th) {
+            return NEUTRAL;
+        }
+    }
+
+    /** 由已读出的档案算分，避免同一条档案被重复读取（快照构建会读很多条）。 */
+    private static double scoreOf(Stat stat) {
+        try {
             if (!stat.hasAnyHistory()) {
                 return NEUTRAL;
             }
@@ -390,8 +580,12 @@ public class SourceQualityStore {
         /** 仅供本类填充，外部勿直接修改。 */
         private final HashMap<String, Double> scores;
 
-        private Snapshot(HashMap<String, Double> scores) {
+        /** 这批源里是否存在任何一条可参考的历史（见 {@link #hasAnyHistory()}）。 */
+        private final boolean anyHistory;
+
+        private Snapshot(HashMap<String, Double> scores, boolean anyHistory) {
             this.scores = scores;
+            this.anyHistory = anyHistory;
         }
 
         /** 取某源的分数；未收录（含空 key）时返回中性分。 */
@@ -409,13 +603,35 @@ public class SourceQualityStore {
         }
 
         /**
-         * 快照里是否「完全没有可参考的历史」。
+         * 快照里是否一个源都没有（即入参 key 列表为空）。
          *
-         * <p>冷启动（首次安装、尚无任何统计）时所有源都是中性分，
-         * 排序不会改变任何顺序，调用方可据此**跳过整个排序**，省下这轮开销。
+         * <p><b>★ v61：语义已澄清。</b>此前本方法的 javadoc 写的是
+         * 「是否完全没有可参考的历史」，<b>但实现是 {@code scores.isEmpty()}</b> ——
+         * 而 {@link #buildSnapshot} 对<b>每个</b>传入的 key 都会 {@code put} 一条
+         * （无历史的源存的是中性分 {@link #NEUTRAL}），所以只要入参非空，
+         * 它就恒为 {@code false}。</p>
+         *
+         * <p>后果：三处调用点都按 javadoc 的语义写了「冷启动时跳过排序」的优化，
+         * 而这个分支<b>从来没有被触发过</b> —— 每次搜索/每次切源都白跑一轮
+         * O(n log n) 排序（虽然结果是稳定排序、行为正确，但开销白付）。</p>
+         *
+         * <p>现按实际实现保留「无源」语义；要判断「有没有历史」请用
+         * {@link #hasAnyHistory()}。</p>
          */
         public boolean isEmpty() {
             return scores.isEmpty();
+        }
+
+        /**
+         * 这批源里是否存在任何一条可参考的历史。
+         *
+         * <p>冷启动（首次安装、尚无任何统计）时为 {@code false}：
+         * 所有源都是中性分 {@link #NEUTRAL}，稳定排序不会改变任何顺序，
+         * 调用方可据此<b>跳过整个排序</b>，省下这轮 O(n log n) 开销。
+         * 这是三处"冷启动跳过"分支本来想要的语义（见 {@link #isEmpty()}）。</p>
+         */
+        public boolean hasAnyHistory() {
+            return anyHistory;
         }
     }
 
@@ -444,15 +660,35 @@ public class SourceQualityStore {
 
     private static Snapshot buildSnapshot(List<String> sourceKeys) {
         HashMap<String, Double> map = new HashMap<>();
+        boolean anyHistory = false;
         if (sourceKeys != null) {
+            // ★ v63 P2：全局一条历史都没有 ⇒ 每个源都必然是中性分，
+            //   直接填中性返回，省掉下面 O(n) 次 Hawk 读（冷启动/清空数据后的首次搜索）。
+            //   map 仍按原样填满，保证 size()/get() 语义与逐条读取时完全一致。
+            if (!hasAnyStatHistoryGlobal()) {
+                for (String key : sourceKeys) {
+                    if (TextUtils.isEmpty(key) || map.containsKey(key)) {
+                        continue;
+                    }
+                    map.put(key, NEUTRAL);
+                }
+                return new Snapshot(map, false);
+            }
             for (String key : sourceKeys) {
                 if (TextUtils.isEmpty(key) || map.containsKey(key)) {
                     continue;
                 }
-                map.put(key, score(key));
+                // ★ v61：每条档案只读一次，同时取出分数和「有没有历史」。
+                //   此前是 map.put(key, score(key))，score 内部又 read 一遍；
+                //   要判断 hasAnyHistory 再读一遍就是 3 次 Hawk 读取/源。
+                Stat stat = read(key);
+                if (stat.hasAnyHistory()) {
+                    anyHistory = true;
+                }
+                map.put(key, scoreOf(stat));
             }
         }
-        return new Snapshot(map);
+        return new Snapshot(map, anyHistory);
     }
 
     /** 平均搜索响应耗时（毫秒），无数据返回 0。 */
@@ -462,11 +698,20 @@ public class SourceQualityStore {
         return total > 0 ? stat.searchTotalMs / total : 0L;
     }
 
-    /** 平均起播耗时（毫秒，拿到地址→首帧），无数据返回 0。 */
+    /**
+     * 平均起播耗时（毫秒，拿到地址→首帧），无数据返回 0。
+     *
+     * <p><b>★ v61：分母改为成功次数</b>，与 {@link #firstFrameSpeedScore} 一致。
+     * 原本除以 {@code playOk + playFail}，而失败的样本从未贡献过耗时
+     * （见 {@link #recordPlay}），算出来的是「成功耗时摊到所有次数」，
+     * 与"平均起播要多久"的语义不符 —— 失败越多反而显得越快。</p>
+     *
+     * <p>注：本方法返回的是<b>真实均值</b>，不做先验收缩（收缩只用于评分排序）。</p>
+     */
     public static long avgFirstFrameMs(String sourceKey) {
         Stat stat = read(sourceKey);
-        int total = stat.playOk + stat.playFail;
-        return total > 0 ? stat.firstFrameTotalMs / total : 0L;
+        // 只有成功样本才贡献过耗时，分母必须是成功次数
+        return stat.playOk > 0 ? stat.firstFrameTotalMs / stat.playOk : 0L;
     }
 
     /**
@@ -475,13 +720,28 @@ public class SourceQualityStore {
      * <p>与 {@link #searchSpeedScore} 同构（{@code 满分线 / avgMs} 截断到 [0,1]），
      * 但样本用 {@code firstFrameTotalMs}、满分线用
      * {@link #FIRST_FRAME_FULL_BONUS_MS}（2000ms，非搜索的 400ms）。</p>
+     *
+     * <p><b>★ v61 修了两处统计错误（都是客观 bug，不是调权重）</b>：</p>
+     * <ol>
+     *   <li><b>分母污染</b>：原本用 {@code playOk + playFail} 当分母，但
+     *       {@link #recordPlay} 只在成功时累加耗时 —— 失败的样本分子贡献恒为 0
+     *       却占一个分母名额，于是<b>失败越多，"平均起播耗时"越小、速度分越高</b>。
+     *       在一个权重 0.55 的项上奖励失败，方向完全反了。现改为只按成功样本求平均，
+     *       失败该受的罚由 {@code playRate} 那 0.30 权重承担。</li>
+     *   <li><b>小样本过度自信</b>：只成功过 1 次的源，一次 2 秒就拿满分 1.0，
+     *       直接压过累积几十次样本的老源。现按
+     *       {@link #FIRST_FRAME_PRIOR_WEIGHT} 向 {@link #FIRST_FRAME_PRIOR_MS} 收缩。</li>
+     * </ol>
      */
     private static double firstFrameSpeedScore(Stat stat) {
-        int total = stat.playOk + stat.playFail;
-        if (total <= 0 || stat.firstFrameTotalMs <= 0) {
+        int n = stat.playOk;
+        if (n <= 0 || stat.firstFrameTotalMs <= 0) {
             return NEUTRAL;
         }
-        double avgMs = (double) stat.firstFrameTotalMs / total;
+        // 收缩均值：垫 K 次"中等水平(4s)"的虚拟观测，样本越多先验影响越小
+        double avgMs = (stat.firstFrameTotalMs
+                + FIRST_FRAME_PRIOR_MS * FIRST_FRAME_PRIOR_WEIGHT)
+                / (n + FIRST_FRAME_PRIOR_WEIGHT);
         if (avgMs <= 0) {
             return NEUTRAL;
         }

@@ -3122,10 +3122,15 @@ public class PlayFragment extends BaseLazyFragment {
      * 开始为「一次播放尝试」计时。
      *
      * <p>调用点：向资源站发起 getPlay 请求之前。若上一次尝试尚未结算（例如换线途中），
-     * 先按失败结算掉，保证每个源每次尝试都有且仅有一条记录。
+     * 先按失败结算掉，保证每个源每次尝试都有且仅有一条记录。</p>
+     *
+     * <p>★ v62：这里的结算<b>套用最短等待约束</b>（{@link #PLAY_QUALITY_ABANDON_MIN_MS}）。
+     * 用户在源列表里快速点过时，上一个源常常还<b>没收到请求</b>就被切走了（实测多在 300ms 内），
+     * 那种「用户主动放弃」不是源的锅 —— 记一次 playFail 等于惩罚「用户没耐心」，
+     * 而不是这个源慢。只有等够了还没出画面的，才算这个源没播成。</p>
      */
     void startPlayQualityTimer() {
-        settlePlayQualityIfPending(false, 0, "superseded");
+        settlePlayQualityIfPending(false, 0, "superseded", true);
         playReqStartMs = System.currentTimeMillis();
         playReqSourceKey = sourceKey;
     }
@@ -3160,14 +3165,28 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     /**
-     * 结算本次播放尝试。
+     * 结算本次播放尝试（不套用最短等待约束）。
      *
-     * <p>只有「有起点、有源 key」才记账；结算后立即清空起点，
-     * 因此重复调用（例如 PREPARED 后又收到 BUFFERED）不会重复计数。
+     * <p>用于有明确结论的场合：出画面（成功）或解析失败/超时/播放报错（失败）。
+     * 这些结论与等待长短无关，短也不该被丢弃。</p>
      *
      * @param elapsedHint 调用方已知的耗时；<=0 时用当前时间减去起点
      */
     private void settlePlayQualityIfPending(boolean ok, long elapsedHint, String reason) {
+        settlePlayQualityIfPending(ok, elapsedHint, reason, false);
+    }
+
+    /**
+     * 结算本次播放尝试。
+     *
+     * <p>只有「有起点、有源 key」才记账；结算后立即清空起点，
+     * 因此重复调用（例如 PREPARED 后又收到 BUFFERED）不会重复计数。</p>
+     *
+     * @param elapsedHint      调用方已知的耗时；<=0 时用当前时间减去起点
+     * @param abandonIfTooFast 为 true 时，耗时短于 {@link #PLAY_QUALITY_ABANDON_MIN_MS}
+     *                         视为「用户主动放弃」，直接作废不记账（仅 superseded 场景使用）
+     */
+    private void settlePlayQualityIfPending(boolean ok, long elapsedHint, String reason, boolean abandonIfTooFast) {
         try {
             if (playReqStartMs <= 0) {
                 return;
@@ -3177,6 +3196,12 @@ public class PlayFragment extends BaseLazyFragment {
             playReqStartMs = 0;
             playReqSourceKey = null;
             if (TextUtils.isEmpty(key) || cost < 0) {
+                return;
+            }
+            // ★ v62：还没起播就被切走、且根本没等够 —— 这是用户主动放弃，不是源播不成。
+            //   记入 playFail 会让「快速浏览源」这个纯操作凭空拉低一批源的成功率。
+            if (abandonIfTooFast && cost < PLAY_QUALITY_ABANDON_MIN_MS) {
+                LOG.i("[PQ] abandon " + key + " cost=" + cost + "ms reason=" + reason);
                 return;
             }
             // 明显不合理的耗时（比如被系统挂起数分钟）直接丢弃，避免污染均值
@@ -3197,6 +3222,20 @@ public class PlayFragment extends BaseLazyFragment {
 
     /** 超过这个耗时就认为不是正常的起播等待（例如应用被切到后台），不计入统计。 */
     private static final long PLAY_QUALITY_MAX_VALID_MS = 120 * 1000L;
+
+    /**
+     * 「还没起播就被切走」时，等待短于这个时长视为<b>用户主动放弃</b>，不计入统计。
+     *
+     * <p><b>取值依据</b>：实测 firstFrame 样本最快的也要 1868ms（见
+     * {@code SourceQualityStore} 的实测样本注释），也就是说正常解析+起播不可能在
+     * 1.2 秒内完成；而在源列表里连续点过源时，切走往往发生在 300ms 内 ——
+     * 那时请求可能都还没发出去。取 1200ms 能把「纯扫源」干净地切掉，
+     * 又不会误伤真正在等但慢的源（那种情况用户会多等一会儿）。</p>
+     *
+     * <p>只作用于 superseded（被切走）这一个入口；解析失败 / 超时 / 播放报错
+     * 有明确结论，不受此约束。要调松紧改这一个常量即可。</p>
+     */
+    private static final long PLAY_QUALITY_ABANDON_MIN_MS = 1200L;
 
     boolean isPlaybackStarted() {
         if (playbackStarted) return true;

@@ -614,6 +614,20 @@ public class FastSearchActivity extends BaseActivity {
     private final List<String> folderHistorySiteKeys = new ArrayList<>();
     private boolean folderLoading;
 
+    /**
+     * 本轮搜索共用的源质量快照。
+     *
+     * <p><b>★ v63 P3</b>：发起搜索时建一次（覆盖本轮<b>全部</b>源，含阻塞源），
+     * 之后每批结果复用。此前每批结果都重建快照 —— 实测 30 源每批 30 次 Hawk 读。</p>
+     *
+     * <p><b>为什么必须包含阻塞源</b>：本页只对「非阻塞源」排下发顺序，但阻塞源
+     * （type==3）一样会出结果并参与结果排序。若快照只含非阻塞源，阻塞源的结果
+     * 会全部退回中性分 —— 与改动前不一致。故快照按全部 {@code searchTasks} 建。</p>
+     *
+     * <p>生命周期：<b>仅本轮有效</b>，新一轮 {@link #searchResult()} 开头置 null。</p>
+     */
+    private SourceQualityStore.Snapshot roundSnapshot = null;
+
     private void searchResult() {
         try {
             if (searchExecutorService != null) {
@@ -640,6 +654,8 @@ public class FastSearchActivity extends BaseActivity {
             searchPaused = false;
             totalSearchCount.set(0);
             timedOutSearchCount.set(0);
+            // ★ v63 P3：新一轮搜索，上一轮的分数快照作废（保证只用本轮的分数）
+            roundSnapshot = null;
             detailFallbackSearchResults.clear();
             folderHistory.clear();
             folderHistoryFilter.clear();
@@ -675,9 +691,15 @@ public class FastSearchActivity extends BaseActivity {
             this.spNames.put(bean.getName(), bean.getKey());
         }
         ArrayList<SearchTask> searchTasks = new ArrayList<>();
+        // ★ v63 P3：先为「本轮全部任务」（含阻塞源）建一份快照 ——
+        //   下发顺序排序与后续各批结果排序都复用它，不再每批重建。
+        ArrayList<SearchTask> allTasks = new ArrayList<>();
+        allTasks.addAll(fastSearchTasks);
+        allTasks.addAll(blockingSearchTasks);
+        roundSnapshot = buildRoundSnapshot(allTasks);
         // 按源质量重排「非阻塞源」的下发顺序：好源先搜、先出结果。
         // 阻塞源（type==3）仍整体排在最后，维持原有策略不变。
-        sortSearchTasksByQuality(fastSearchTasks);
+        sortSearchTasksByQuality(fastSearchTasks, roundSnapshot);
         searchTasks.addAll(fastSearchTasks);
         searchTasks.addAll(blockingSearchTasks);
 
@@ -773,10 +795,13 @@ public class FastSearchActivity extends BaseActivity {
         }
         try {
             List<Movie.Video> copy = new ArrayList<>(data);
-            // ★ 先批量取分，比较器内不再读 Hawk（原因见 SourceQualityStore.Snapshot 注释）
+            // ★ v63 P3：优先复用「本轮」已建好的快照（0 次 Hawk 读）；
+            //   本轮快照缺失时（例如外部直接调本方法）才临时建一份。
+            //   先批量取分，比较器内不再读 Hawk（原因见 SourceQualityStore.Snapshot 注释）
             SourceQualityStore.Snapshot snapshot =
-                    SourceQualityStore.snapshotForSearch(collectSourceKeys(copy));
-            if (snapshot.isEmpty()) {
+                    roundSnapshot != null ? roundSnapshot
+                            : SourceQualityStore.snapshotForSearch(collectSourceKeys(copy));
+            if (!snapshot.hasAnyHistory()) {
                 // 冷启动：一条历史都没有，全是中性分，排序不会改变顺序 —— 直接跳过
                 return data;
             }
@@ -806,8 +831,11 @@ public class FastSearchActivity extends BaseActivity {
      *
      * <p>降级安全：冷启动（无任何统计数据）时所有源得分相同，
      * 稳定排序会保持仓库原始顺序，与改动前行为一致。
+     *
+     * @param snapshot 本轮已建好的快照；为 {@code null} 时本方法自建一份（回退）
      */
-    private void sortSearchTasksByQuality(List<SearchTask> tasks) {
+    private void sortSearchTasksByQuality(List<SearchTask> tasks,
+                                          SourceQualityStore.Snapshot snapshot) {
         if (tasks == null || tasks.size() <= 1) {
             return;
         }
@@ -819,8 +847,10 @@ public class FastSearchActivity extends BaseActivity {
                     keys.add(task.sourceKey);
                 }
             }
-            final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshotForSearch(keys);
-            if (snapshot.isEmpty()) {
+            // ★ v63 P3：优先复用本轮快照（0 次 Hawk 读），缺失时才自建
+            final SourceQualityStore.Snapshot snap =
+                    snapshot != null ? snapshot : SourceQualityStore.snapshotForSearch(keys);
+            if (!snap.hasAnyHistory()) {
                 return;   // 冷启动：无可参考历史，保持原下发顺序
             }
             Collections.sort(tasks, new Comparator<SearchTask>() {
@@ -828,11 +858,35 @@ public class FastSearchActivity extends BaseActivity {
                 public int compare(SearchTask a, SearchTask b) {
                     String ka = a == null ? null : a.sourceKey;
                     String kb = b == null ? null : b.sourceKey;
-                    return Double.compare(snapshot.get(kb), snapshot.get(ka));
+                    return Double.compare(snap.get(kb), snap.get(ka));
                 }
             });
         } catch (Throwable th) {
             LOG.e("sortSearchTasksByQuality fail: " + th);
+        }
+    }
+
+    /**
+     * 为本轮<b>全部</b>搜索任务建一份质量快照（含阻塞源）。
+     *
+     * <p>阻塞源虽不参与下发顺序排序，但会出结果、参与结果排序；
+     * 若快照漏掉它们，这些源的结果会全部退回中性分，与改动前行为不一致。</p>
+     */
+    private SourceQualityStore.Snapshot buildRoundSnapshot(List<SearchTask> tasks) {
+        try {
+            if (tasks == null || tasks.isEmpty()) {
+                return null;
+            }
+            List<String> keys = new ArrayList<>(tasks.size());
+            for (SearchTask task : tasks) {
+                if (task != null && !TextUtils.isEmpty(task.sourceKey)) {
+                    keys.add(task.sourceKey);
+                }
+            }
+            return SourceQualityStore.snapshotForSearch(keys);
+        } catch (Throwable th) {
+            LOG.e("buildRoundSnapshot fail: " + th);
+            return null;
         }
     }
 
