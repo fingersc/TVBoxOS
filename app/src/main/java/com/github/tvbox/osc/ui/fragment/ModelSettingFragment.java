@@ -27,6 +27,7 @@ import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.cache.CacheManager;
 import com.github.tvbox.osc.cache.RoomDataManger;
 import com.github.tvbox.osc.event.RefreshEvent;
+import com.github.tvbox.osc.ui.activity.DetailActivity;
 import com.github.tvbox.osc.ui.activity.LocalFileActivity;
 import com.github.tvbox.osc.ui.activity.SettingActivity;
 import com.github.tvbox.osc.ui.adapter.ApiHistoryDialogAdapter;
@@ -47,6 +48,7 @@ import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.PlayerHelper;
+import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
 import com.lzy.okgo.callback.FileCallback;
@@ -1076,6 +1078,25 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 //    只能集中存放在 Room 的 cache 表，一并清掉。
                 //    表内其余内容是可再生的字幕缓存，清除后会自动重新生成。
                 CacheManager.deleteAll();
+                // ③ ★ v69：清掉「运行期沉淀」出来的持久化数据 —— 只清运行态，
+                //    <b>不动任何用户设置</b>（源地址、解码器、字幕样式等一概保留）。
+                //
+                //    此前「清空缓存」只清文件缓存与数据库里的孤儿/直链进度，
+                //    而下面这几样是 App 跑久了自己攒出来的运行态数据，
+                //    用户没有任何单独入口能清掉它们。
+                //    · 站点质量统计（起播/搜索打点累积，直接决定切源与搜索的排序）。
+                //      一旦某批站点的历史因网络波动失真，只能卸载重装才能重置 —— 现在不用了。
+                SourceQualityStore.clearAll();
+                //    · 切源候选池缓存（每部片一条，24h TTL 的纯缓存）
+                DetailActivity.clearPersistedFallbackCache();
+                //    · 观看历史 + 全部播放进度（含「上次看到第几集 / 第几分钟」）。
+                //      历史记着某部剧的播放时间，与「清干净运行期数据」的要求直接冲突，
+                //      按用户拍板：一并清掉（已覆盖上面的 deleteOrphanedPlayProgress）。
+                //      ★ 收藏（VodCollect）是用户主动攒的资产，不在清理范围内。
+                RoomDataManger.deleteVodRecordAll();
+                //    · 搜索历史与上次搜索的关键词
+                Hawk.delete(HawkConfig.SEARCH_HISTORY);
+                Hawk.delete(HawkConfig.LAST_SEARCH_KEYWORD);
             } catch (Exception e) {
                 e.printStackTrace();
             } finally {

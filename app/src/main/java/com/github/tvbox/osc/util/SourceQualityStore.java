@@ -829,6 +829,40 @@ public class SourceQualityStore {
     }
 
     /**
+     * ★ v69：清空全部站点质量统计（设置页「清空缓存」调用）。
+     *
+     * <p><b>为什么需要它</b>：这份统计是 App 跑起来之后一点点<b>沉淀</b>出来的
+     * （搜索打点 + 起播打点累积），<b>不是用户配置</b>。它直接决定切源顺序与搜索排序，
+     * 一旦某批站点的历史因为一段时间的网络波动而失真，用户除了卸载重装没有任何
+     * 办法把它重置回冷启动状态 —— 「清空缓存」理应能清掉它。</p>
+     *
+     * <p><b>必须连索引一起清</b>：只删统计键不删索引，索引仍写着「这些源有历史」，
+     * {@link #hasAnyStatHistoryGlobal()} 会继续返回 {@code true}，于是每个源都要被
+     * 读一遍才知道是空的 —— 既没清干净，还白白多读一轮。</p>
+     *
+     * <p>清完之后所有源回到中性分 {@link #NEUTRAL}，与首次安装完全一致
+     * （稳定排序不会打乱顺序，等于原顺序）。</p>
+     */
+    public static void clearAll() {
+        synchronized (STAT_LOCK) {
+            try {
+                ensureIndexCacheLoaded();
+                for (String key : new ArrayList<String>(INDEX_CACHE)) {
+                    Hawk.delete(KEY_PREFIX + key);
+                }
+                INDEX_CACHE.clear();
+                // 保持「已载入」状态（现在是空的）：否则下次调用会回读 Hawk，
+                // 而索引键要到下一行才删掉，会把刚清掉的内容又读回来。
+                Hawk.delete(KEY_INDEX);
+            } catch (Throwable th) {
+                // 清理失败不影响主流程：最坏情况是下次启动时再清一次
+                INDEX_CACHE.clear();
+                indexCacheLoaded = false;
+            }
+        }
+    }
+
+    /**
      * 起播速度分（越高越好）：拿到播放地址 → 出首帧的耗时。
      *
      * <p>与 {@link #searchSpeedScore} 同构（{@code 满分线 / avgMs} 截断到 [0,1]），

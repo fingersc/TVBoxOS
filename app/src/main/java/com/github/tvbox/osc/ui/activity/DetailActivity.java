@@ -1626,9 +1626,10 @@ public class DetailActivity extends BaseActivity {
             // ★ v67：换片 ⇒ 基准集数置零（新片的集数与上一部片无关）。
             detailFallbackRefEpisodes = 0;
             detailFallbackCycleCount = 0;
-            detailFallbackCycleStart = 0;
-            detailFallbackCycleStartOfNext = 0;
-            detailFallbackCycleStartKey = "";
+            // ★ v69：换片 ⇒ 本圈冻结顺序作废。
+            //   得分是「站点级」的（换片不清分），新片沿用旧片的站点排序重新定一圈，
+            //   「哪几站有这部片」由候选池隔离，不受影响。
+            detailFallbackCycleFrozenOrder.clear();
             detailFallbackTimedOutKey = null;
             detailFallbackTimedOutSource = null;
             }
@@ -1691,7 +1692,8 @@ public class DetailActivity extends BaseActivity {
         // 表现为「点多少次都切回同一个站点」。这正是一直切回同一站点的根因。
         if (detailFallbackNewCycle) {
             detailFallbackCycleKeys.clear();
-            detailFallbackCycleStartKey = "";
+            // ★ v69：换片后的第一圈 ⇒ 冻结顺序作废，按新片自己的得分重新定序
+            detailFallbackCycleFrozenOrder.clear();
             detailFallbackNewCycle = false;
         }
 
@@ -1787,7 +1789,9 @@ public class DetailActivity extends BaseActivity {
         // 与站点质量无关；质量排序只在整表层面做了一次，进到轮转里就失效了。
         // 质量分相同（都是冷启动的 NEUTRAL）时按显示名排，保证同一部片每次进入
         // 切源顺序稳定可复现，不会「这次先切 A、下次先切 B」。
-        List<String> orderedSources = buildFallbackCycleOrder(cachedCandidates);
+        //
+        // ★ v69：取的是「本圈顺序」而不是每次现排的一份，详见 currentCycleOrder 注释。
+        List<String> orderedSources = currentCycleOrder(cachedCandidates);
         if (orderedSources.isEmpty()) {
             detailFallbackPickedVideoId = "";
             return "";
@@ -1796,7 +1800,9 @@ public class DetailActivity extends BaseActivity {
         //   点切源却切回自己 = 页面原地重载一遍，用户只会以为没生效。
         String picked = scanOrderedSources(orderedSources, false);
         if (TextUtils.isEmpty(picked) && orderedSources.size() > 1) {
-            // 其它站本圈都轮过了 → 允许回到当前源（一圈的终点本来就是回到起点）
+            // ★ v69：其它站本圈都轮过了 → 允许回到当前源。
+            //   「一圈走完、且当前正在播的站恰好是最高分站」就落在这里：
+            //   跳过它 ⇒ 切到第二名，不会原地卡死（用户拍板的口径）。
             picked = scanOrderedSources(orderedSources, true);
         }
         if (!TextUtils.isEmpty(picked)) {
@@ -1814,15 +1820,16 @@ public class DetailActivity extends BaseActivity {
         // 不清的话新圈里每一个站点都还被判为「试过」，等于开新圈立刻死空。
         detailFallbackCycleKeys.clear();
         detailFallbackSoftTriedKeys.clear();
+        // ★ v69：开新圈 ⇒ 冻结顺序作废，按此刻最新的得分重新定一整圈。
+        //   这就是「循环一圈之后，下一圈应该从得分最高的站开始」的落点。
+        detailFallbackCycleFrozenOrder.clear();
         detailFallbackCycleCount++;
-        detailFallbackCycleStart = detailFallbackCycleStartOfNext;
         LOG.i("[FB] newCycle #" + detailFallbackCycleCount
-                + " pool=" + orderedSources.size()
-                + " start=" + detailFallbackCycleStart
-                + " startKey=" + detailFallbackCycleStartKey);
-        picked = scanOrderedSources(orderedSources, false);
+                + " pool=" + orderedSources.size());
+        List<String> newOrder = currentCycleOrder(cachedCandidates);
+        picked = scanOrderedSources(newOrder, false);
         if (TextUtils.isEmpty(picked)) {
-            picked = scanOrderedSources(orderedSources, true);
+            picked = scanOrderedSources(newOrder, true);
         }
         if (TextUtils.isEmpty(picked)) {
             detailFallbackPickedVideoId = "";
@@ -1838,7 +1845,13 @@ public class DetailActivity extends BaseActivity {
      */
     private String scanOrderedSources(List<String> orderedSources, boolean allowCurrent) {
         int total = orderedSources.size();
-        int startIdx = resolveCycleStartIndex(orderedSources);
+        // ★ v69：起点恒为 0 —— 从头扫 == 取「本圈还没轮过、且不是当前源」里分数最高的。
+        //
+        // 改前这里取的是「上一跳的下一个」（环上接续）：列表排得再准，
+        // 下一跳也只会落在「上一圈末尾的后面」—— 排序决定的是排列，
+        // 接续决定的是落点，两者一叠加，走完一圈后看到的顺序就与得分毫无关系。
+        // 这正是「循环一圈后再切源，感觉没按得分顺序切」的根因。
+        int startIdx = 0;
         for (int step = 0; step < total; step++) {
             int index = (startIdx + step) % total;
             String cycleKey = orderedSources.get(index);
@@ -1869,10 +1882,6 @@ public class DetailActivity extends BaseActivity {
             detailFallbackCycleKeys.add(cycleKey);
             detailFallbackSoftTriedKeys.add(cycleKey);
             detailFallbackPickedVideoId = videoId;
-            // 记下本圈选到哪了，供开新圈时接续。用 key 而不是下标：池子会按质量分重排，
-            // 下标会漂移，key 才能稳定指向「上一圈末尾的下一个」。
-            detailFallbackCycleStartOfNext = (index + 1) % total;
-            detailFallbackCycleStartKey = orderedSources.get(detailFallbackCycleStartOfNext);
             LOG.sw("[FB] pollPick source=" + cycleKey
                     + " name=" + detailFallbackDisplayName(cycleKey)
                     + " id=" + videoId
@@ -1884,19 +1893,91 @@ public class DetailActivity extends BaseActivity {
         return "";
     }
 
-    /** 本圈扫描起点：优先用记录的站点 key 定位，key 已不在池子里才退回下标。 */
-    private int resolveCycleStartIndex(List<String> orderedSources) {
-        if (!TextUtils.isEmpty(detailFallbackCycleStartKey)) {
-            int idx = orderedSources.indexOf(detailFallbackCycleStartKey);
-            if (idx >= 0) {
-                return idx;
+    /**
+     * ★ v69：本圈实际使用的切源顺序。
+     *
+     * <p><b>背景</b>：改前每一跳都按最新得分整表重排，而扫描起点又是「上一跳的下一个」，
+     * 于是「排好序」只影响环上的相邻关系，不影响下一跳落在哪 —— 表现为
+     * 「循环一圈后再切源，顺序跟得分完全无关」。</p>
+     *
+     * <p><b>本方法定下两件事</b>：
+     * <ol>
+     *   <li><b>起点归零</b>：返回的列表本身就是「该切的先后」，
+     *       {@link #scanOrderedSources} 从头扫即可等价于「取未轮过里最好的」；</li>
+     *   <li><b>圈内冻结</b>（用户拍板：一圈内顺序要稳定，不要每切一次就整体重排）：
+     *       本圈<b>已经轮过的部分</b>保持原相对顺序不再变动；
+     *       <b>还没轮到的部分</b>仍按最新得分重排，池子新回流的站也按得分插进来。</li>
+     * </ol>
+     *
+     * <p><b>为什么不整圈完全冻结</b>：完全冻结会把本圈内新回流的站点挡在圈外，
+     * 要等下一圈才轮得到，等于让「边搜边补」白补。只冻已轮过部分，
+     * 既保住顺序稳定，又不漏新站。</p>
+     */
+    private List<String> currentCycleOrder(List<Movie.Video> cachedCandidates) {
+        List<String> fresh = buildFallbackCycleOrder(cachedCandidates);
+        if (fresh.isEmpty()) {
+            detailFallbackCycleFrozenOrder.clear();
+            return fresh;
+        }
+        if (detailFallbackCycleFrozenOrder.isEmpty()) {
+            // 首圈 / 换片 / 开新圈后的第一次：整份按得分降序定下来
+            detailFallbackCycleFrozenOrder.addAll(fresh);
+        } else {
+            // 本圈内：已轮过的保持原相对顺序；未轮过的按最新得分重排（新站自动归位）
+            List<String> cycled = new ArrayList<>();
+            for (String k : detailFallbackCycleFrozenOrder) {
+                if (detailFallbackCycleKeys.contains(k)
+                        || detailFallbackSoftTriedKeys.contains(k)) {
+                    cycled.add(k);
+                }
             }
+            List<String> pending = new ArrayList<>();
+            for (String k : fresh) {
+                if (!cycled.contains(k)) {
+                    pending.add(k);
+                }
+            }
+            detailFallbackCycleFrozenOrder.clear();
+            detailFallbackCycleFrozenOrder.addAll(cycled);
+            detailFallbackCycleFrozenOrder.addAll(pending);
         }
-        int fallback = detailFallbackCycleStart;
-        if (fallback < 0 || fallback >= orderedSources.size()) {
-            fallback = 0;
+        logCycleOrder(detailFallbackCycleFrozenOrder);
+        return detailFallbackCycleFrozenOrder;
+    }
+
+    /**
+     * ★ v69：把本圈的切源顺序（含各站得分）打进日志，
+     * 让「排序到底生效没有」可以直接从 logcat 判定，不用再靠感觉。
+     *
+     * <p>与 {@code pollPick} 同一条日志通道（TVBox-switch）；带 {@code *}
+     * 的项表示本圈已经轮过。分数复用 {@link #buildFallbackCycleOrder} 建的
+     * 快照（{@link #detailFallbackCycleOrderSnapshot}），不额外读 Hawk。</p>
+     */
+    private void logCycleOrder(List<String> orderedSources) {
+        try {
+            if (orderedSources == null || orderedSources.isEmpty()) {
+                return;
+            }
+            SourceQualityStore.Snapshot snap = detailFallbackCycleOrderSnapshot;
+            StringBuilder sb = new StringBuilder();
+            sb.append("[FB] cycleOrder cycle=").append(detailFallbackCycleCount)
+                    .append(" n=").append(orderedSources.size());
+            for (int i = 0; i < orderedSources.size(); i++) {
+                String k = orderedSources.get(i);
+                sb.append(" | ").append(i).append(':')
+                        .append(detailFallbackDisplayName(k));
+                if (snap != null) {
+                    sb.append('=').append(
+                            String.format(java.util.Locale.US, "%.3f", snap.get(k)));
+                }
+                if (detailFallbackCycleKeys.contains(k)) {
+                    sb.append('*');
+                }
+            }
+            LOG.sw(sb.toString());
+        } catch (Throwable th) {
+            LOG.e("logCycleOrder fail: " + th);
         }
-        return fallback;
     }
 
     /**
@@ -2149,6 +2230,9 @@ public class DetailActivity extends BaseActivity {
      * </ol>
      */
     private List<String> buildFallbackCycleOrder(List<Movie.Video> cachedCandidates) {
+        // ★ v69：快照是「单次调用内有效」的日志副产品（见字段注释）。
+        //   每次进入本方法先作废，避免池子为空时残留上一份、把日志打到错误的分数上。
+        detailFallbackCycleOrderSnapshot = null;
         Map<String, Movie.Video> byKey = new LinkedHashMap<>();
         // 显示名去重只在本次构建内有效，必须放局部：
         // 早先用的是实例字段，一旦两条路径重入（探路回调与轮转并发）就会互相污染，
@@ -2183,6 +2267,8 @@ public class DetailActivity extends BaseActivity {
         // 质量分降序；同分按显示名升序，保证顺序稳定可复现
         try {
             final SourceQualityStore.Snapshot snapshot = SourceQualityStore.snapshot(keys);
+            // ★ v69：留给 logCycleOrder 复用，避免排序之外再读一遍 Hawk
+            detailFallbackCycleOrderSnapshot = snapshot;
             if (!snapshot.hasAnyHistory()) {
                 // 冷启动：所有源都是中性分，排序不会改变任何顺序，省下这轮 O(n log n)
                 return keys;
@@ -3397,6 +3483,33 @@ public class DetailActivity extends BaseActivity {
      * 于是 key 只增不减。看过的片子多了，Hawk 里会堆出成百上千条，读写都变慢。
      * 这里维护一张「写入顺序」索引，超出 {@link #FALLBACK_CACHE_MAX_ENTRIES} 就删最旧的。</p>
      */
+    /**
+     * ★ v69：清空持久化的切源候选池（设置页「清空缓存」调用）。
+     *
+     * <p>候选池按「片名」一条条存在 Hawk（{@link #HAWK_FALLBACK_CACHE_PREFIX} + 片名），
+     * 另有 {@link #HAWK_FALLBACK_CACHE_INDEX} 记写入顺序做 LRU 淘汰。
+     * 它是<b>纯缓存</b>：清掉后下次进详情页会重新搜一遍，不丢任何用户数据。</p>
+     *
+     * <p><b>必须连索引一起清</b>：只删数据键不删索引，{@link #trimFallbackCacheIndex}
+     * 下次写入时会拿着一份「记载着已删除片名」的索引做淘汰，淘汰到的片名对应的键
+     * 早就不存在了 —— 白删一次不说，索引还会长期停留在满容量。</p>
+     */
+    public static void clearPersistedFallbackCache() {
+        try {
+            List<String> raw = Hawk.get(HAWK_FALLBACK_CACHE_INDEX);
+            if (raw != null) {
+                for (String title : raw) {
+                    if (title != null && !title.isEmpty()) {
+                        Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + title);
+                    }
+                }
+            }
+            Hawk.delete(HAWK_FALLBACK_CACHE_INDEX);
+        } catch (Throwable th) {
+            LOG.e("clearPersistedFallbackCache fail: " + th);
+        }
+    }
+
     private void trimFallbackCacheIndex(String title) {
         try {
             List<String> raw = Hawk.get(HAWK_FALLBACK_CACHE_INDEX);
@@ -4145,18 +4258,28 @@ public class DetailActivity extends BaseActivity {
 
     /** 已开过的圈数，仅用于日志观察轮转是否正常推进。 */
     private int detailFallbackCycleCount;
-    /** 本圈轮转的起始下标；开新圈时接续上一圈末尾，避免跨圈撞回头（仅作 key 缺失时的兜底）。 */
-    private int detailFallbackCycleStart;
-    /** 本圈刚选中的下一个起点下标，开新圈时赋给 cycleStart。 */
-    private int detailFallbackCycleStartOfNext;
     /**
-     * 本圈轮转的起始「站点 key」。
+     * ★ v69：本圈实际使用的切源顺序（「圈内冻结」的载体）。
      *
-     * <p><b>为什么不用下标</b>：轮转顺序是按站点质量分排出来的，分数会随每次
-     * 搜索打点更新，池子一重排，同一个下标就指向了另一个站 —— 用它记录
-     * 「上一圈停在哪」会漂移。改为记 key，下标只在 key 已不在池子里时兜底。</p>
+     * <p><b>为什么需要它</b>：本圈的轮转顺序在<b>开圈那一刻</b>按站点质量分定下来，
+     * 之后本圈内「已经轮过的部分」不再变动 —— 否则每切一次源都整表重排，
+     * 用户看到的顺序会一路漂移，与「按得分从高到低切一遍」的预期对不上。</p>
+     *
+     * <p><b>冻结的粒度</b>：只冻「已经轮过的部分」的相对顺序；
+     * 还没轮到的部分仍按最新得分重排，池子里新回流的站点也会按得分插进
+     * 未轮过区间 —— 不会因为冻结而错过好站（详见 {@link #currentCycleOrder}）。</p>
+     *
+     * <p>开新圈 / 换片 / 首次进入时清空，由 {@link #currentCycleOrder} 重建。</p>
      */
-    private String detailFallbackCycleStartKey = "";
+    private final List<String> detailFallbackCycleFrozenOrder = new ArrayList<>();
+    /**
+     * ★ v69：{@link #buildFallbackCycleOrder} 本次建的质量分快照。
+     *
+     * <p><b>仅供日志</b>：{@link #logCycleOrder} 要用分数，而排序时快照已经建好了，
+     * 再建一次就是重复的 n 次 Hawk 读（v63 才优化掉的老毛病）。
+     * 单次调用内有效，<b>不参与任何决策</b>。</p>
+     */
+    private SourceQualityStore.Snapshot detailFallbackCycleOrderSnapshot = null;
     /**
      * 最近一次选源命中的<b>具体候选影片 id</b>。
      *
