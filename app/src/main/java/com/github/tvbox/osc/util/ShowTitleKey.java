@@ -395,6 +395,100 @@ public final class ShowTitleKey {
         return isPureModifier(longer.substring(shorter.length()));
     }
 
+    /**
+     * 换片判定的修饰词表：{@link #MODIFIER_WORDS} + {@link #FORM_CHANGE_WORDS}。
+     *
+     * <p><b>为什么换片判定要把形态词加回来</b>：{@link #sameFamily}（切源候选口径）
+     * 拒绝电影版/TV版，是防止「看动漫切进电影」；而换片判定要回答的是另一个问题
+     * ——「用户是不是换了部片」。切源中 {@code vod_name} 被替换成新站写法
+     * （{@code 人世间} → {@code 人世间TV版}）时用户并没换片，此时把 TV版算
+     * 同片修饰才能避免误清基准。注意 {@code tv} 不在 {@link #TAG_WORDS} 里
+     * （那是 v65 为候选红线刻意留的边界），所以这里必须显式合并两张表。</p>
+     *
+     * <p>声明位置在 {@link #FORM_CHANGE_WORDS} / {@link #MODIFIER_WORDS} 之后 ——
+     * 静态字段按声明顺序初始化，放前面会拿到 null。</p>
+     */
+
+    /**
+     * 「是否同一部片」的<b>换片判定</b>口径：比 {@link #sameFamily} 更宽 ——
+     * 形态词（电影版/TV版/剧场版…）与「序号有无不一」在这里都算<b>同片</b>。
+     *
+     * <p><b>★ v68：为「切源中片名漂移不误判换片」而加，与 {@link #sameFamily}
+     * 的场景区别：</b>sameFamily 管「切源候选收不收」（一人之下的动漫与电影
+     * 不是同一部，必须拒绝）；sameFilmTitle 管「切源状态机要不要重置」
+     * （用户在连续切源，vod_name 被替换成新站写法「人世间」→「人世间TV版」，
+     * 这不是用户换了片，不能把基准资源/死站/圈清掉 —— 红牛案例 ref=none
+     * 的第二个入口）。</p>
+     *
+     * <p><b>红线仍然生效</b>：两边<b>都有</b>序号且不同（第一季≠第二季）、
+     * 数字不同（1995≠2005、庆余年≠庆余年2）、主干不同，一律算不同片 ——
+     * 那确实是不同的片，该重置。只有「一边有序号一边无」（无季简称 vs 第1季）
+     * 按同片处理：剥掉序号后主干相同即是同一部。</p>
+     */
+    public static boolean sameFilmTitle(String a, String b) {
+        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
+            return false;
+        }
+        String ta = a.trim();
+        String tb = b.trim();
+        if (ta.equals(tb)) {
+            return true;
+        }
+        String na = normalize(ta);
+        String nb = normalize(tb);
+        if (TextUtils.isEmpty(na) || TextUtils.isEmpty(nb)) {
+            return false;
+        }
+        // 序号：两边都有且不同 ⇒ 不同片；否则剥掉序号再比（有无不按同片处理）。
+        // 在归一化串上定位（归一化不剥季/部/篇，序号段完整保留）。
+        Ordinal ordA = findOrdinalSegment(na);
+        Ordinal ordB = findOrdinalSegment(nb);
+        if (ordA != null && ordB != null && !ordinalEq(ordA, ordB)) {
+            return false;
+        }
+        String ca = ordA == null ? na : na.substring(0, ordA.start) + na.substring(ordA.end);
+        String cb = ordB == null ? nb : nb.substring(0, ordB.start) + nb.substring(ordB.end);
+        if (ca.equals(cb)) {
+            return true;
+        }
+        if (ca.length() == cb.length()) {
+            return false;
+        }
+        String longer = ca.length() > cb.length() ? ca : cb;
+        String shorter = ca.length() > cb.length() ? cb : ca;
+        if (!longer.startsWith(shorter)) {
+            return false;
+        }
+        return isPureModifierForSwitch(longer.substring(shorter.length()));
+    }
+
+    /**
+     * 换片判定的修饰扫描：与 {@link #isPureModifier} 同构，但查
+     * {@link #SWITCH_MODIFIER_WORDS}（含形态词）—— TV版/电影版在此算同片修饰。
+     */
+    private static boolean isPureModifierForSwitch(String tail) {
+        if (tail == null || tail.isEmpty()) {
+            return false;
+        }
+        int i = 0;
+        int n = tail.length();
+        while (i < n) {
+            boolean matched = false;
+            int maxLen = Math.min(MAX_MODIFIER_LEN, n - i);
+            for (int len = maxLen; len >= 1; len--) {
+                if (SWITCH_MODIFIER_WORDS.contains(tail.substring(i, i + len))) {
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** 语言词表：出现在片名中即视为「语言标注」，是红线字段而非可忽略修饰。 */
     private static final String[] LANGUAGE_WORDS = {
             "普通话版", "普通话", "国语版", "国语", "粤语版", "粤语",
@@ -428,6 +522,20 @@ public final class ShowTitleKey {
             }
         }
         MAX_MODIFIER_LEN = max;
+    }
+
+    /**
+     * 换片判定的修饰词表：{@link #MODIFIER_WORDS} + {@link #FORM_CHANGE_WORDS}
+     * （TV版/电影版/剧场版… 在换片判定里算同片修饰，见 {@link #sameFilmTitle}）。
+     *
+     * <p>必须声明在两个源表之后：静态字段按声明顺序初始化。</p>
+     */
+    private static final Set<String> SWITCH_MODIFIER_WORDS;
+
+    static {
+        Set<String> s2 = new HashSet<>(MODIFIER_WORDS);
+        s2.addAll(FORM_CHANGE_WORDS);
+        SWITCH_MODIFIER_WORDS = Collections.unmodifiableSet(s2);
     }
 
     /**

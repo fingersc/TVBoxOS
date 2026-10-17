@@ -1069,6 +1069,12 @@ public class DetailActivity extends BaseActivity {
                     //   同样只在首轮（非切源内的详情返回）记录一次。
                     if (!fallbackResult && detailFallbackRefVideo == null) {
                         detailFallbackRefVideo = snapshotReference(mVideo);
+                        // ★ v68：诊断日志 —— 基准是否记上是同站择优是否生效的总闸门，
+                        //   红牛案例的 ref=none 正是缺这条链路的证据。
+                        LOG.sw("[FB] refRecorded id=" + (mVideo.id == null ? "?" : mVideo.id)
+                                + " source=" + mVideo.sourceKey
+                                + " pic=" + (TextUtils.isEmpty(mVideo.pic) ? "-" : shortHash(mVideo.pic))
+                                + " year=" + mVideo.year);
                     }
                     // ★ v66：约一次静默预热（延迟错开起播高峰；切源内的详情返回不约）。
                     //   预热把候选池提前攒厚，用户点切源时就是厚池。
@@ -1584,8 +1590,23 @@ public class DetailActivity extends BaseActivity {
         // 切一次源就会被判定为"换片" → 清空 CycleKeys + DeadKeys + 重置为第一圈
         // → 表现为「再点切源又切回同一个站点」。
         String normalizedTitle = normalizeFallbackTitle(detailFallbackTitle);
+        // ★ v68：换片判定必须排除「首次切源」。
+        //
+        // detailFallbackCycleTitle 初值是空串，用户第一次点切源时它与任何片名都
+        // 「不相等」⇒ 旧逻辑无条件走进换片分支，把首轮详情刚记录的基准资源
+        // （refVideo/refEpisodes）、死站列表、圈记录全部清掉。后果正是虎牙/红牛
+        // 案例的日志三证：所有站的 sameStationPick 全是 ref=none、scores 全 0、
+        // episodeCheck 从不出现（refEpisodes=0）——同站多资源择优与集数校验
+        // 双重失效，只能取第一条（另一部同名剧）。
+        //
+        // 修：cycleTitle 为空 = 首次切源 ⇒ 只记录片名，不做任何清理；
+        // cycleTitle 非空且归一化片名变了 = 真换片 ⇒ 才走清理分支。
+        // ★ v68：判定必须在赋值前算（赋值后 cycleTitle 就「相等」了，恒 false）。
+        boolean reallySwitchFilm =
+                needResetForFilmSwitch(detailFallbackCycleTitle, normalizedTitle);
         if (!TextUtils.equals(detailFallbackCycleTitle, normalizedTitle)) {
             detailFallbackCycleTitle = normalizedTitle;
+            if (reallySwitchFilm) {
             detailFallbackCycleKeys.clear();
             detailFallbackNewCycle = true;
             // ★ 换片必须清 DeadKeys / SoftTriedKeys：
@@ -1610,6 +1631,7 @@ public class DetailActivity extends BaseActivity {
             detailFallbackCycleStartKey = "";
             detailFallbackTimedOutKey = null;
             detailFallbackTimedOutSource = null;
+            }
         }
 
         detailFallbackActive = true;
@@ -2193,6 +2215,26 @@ public class DetailActivity extends BaseActivity {
             LOG.e("buildFallbackCycleOrder sort fail: " + th);
         }
         return keys;
+    }
+
+    /**
+     * ★ v68：是否应当按「换片」重置切源状态（基准资源/死站/圈/锚全部清空）。
+     *
+     * <p><b>首次切源不算换片</b>：{@code cycleTitle} 初值为空串，与任何片名都
+     * 「不相等」。旧逻辑把这种「不相等」一律当换片处理，于是用户第一次点切源时
+     * 就把首轮详情刚记录的基准资源（{@link #detailFallbackRefVideo}）清掉了 ——
+     * 红牛/虎牙案例的同站择优失效（所有站 {@code ref=none}）正是由此而来。</p>
+     *
+     * <p><b>片名漂移也不算换片</b>：切源过程中 {@code vod_name} 会被替换成新站
+     * 写法（{@code 人世间} → {@code 人世间TV版}），normalize 剥不掉版号类修饰，
+     * 严格相等会误判换片、二次清掉基准。故用 {@link ShowTitleKey#sameFilmTitle}
+     * 做同片判定（形态词算同片修饰；序号/数字/季数不同仍算换片）。</p>
+     */
+    private static boolean needResetForFilmSwitch(String cycleTitle, String normalizedTitle) {
+        if (TextUtils.isEmpty(cycleTitle)) {
+            return false;   // 首次切源：只记录片名，不清理
+        }
+        return !ShowTitleKey.sameFilmTitle(cycleTitle, normalizedTitle);
     }
 
     /** 取站点显示名，取不到就退回 key，保证排序键永不为 null。 */
