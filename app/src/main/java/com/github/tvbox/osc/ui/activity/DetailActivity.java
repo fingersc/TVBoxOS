@@ -1523,6 +1523,8 @@ public class DetailActivity extends BaseActivity {
             // 可切站点凭空变少（表现为「这部片只有两三个源能切」）。
             detailFallbackDeadKeys.clear();
             detailFallbackSoftTriedKeys.clear();
+            // ★ v65：换片重新判据 —— 新片的池子厚薄与上一部片无关。
+            detailFallbackPoolRefreshed = false;
             detailFallbackCycleCount = 0;
             detailFallbackCycleStart = 0;
             detailFallbackCycleStartOfNext = 0;
@@ -1539,6 +1541,22 @@ public class DetailActivity extends BaseActivity {
         //   是进页面那一刻的副本；不重新拉取的话，切源能在几个站之间轮转，
         //   但「可切站点总数」永远停在进页面时的数量 —— 这正是要修的现象。
         refreshFallbackCandidatesFromSession();
+        // ★ v65：池子「明显不完整」时补一轮全网搜索。
+        //
+        // 背景：loadNextDetailFallbackFromCache 的判据是「缓存非空就只轮转、不联网」，
+        // 于是候选池会永远停在进页面时的数量 —— 用户从搜索页带了残缺池进来
+        // （聚合搜索边跑边补，点进详情时往往只回来几个源），或从播放历史直接进来
+        // （池子只剩 SearchSession 里该片的几个写法），表现就是「切源只有两三个站」。
+        // v65 的 sameFamily 放宽让候选更容易进池，但池子「源头」残缺时仍会卡住，
+        // 故在此补一道：可用候选不足可搜源一半时，派一轮全网搜索增量并入池。
+        //
+        // 时序：本轮仍立刻从现有池轮转（用户不等搜索），搜索结果边回流边合并，
+        // 后续再点切源时池子已变大；一次进页只补一轮（detailFallbackPoolRefreshed）。
+        if (!detailFallbackPoolRefreshed && detailFallbackPoolLooksThin()) {
+            detailFallbackPoolRefreshed = true;
+            LOG.i("[FB] pool thin, dispatch full-net search to enrich pool");
+            startDetailFallback();
+        }
         boolean accepted = loadNextDetailFallbackFromCache();
         // 只有「这一圈确实没得切、且也没转成全网搜索」时才复位状态；
         // 一旦进入全网搜索（detailFallbackSearching/Collecting 为真）或已发起 loadDetail
@@ -2623,19 +2641,22 @@ public class DetailActivity extends BaseActivity {
     }
 
     /**
-     * 判断某个搜索结果是不是「同一部片」。
+     * 判断某个搜索结果是不是「同一部片」（切源候选口径）。
      *
      * <p>先做严格相等，再退回归一化相等 —— 各资源站对同一部片的写法常有差异
      * （多余空格、全角/半角、{@code ·}/ {@code /} / {@code -} 等分隔符、
      * 以及 {@code 【} {@code 全集} 之类不影响判定的符号）。只认严格相等时，
      * 这些站明明搜到了也进不了候选池，结果就是「能切的站只剩两三个」。</p>
      *
-     * <p>归一化只抹掉符号与大小写，汉字/字母/数字序列必须完全一致才算同一部片，
-     * 所以 {@code 花开锦绣} 与 {@code 花开锦绣2}、{@code 花开锦绣 第二季}
-     * 依然会被区分开，不会误把别的片切进来。</p>
+     * <p><b>★ v65：口径从 {@code same} 升级为 {@code sameFamily}</b> ——
+     * 在归一化相等之上，额外容忍「画质/状态/再制作版本」类命名变体
+     * （HD/4K/完结/全集/重制版/修复版…），因此同一部片能切到更多站。
+     * 但三条硬红线一个没放：<b>序号</b>（第一季≠第二季）、<b>语言</b>（国语版
+     * 候选里不出现粤语版）、<b>数字</b>（神雕侠侣1995≠2005、庆余年≠庆余年2），
+     * 详见 {@link ShowTitleKey#sameFamily} 的注释。</p>
      */
     private boolean isSameFallbackTitle(String title, String name) {
-        return ShowTitleKey.same(title, name);
+        return ShowTitleKey.sameFamily(title, name);
     }
 
 
@@ -2694,6 +2715,43 @@ public class DetailActivity extends BaseActivity {
             loadNextDetailFallbackSource();
         }
         // 池子还不够厚 → 不抢跳，安静地等批处理把候选补齐，由收集结束统一决定跳转。
+    }
+
+    /**
+     * ★ v65：当前候选池是否「明显不完整」。
+     *
+     * <p>判据 = 可用候选站点数 &lt; 可搜源站点数的一半。可用数用
+     * {@link #detailFallbackUsableCandidateCount()}（与轮转同一口径），
+     * 可搜源数按 {@code isSearchable()} 统计（与切源全网搜索的派发范围一致）。</p>
+     *
+     * <p>两个保护：</p>
+     * <ul>
+     *   <li>可搜源 &lt; 4 时不触发 —— 单源/极小配置下「一半」没有意义，
+     *       且这种配置下全网搜索也捞不到更多站；</li>
+     *   <li>ApiConfig 异常时保守返回 false —— 补搜是优化，不能拖垮主流程。</li>
+     * </ul>
+     */
+    private boolean detailFallbackPoolLooksThin() {
+        if (TextUtils.isEmpty(detailFallbackTitle)) {
+            return false;
+        }
+        int searchable = 0;
+        try {
+            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
+            if (sourceBeanList != null) {
+                for (SourceBean bean : sourceBeanList) {
+                    if (bean != null && bean.isSearchable()) {
+                        searchable++;
+                    }
+                }
+            }
+        } catch (Throwable th) {
+            return false;
+        }
+        if (searchable < 4) {
+            return false;
+        }
+        return detailFallbackUsableCandidateCount() < searchable / 2;
     }
 
     /**
@@ -3488,6 +3546,13 @@ public class DetailActivity extends BaseActivity {
     private final Set<String> detailFallbackDeadKeys = new HashSet<>();
     /** 软失败（超时 / 网络错误）：只本圈跳过，下圈可重试。 */
     private final Set<String> detailFallbackSoftTriedKeys = new HashSet<>();
+    /**
+     * ★ v65：本轮进页会话是否已为「池子太薄」补过一轮全网搜索。
+     *
+     * <p>节流字段：一次进页只补一轮，避免用户连点切源反复触发全网搜索；
+     * 换片名时重置（新片重新判据）。</p>
+     */
+    private boolean detailFallbackPoolRefreshed = false;
     /** 当前在途详情请求的「源|影片id」键；超时回调据此精确记软失败，避免整站连坐。 */
     private String detailFallbackTimedOutKey;
     /** 当前在途详情请求的站点 key（与 {@link #detailFallbackTimedOutKey} 配套，供软失败按站粒度记录）。 */

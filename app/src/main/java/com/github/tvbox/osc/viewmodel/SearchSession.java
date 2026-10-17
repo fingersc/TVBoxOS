@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -651,6 +652,13 @@ public class SearchSession {
      *
      * <p>传入的 {@code title} 可以是任意写法（原始 {@code vod_name} 即可），
      * 内部统一归一化后再查 —— 调用方<b>不需要</b>自己先归一化。</p>
+     *
+     * <p><b>★ v65：同族合并。</b>候选池的 key 是各站自己写法的归一化
+     * （{@code 庆余年} / {@code 庆余年hd} / {@code 庆余年重制版} 会是不同的 key），
+     * 而调用方（详情页切源）的 title 只是其中某一种写法 —— 精确查 key 只能拿到
+     * 同写法的那几个，于是「切源只有两三个站」。现在除精确 key 外，还把池内
+     * <b>同族</b>（{@link ShowTitleKey#sameFamily}，序号/语言/数字红线见其注释）
+     * 的 key 的候选一并合并返回，按 sourceKey+id 去重。</p>
      */
     public List<Movie.Video> getCandidates(String title) {
         if (title == null) {
@@ -661,8 +669,7 @@ public class SearchSession {
             return new ArrayList<>();
         }
         synchronized (lock) {
-            List<Movie.Video> list = candidatePool.get(key);
-            return list == null ? new ArrayList<Movie.Video>() : new ArrayList<>(list);
+            return collectFamilyCandidates(title, key);
         }
     }
 
@@ -675,9 +682,50 @@ public class SearchSession {
             return 0;
         }
         synchronized (lock) {
-            List<Movie.Video> list = candidatePool.get(key);
-            return list == null ? 0 : list.size();
+            return collectFamilyCandidates(title, key).size();
         }
+    }
+
+    /**
+     * 精确 key + 同族 key 的候选合并（调用方须持有 {@link #lock}）。
+     *
+     * <p>同族判定用池内代表 video 的<b>原始 name</b> 与 title 比
+     * （{@link ShowTitleKey#sameFamily} 需要原始串上的语言/序号信息，
+     * 而 key 已被 normalize 抹掉）；池子通常只有几十部片，遍历开销可忽略。</p>
+     */
+    private List<Movie.Video> collectFamilyCandidates(String title, String key) {
+        List<Movie.Video> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Map.Entry<String, List<Movie.Video>> entry : candidatePool.entrySet()) {
+            List<Movie.Video> list = entry.getValue();
+            if (list == null || list.isEmpty()) {
+                continue;
+            }
+            if (!entry.getKey().equals(key)) {
+                // 用池内代表条目的原始片名与 title 做同族判定
+                boolean family = false;
+                for (Movie.Video v : list) {
+                    if (v != null && !TextUtils.isEmpty(v.name)
+                            && ShowTitleKey.sameFamily(title, v.name)) {
+                        family = true;
+                        break;
+                    }
+                }
+                if (!family) {
+                    continue;
+                }
+            }
+            for (Movie.Video v : list) {
+                if (v == null) {
+                    continue;
+                }
+                String vk = (v.sourceKey == null ? "" : v.sourceKey) + "|" + v.id;
+                if (seen.add(vk)) {
+                    out.add(v);
+                }
+            }
+        }
+        return out;
     }
 
     public void clearCandidates() {
