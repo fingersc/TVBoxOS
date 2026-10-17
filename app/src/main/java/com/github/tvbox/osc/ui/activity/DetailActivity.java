@@ -1108,6 +1108,32 @@ public class DetailActivity extends BaseActivity {
                     }
 
                     if (vodInfo.seriesMap != null && vodInfo.seriesMap.size() > 0) {
+                        // ★ v67：首轮记录基准集数（同站多资源择优的兜底信号，见字段注释）
+                        if (!fallbackResult && detailFallbackRefEpisodes <= 0) {
+                            detailFallbackRefEpisodes = countSeriesEpisodes(vodInfo);
+                        }
+                        // ★ v67：切源集数一致性校验 —— 元数据贫瘠的同站多条选错兜底。
+                        //   两条同名剧封面/演员/年份/类型全同或全空时择优全 0 只能取第一条，
+                        //   而第一条可能正是另一部（虎牙《人世间》153010 实测：20 集 vs 58 集）。
+                        //   详情已回来、集数悬殊 ⇒ 把该候选记死并自动续切下一站，不渲染错剧集。
+                        //   保守三重门：切源会话内 + 该站有多个候选（有得选）+ 新源集数不足基准一半。
+                        if (fallbackResult && detailFallbackRefEpisodes > 0) {
+                            int nowEpisodes = countSeriesEpisodes(vodInfo);
+                            int sameStation = countSameStationCandidates(sourceKey);
+                            if (shouldRejectByEpisodes(nowEpisodes, sameStation)) {
+                                LOG.sw("[FB] episodeMismatch source=" + sourceKey + " id=" + vodId
+                                        + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
+                                        + " candidates=" + sameStation + " => dead + next");
+                                detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
+                                detailFallbackLoadingCandidate = false;
+                                llLayout.removeCallbacks(detailFallbackDetailTimeout);
+                                loadNextDetailFallbackSource();
+                                return;
+                            }
+                            LOG.sw("[FB] episodeCheck source=" + sourceKey + " id=" + vodId
+                                    + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
+                                    + " candidates=" + sameStation + " => pass");
+                        }
                         mGridViewFlag.setVisibility(View.VISIBLE);
                         mGridView.setVisibility(View.VISIBLE);
                         tvPlay.setVisibility(View.VISIBLE);
@@ -1576,6 +1602,8 @@ public class DetailActivity extends BaseActivity {
             detailFallbackPreheatTried = false;
             // ★ v66：换片 ⇒ 基准资源置空，等新片首轮详情返回后重新记录。
             detailFallbackRefVideo = null;
+            // ★ v67：换片 ⇒ 基准集数置零（新片的集数与上一部片无关）。
+            detailFallbackRefEpisodes = 0;
             detailFallbackCycleCount = 0;
             detailFallbackCycleStart = 0;
             detailFallbackCycleStartOfNext = 0;
@@ -1867,6 +1895,7 @@ public class DetailActivity extends BaseActivity {
         //   全部零分（基准为空或字段都缺）时退回第一条，不会比旧行为差。
         String firstAlive = "";
         int bestScore = 0;
+        StringBuilder pickLog = new StringBuilder();
         for (Movie.Video video : cachedCandidates) {
             if (video == null || !TextUtils.equals(video.sourceKey, sourceKey)
                     || TextUtils.isEmpty(video.id)) {
@@ -1879,6 +1908,10 @@ public class DetailActivity extends BaseActivity {
                 firstAlive = video.id;   // 第一条未拉黑的候选 = 兜底
             }
             int score = referenceMatchScore(detailFallbackRefVideo, video);
+            if (pickLog.length() > 0) {
+                pickLog.append(' ');
+            }
+            pickLog.append(video.id).append(':').append(score);
             if (score < 0) {
                 continue;   // 硬矛盾（年份冲突）：排除
             }
@@ -1890,7 +1923,87 @@ public class DetailActivity extends BaseActivity {
                 }
             }
         }
+        // ★ v67：同站多资源择优的诊断日志（sw 通道，release 也输出）。
+        //   「切到同站另一部同名剧」排障必备：该站有几条同名候选、每条与基准的
+        //   得分、最终选了谁、基准是什么。日志里一眼看出是「择优没生效」
+        //   （scores 全 0 或 ref=none）还是「元数据贫瘠无从区分」。
+        if (!TextUtils.isEmpty(firstAlive)) {
+            LOG.sw("[FB] sameStationPick source=" + sourceKey
+                    + " ref=" + describeReference(detailFallbackRefVideo)
+                    + " scores=[" + pickLog + "]"
+                    + " picked=" + firstAlive + " best=" + bestScore);
+        }
         return firstAlive;
+    }
+
+    /** 基准资源的日志摘要（不打全串，避免日志爆炸）。 */
+    private static String describeReference(Movie.Video ref) {
+        if (ref == null) {
+            return "none";
+        }
+        return "id=" + ref.id + " year=" + ref.year
+                + " pic=" + (TextUtils.isEmpty(ref.pic) ? "-" : shortHash(ref.pic))
+                + " actor=" + (TextUtils.isEmpty(ref.actor) ? "-" : ref.actor.length() + "字")
+                + " type=" + (ref.type == null ? "-" : ref.type);
+    }
+
+    private static String shortHash(String s) {
+        return Integer.toHexString(s.hashCode() & 0xffff);
+    }
+
+    /**
+     * ★ v67：集数校验判据（抽成方法以便端到端验证）。
+     *
+     * <p>三重门全部满足才判「悬殊」：该站有多个候选（有得选，单候选的站没得换）、
+     * 新源集数已知、新源集数不足基准的一半。阈值取「一半」是保守值 ——
+     * 删减版通常只少几集（58→50 不会触发），而另一部同名剧往往量级不同
+     * （58→20 必触发）。</p>
+     */
+    private boolean shouldRejectByEpisodes(int nowEpisodes, int sameStation) {
+        return sameStation > 1 && nowEpisodes > 0
+                && detailFallbackRefEpisodes > 0 && nowEpisodes * 2 < detailFallbackRefEpisodes;
+    }
+
+    /** ★ v67：统计一部片的总集数（seriesMap 各线路的剧集数之和）。 */
+    private static int countSeriesEpisodes(VodInfo vodInfo) {
+        if (vodInfo == null || vodInfo.seriesMap == null) {
+            return 0;
+        }
+        int total = 0;
+        for (List<VodInfo.VodSeries> list : vodInfo.seriesMap.values()) {
+            if (list != null) {
+                total += list.size();
+            }
+        }
+        return total;
+    }
+
+    /**
+     * ★ v67：候选池里某站「未被拉黑」的候选条数（同站多资源判定的依据）。
+     *
+     * <p>用锚 key 读池（与轮转/择优同一口径）。只有 1 条时说明没得选，
+     * 集数校验不启动（避免把唯一候选记死后无源可切）。</p>
+     */
+    private int countSameStationCandidates(String sourceKey) {
+        if (TextUtils.isEmpty(sourceKey)) {
+            return 0;
+        }
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        if (cachedCandidates == null) {
+            return 0;
+        }
+        int n = 0;
+        for (Movie.Video video : cachedCandidates) {
+            if (video == null || !TextUtils.equals(video.sourceKey, sourceKey)
+                    || TextUtils.isEmpty(video.id)) {
+                continue;
+            }
+            if (detailFallbackDeadKeys.contains(getDetailFallbackKey(sourceKey, video.id))) {
+                continue;
+            }
+            n++;
+        }
+        return n;
     }
 
     /**
@@ -2638,12 +2751,17 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            // ★ v67：诊断日志 —— 锚为空（入口没传片名且详情未回）时预热不启动，
+            //   这是「进了详情却没有 preheatStart 日志」的可疑原因之一。
+            LOG.sw("[FB] preheatSkip reason=emptyAnchor");
             return;
         }
         detailFallbackPreheatTried = true;
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackPreheatStart);
             llLayout.postDelayed(detailFallbackPreheatStart, DETAIL_FALLBACK_PREHEAT_DELAY_MS);
+            LOG.sw("[FB] preheatScheduled delay=" + DETAIL_FALLBACK_PREHEAT_DELAY_MS
+                    + " title=" + detailFallbackAnchorTitle);
         }
     }
 
@@ -3973,6 +4091,15 @@ public class DetailActivity extends BaseActivity {
      * 换片时置空重新记录。</p>
      */
     private Movie.Video detailFallbackRefVideo = null;
+    /**
+     * ★ v67：基准资源的总集数（首轮详情 seriesMap 就绪时记录，换片重置）。
+     *
+     * <p>「同站多资源择优」的兜底信号：当两条同名剧的元数据贫瘠到无从区分
+     * （封面/演员/年份/类型全同或全空，打分全是 0）时，<b>集数是详情级最强信号</b> ——
+     * 另一部同名剧的集数通常与正片悬殊（如《人世间》58 集 vs 某条目 20 集）。
+     * 详情返回时校验：悬殊 ⇒ 把该候选记死 + 自动续切下一站。</p>
+     */
+    private int detailFallbackRefEpisodes = 0;
 
     /** 已开过的圈数，仅用于日志观察轮转是否正常推进。 */
     private int detailFallbackCycleCount;
