@@ -142,6 +142,29 @@ public class DetailActivity extends BaseActivity {
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
     private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000L;
     /**
+     * ★ v66：静默预热的并发上限。
+     *
+     * <p>远小于切源的 {@link #DETAIL_FALLBACK_MAX_SEARCH}(20)：预热与前台播放
+     * <b>并行</b>，必须让视频流占据绝对多数的带宽。预热请求是一次性小报文
+     * （站点搜索接口），3 并发的实测占用可以忽略；20 并发则可能与起播抢带宽。</p>
+     */
+    private static final int DETAIL_FALLBACK_PREHEAT_MAX_SEARCH = 3;
+    /**
+     * ★ v66：预热启动延迟（详情加载成功后）。
+     *
+     * <p>错开「起播高峰」：详情返回 → 解析 → 拉流起播的前 1.5 秒是带宽最紧的
+     * 窗口，预热若此刻扎进去会拖慢首帧。等首帧出来、播放进入稳态再慢慢补，
+     * 用户点切源时池子通常已经预热了一部分。</p>
+     */
+    private static final long DETAIL_FALLBACK_PREHEAT_DELAY_MS = 1500L;
+    /**
+     * ★ v66：预热的整体超时（从派发起）。
+     *
+     * <p>预热是尽力而为的后台优化，不能无限期挂着：到点还没发完就停止派发，
+     * 已收回来的候选照常入池。取 8s 与切源搜索超时同档。</p>
+     */
+    private static final long DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS = 8000L;
+    /**
      * 「提前消费」等待窗口：第一个候选进缓存后等这么久就立刻放起来。
      *
      * <p><b>这是空白期的真正主因</b>。原流程规定：搜索阶段（collecting）只负责把候选池灌满，
@@ -1036,6 +1059,22 @@ public class DetailActivity extends BaseActivity {
                     mVideo.id = vodId;
                     if (TextUtils.isEmpty(mVideo.name))mVideo.name = vod_name;
                     if (TextUtils.isEmpty(mVideo.name))mVideo.name = "TVBox";
+                    // ★ v66：锚的兜底设定 —— 有些入口（如收藏）进详情时 vod_name 为空，
+                    //   首次详情返回后用真实片名补设锚（只设一次，切源后不再改）。
+                    //   注意用 fallbackResult 区分：切源内的详情返回不重设锚。
+                    if (!fallbackResult && TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+                        detailFallbackAnchorTitle = mVideo.name == null ? "" : mVideo.name.trim();
+                    }
+                    // ★ v66：记录「基准资源」快照（同站多资源择优用，见 detailFallbackRefVideo）。
+                    //   同样只在首轮（非切源内的详情返回）记录一次。
+                    if (!fallbackResult && detailFallbackRefVideo == null) {
+                        detailFallbackRefVideo = snapshotReference(mVideo);
+                    }
+                    // ★ v66：约一次静默预热（延迟错开起播高峰；切源内的详情返回不约）。
+                    //   预热把候选池提前攒厚，用户点切源时就是厚池。
+                    if (!fallbackResult) {
+                        scheduleDetailFallbackPreheat();
+                    }
                     vodInfo = new VodInfo();
                     routeSwitchSeries = null;
                     if((mVideo.pic==null || mVideo.pic.isEmpty()) && !vod_picture.isEmpty()){
@@ -1258,7 +1297,7 @@ public class DetailActivity extends BaseActivity {
                         // 所以只改「来源」不会造成"来源与剧集不一致"的误导。
                         if (detailFallbackActive || detailFallbackLoadingCandidate) {
                             showDetailFallbackIndicators(sourceKey,
-                                    detailFallbackCacheVideo(detailFallbackTitle, sourceKey));
+                                    detailFallbackCacheVideo(detailFallbackAnchorTitle, sourceKey));
                             // 详情**已成功返回**、但该源没有可播剧集 → 这是「确认不可用」，
                             // 不是网络抖动。记入 DeadKeys，本圈与后续各圈都跳过它，
                             // 免得一圈又一圈地反复试同一个空站（这正是轮转"停不下来"的原因之一）。
@@ -1280,7 +1319,7 @@ public class DetailActivity extends BaseActivity {
                         // detailFallbackLoadingCandidate 是「本次响应属于切源请求」的唯一凭据，
                         // 必须先据它把页面画出来，复位后再判断就晚了。
                         showDetailFallbackIndicators(sourceKey,
-                                detailFallbackCacheVideo(detailFallbackTitle, sourceKey));
+                                detailFallbackCacheVideo(detailFallbackAnchorTitle, sourceKey));
                         detailFallbackLoadingCandidate = false;
                         detailFallbackDetailTimedOut = true;
                         llLayout.removeCallbacks(detailFallbackDetailTimeout);
@@ -1334,6 +1373,11 @@ public class DetailActivity extends BaseActivity {
                     // 与 onDetailFallbackSearchResult（后台回流）置脏。
                     cacheDetailFallbackCandidates(vod_name, poolCandidates, false);
                 }
+            }
+            // ★ v66：设定候选池的「片名锚」——进详情这一刻的片名原文，之后不随切源
+            //   漂移（详见 detailFallbackAnchorTitle 注释）。空片名兜底为空串。
+            if (!TextUtils.isEmpty(vod_name)) {
+                detailFallbackAnchorTitle = vod_name.trim();
             }
             loadDetail(bundle.getString("id", null), bundle.getString("sourceKey", ""));
         }
@@ -1525,6 +1569,13 @@ public class DetailActivity extends BaseActivity {
             detailFallbackSoftTriedKeys.clear();
             // ★ v65：换片重新判据 —— 新片的池子厚薄与上一部片无关。
             detailFallbackPoolRefreshed = false;
+            // ★ v66：换片 ⇒ 锚跟着换成新片的当前写法（此后该片的池/搜索/持久化
+            //   全部以新锚为准，直到下一次换片）。
+            detailFallbackAnchorTitle = TextUtils.isEmpty(vod_name) ? "" : vod_name.trim();
+            // ★ v66：换片 ⇒ 预热重新判据（新片值得再预热一轮）。
+            detailFallbackPreheatTried = false;
+            // ★ v66：换片 ⇒ 基准资源置空，等新片首轮详情返回后重新记录。
+            detailFallbackRefVideo = null;
             detailFallbackCycleCount = 0;
             detailFallbackCycleStart = 0;
             detailFallbackCycleStartOfNext = 0;
@@ -1611,7 +1662,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackDetailTimedOut = false;
         // ★ 沿用选源时挑中的具体候选 id（同一站可能有多条，第一条未必是正片）
         String nextId = detailFallbackPickedVideoId;
-        Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource, nextId);
+        Movie.Video video = detailFallbackCacheVideo(detailFallbackAnchorTitle, nextSource, nextId);
         if (video != null) {
             vod_name = video.name == null ? "" : video.name;
             vod_picture = video.pic == null ? "" : video.pic;
@@ -1667,7 +1718,7 @@ public class DetailActivity extends BaseActivity {
 
     /** 缓存里是否还有该片名的可用候选（不含是否已轮转的判断）。 */
     private boolean detailFallbackCacheEntryUsable() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
         return cachedCandidates != null && !cachedCandidates.isEmpty();
     }
 
@@ -1676,7 +1727,7 @@ public class DetailActivity extends BaseActivity {
      * 取不到时先尝试开新圈（清空 CycleKeys），仍然取不到才返回 ""。
      */
     private String pollNextCycledSource() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return "";
         }
@@ -1757,8 +1808,10 @@ public class DetailActivity extends BaseActivity {
             if (detailFallbackDeadKeys.contains(cycleKey)) {
                 continue;
             }
-            // ★ 取该站第一条「未被拉黑」的候选：某站第 1 条是 MV/预告、后面才是正片时，
+            // ★ 取该站「最优」的未拉黑候选：某站第 1 条是 MV/预告、后面才是正片时，
             //   只认第一条会让该站的正片永远轮不到（表现为「明明有片却切不过去」）。
+            //   ★ v66：同站多资源时按与「基准资源」的相似度择优（含年份硬矛盾排除），
+            //   全部无信号时退回第一条 —— 详见 detailFallbackFirstAliveId 内注释。
             String videoId = detailFallbackFirstAliveId(cycleKey);
             if (TextUtils.isEmpty(videoId)) {
                 continue;
@@ -1803,10 +1856,17 @@ public class DetailActivity extends BaseActivity {
      * 那么第一条被拉黑后，同站的其它正片候选就再也轮不到。故按 id 粒度在站内跳过。</p>
      */
     private String detailFallbackFirstAliveId(String sourceKey) {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
         if (cachedCandidates == null || TextUtils.isEmpty(sourceKey)) {
             return "";
         }
+        // ★ v66：同站多资源择优。同一片名在同一站可能有多个资源（如《人世间》
+        //   两部剧，详情/封面都不同），「取第一条」会切到另一部去。改为按与
+        //   「基准资源」（detailFallbackRefVideo，进详情时看的那条）的相似度
+        //   选最优：封面相同是最强信号，演员/年份/类型/导演/备注一致加分；
+        //   全部零分（基准为空或字段都缺）时退回第一条，不会比旧行为差。
+        String firstAlive = "";
+        int bestScore = 0;
         for (Movie.Video video : cachedCandidates) {
             if (video == null || !TextUtils.equals(video.sourceKey, sourceKey)
                     || TextUtils.isEmpty(video.id)) {
@@ -1815,9 +1875,128 @@ public class DetailActivity extends BaseActivity {
             if (detailFallbackDeadKeys.contains(getDetailFallbackKey(sourceKey, video.id))) {
                 continue;
             }
-            return video.id;
+            if (TextUtils.isEmpty(firstAlive)) {
+                firstAlive = video.id;   // 第一条未拉黑的候选 = 兜底
+            }
+            int score = referenceMatchScore(detailFallbackRefVideo, video);
+            if (score < 0) {
+                continue;   // 硬矛盾（年份冲突）：排除
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                firstAlive = video.id;
+                if (bestScore >= 100) {
+                    break;   // 封面命中，不必再扫
+                }
+            }
         }
-        return "";
+        return firstAlive;
+    }
+
+    /**
+     * ★ v66：候选与「基准资源」的相似度打分（用于同站多资源择优）。
+     *
+     * <p><b>返回 -1 = 硬矛盾</b>（两边都有年份且不同）——同一部片跨站的年份一致是
+     * 常态，年份冲突几乎必然是另一部（如两部《人世间》一新一旧），调用方应排除。</p>
+     *
+     * <p><b>为什么不能要求字段全等</b>：同一部剧在不同站的元数据完整度与叫法
+     * 都不同 —— A 站演员列全（雷佳音,辛柏青,宋佳…）、B 站只列前两个；
+     * 类型叫 {@code 剧情/家庭} 与 {@code 剧情,家庭} 甚至 {@code 国产剧}。
+     * 全等判定会让「更全的站」与「不全的站」互相丢分，同一部被误判。
+     * 故演员/类型/导演一律走 {@link #metaRelated} 的<b>相容匹配</b>
+     * （按分隔符拆集合，一方是另一方的子集即算匹配），「不全」不再丢分。</p>
+     *
+     * <p>权重设计：封面（{@code pic} URL 完全相同）是<b>最强</b>信号 —— 同站两部
+     * 不同剧海报必然不同，而同一部片跨站常用同一张海报；片名/演员次之；
+     * 年份/类型/导演辅助。</p>
+     */
+    private static int referenceMatchScore(Movie.Video ref, Movie.Video v) {
+        if (ref == null || v == null) {
+            return 0;
+        }
+        // 硬矛盾：两边都有年份且不同 ⇒ 排除（见方法注释）
+        if (ref.year > 0 && v.year > 0 && ref.year != v.year) {
+            return -1;
+        }
+        int score = 0;
+        if (!TextUtils.isEmpty(ref.pic) && ref.pic.equals(v.pic)) {
+            score += 100;
+        }
+        if (!TextUtils.isEmpty(ref.name)
+                && ref.name.trim().equals(v.name == null ? "" : v.name.trim())) {
+            score += 20;
+        }
+        if (metaRelated(ref.actor, v.actor)) {
+            score += 20;
+        }
+        if (ref.year > 0 && ref.year == v.year) {
+            score += 15;
+        }
+        if (metaRelated(ref.type, v.type)) {
+            score += 10;
+        }
+        if (metaRelated(ref.director, v.director)) {
+            score += 10;
+        }
+        return score;
+    }
+
+    /**
+     * 两个元数据字段是否「相容」：按常见分隔符拆成标签集合后，
+     * 一方是另一方的<b>子集</b>（含相等）即算匹配。
+     *
+     * <p>容忍三种现实差异：①完整度（演员列全 vs 列不全）；②分隔符与顺序
+     * （{@code 雷佳音,辛柏青} vs {@code 辛柏青/雷佳音}）；③叫法一致但组合不同
+     * （{@code 剧情} vs {@code 剧情/家庭}）。任一侧为空返回 false（不猜）。</p>
+     */
+    private static boolean metaRelated(String a, String b) {
+        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
+            return false;
+        }
+        Set<String> sa = splitMetaTags(a);
+        Set<String> sb = splitMetaTags(b);
+        if (sa.isEmpty() || sb.isEmpty()) {
+            return false;
+        }
+        return sa.containsAll(sb) || sb.containsAll(sa);
+    }
+
+    /** 按常见分隔符拆元数据字段为标签集合（统一 trim，滤空）。 */
+    private static Set<String> splitMetaTags(String s) {
+        Set<String> out = new HashSet<>();
+        for (String p : s.split("[/,，、|;；\\s]+")) {
+            String t = p.trim();
+            if (!t.isEmpty()) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * ★ v66：把一条视频浅拷贝成「基准资源」快照。
+     *
+     * <p>只带择优用得上的字段。必须拷贝而不是持有引用：{@code mVideo} 会在切源后
+     * 被整体替换，基准要始终指向「进详情时看的那条」。</p>
+     */
+    private static Movie.Video snapshotReference(Movie.Video v) {
+        if (v == null) {
+            return null;
+        }
+        Movie.Video r = new Movie.Video();
+        r.id = v.id;
+        r.sourceKey = v.sourceKey;
+        r.name = v.name;
+        r.pic = v.pic;
+        r.type = v.type;
+        r.lang = v.lang;
+        r.area = v.area;
+        r.year = v.year;
+        r.state = v.state;
+        r.note = v.note;
+        r.actor = v.actor;
+        r.director = v.director;
+        return r;
     }
 
     /**
@@ -1963,7 +2142,7 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
-        restoreDetailFallbackCache(detailFallbackTitle);
+        restoreDetailFallbackCache();
 
         detailFallbackSourceOrder.clear();
         for (SourceBean bean : ApiConfig.get().getSourceBeanList()) {
@@ -2341,6 +2520,13 @@ public class DetailActivity extends BaseActivity {
             handleDetailFallbackProbeResult(data);
             return;
         }
+        // ===== ★ v66：预热结果单独处理（只入池，不切源）=====
+        // 放在切源守卫之前：预热与切源并行，结果必须都能进来
+        if (detailFallbackPreheating && !TextUtils.isEmpty(detailFallbackPreheatToken)
+                && detailFallbackPreheatToken.equals(data.searchToken)) {
+            handleDetailFallbackPreheatResult(data);
+            return;
+        }
         if (!detailFallbackActive || !detailFallbackSearchCollecting || !detailFallbackBatchToken.equals(data.searchToken)) {
             return;
         }
@@ -2358,7 +2544,7 @@ public class DetailActivity extends BaseActivity {
         if (data.movie != null && data.movie.videoList != null) {
             for (Movie.Video video : data.movie.videoList) {
                 if (video == null || TextUtils.isEmpty(video.id)
-                        || !isSameFallbackTitle(detailFallbackTitle, video.name)) {
+                        || !isSameFallbackTitle(detailFallbackAnchorTitle, video.name)) {
                     continue;
                 }
                 // 全网搜索的职责是「建立这一圈完整的缓存」，所以这里不再按「已用源」过滤，
@@ -2416,7 +2602,7 @@ public class DetailActivity extends BaseActivity {
         while (detailFallbackPendingSources.size() < DETAIL_FALLBACK_MAX_SEARCH
                 && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
             final String searchKey = detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++);
-            final String searchTitle = detailFallbackTitle;
+            final String searchTitle = detailFallbackAnchorTitle;
             final String searchToken = detailFallbackBatchToken;
             detailFallbackPendingSources.add(searchKey);
             // 逐源记录发出时刻，统计耗时不再用"批次开始时刻"（滑动窗口下批次无意义）
@@ -2439,6 +2625,162 @@ public class DetailActivity extends BaseActivity {
             detailFallbackSearchTimeoutScheduled = true;
             llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
         }
+    }
+
+    // ==================== ★ v66：静默预热（只攒池，不切源） ====================
+
+    /**
+     * 安排一次预热（详情加载成功后调用，延迟 {@link #DETAIL_FALLBACK_PREHEAT_DELAY_MS}
+     * 错开起播高峰）。一次进页只约一次，由 {@link #detailFallbackPreheatTried} 节流。
+     */
+    private void scheduleDetailFallbackPreheat() {
+        if (detailFallbackPreheatTried || detailFallbackPreheating) {
+            return;
+        }
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            return;
+        }
+        detailFallbackPreheatTried = true;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackPreheatStart);
+            llLayout.postDelayed(detailFallbackPreheatStart, DETAIL_FALLBACK_PREHEAT_DELAY_MS);
+        }
+    }
+
+    /**
+     * 启动静默预热：对全部可搜源派发一轮搜索，结果只入候选池。
+     *
+     * <p><b>与切源主状态机完全并行</b>：独立 token（{@link #detailFallbackPreheatToken}）、
+     * 独立在途集合（{@link #detailFallbackPreheatPending}）、独立源队列下标。
+     * 不设 {@link #detailFallbackActive}、不弹「正在切换片源」提示、不触发
+     * early consume —— 用户无感知，只是池子提前变厚。</p>
+     *
+     * <p><b>播放保护</b>：并发上限 {@link #DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}(3)
+     * 远小于切源的 20，且由 {@link #scheduleDetailFallbackPreheat()} 延迟启动
+     * 错开起播带宽高峰；请求本身是一次性小报文，不与视频流抢通道。</p>
+     */
+    private void startDetailFallbackPreheat() {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            return;
+        }
+        detailFallbackPreheatOrder = new ArrayList<>();
+        try {
+            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
+            if (sourceBeanList != null) {
+                for (SourceBean bean : sourceBeanList) {
+                    // 与切源全网搜索同一范围：只要 isSearchable（可搜但不可换的源
+                    // 也可能有候选，预热不挑）
+                    if (bean != null && bean.isSearchable()) {
+                        detailFallbackPreheatOrder.add(bean.getKey());
+                    }
+                }
+            }
+        } catch (Throwable th) {
+            LOG.e("[FB] preheat build order fail: " + th);
+            return;
+        }
+        if (detailFallbackPreheatOrder.isEmpty()) {
+            return;
+        }
+        detailFallbackPreheatNextIndex = 0;
+        detailFallbackPreheatPending.clear();
+        // 复用 requestIndex 自增，保证与切源 token 不撞
+        detailFallbackPreheatToken = "detail_preheat_" + (++detailFallbackRequestIndex);
+        detailFallbackPreheating = true;
+        detailFallbackPreheatTimeoutScheduled = false;
+        LOG.i("[FB] preheatStart title=" + detailFallbackAnchorTitle + " sources="
+                + detailFallbackPreheatOrder.size() + " token=" + detailFallbackPreheatToken);
+        scheduleDetailFallbackPreheatSearch();
+    }
+
+    /**
+     * 预热的滑动窗口派发（并发上限 {@link #DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}）。
+     *
+     * <p>与 {@link #scheduleDetailFallbackSearch} 同构但更克制：不设
+     * {@code detailFallbackLoadingCandidate} 检查（预热与切源互不阻塞），
+     * 不记账（切源路径照常记，预热只是提前攒数据）。</p>
+     */
+    private void scheduleDetailFallbackPreheatSearch() {
+        if (!detailFallbackPreheating) {
+            return;
+        }
+        if (detailFallbackPreheatNextIndex >= detailFallbackPreheatOrder.size()
+                && detailFallbackPreheatPending.isEmpty()) {
+            finishDetailFallbackPreheat();
+            return;
+        }
+        ensureDetailFallbackSearchExecutor();
+        List<String> dispatched = new ArrayList<>();
+        while (detailFallbackPreheatPending.size() < DETAIL_FALLBACK_PREHEAT_MAX_SEARCH
+                && detailFallbackPreheatNextIndex < detailFallbackPreheatOrder.size()) {
+            final String searchKey = detailFallbackPreheatOrder.get(detailFallbackPreheatNextIndex++);
+            final String searchTitle = detailFallbackAnchorTitle;
+            final String searchToken = detailFallbackPreheatToken;
+            detailFallbackPreheatPending.add(searchKey);
+            detailFallbackSearchExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    sourceViewModel.getDetailFallbackSearch(searchKey, searchTitle, searchToken);
+                }
+            });
+            dispatched.add(searchKey);
+        }
+        if (!dispatched.isEmpty()) {
+            LOG.i("[FB] preheatDispatch n=" + dispatched.size()
+                    + " inflight=" + detailFallbackPreheatPending.size()
+                    + " next=" + detailFallbackPreheatNextIndex + "/" + detailFallbackPreheatOrder.size());
+        }
+        if (!detailFallbackPreheatTimeoutScheduled) {
+            detailFallbackPreheatTimeoutScheduled = true;
+            llLayout.postDelayed(detailFallbackPreheatTimeout, DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS);
+        }
+    }
+
+    /**
+     * 预热结果处理：只入池 + 补位 + 收尾。
+     *
+     * <p>由 {@link #onDetailFallbackSearchResult} 按预热 token 分流进来。
+     * 过滤口径与切源完全一致（{@link #isSameFallbackTitle} 对<b>锚</b>判定），
+     * 保证两条路径攒进池子的是同一批候选。</p>
+     */
+    private void handleDetailFallbackPreheatResult(AbsXml data) {
+        if (data == null) {
+            return;
+        }
+        detailFallbackPreheatPending.remove(data.sourceKey);
+        boolean cachedAny = false;
+        if (data.movie != null && data.movie.videoList != null) {
+            for (Movie.Video video : data.movie.videoList) {
+                if (video == null || TextUtils.isEmpty(video.id)
+                        || !isSameFallbackTitle(detailFallbackAnchorTitle, video.name)) {
+                    continue;
+                }
+                cacheDetailFallbackCandidate(video);
+                cachedAny = true;
+            }
+        }
+        if (cachedAny) {
+            detailFallbackCacheDirty = true;
+        }
+        if (detailFallbackPreheatNextIndex >= detailFallbackPreheatOrder.size()
+                && detailFallbackPreheatPending.isEmpty()) {
+            finishDetailFallbackPreheat();
+        } else {
+            scheduleDetailFallbackPreheatSearch();
+        }
+    }
+
+    /** 预热收尾：清标志 + 落盘（幂等，dirty 才写）。 */
+    private void finishDetailFallbackPreheat() {
+        detailFallbackPreheating = false;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackPreheatTimeout);
+        }
+        persistDetailFallbackCache(detailFallbackAnchorTitle);
+        LOG.i("[FB] preheatDone poolSize=" + detailFallbackUsableCandidateCount());
     }
 
     /**
@@ -2510,7 +2852,7 @@ public class DetailActivity extends BaseActivity {
                     finishDetailFallbackWithoutResult();
                     return;
                 }
-                Movie.Video video = detailFallbackCacheVideo(detailFallbackTitle, nextSource, videoId);
+                Movie.Video video = detailFallbackCacheVideo(detailFallbackAnchorTitle, nextSource, videoId);
                 detailFallbackLoadingCandidate = true;
                 detailFallbackDetailTimedOut = false;
                 if (video != null) {
@@ -2681,7 +3023,7 @@ public class DetailActivity extends BaseActivity {
         LOG.sw("[FB] probeStart source=" + probeKey + " title=" + detailFallbackTitle + " token=" + detailFallbackProbeToken);
         llLayout.removeCallbacks(detailFallbackProbeTimeout);
         llLayout.postDelayed(detailFallbackProbeTimeout, DETAIL_FALLBACK_PROBE_TIMEOUT_MS);
-        final String title = detailFallbackTitle;
+        final String title = detailFallbackAnchorTitle;
         final String token = detailFallbackProbeToken;
         OkGo.getInstance().cancelTag(DETAIL_FALLBACK_PROBE_TAG);
         sourceViewModel.getDetailFallbackSearch(probeKey, title, token);
@@ -2695,7 +3037,7 @@ public class DetailActivity extends BaseActivity {
         if (data.movie != null && data.movie.videoList != null) {
             for (Movie.Video video : data.movie.videoList) {
                 if (video == null || TextUtils.isEmpty(video.id)
-                        || !isSameFallbackTitle(detailFallbackTitle, video.name)) {
+                        || !isSameFallbackTitle(detailFallbackAnchorTitle, video.name)) {
                     continue;
                 }
                 cacheDetailFallbackCandidate(video);
@@ -2732,7 +3074,7 @@ public class DetailActivity extends BaseActivity {
      * </ul>
      */
     private boolean detailFallbackPoolLooksThin() {
-        if (TextUtils.isEmpty(detailFallbackTitle)) {
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
             return false;
         }
         int searchable = 0;
@@ -2759,7 +3101,7 @@ public class DetailActivity extends BaseActivity {
      * 用于「抢跳门槛」判断：池子太薄时抢跳会导致原地打转。
      */
     private int detailFallbackUsableCandidateCount() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return 0;
         }
@@ -2920,19 +3262,38 @@ public class DetailActivity extends BaseActivity {
      * （该片已下架）被长期保留，切源反复切到「详情能出但列表为空」的站。
      * 现在恢复路径直接建列表并放入缓存，<b>不碰 dirty 标志</b> ——
      * 只有本轮真的搜到新候选才值得回写。</p>
+     *
+     * <p><b>★ v66：恢复改以「片名锚」为主键</b>。v66 起 persist 一律写锚 key，
+     * 但 v66 之前落盘的旧缓存用的是当时的 {@code detailFallbackTitle}
+     * （可能已漂移成变体写法）。故这里先试锚 key，再试一次「当前 title」
+     * 作为兼容键 —— 两条都恢复进<b>锚池</b>，旧数据不丢、新口径统一。</p>
      */
-    private void restoreDetailFallbackCache(String title) {
-        title = title == null ? "" : title.trim();
-        if (TextUtils.isEmpty(title)) {
+    private void restoreDetailFallbackCache() {
+        String anchor = detailFallbackAnchorTitle == null ? "" : detailFallbackAnchorTitle.trim();
+        String legacy = detailFallbackTitle == null ? "" : detailFallbackTitle.trim();
+        if (TextUtils.isEmpty(anchor) && TextUtils.isEmpty(legacy)) {
+            return;
+        }
+        restoreOneDetailFallbackCache(anchor);
+        if (!TextUtils.isEmpty(legacy) && !legacy.equals(anchor)) {
+            restoreOneDetailFallbackCache(legacy);
+        }
+    }
+
+    /** 恢复一个 Hawk key 的候选池，并入锚 key 下的内存池（v66）。 */
+    private void restoreOneDetailFallbackCache(String hawkTitle) {
+        String poolKey = detailFallbackAnchorTitle == null ? "" : detailFallbackAnchorTitle.trim();
+        hawkTitle = hawkTitle == null ? "" : hawkTitle.trim();
+        if (TextUtils.isEmpty(hawkTitle) || TextUtils.isEmpty(poolKey)) {
             return;
         }
         try {
-            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + title);
+            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + hawkTitle);
             if (box == null || box.entries == null || box.entries.isEmpty()) {
                 return;
             }
             if (System.currentTimeMillis() - box.savedAt > FALLBACK_CACHE_TTL_MS) {
-                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + title);
+                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + hawkTitle);
                 return;
             }
             List<Movie.Video> restored = new ArrayList<>(box.entries.size());
@@ -2948,16 +3309,16 @@ public class DetailActivity extends BaseActivity {
                 Movie.Video v = new Movie.Video();
                 v.sourceKey = e[0];
                 v.id = e[1];
-                v.name = e.length > 2 && e[2] != null ? e[2] : title;
+                v.name = e.length > 2 && e[2] != null ? e[2] : hawkTitle;
                 restored.add(v);
             }
             if (restored.isEmpty()) {
                 return;
             }
             // 并入内存缓存：与已有条目按 key 增量合并，不置 dirty（见方法注释）。
-            List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+            List<Movie.Video> cachedCandidates = detailFallbackCache.get(poolKey);
             if (cachedCandidates == null) {
-                detailFallbackCache.put(title, restored);
+                detailFallbackCache.put(poolKey, restored);
             } else {
                 Set<String> existing = new HashSet<>(Math.max(16, cachedCandidates.size() * 2));
                 for (Movie.Video c : cachedCandidates) {
@@ -3166,14 +3527,14 @@ public class DetailActivity extends BaseActivity {
      * 重复调用只做增量合并，安全。</p>
      */
     private void refreshFallbackCandidatesFromSession() {
-        if (TextUtils.isEmpty(detailFallbackTitle) || sourceViewModel == null) {
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle) || sourceViewModel == null) {
             return;
         }
         try {
             List<Movie.Video> latest =
-                    SearchSession.getShared().getCandidates(detailFallbackTitle);
+                    SearchSession.getShared().getCandidates(detailFallbackAnchorTitle);
             if (latest != null && !latest.isEmpty()) {
-                cacheDetailFallbackCandidates(detailFallbackTitle, latest);
+                cacheDetailFallbackCandidates(detailFallbackAnchorTitle, latest);
             }
         } catch (Throwable th) {
             // 会话不可用时不影响切源主流程
@@ -3232,10 +3593,10 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void cacheDetailFallbackCandidate(Movie.Video video) {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackTitle);
+        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
         if (cachedCandidates == null) {
             cachedCandidates = new ArrayList<>();
-            detailFallbackCache.put(detailFallbackTitle, cachedCandidates);
+            detailFallbackCache.put(detailFallbackAnchorTitle, cachedCandidates);
         }
         String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
         for (Movie.Video cachedVideo : cachedCandidates) {
@@ -3287,7 +3648,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackToken = "";
         detailFallbackBatchToken = "";
         // 方案D：复位前把候选池落盘，供下次进同一部片直接复用
-        persistDetailFallbackCache(detailFallbackTitle);
+        persistDetailFallbackCache(detailFallbackAnchorTitle);
         detailFallbackSourceOrder.clear();
         detailFallbackPendingSources.clear();
         detailFallbackSourceStartMs.clear();
@@ -3306,14 +3667,22 @@ public class DetailActivity extends BaseActivity {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
             llLayout.removeCallbacks(detailFallbackEarlyConsume);
+            // ★ v66：预热的两个定时器无论哪种复位都摘掉（防退出后还启动/落盘）
+            llLayout.removeCallbacks(detailFallbackPreheatStart);
+            llLayout.removeCallbacks(detailFallbackPreheatTimeout);
         }
         detailFallbackEarlyConsumeScheduled = false;
+        detailFallbackPreheatTimeoutScheduled = false;
         if (!keepCache) {
             // 只有「彻底复位」才掐断批处理；切源成功后的收尾必须让它继续跑完，
             // 否则候选池永远只有第一个源 —— 这正是「一直切回同一站点」的根因。
             stopDetailFallbackSearchExecutor();
             OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
             cancelDetailFallbackProbe();
+            // ★ v66：彻底复位时预热也停（在途任务已被 executor.shutdownNow 掐掉，
+            //   这里清标志与集合；已攒的候选保留在池里）。
+            detailFallbackPreheating = false;
+            detailFallbackPreheatPending.clear();
         }
     }
 
@@ -3526,6 +3895,22 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackToken = "";
     private String detailFallbackBatchToken = "";
     private String detailFallbackTitle = "";
+    /**
+     * ★ v66：候选池的「片名锚」—— 首轮进入时的片名原文，之后<b>不随切源漂移</b>。
+     *
+     * <p><b>为什么需要它</b>：{@link #detailFallbackTitle} 会跟着 {@code vod_name}
+     * 被替换成新源的写法（切到 {@code 庆余年HD} 站后它就变成「庆余年HD」）。而候选池
+     * 的 key、{@code refreshFallbackCandidatesFromSession} 的读取 title、
+     * persist/restore 的 Hawk key 全都用它 ⇒ 切源后池子「裂键」：新 title 下池为空
+     * ⇒ usable=false ⇒ 触发（补）全网搜索 ⇒ 回流再按新 title 做 sameFamily 过滤
+     * ⇒ 与旧 title 互不为前缀的同族站（重制版/4K…）被滤掉 ⇒ <b>池子级联收缩，
+     * 每切一刀少一圈</b>。用户看到的就是「切源候选远比搜索结果少」。</p>
+     *
+     * <p>锚在 initData（首次进详情）时设定，只在换片（cycleTitle 变化）时重置。
+     * 显示用的 {@link #detailFallbackTitle} 照旧随切源漂移（页面上要显示新源写法），
+     * 但一切「池/搜索/持久化」语义都改锚不动。</p>
+     */
+    private String detailFallbackAnchorTitle = "";
     /** 当前 CycleKeys / TriedKeys 归属的片名；片名一变说明换剧了，圈记录必须重置。 */
     private String detailFallbackCycleTitle = "";
     // ===== 方案A：探路状态 =====
@@ -3557,6 +3942,38 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackTimedOutKey;
     /** 当前在途详情请求的站点 key（与 {@link #detailFallbackTimedOutKey} 配套，供软失败按站粒度记录）。 */
     private String detailFallbackTimedOutSource;
+    // ===== ★ v66：进详情静默预热 =====
+    /**
+     * 是否正在静默预热（进详情页后后台派发一轮搜索，只往候选池攒数据，
+     * 不切源、不弹提示、不触发 early consume）。
+     *
+     * <p>与切源主状态机（{@link #detailFallbackActive}）<b>完全并行</b>：
+     * 预热用自己的 token 与在途集合，用户随时点切源不受影响；
+     * 预热结果照常按锚做 sameFamily 过滤后入池。</p>
+     */
+    private boolean detailFallbackPreheating = false;
+    /** 预热的批次令牌（与切源的 {@link #detailFallbackBatchToken} 独立，防结果串扰）。 */
+    private String detailFallbackPreheatToken = "";
+    /** 预热源队列的下一个待派发下标。 */
+    private int detailFallbackPreheatNextIndex = 0;
+    /** 预热在途的源 key 集合。 */
+    private final Set<String> detailFallbackPreheatPending = new HashSet<>();
+    /** 预热的源队列（全部可搜源，与切源全网搜索同范围）。 */
+    private List<String> detailFallbackPreheatOrder = new ArrayList<>();
+    /** 预热整体超时是否已预约（只约一次）。 */
+    private boolean detailFallbackPreheatTimeoutScheduled = false;
+    /** 预热是否已尝试过（一次进页只预热一轮，换片重置）。 */
+    private boolean detailFallbackPreheatTried = false;
+    /**
+     * ★ v66：切源择优的「基准资源」—— 首轮进详情时用户看的那条视频快照。
+     *
+     * <p>同站多资源时（如《人世间》在同一站有两部，详情/封面都不同），
+     * {@link #detailFallbackFirstAliveId} 用它挑与基准最像的一条。基准在首轮
+     * 详情成功返回时记录（{@code !fallbackResult} 的路径），之后<b>不随切源更新</b>；
+     * 换片时置空重新记录。</p>
+     */
+    private Movie.Video detailFallbackRefVideo = null;
+
     /** 已开过的圈数，仅用于日志观察轮转是否正常推进。 */
     private int detailFallbackCycleCount;
     /** 本圈轮转的起始下标；开新圈时接续上一圈末尾，避免跨圈撞回头（仅作 key 缺失时的兜底）。 */
@@ -3591,6 +4008,28 @@ public class DetailActivity extends BaseActivity {
         @Override
         public void run() {
             finishDetailFallbackDetailOnTimeout();
+        }
+    };
+
+    // ===== ★ v66：静默预热的两个定时器 =====
+    /** 预热启动（详情成功回调里 postDelayed，错开起播高峰）。 */
+    private final Runnable detailFallbackPreheatStart = new Runnable() {
+        @Override
+        public void run() {
+            startDetailFallbackPreheat();
+        }
+    };
+    /** 预热整体超时：停止派发（在途结果照常入池），已攒的落盘。 */
+    private final Runnable detailFallbackPreheatTimeout = new Runnable() {
+        @Override
+        public void run() {
+            if (detailFallbackPreheating) {
+                detailFallbackPreheating = false;
+                LOG.i("[FB] preheat timeout, stop dispatch (pending="
+                        + detailFallbackPreheatPending.size() + ")");
+            }
+            // 无论是否正在预热，把已攒的候选落盘（幂等，dirty 才写）
+            persistDetailFallbackCache(detailFallbackAnchorTitle);
         }
     };
 
