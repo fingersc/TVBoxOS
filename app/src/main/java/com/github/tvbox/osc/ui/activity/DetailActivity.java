@@ -1695,6 +1695,15 @@ public class DetailActivity extends BaseActivity {
             // ★ v69：换片后的第一圈 ⇒ 冻结顺序作废，按新片自己的得分重新定序
             detailFallbackCycleFrozenOrder.clear();
             detailFallbackNewCycle = false;
+            // ★ v70：入口源（此刻正在播的源）直接计入本圈「已轮过」。
+            // 之前它只有被选中才会进 cycleKeys，而第一跳按规则跳过当前源（防原地重载）
+            // ⇒ 它留在「未轮过」区间；切走之后就成了普通候选，而它的得分往往靠前
+            //（用户正在用它看片）⇒ 第二跳常切回入口源，表现为「切源前几个出现重复」。
+            // 与 isCurrentPlayingSource 同一 key 口径，见 currentPlayingSourceKey()。
+            String entryKey = currentPlayingSourceKey();
+            if (!TextUtils.isEmpty(entryKey)) {
+                detailFallbackCycleKeys.add(entryKey);
+            }
         }
 
         // 缓存轮转：直接从缓存里按圈取下一个，零网络开销
@@ -1799,12 +1808,6 @@ public class DetailActivity extends BaseActivity {
         // ★ 第一轮只挑「别的站」：本圈内还有没轮过的其它站点时，跳过当前正在播放的源。
         //   点切源却切回自己 = 页面原地重载一遍，用户只会以为没生效。
         String picked = scanOrderedSources(orderedSources, false);
-        if (TextUtils.isEmpty(picked) && orderedSources.size() > 1) {
-            // ★ v69：其它站本圈都轮过了 → 允许回到当前源。
-            //   「一圈走完、且当前正在播的站恰好是最高分站」就落在这里：
-            //   跳过它 ⇒ 切到第二名，不会原地卡死（用户拍板的口径）。
-            picked = scanOrderedSources(orderedSources, true);
-        }
         if (!TextUtils.isEmpty(picked)) {
             return picked;
         }
@@ -1829,6 +1832,11 @@ public class DetailActivity extends BaseActivity {
         List<String> newOrder = currentCycleOrder(cachedCandidates);
         picked = scanOrderedSources(newOrder, false);
         if (TextUtils.isEmpty(picked)) {
+            // ★ v70：圈尾兜底顺序调整（用户拍板「跳过当前最高分切第二名」）。
+            // v69 这里先「切回当前源」再开新圈，圈尾会多出一次原地重载，
+            // 用户看到的又是一次「重复」。改为先开新圈取「非当前源里分数最高的」；
+            // 只有新圈里连非当前源都选不出来（实际只剩当前源可用）才允许回到当前源，
+            // 避免用户彻底切不动。
             picked = scanOrderedSources(newOrder, true);
         }
         if (TextUtils.isEmpty(picked)) {
@@ -3778,6 +3786,24 @@ public class DetailActivity extends BaseActivity {
             return true;
         }
         return false;
+    }
+
+    /**
+     * ★ v70：当前正在播放的源 key，与 {@link #isCurrentPlayingSource} 完全同一口径
+     * （sourceKey → previewVodInfo → vodInfo 依次兜底）。
+     * 供开新圈时把入口源计入「本圈已轮过」，防止第二跳切回入口源。
+     */
+    private String currentPlayingSourceKey() {
+        if (!TextUtils.isEmpty(sourceKey)) {
+            return sourceKey;
+        }
+        if (previewVodInfo != null && !TextUtils.isEmpty(previewVodInfo.sourceKey)) {
+            return previewVodInfo.sourceKey;
+        }
+        if (vodInfo != null && !TextUtils.isEmpty(vodInfo.sourceKey)) {
+            return vodInfo.sourceKey;
+        }
+        return "";
     }
 
     // 原 sortSourcesByHitRate(List<String>) 已删除：
