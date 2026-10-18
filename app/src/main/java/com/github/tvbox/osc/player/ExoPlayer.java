@@ -1,5 +1,6 @@
 package com.github.tvbox.osc.player;
 
+import android.app.ActivityManager;
 import android.content.Context;
 import android.os.Looper;
 import android.util.Pair;
@@ -62,51 +63,61 @@ public class ExoPlayer extends ExoMediaPlayer {
     private static final int LIVE_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 500;
 
     /**
-     * 点播缓冲水位（毫秒）。
+     * 点播「起播 / 卡后恢复」水位（毫秒），各内存档共用、恒定不变。
      *
-     * <p>此前点播直接沿用 ExoPlayer 默认值（MIN=MAX=50000、
-     * BUFFER_FOR_PLAYBACK=2500、AFTER_REBUFFER=5000），等于「完全没调过」。
-     * 实测表现为：源侧下载速度一旦低于码率，缓冲被吃到 BUFFER_FOR_PLAYBACK
-     * 以下就立刻起 loading，且因为要重新攒够 5 秒才恢复播放，一次卡顿的
-     * 停顿感被放大。</p>
-     *
-     * <p>这里改成一组「抗瞬时抖动优先」的取值：</p>
-     * <ul>
-     *   <li>{@code MAX_BUFFER} 60s —— 比默认再放宽，慢源可以更早开始囤货，
-     *       把「下得慢」摊平到更长的时间窗上；</li>
-     *   <li>{@code MIN_BUFFER} 15s —— 缓冲低于此才开始补，避免频繁进退缓冲；</li>
-     *   <li>{@code FOR_PLAYBACK} 1500ms —— 起播只需 1.5s，不必像默认那样等 2.5s；</li>
-     *   <li>{@code AFTER_REBUFFER} 3000ms —— 卡顿后攒 3 秒即恢复（默认 5 秒偏保守，
-     *       会让用户觉得「卡完后要等很久」）。</li>
-     * </ul>
-     *
-     * <p>为什么点播敢放宽到 60s：点播对延迟不敏感（用户本来就从上次进度续播），
-     * 而直播必须贴住直播边缘，所以两者水位必须分开，不能共用一套值。</p>
+     * <p>这两个值直接决定用户的单次等待时长：起播攒 1.5s 出画面，卡顿后攒 3s 恢复。
+     * 用户拍板「宁可偶尔短卡，不接受长缓冲」——所以它们永远不往上加；
+     * 频繁短卡的正解是切源（站点质量分已含卡顿折扣，爱卡的站会被自动往后排）。</p>
      */
-    private static final int VOD_MIN_BUFFER_MS = 15_000;
-    private static final int VOD_MAX_BUFFER_MS = 60_000;
     private static final int VOD_BUFFER_FOR_PLAYBACK_MS = 1_500;
     private static final int VOD_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS = 3_000;
 
+    // ── 点播缓冲水位按设备内存分档（largeMemoryClass，manifest 开了 largeHeap）──
+    //
+    // MIN = 时间MAX 的一半：下载囤满 MAX 停下，消耗跌回一半就重新开闸。
+    // 好处是把「网络中断恰好落在回差空窗期」能撑住的时长从 MAX/4 提到 MAX/2，
+    // 且全程只是后台提前开闸，不产生任何播放等待。
+    //
+    // 字节上限改为显式设定（不再吃 Exo 默认 ≈137.5MiB 的隐式值，那个值既不是
+    // 有意设计、也不与时间水位自洽）：
+    //   · 常规码率（≲21Mbps）下时间水位先到，字节上限只是兜底；
+    //   · 超高码率源（如 50Mbps，30s 就要 187MB）时间水位到不了，MIN 可能高于
+    //     字节上限换算的水位 ⇒「低于 MIN 就下载」恒成立，行为优雅退化为
+    //     「有下载机会就一直下」，由 Allocator 的阻塞分配兜底 —— 对这类源
+    //     这正是想要的。MIN 不做按码率的动态换算，避免整套路转自定义 LoadControl。
+    private static final int VOD_TIER_HIGH_MIN_MS = 30_000;   // = 60s 的一半
+    private static final int VOD_TIER_HIGH_MAX_MS = 60_000;   // 字节上限192MB ≈ 25.6Mbps 才先拦
+    private static final int VOD_TIER_HIGH_TARGET_BYTES = 192 * 1024 * 1024;
+    /** 高档额外保留已播 30s：往回拖进度条秒开（中低档不开，省内存）。 */
+    private static final int VOD_TIER_HIGH_BACK_BUFFER_MS = 30_000;
+
+    private static final int VOD_TIER_MID_MIN_MS = 22_500;    // = 45s 的一半（22.5s）
+    private static final int VOD_TIER_MID_MAX_MS = 45_000;    // 字节上限128MB ≈ 22.8Mbps
+    private static final int VOD_TIER_MID_TARGET_BYTES = 128 * 1024 * 1024;
+    private static final int VOD_TIER_MID_BACK_BUFFER_MS = 0;
+
+    private static final int VOD_TIER_LOW_MIN_MS = 15_000;    // = 30s 的一半
+    private static final int VOD_TIER_LOW_MAX_MS = 30_000;    // 字节上限80MB ≈ 21.3Mbps
+    private static final int VOD_TIER_LOW_TARGET_BYTES = 80 * 1024 * 1024;
+    private static final int VOD_TIER_LOW_BACK_BUFFER_MS = 0;
+
     public ExoPlayer(Context context) {
         super(context);
-        setLoadControl(buildLoadControl(Hawk.get(HawkConfig.PLAYER_IS_LIVE, false)));
+        setLoadControl(buildLoadControl(context, Hawk.get(HawkConfig.PLAYER_IS_LIVE, false)));
         setRenderersFactory(buildRenderersFactory(context));
         memory = AudioTrackMemory.getInstance(context);
     }
 
     /**
-     * 直播用低延迟水位，点播用抗抖动水位。
+     * 直播用低延迟水位，点播用按设备内存分档的抗抖动水位。
      *
-     * <p>{@code setPrioritizeTimeOverSizeThresholds(true)} 是直播的另一半：默认的
-     * 缓冲策略按"字节数"判断是否够播，直播码率起伏大容易卡在阈值上；改成按
-     * "已缓冲时长"判断后，起播与追帧都更贴合直播场景。</p>
-     *
-     * <p>点播侧同样设 {@code true}，但理由是相反的：按字节数判断时，
-     * 高码率片源（4K/高码率 H.264）会过早触发「缓冲已满」而停止下载，
-     * 实际上按时间算才囤了几秒。按时间判断可以让下载一直跑到 60s 水位。</p>
+     * <p>{@code setPrioritizeTimeOverSizeThresholds(true)} 是按「已缓冲时长」而非
+     * 「字节数」判断水位：高码率片源若按字节判断会过早触发「缓冲已满」而停止下载，
+     * 按时间判断才能跑满时间水位。注意该标志只豁免「低于 MIN 就下载」这一个分支 ——
+     * MIN~MAX 区间仍受字节上限约束，字节上限经 {@link DefaultAllocator} 的阻塞分配
+     * 兜底，不会失控。</p>
      */
-    private DefaultLoadControl buildLoadControl(boolean isLive) {
+    private DefaultLoadControl buildLoadControl(Context context, boolean isLive) {
         DefaultLoadControl.Builder builder = new DefaultLoadControl.Builder();
         if (isLive) {
             builder.setBufferDurationsMs(
@@ -116,15 +127,46 @@ public class ExoPlayer extends ExoMediaPlayer {
                     LIVE_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS);
             builder.setPrioritizeTimeOverSizeThresholds(true);
         } else {
+            // largeHeap=true（见 AndroidManifest），用 largeMemoryClass 才是真实可用堆
+            ActivityManager am =
+                    (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+            int memClass = am != null ? am.getLargeMemoryClass() : 128;
+            int minMs;
+            int maxMs;
+            int targetBytes;
+            int backBufferMs;
+            if (memClass >= 256) {
+                minMs = VOD_TIER_HIGH_MIN_MS;
+                maxMs = VOD_TIER_HIGH_MAX_MS;
+                targetBytes = VOD_TIER_HIGH_TARGET_BYTES;
+                backBufferMs = VOD_TIER_HIGH_BACK_BUFFER_MS;
+            } else if (memClass >= 128) {
+                minMs = VOD_TIER_MID_MIN_MS;
+                maxMs = VOD_TIER_MID_MAX_MS;
+                targetBytes = VOD_TIER_MID_TARGET_BYTES;
+                backBufferMs = VOD_TIER_MID_BACK_BUFFER_MS;
+            } else {
+                minMs = VOD_TIER_LOW_MIN_MS;
+                maxMs = VOD_TIER_LOW_MAX_MS;
+                targetBytes = VOD_TIER_LOW_TARGET_BYTES;
+                backBufferMs = VOD_TIER_LOW_BACK_BUFFER_MS;
+            }
+            LOG.i("[Buffer] vod tier memClass=" + memClass + " min=" + minMs
+                    + " max=" + maxMs + " bytes=" + targetBytes
+                    + " back=" + backBufferMs);
             builder.setBufferDurationsMs(
-                    VOD_MIN_BUFFER_MS,
-                    VOD_MAX_BUFFER_MS,
+                    minMs,
+                    maxMs,
                     VOD_BUFFER_FOR_PLAYBACK_MS,
                     VOD_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS);
-            // 同上：点播也按「时长」而非「字节」判断水位，避免高码率源提前停下载
+            // 显式字节上限：经 onTracksSelected 覆写并传导给 Allocator.setTargetBufferSize，
+            // 不再依赖 Exo 按轨道类型拼出来的隐式默认值
+            builder.setTargetBufferBytes(targetBytes);
             builder.setPrioritizeTimeOverSizeThresholds(true);
-            // 允许 Exo 按媒体类型分别预留缓冲（视频多、音频少），默认即为 true，
-            // 这里显式声明以固化行为，避免将来被上游默认值变更影响。
+            // 回看缓冲：高档保留已播 30s，往回拖进度条秒开；retain=true 让回退
+            // 位置按关键帧保留（默认 false 只保留到上一个读点，回看命中率低）。
+            // 中低档 backBufferMs=0，行为与默认一致（不留回看数据）。
+            builder.setBackBuffer(backBufferMs, backBufferMs > 0);
             builder.setAllocator(new DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE));
         }
         return builder.build();
