@@ -24,7 +24,10 @@ public class AboutDialog extends BaseDialog {
     public AboutDialog(@NonNull @NotNull Context context) {
         super(context);
         setContentView(R.layout.dialog_about);
-        // 版本号文本由 CI 构建时注入 dialog_about.xml 的 tvVersion（见该布局内的注释）
+        // 版本号：CI 会把构建号连同两个换行 sed 进布局的 tvVersion，这里用
+        // BuildConfig.VERSION_NAME（同一构建号、无换行尾缀）覆盖，避免版本行被
+        // 撑高、与右侧调试模式文字基线错位；本地直接编译则显示 1.0.0。
+        ((TextView) findViewById(R.id.tvVersion)).setText(BuildConfig.VERSION_NAME);
         ((TextView) findViewById(R.id.tvDisclaimer)).setText(DISCLAIMER);
         tvDebugOpen = (TextView) findViewById(R.id.tvDebugOpen);
         refreshDebugText();
