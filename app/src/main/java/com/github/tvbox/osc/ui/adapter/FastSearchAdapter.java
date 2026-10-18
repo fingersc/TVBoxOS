@@ -1,7 +1,7 @@
 package com.github.tvbox.osc.ui.adapter;
 
+import com.github.tvbox.osc.util.LOG;
 import android.text.TextUtils;
-import android.util.Log;
 import android.widget.ImageView;
 
 import com.chad.library.adapter.base.BaseQuickAdapter;
@@ -32,7 +32,7 @@ public class FastSearchAdapter extends BaseQuickAdapter<Movie.Video, BaseViewHol
         if (!TextUtils.isEmpty(item.pic)) {
             ImgUtil.load(item.pic, ivThumb, AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 214), AutoSizeUtils.mm2px(mContext, 280), item.name);
         } else {
-            Log.d(TAG, "empty image for item: " + item.name);
+            LOG.d("empty image for item: " + item.name);
             ivThumb.setImageDrawable(ImgUtil.createTextDrawable(item.name));
         }
     }

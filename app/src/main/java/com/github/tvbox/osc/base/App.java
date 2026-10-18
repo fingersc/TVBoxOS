@@ -3,6 +3,7 @@ package com.github.tvbox.osc.base;
 import android.app.Activity;
 import androidx.multidex.MultiDexApplication;
 
+import com.github.tvbox.osc.BuildConfig;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.callback.EmptyCallback;
 import com.github.tvbox.osc.callback.LoadingCallback;
@@ -78,7 +79,14 @@ public class App extends MultiDexApplication {
     private void initParams() {
         // Hawk
         Hawk.init(this).build();
+        // 调试模式每次启动重置为关：避免上次忘了关、日志一直刷影响日常使用。
+        // 需要抓日志时「设置 → 关于 → 调试模式」打开即可，当次会话内全量输出。
         Hawk.put(HawkConfig.DEBUG_OPEN, false);
+        // release 构建：调试关（LOG 全通道静默 + Exo 内部日志静默 + OkHttp 拦截器 NONE）；
+        // dev 构建（BuildConfig.DEBUG）：日志常开，方便开发期排障。
+        LOG.setDebugEnabled(BuildConfig.DEBUG);
+        com.github.tvbox.osc.player.ExoPlayer.setExoLogEnabled(BuildConfig.DEBUG);
+        OkGoHelper.applyHttpDebug(BuildConfig.DEBUG);
         Hawk.put(HawkConfig.PLAYER_IS_LIVE, false);
         if (!Hawk.contains(HawkConfig.PLAY_TYPE)) {
             Hawk.put(HawkConfig.PLAY_TYPE, 2);

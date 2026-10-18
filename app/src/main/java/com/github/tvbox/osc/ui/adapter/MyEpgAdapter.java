@@ -1,8 +1,8 @@
 package com.github.tvbox.osc.ui.adapter;
 
+import com.github.tvbox.osc.util.LOG;
 import android.content.Context;
 import android.graphics.Color;
-import android.util.Log;
 import android.util.TypedValue;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -77,7 +77,7 @@ public class MyEpgAdapter extends BaseAdapter {
             timeview.setText(data.get(i).start + "--" + data.get(i).end);
             textview.setTextColor(Color.WHITE) ;
             timeview.setTextColor(Color.WHITE) ;
-            Log.e("roinlong", "getView: "+  i);
+            LOG.e("getView: "+  i);
                if(i == this.defaultSelection){
                     wqddg_AudioWaveView.setVisibility(View.VISIBLE);
                     textview.setTextColor(Color.rgb(0, 153, 255)) ;

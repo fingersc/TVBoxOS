@@ -1,9 +1,9 @@
 package com.github.tvbox.osc.subtitle;
 
+import com.github.tvbox.osc.util.LOG;
 import android.net.Uri;
 import android.text.TextUtils;
 import android.util.Base64;
-import android.util.Log;
 
 import com.github.tvbox.osc.subtitle.exception.FatalParsingException;
 import com.github.tvbox.osc.subtitle.format.FormatASS;
@@ -194,7 +194,7 @@ public class SubtitleLoader {
 
     private static SubtitleLoadSuccessResult loadFromRemote(final String remoteSubtitlePath)
             throws IOException, FatalParsingException, Exception {
-        Log.d(TAG, "parseRemote: remoteSubtitlePath = " + remoteSubtitlePath);
+        LOG.d("parseRemote: remoteSubtitlePath = " + remoteSubtitlePath);
         String referer = "";
         if (remoteSubtitlePath.contains("alicloud") || remoteSubtitlePath.contains("aliyundrive")) {
             referer = "https://www.aliyundrive.com/";
@@ -248,10 +248,10 @@ public class SubtitleLoader {
 
     private static SubtitleLoadSuccessResult loadFromLocal(final String localSubtitlePath)
             throws IOException, FatalParsingException {
-        Log.d(TAG, "parseLocal: localSubtitlePath = " + localSubtitlePath);
+        LOG.d("parseLocal: localSubtitlePath = " + localSubtitlePath);
         File file = new File(localSubtitlePath);
         if (!file.exists()) {
-            Log.d(TAG, "parseLocal: localSubtitlePath = " + localSubtitlePath + " file not exsits");
+            LOG.d("parseLocal: localSubtitlePath = " + localSubtitlePath + " file not exsits");
             return null;
         }
         byte[] bytes = FileUtils.readSimple(file);
@@ -277,7 +277,7 @@ public class SubtitleLoader {
         if (fileName.lastIndexOf(".") > 0) {
             ext = fileName.substring(fileName.lastIndexOf("."));
         }
-        Log.d(TAG, "parse: name = " + fileName + ", ext = " + ext);
+        LOG.d("parse: name = " + fileName + ", ext = " + ext);
         Reader reader = new UnicodeReader(is); //处理有BOM头的utf8
         InputStream newInputStream = new ReaderInputStream(reader, Charset.defaultCharset());
         if (".srt".equalsIgnoreCase(ext)) {

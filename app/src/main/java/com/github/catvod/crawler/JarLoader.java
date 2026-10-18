@@ -1,9 +1,9 @@
 package com.github.catvod.crawler;
 
+import com.github.tvbox.osc.util.LOG;
 import android.content.Context;
 import android.os.Environment;
 import android.text.TextUtils;
-import android.util.Log;
 
 import com.github.catvod.net.OkHttp;
 import com.github.tvbox.osc.base.App;
@@ -88,17 +88,17 @@ public class JarLoader {
             String cachePath = jarDir().getAbsolutePath();
             DexClassLoader loader = new DexClassLoader(file.getAbsolutePath(), cachePath, cachePath, App.getInstance().getClassLoader());
             if (!invokeInit(loader, file.getAbsolutePath())) {
-                Log.i(TAG, "load error key=" + key + ", protected jar loader not bound");
+                LOG.i("load error key=" + key + ", protected jar loader not bound");
                 return false;
             }
             invokeProxy(key, loader);
             invokeDanmaku(key, loader);
             injectProxyPort(loader);
             loaders.put(key, loader);
-            Log.i(TAG, "load success key=" + key + ", file=" + file.getAbsolutePath());
+            LOG.i("load success key=" + key + ", file=" + file.getAbsolutePath());
             return true;
         } catch (Throwable e) {
-            Log.i(TAG, "load error key=" + key + ", msg=" + e.getMessage());
+            LOG.i("load error key=" + key + ", msg=" + e.getMessage());
             e.printStackTrace();
             return false;
         }
@@ -110,7 +110,7 @@ public class JarLoader {
             Class<?> clz = loader.loadClass("com.github.catvod.spider.Init");
             protectedJar = protectedInitJar.check(jar);
             if (protectedJar) {
-                Log.i(TAG, "echo-load initProtectedJar file=" + jar);
+                LOG.i("echo-load initProtectedJar file=" + jar);
                 return protectedInitJar.init(clz);
             } else {
                 Method method = clz.getMethod("init", Context.class);
@@ -208,7 +208,7 @@ public class JarLoader {
 
         Spider cached = spiders.get(spKey);
         if (cached != null) {
-            Log.i(TAG, "getSpider cached key=" + spKey);
+            LOG.i("getSpider cached key=" + spKey);
             return cached;
         }
 
@@ -221,10 +221,10 @@ public class JarLoader {
             spider.initApi(new SpiderApi());
             spider.init(App.getInstance(), ext);
             spiders.put(spKey, spider);
-            Log.i(TAG, "getSpider success key=" + spKey);
+            LOG.i("getSpider success key=" + spKey);
             return spider;
         } catch (Throwable e) {
-            Log.i(TAG, "getSpider error key=" + spKey + ", msg=" + e.getMessage());
+            LOG.i("getSpider error key=" + spKey + ", msg=" + e.getMessage());
             e.printStackTrace();
             return new SpiderNull();
         }

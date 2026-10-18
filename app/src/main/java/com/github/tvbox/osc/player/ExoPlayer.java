@@ -109,6 +109,17 @@ public class ExoPlayer extends ExoMediaPlayer {
     }
 
     /**
+     * 调试模式联动：切换 ExoPlayer 内部日志（播放内核、HLS/DASH、数据源等）的输出级别。
+     *
+     * <p>开 = VERBOSE 全量；关 = ASSERT（android Log 体系里最高优先级，
+     * Exo 的任何常规日志都到不了该级 ⇒ 等效静默）。</p>
+     */
+    public static void setExoLogEnabled(boolean enabled) {
+        com.google.android.exoplayer2.util.Log.setLogLevel(
+                enabled ? android.util.Log.VERBOSE : android.util.Log.ASSERT);
+    }
+
+    /**
      * 直播用低延迟水位，点播用按设备内存分档的抗抖动水位。
      *
      * <p>{@code setPrioritizeTimeOverSizeThresholds(true)} 是按「已缓冲时长」而非

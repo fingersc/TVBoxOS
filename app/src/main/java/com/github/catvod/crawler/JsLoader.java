@@ -1,7 +1,6 @@
 package com.github.catvod.crawler;
 
 
-import android.util.Log;
 
 import com.github.tvbox.osc.base.App;
 
@@ -66,14 +65,14 @@ public class JsLoader {
                     try {
                         classInit = classLoader.loadClass("com.github.catvod.js.Function");
                         classInit.getDeclaredConstructor(com.whl.quickjs.wrapper.QuickJSContext.class);
-                        Log.i("JSLoader", "echo-load_com.github.catvod.js.Function");
+                        LOG.i("echo-load_com.github.catvod.js.Function");
                     } catch (Throwable ignored) {
                         classInit = classLoader.loadClass("com.github.catvod.js.Method");
                         classInit.getDeclaredConstructor(com.whl.quickjs.wrapper.QuickJSContext.class);
-                        Log.i("JSLoader", "echo-load_com.github.catvod.js.Method");
+                        LOG.i("echo-load_com.github.catvod.js.Method");
                     }
                     if (classInit != null) {
-                        Log.i("JSLoader", "echo-自定义jsapi代码加载成功!");
+                        LOG.i("echo-自定义jsapi代码加载成功!");
                         success = true;
                         break;
                     }
@@ -95,7 +94,7 @@ public class JsLoader {
 
     private Class<?> loadJarInternal(String jar, String md5, String key) {
         if (classes.containsKey(key)){
-            Log.i("JSLoader", "echo-loadJarInternal cached");
+            LOG.i("echo-loadJarInternal cached");
             return classes.get(key);
         }
         File cache = new File(App.getInstance().getFilesDir().getAbsolutePath() + "/csp/" + key + ".jar");
@@ -140,7 +139,7 @@ public class JsLoader {
     public synchronized Spider getSpider(String key, String api, String ext, String jar) {
         recentKey = key;
         if (spiders.containsKey(key)){
-            Log.i("JSLoader", "echo-getSpider cached "+key);
+            LOG.i("echo-getSpider cached "+key);
             return spiders.get(key);
         }
         Class<?> classLoader = null;
@@ -152,7 +151,7 @@ public class JsLoader {
             classLoader = loadJarInternal(jarUrl, jarMd5, jarKey);
         }
         try {
-            Log.i("JSLoader", "echo-getSpider load");
+            LOG.i("echo-getSpider load");
             Spider sp = new JsSpider(key, api, classLoader);
             sp.siteKey = key;
             sp.init(App.getInstance(), ext);

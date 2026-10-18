@@ -66,6 +66,28 @@ public class OkGoHelper {
     private static OkProxySelector proxySelector = null;
     private static ProxyAuthenticator proxyAuthenticator = null;
 
+    /** 全部 OkHttp 日志拦截器：调试模式切换时即时改级别，无需重启。 */
+    private static final List<HttpLoggingInterceptor> HTTP_LOG_INTERCEPTORS = new ArrayList<>();
+
+    /** 创建受调试模式总闸管理的 OkHttp 日志拦截器（替代原先各处重复的 if/else 配置）。 */
+    private static HttpLoggingInterceptor newHttpLogInterceptor(String name) {
+        HttpLoggingInterceptor interceptor = new HttpLoggingInterceptor(name);
+        HTTP_LOG_INTERCEPTORS.add(interceptor);
+        interceptor.setPrintLevel(LOG.isDebugEnabled()
+                ? HttpLoggingInterceptor.Level.BODY : HttpLoggingInterceptor.Level.NONE);
+        interceptor.setColorLevel(LOG.isDebugEnabled() ? Level.INFO : Level.OFF);
+        return interceptor;
+    }
+
+    /** 调试模式开 ⇒ BODY 级全量打印；关 ⇒ NONE（完全静默）。 */
+    public static void applyHttpDebug(boolean open) {
+        for (HttpLoggingInterceptor interceptor : HTTP_LOG_INTERCEPTORS) {
+            interceptor.setPrintLevel(open
+                    ? HttpLoggingInterceptor.Level.BODY : HttpLoggingInterceptor.Level.NONE);
+            interceptor.setColorLevel(open ? Level.INFO : Level.OFF);
+        }
+    }
+
     public static synchronized OkProxySelector proxySelector() {
         if (proxySelector == null) proxySelector = new OkProxySelector();
         return proxySelector;
@@ -85,15 +107,7 @@ public class OkGoHelper {
     static void initExoOkHttpClient() {
         OkHttpClient base = getDefaultClient();
         OkHttpClient.Builder builder = base != null ? base.newBuilder() : new OkHttpClient.Builder();
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor("OkExoPlayer");
-
-        if (Hawk.get(HawkConfig.DEBUG_OPEN, false)) {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.setColorLevel(Level.INFO);
-        } else {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.NONE);
-            loggingInterceptor.setColorLevel(Level.OFF);
-        }
+        HttpLoggingInterceptor loggingInterceptor = newHttpLogInterceptor("OkExoPlayer");
         builder.addInterceptor(loggingInterceptor);
 
         builder.retryOnConnectionFailure(true);
@@ -229,14 +243,7 @@ public class OkGoHelper {
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
         builder.proxySelector(proxySelector());
         builder.proxyAuthenticator(proxyAuthenticator());
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor("OkExoPlayer");
-        if (Hawk.get(HawkConfig.DEBUG_OPEN, false)) {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.setColorLevel(Level.INFO);
-        } else {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.NONE);
-            loggingInterceptor.setColorLevel(Level.OFF);
-        }
+        HttpLoggingInterceptor loggingInterceptor = newHttpLogInterceptor("OkExoPlayer");
         builder.addInterceptor(loggingInterceptor);
         try {
             setOkHttpSsl(builder);
@@ -351,15 +358,7 @@ public class OkGoHelper {
         initDnsOverHttps();
 
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor("OkGo");
-
-        if (Hawk.get(HawkConfig.DEBUG_OPEN, false)) {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.setColorLevel(Level.INFO);
-        } else {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.NONE);
-            loggingInterceptor.setColorLevel(Level.OFF);
-        }
+        HttpLoggingInterceptor loggingInterceptor = newHttpLogInterceptor("OkGo");
 
         //builder.retryOnConnectionFailure(false);
 
@@ -397,15 +396,7 @@ public class OkGoHelper {
         initDnsOverHttps();
 
         OkHttpClient.Builder builder = new OkHttpClient.Builder();
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor("OkGo");
-
-        if (Hawk.get(HawkConfig.DEBUG_OPEN, false)) {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BODY);
-            loggingInterceptor.setColorLevel(Level.INFO);
-        } else {
-            loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.NONE);
-            loggingInterceptor.setColorLevel(Level.OFF);
-        }
+        HttpLoggingInterceptor loggingInterceptor = newHttpLogInterceptor("OkGo");
 
         builder.addInterceptor(loggingInterceptor);
 

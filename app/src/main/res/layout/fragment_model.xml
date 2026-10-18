@@ -23,49 +23,7 @@
                 android:layout_marginTop="@dimen/vs_10"
                 android:orientation="vertical">
 
-            <LinearLayout
-                    android:id="@+id/llDebug"
-                    android:layout_width="match_parent"
-                    android:layout_height="@dimen/vs_50"
-                    android:layout_marginBottom="@dimen/vs_10"
-                    android:background="@drawable/shape_setting_model_focus"
-                    android:focusable="true"
-
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal"
-                    android:paddingLeft="@dimen/vs_20"
-                    android:paddingRight="@dimen/vs_20"
-                    android:visibility="gone">
-
-                <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="调试模式"
-                        android:textColor="@android:color/white"
-                        android:textSize="@dimen/ts_24" />
-
-                <Space
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1" />
-
-                <TextView
-                        android:id="@+id/tvDebugOpen"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="关"
-                        android:textColor="@android:color/white"
-                        android:textSize="@dimen/ts_24" />
-
-                <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="@dimen/vs_10"
-                        android:layout_marginLeft="@dimen/vs_10"
-                        android:text=">"
-                        android:textColor="@android:color/white"
-                        android:textSize="@dimen/ts_30" />
-            </LinearLayout>
+            <!-- ★ v72：调试模式开关已移至「关于」弹窗（dialog_about.xml），原 llDebug 行删除 -->
 
             <LinearLayout
                 android:layout_width="match_parent"

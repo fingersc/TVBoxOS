@@ -1,12 +1,12 @@
 package com.github.tvbox.osc.player.thirdparty;
 
+import com.github.tvbox.osc.util.LOG;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
-import android.util.Log;
 
 import com.github.tvbox.osc.base.App;
 
@@ -37,9 +37,9 @@ public class VlcPlayer {
                 if (info.enabled)
                     return pkg;
                 else
-                    Log.v(TAG, "VLC Player package `" + pkg.packageName + "` is disabled.");
+                    LOG.d("VLC Player package `" + pkg.packageName + "` is disabled.");
             } catch (PackageManager.NameNotFoundException ex) {
-                Log.v(TAG, "VLC Player package `" + pkg.packageName + "` does not exist.");
+                LOG.d("VLC Player package `" + pkg.packageName + "` does not exist.");
             }
         }
         return null;
@@ -69,7 +69,7 @@ public class VlcPlayer {
             activity.startActivity(intent);
             return true;
         } catch (ActivityNotFoundException ex) {
-            Log.e(TAG, "Can't run VLC Player(Pro)", ex);
+            LOG.e("Can't run VLC Player(Pro)", ex);
             return false;
         }
     }

@@ -1,12 +1,12 @@
 package com.github.tvbox.osc.player.thirdparty;
 
+import com.github.tvbox.osc.util.LOG;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
-import android.util.Log;
 
 import com.github.tvbox.osc.base.App;
 
@@ -43,9 +43,9 @@ public class Kodi {
                 if (info.enabled)
                     return pkg;
                 else
-                    Log.v(TAG, "Kodi package `" + pkg.packageName + "` is disabled.");
+                    LOG.d("Kodi package `" + pkg.packageName + "` is disabled.");
             } catch (PackageManager.NameNotFoundException ex) {
-                Log.v(TAG, "Kodi package `" + pkg.packageName + "` does not exist.");
+                LOG.d("Kodi package `" + pkg.packageName + "` does not exist.");
             }
         }
         return null;
@@ -101,7 +101,7 @@ public class Kodi {
             activity.startActivity(intent);
             return true;
         } catch (Exception ex) {
-            Log.e(TAG, "Can't run Kodi", ex);
+            LOG.e("Can't run Kodi", ex);
             return false;
         }
     }

@@ -1,9 +1,11 @@
 package com.github.catvod.crawler;
 
+import com.github.tvbox.osc.util.LOG;
+
 public class SpiderDebug {
     public static void log(Throwable th) {
         try {
-            android.util.Log.d("SpiderLog", th.getMessage(), th);
+            LOG.d(th.getMessage(), th);
         } catch (Throwable th1) {
 
         }
@@ -11,7 +13,7 @@ public class SpiderDebug {
 
     public static void log(String msg) {
         try {
-            android.util.Log.d("SpiderLog", msg);
+            LOG.d(msg);
         } catch (Throwable th1) {
 
         }
