@@ -437,8 +437,8 @@ public final class HistorySyncManager {
                 }
             }
             if (scopes.settings) {
-                SyncSettings.apply(merged.settings);
-                SyncSettings.saveSnapshot(merged.settings);
+                SyncSettings.apply(merged.settingsMap());
+                SyncSettings.saveSnapshot(merged.settingsMap());
             }
         } finally {
             SyncTombstones.suppress(false);

@@ -107,10 +107,13 @@ public final class SyncMerge {
 
         // ── 设置 ──
         Map<String, SyncPayload.Tomb> settingTombs = tombMap(local.deleted.settings, remote.deleted.settings);
-        Set<String> settingKeys = union(local.settings.keySet(), remote.settings.keySet());
+        Map<String, SyncPayload.SettingValue> localSettings = local.settingsMap();
+        Map<String, SyncPayload.SettingValue> remoteSettings = remote.settingsMap();
+        Map<String, SyncPayload.SettingValue> mergedSettings = new LinkedHashMap<>();
+        Set<String> settingKeys = union(localSettings.keySet(), remoteSettings.keySet());
         for (String key : settingKeys) {
-            SyncPayload.SettingValue a = local.settings.get(key);
-            SyncPayload.SettingValue b = remote.settings.get(key);
+            SyncPayload.SettingValue a = localSettings.get(key);
+            SyncPayload.SettingValue b = remoteSettings.get(key);
             long maxTime = Math.max(a == null ? 0 : a.t, b == null ? 0 : b.t);
             SyncPayload.Tomb tomb = settingTombs.get(key);
             if (tomb != null && tomb.at > maxTime) {
@@ -118,9 +121,10 @@ public final class SyncMerge {
             }
             SyncPayload.SettingValue win = pickSetting(a, b);
             if (win != null) {
-                out.settings.put(key, win);
+                mergedSettings.put(key, win);
             }
         }
+        out.setSettingsMap(mergedSettings);
         out.deleted.settings = prune(settingTombs, now);
         return out;
     }
