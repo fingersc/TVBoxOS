@@ -386,7 +386,8 @@ public final class HistorySyncManager {
             }
         }
         if (scopes.settings) {
-            p.settings = SyncSettings.detectChanges(SyncSettings.loadSnapshot(), now);
+            // payload.settings 是 List<SettingItem>（规避 R8 收紧 Map 字段），Map 需经适配器转换
+            p.setSettingsMap(SyncSettings.detectChanges(SyncSettings.loadSnapshot(), now));
         }
         SyncTombstones.fill(p);
         return p;
