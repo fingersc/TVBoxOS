@@ -10,6 +10,7 @@ import com.github.tvbox.osc.callback.LoadingCallback;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncSettings;
 import com.github.tvbox.osc.util.AppManager;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
@@ -82,6 +83,8 @@ public class App extends MultiDexApplication {
     private void initParams() {
         // Hawk
         Hawk.init(this).build();
+        // v73：修复被早期版本写坏的设置类型（集合/浮点被存成 String），必须早于任何读取
+        SyncSettings.repairCorruptedTypes();
         // 调试模式每次启动重置为关：避免上次忘了关、日志一直刷影响日常使用。
         // 需要抓日志时「设置 → 关于 → 调试模式」打开即可，当次会话内全量输出。
         Hawk.put(HawkConfig.DEBUG_OPEN, false);

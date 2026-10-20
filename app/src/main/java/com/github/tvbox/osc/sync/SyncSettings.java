@@ -16,16 +16,26 @@ import java.util.Map;
  */
 public final class SyncSettings {
 
+    /**
+     * 集合 / Map 类型的设置键：<b>不参与同步</b>。
+     *
+     * <p>原因：同步包是「字符串值 + 类型标记」，集合若按 String 写回会破坏 Hawk 里的实际类型，
+     * 导致 {@code Hawk.get(API_HISTORY, new ArrayList<String>())} 抛 ClassCastException。
+     * 这些键本身也是「本机配置历史 / 本机线路列表 / 搜索源勾选」，跨设备同步价值低。</p>
+     */
+    public static final String[] NON_SYNC_COLLECTION_KEYS = {
+            HawkConfig.API_HISTORY, HawkConfig.LIVE_API_HISTORY, HawkConfig.EPG_HISTORY,
+            HawkConfig.API_LINE_LIST, HawkConfig.SOURCES_FOR_SEARCH,
+    };
+
     /** 参与同步的键（其余 Hawk 键一律不同步）。 */
     public static final String[] SYNC_KEYS = {
             // 源与线路
-            HawkConfig.API_URL, HawkConfig.API_HISTORY, HawkConfig.API_LINE_LIST,
-            HawkConfig.API_LINE_SOURCE, HawkConfig.HOME_API, HawkConfig.LIVE_API_URL,
-            HawkConfig.LIVE_API_HISTORY, HawkConfig.EPG_URL, HawkConfig.EPG_HISTORY,
+            HawkConfig.API_URL, HawkConfig.API_LINE_SOURCE, HawkConfig.HOME_API, HawkConfig.LIVE_API_URL,
+            HawkConfig.EPG_URL,
             // 首页与搜索
             HawkConfig.HOME_REC, HawkConfig.HOME_REC_STYLE, HawkConfig.SHOW_PREVIEW,
             HawkConfig.DEFAULT_LOAD_LIVE, HawkConfig.SEARCH_VIEW, HawkConfig.FAST_SEARCH_MODE,
-            HawkConfig.SOURCES_FOR_SEARCH,
             // 历史
             HawkConfig.HISTORY_NUM, HawkConfig.HISTORY_MERGE,
             // 播放偏好
@@ -45,6 +55,26 @@ public final class SyncSettings {
             HawkConfig.LIVE_CONNECT_TIMEOUT, HawkConfig.LIVE_SHOW_NET_SPEED,
             HawkConfig.LIVE_SHOW_RESOLUTION, HawkConfig.LIVE_SHOW_TIME,
             HawkConfig.LIVE_WEB_HEADER,
+    };
+
+    private static final String[] BOOL_KEYS = {
+            HawkConfig.HOME_REC_STYLE, HawkConfig.FAST_SEARCH_MODE, HawkConfig.HISTORY_MERGE,
+            HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.IJK_CACHE_PLAY,
+            HawkConfig.DANMU_OPEN, HawkConfig.DANMU_RANDOM_COLOR, HawkConfig.LIVE_SHOW_NET_SPEED,
+            HawkConfig.LIVE_SHOW_TIME, HawkConfig.LIVE_CHANNEL_REVERSE, HawkConfig.LIVE_CROSS_GROUP,
+            HawkConfig.SHOW_PREVIEW, HawkConfig.DEFAULT_LOAD_LIVE,
+    };
+
+    private static final String[] INT_KEYS = {
+            HawkConfig.SUBTITLE_EXO_SCALE, HawkConfig.SUBTITLE_TIME_DELAY, HawkConfig.SUBTITLE_TEXT_SIZE,
+            HawkConfig.HISTORY_NUM, HawkConfig.HOME_REC, HawkConfig.SEARCH_VIEW,
+            HawkConfig.DANMU_MAX_LINE, HawkConfig.DOH_URL, HawkConfig.LIVE_CONNECT_TIMEOUT,
+            HawkConfig.SCREEN_DISPLAY,
+    };
+
+    private static final String[] FLOAT_KEYS = {
+            HawkConfig.DANMU_ALPHA, HawkConfig.DANMU_SPEED, HawkConfig.DANMU_SIZE_SCALE,
+            HawkConfig.SUBTITLE_EXO_POSITION,
     };
 
     private SyncSettings() {
@@ -95,10 +125,12 @@ public final class SyncSettings {
         if (merged == null) {
             return;
         }
+        java.util.Set<String> allowed = new java.util.HashSet<>();
+        java.util.Collections.addAll(allowed, SYNC_KEYS);
         for (Map.Entry<String, SyncPayload.SettingValue> e : merged.entrySet()) {
             String key = e.getKey();
             SyncPayload.SettingValue sv = e.getValue();
-            if (sv == null || sv.v == null) {
+            if (sv == null || sv.v == null || !allowed.contains(key)) {
                 continue;
             }
             try {
@@ -107,7 +139,11 @@ public final class SyncSettings {
                 if (next == null) {
                     continue;
                 }
-                if (cur != null && cur.getClass().equals(next.getClass()) && String.valueOf(cur).equals(String.valueOf(next))) {
+                // 类型护栏：已有值类型不同就绝不覆盖（防再次把集合写成字符串）
+                if (cur != null && !cur.getClass().equals(next.getClass())) {
+                    continue;
+                }
+                if (cur != null && String.valueOf(cur).equals(String.valueOf(next))) {
                     continue;
                 }
                 Hawk.put(key, next);
@@ -156,6 +192,82 @@ public final class SyncSettings {
         return out;
     }
 
+    /**
+     * 自愈：修复被 v73 早期版本写坏的集合类型（String → ArrayList / Map）。
+     * App 启动时调用一次，幂等。
+     */
+    public static void repairCorruptedTypes() {
+        for (String key : BOOL_KEYS) {
+            repairScalar(key, "b");
+        }
+        for (String key : INT_KEYS) {
+            repairScalar(key, "i");
+        }
+        for (String key : FLOAT_KEYS) {
+            repairScalar(key, "f");
+        }
+        repairStringList(HawkConfig.API_HISTORY);
+        repairStringList(HawkConfig.LIVE_API_HISTORY);
+        repairStringList(HawkConfig.EPG_HISTORY);
+        repairStringList(HawkConfig.API_LINE_LIST);
+        try {
+            if (Hawk.contains(HawkConfig.SOURCES_FOR_SEARCH)) {
+                Object v = Hawk.get(HawkConfig.SOURCES_FOR_SEARCH);
+                if (v instanceof String) {
+                    // 无法可靠还原嵌套 Map，直接清掉，搜索时会按默认重建
+                    Hawk.delete(HawkConfig.SOURCES_FOR_SEARCH);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 把被写成 String 的标量恢复成正确类型；解析失败则删除（回落到默认值）。 */
+    private static void repairScalar(String key, String ty) {
+        try {
+            if (!Hawk.contains(key)) {
+                return;
+            }
+            Object v = Hawk.get(key);
+            if (!(v instanceof String)) {
+                return;
+            }
+            Object val = fromValue(new SyncPayload.SettingValue((String) v, ty, 0L));
+            if (val == null) {
+                Hawk.delete(key);
+            } else {
+                Hawk.put(key, val);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void repairStringList(String key) {
+        try {
+            if (!Hawk.contains(key)) {
+                return;
+            }
+            Object v = Hawk.get(key);
+            if (!(v instanceof String)) {
+                return;
+            }
+            String s = (String) v;
+            java.util.ArrayList<String> list = new java.util.ArrayList<>();
+            if (s.length() > 2 && s.startsWith("[") && s.endsWith("]")) {
+                String body = s.substring(1, s.length() - 1).trim();
+                if (body.length() > 0) {
+                    for (String part : body.split(", ")) {
+                        if (part.length() > 0) {
+                            list.add(part);
+                        }
+                    }
+                }
+            }
+            Hawk.put(key, list);
+        } catch (Throwable ignored) {
+        }
+    }
+
     // ---------------------------------------------------------------- 类型编解码
 
     private static SyncPayload.SettingValue toValue(Object v, long t) {
@@ -167,6 +279,9 @@ public final class SyncSettings {
         }
         if (v instanceof Long) {
             return new SyncPayload.SettingValue(String.valueOf(v), "l", t);
+        }
+        if (v instanceof Float || v instanceof Double) {
+            return new SyncPayload.SettingValue(String.valueOf(v), "f", t);
         }
         return new SyncPayload.SettingValue(String.valueOf(v), "s", t);
     }
@@ -181,6 +296,8 @@ public final class SyncSettings {
                     return Integer.parseInt(sv.v);
                 case "l":
                     return Long.parseLong(sv.v);
+                case "f":
+                    return Float.parseFloat(sv.v);
                 default:
                     return sv.v;
             }
