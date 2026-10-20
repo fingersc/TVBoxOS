@@ -16,6 +16,7 @@ import com.github.tvbox.osc.sync.AccountPaths;
 import com.github.tvbox.osc.sync.AccountService;
 import com.github.tvbox.osc.sync.Crypto;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.QrLoginBridge;
 import com.github.tvbox.osc.sync.SyncScopes;
 import com.github.tvbox.osc.sync.WebDavClient;
 import com.github.tvbox.osc.ui.dialog.LoginQrDialog;
@@ -29,7 +30,7 @@ import com.orhanobut.hawk.Hawk;
  *
  * <p>首页原「历史」按钮改为「账号」，历史功能作为本页第一项保留。</p>
  */
-public class AccountActivity extends BaseActivity implements View.OnClickListener {
+public class AccountActivity extends BaseActivity implements View.OnClickListener, QrLoginBridge.Listener {
 
     private TextView tvIdentity;
     private TextView tvSyncStatus;
@@ -93,6 +94,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvScopeCollect.setOnClickListener(this);
         tvScopeSettings.setOnClickListener(this);
         tvWifiOnly.setOnClickListener(this);
+        // v75：扫码登录成功后要刷新本页（Dialog 关闭不会触发 Activity.onResume）
+        QrLoginBridge.addListener(this);
         refreshAll();
     }
 
@@ -100,6 +103,19 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     protected void onResume() {
         super.onResume();
         refreshAll();
+    }
+
+    /** 手机扫码把账号登到本机后：立刻刷新页面上的身份、存储配置与同步状态。 */
+    @Override
+    public void onLoginOk(String name) {
+        refreshAll();
+        tvSyncStatus.setText("已登录：" + name + "，正在同步…");
+    }
+
+    @Override
+    protected void onDestroy() {
+        QrLoginBridge.removeListener(this);
+        super.onDestroy();
     }
 
     private void refreshAll() {
