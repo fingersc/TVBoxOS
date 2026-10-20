@@ -14,10 +14,13 @@ import com.github.tvbox.osc.cache.VodCollectDao;
 import com.github.tvbox.osc.cache.VodRecord;
 import com.github.tvbox.osc.cache.VodRecordDao;
 import com.github.tvbox.osc.data.AppDataManager;
+import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.google.gson.Gson;
 import com.orhanobut.hawk.Hawk;
+
+import org.greenrobot.eventbus.EventBus;
 
 import java.io.IOException;
 import java.util.List;
@@ -42,10 +45,12 @@ public final class HistorySyncManager {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
     private static final long DEBOUNCE_MS = 5 * 60 * 1000L;
-    private static final long MIN_GAP_MS = 3 * 60 * 1000L;
+    private static final long MIN_GAP_MS = 60 * 1000L;
 
     private static volatile boolean syncing;
     private static boolean started;
+    /** 页面主动拉取的节流时间戳（避免来回切页面刷请求）。 */
+    private static long lastPullAt;
 
     private static final Runnable DEBOUNCE_TASK = new Runnable() {
         @Override
@@ -65,6 +70,24 @@ public final class HistorySyncManager {
     private HistorySyncManager() {
     }
 
+    /**
+     * 与首页加载直接相关的配置键：这些键变化后首页必须重新 loadConfig，
+     * 否则「首次安装 → 登录 → 同步写回接口地址」后首页仍然是空的。
+     */
+    private static final String[] HOME_CONFIG_KEYS = {
+            HawkConfig.API_URL, HawkConfig.API_LINE_SOURCE, HawkConfig.HOME_API,
+            HawkConfig.LIVE_API_URL, HawkConfig.EPG_URL,
+    };
+
+    private static String configSnapshot() {
+        StringBuilder sb = new StringBuilder();
+        for (String k : HOME_CONFIG_KEYS) {
+            Object v = Hawk.contains(k) ? Hawk.get(k) : null;
+            sb.append(k).append('=').append(v == null ? "" : String.valueOf(v)).append('\n');
+        }
+        return sb.toString();
+    }
+
     /** App 启动时调用一次。 */
     public static void start() {
         if (started) {
@@ -77,7 +100,7 @@ public final class HistorySyncManager {
             public void run() {
                 sync(false, false, null);
             }
-        }, 10 * 1000L);
+        }, 1500L);
         MAIN.postDelayed(PERIODIC_TASK, 30 * 60 * 1000L);
     }
 
@@ -125,13 +148,29 @@ public final class HistorySyncManager {
         sync(false, false, null);
     }
 
-    /** 回到前台（首页 onResume）：距上次同步 ≥10 分钟才拉。 */
+    /** 页面主动拉取（历史页 onResume）：绕过自动同步的最小间隔，自带 20 秒节流。 */
+    public static void pullNow(final Callback cb) {
+        if (AccountContext.isGuest() || !hasConfig()) {
+            post(cb, false, "登录后才能同步");
+            return;
+        }
+        long now = System.currentTimeMillis();
+        synchronized (LOCK) {
+            if (now - lastPullAt < 20 * 1000L) {
+                return;
+            }
+            lastPullAt = now;
+        }
+        sync(true, false, cb);
+    }
+
+    /** 回到前台（首页 onResume）：距上次同步 ≥2 分钟才拉。 */
     public static void onForeground() {
         if (AccountContext.isGuest()) {
             return;
         }
         long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
-        if (System.currentTimeMillis() - last >= 10 * 60 * 1000L) {
+        if (System.currentTimeMillis() - last >= 2 * 60 * 1000L) {
             sync(false, false, null);
         }
     }
@@ -438,8 +477,18 @@ public final class HistorySyncManager {
                 }
             }
             if (scopes.settings) {
+                String before = configSnapshot();
                 SyncSettings.apply(merged.settingsMap());
                 SyncSettings.saveSnapshot(merged.settingsMap());
+                if (!before.equals(configSnapshot())) {
+                    MAIN.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            EventBus.getDefault().post(
+                                    new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                        }
+                    });
+                }
             }
         } finally {
             SyncTombstones.suppress(false);

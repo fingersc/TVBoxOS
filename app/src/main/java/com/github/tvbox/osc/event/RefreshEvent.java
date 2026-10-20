@@ -25,6 +25,8 @@ public class RefreshEvent {
     public static final int TYPE_SET_DANMU_SETTINGS = 18;
     public static final int TYPE_DANMU_REFRESH = 19;
     public static final int TYPE_PLAY_QUALITY = 20;
+    /** 同步写回了「接口地址」类配置：首页需要重新加载配置（v75）。 */
+    public static final int TYPE_CONFIG_CHANGE = 21;
     public int type;
     public Object obj;
 

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v75：账号页专用输入框背景。
+     原 dialog_api 输入框背景用 layer-list 在上下各内缩 vs_20_，导致高度被"吃掉"、
+     视觉上比按钮矮一截；这里去掉内缩，配合布局里的固定行高做到与按钮齐平。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <item android:state_focused="true">
+        <shape>
+            <corners android:radius="@dimen/vs_6" />
+            <solid android:color="@color/dialog_input_bg" />
+            <stroke
+                android:width="@dimen/vs_2"
+                android:color="@color/dialog_control_stroke_focused" />
+        </shape>
+    </item>
+
+    <item>
+        <shape>
+            <corners android:radius="@dimen/vs_6" />
+            <solid android:color="@color/dialog_input_bg" />
+            <stroke
+                android:width="@dimen/vs_1"
+                android:color="@color/dialog_panel_stroke" />
+        </shape>
+    </item>
+</selector>

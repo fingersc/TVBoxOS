@@ -3,10 +3,8 @@ package com.github.tvbox.osc.ui.activity;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.text.InputType;
 import android.text.TextUtils;
 import android.view.View;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -39,11 +37,13 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private EditText etPass;
     private EditText etPassConfirm;
     private View llPassConfirm;
-    private CheckBox cbShowPass;
-    private TextView tvPathHint;
+    private TextView tvLoginHint;
     private TextView btnLogin;
+    private TextView btnQrLogin;
     /** 首次激活阶段：等待二次输入密码 */
     private boolean activating;
+    /** 登录/激活进行中：忽略重复点击，按钮置灰 */
+    private boolean loggingIn;
     private String pendingName;
     private byte[] pendingKey;
     private EditText etDavUrl;
@@ -69,15 +69,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etPass = findViewById(R.id.etPass);
         etPassConfirm = findViewById(R.id.etPassConfirm);
         llPassConfirm = findViewById(R.id.llPassConfirm);
-        cbShowPass = findViewById(R.id.cbShowPass);
-        tvPathHint = findViewById(R.id.tvPathHint);
+        tvLoginHint = findViewById(R.id.tvLoginHint);
         btnLogin = findViewById(R.id.btnLogin);
-        cbShowPass.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                applyPasswordVisibility(cbShowPass.isChecked());
-            }
-        });
+        btnQrLogin = findViewById(R.id.btnQrLogin);
         etDavUrl = findViewById(R.id.etDavUrl);
         etDavUser = findViewById(R.id.etDavUser);
         etDavPass = findViewById(R.id.etDavPass);
@@ -128,12 +122,6 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvSyncStatus.setText(AccountContext.isGuest()
                 ? "登录后可跨设备同步"
                 : "上次同步：" + HistorySyncManager.lastSyncText());
-        String root = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");
-        if (root.endsWith("/")) {
-            root = root.substring(0, root.length() - 1);
-        }
-        String name = etUser.getText().toString().trim();
-        tvPathHint.setText("账号目录：" + root + "/" + (name.length() == 0 ? "<账号名>" : AccountPaths.normalize(name)) + "/（由管理员在网盘中创建）");
     }
 
     @Override
@@ -181,6 +169,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     }
 
     private void doLogin() {
+        if (loggingIn) {
+            return;
+        }
         if (activating) {
             confirmActivate();
             return;
@@ -199,12 +190,15 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             toast("密码至少 " + AccountPaths.MIN_PASSWORD + " 位");
             return;
         }
-        tvSyncStatus.setText("正在验证账号…");
+        setBusy(true, "正在登录…");
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
+                    // 密钥派生 20 万轮，老盒子上约 1 秒，先给一句「正在计算密钥」
+                    postStage("正在计算密钥…");
                     final byte[] key = Crypto.deriveKey(user, pass);
+                    postStage("正在验证账号…");
                     final AccountService.Result result = AccountService.check(dav(), user, key);
                     main.post(new Runnable() {
                         @Override
@@ -216,6 +210,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                     main.post(new Runnable() {
                         @Override
                         public void run() {
+                            setBusy(false, null);
                             tvSyncStatus.setText("验证失败：" + t.getMessage());
                         }
                     });
@@ -229,6 +224,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             loginWith(user, key);
             return;
         }
+        setBusy(false, null);
         if (result.status == AccountService.NOT_FOUND) {
             String dir = accountDirHint(user);
             tvSyncStatus.setText("账号不存在。请管理员在网盘中创建文件夹：" + dir);
@@ -262,7 +258,10 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             toast("两次输入的密码不一致");
             return;
         }
-        tvSyncStatus.setText("正在激活账号…");
+        if (loggingIn) {
+            return;
+        }
+        setBusy(true, "正在激活账号…");
         final String name = pendingName;
         final byte[] key = pendingKey;
         new Thread(new Runnable() {
@@ -280,6 +279,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                     main.post(new Runnable() {
                         @Override
                         public void run() {
+                            setBusy(false, null);
                             tvSyncStatus.setText("激活失败：" + t.getMessage());
                         }
                     });
@@ -295,10 +295,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etPassConfirm.setText("");
         refreshAll();
         toast("已登录：" + user);
-        tvSyncStatus.setText("正在同步…");
+        setBusy(true, "正在同步…");
         HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
             @Override
             public void onDone(boolean ok, String message) {
+                setBusy(false, null);
                 tvSyncStatus.setText(message);
             }
         });
@@ -312,18 +313,28 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         btnLogin.setText("登录");
     }
 
-    private void applyPasswordVisibility(boolean visible) {
-        int type = visible
-                ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-                : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD;
-        etPass.setInputType(type);
-        etPassConfirm.setInputType(type);
-        if (etPass.getText() != null) {
-            etPass.setSelection(etPass.getText().length());
+    /** 登录中：显示阶段提示、按钮置灰、忽略重复点击。 */
+    private void setBusy(boolean busy, String hint) {
+        loggingIn = busy;
+        if (hint != null) {
+            tvLoginHint.setText(hint);
         }
-        if (etPassConfirm.getText() != null) {
-            etPassConfirm.setSelection(etPassConfirm.getText().length());
-        }
+        tvLoginHint.setVisibility(busy ? View.VISIBLE : View.GONE);
+        btnLogin.setAlpha(busy ? 0.5f : 1f);
+        btnQrLogin.setAlpha(busy ? 0.5f : 1f);
+        // 扫码入口在登录过程中必须禁用，否则会与登录流程抢状态
+        btnQrLogin.setEnabled(!busy);
+    }
+
+    private void postStage(final String text) {
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                if (loggingIn) {
+                    tvLoginHint.setText(text);
+                }
+            }
+        });
     }
 
     private WebDavClient dav() {
@@ -387,9 +398,18 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
     private void performLogout() {
         resetActivateUi();
+        setBusy(false, null);
         AccountContext.logout();
+        // v75：退出后不再保留网盘凭据；下次扫码登录会由二维码自动填回
+        Hawk.delete(HawkConfig.SYNC_WEBDAV_URL);
+        Hawk.delete(HawkConfig.SYNC_WEBDAV_USER);
+        Hawk.delete(HawkConfig.SYNC_WEBDAV_PASS);
+        etDavUrl.setText("");
+        etDavUser.setText("");
+        etDavPass.setText("");
         refreshAll();
-        toast("已退出，回到游客模式");
+        tvSyncStatus.setText("已退出。网盘配置已清空，扫码登录会自动填回");
+        toast("已退出，网盘配置已清空");
     }
 
     private void testDav() {

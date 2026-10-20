@@ -15,6 +15,7 @@ import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.RoomDataManger;
 import com.github.tvbox.osc.event.RefreshEvent;
+import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.ui.adapter.HistoryAdapter;
 import com.github.tvbox.osc.ui.dialog.ConfirmClearDialog;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
@@ -57,6 +58,20 @@ public class HistoryActivity extends BaseActivity {
     protected void init() {
         initView();
         initData();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // v75：打开历史页先拉一次云端 —— 别的设备刚看完，这里立刻可见（自带 20 秒节流）
+        HistorySyncManager.pullNow(new HistorySyncManager.Callback() {
+            @Override
+            public void onDone(boolean ok, String message) {
+                if (ok) {
+                    initData();
+                }
+            }
+        });
     }
 
     private void toggleDelMode() {

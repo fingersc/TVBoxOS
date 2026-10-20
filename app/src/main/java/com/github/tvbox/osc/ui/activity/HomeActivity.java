@@ -114,6 +114,10 @@ public class HomeActivity extends BaseActivity {
     private final Handler mHandler = new Handler();
     private long mExitTime = 0;
     private boolean eventBusRegistered = false;
+    /** v75：同步写回接口地址后需要重载配置；页面不可见时先记下来，onResume 再执行。 */
+    private boolean pendingConfigReload = false;
+    private boolean activityResumed = false;
+    private long lastConfigReloadAt = 0L;
     // 首页时钟每秒刷新一次。Date/SimpleDateFormat 提到字段复用，避免每秒 new 两个对象。
     // （SimpleDateFormat 非线程安全，但此处仅在主线程 Handler 中使用。）
     private final Date mClockDate = new Date();
@@ -687,6 +691,11 @@ public class HomeActivity extends BaseActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
+        if (pendingConfigReload) {
+            pendingConfigReload = false;
+            reloadConfigAfterSync();
+        }
         HistorySyncManager.onForeground();
         refreshTopInfoTextSize();
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
@@ -707,6 +716,7 @@ public class HomeActivity extends BaseActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        activityResumed = false;
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
         mHandler.removeCallbacks(refreshTopLayoutRunnable);
         mHandler.removeCallbacks(mRunnable);
@@ -842,7 +852,34 @@ public class HomeActivity extends BaseActivity {
             }
         } else if (event.type == RefreshEvent.TYPE_HOME_SOURCE_CHANGE) {
             refreshHome(false);
+        } else if (event.type == RefreshEvent.TYPE_CONFIG_CHANGE) {
+            // 同步把接口地址写回来了（首次安装登录后最常见）：配置没加载过就重新加载
+            if (activityResumed) {
+                reloadConfigAfterSync();
+            } else {
+                pendingConfigReload = true;
+            }
         }
+    }
+
+    /**
+     * v75：同步写回了接口地址（api_url 等），首页需要重新走一遍 loadConfig。
+     * 只在配置真的变化时由事件触发；1 分钟内最多执行一次。
+     */
+    private void reloadConfigAfterSync() {
+        if (isActivityUnavailable()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastConfigReloadAt < 60 * 1000L) {
+            return;
+        }
+        lastConfigReloadAt = now;
+        LOG.i("[Sync] config changed, reload home config");
+        dataInitOk = false;
+        jarInitOk = false;
+        useCacheConfig = false;
+        initData();
     }
 
     private void showFilterIcon(int count) {
