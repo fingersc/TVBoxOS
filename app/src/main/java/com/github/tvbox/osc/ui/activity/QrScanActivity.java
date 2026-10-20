@@ -393,13 +393,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     }
 
     private void decodeFrame(byte[] data, int w, int h) {
-        String text = decode(data, w, h, 0);
-        if (text == null) {
-            text = decode(data, w, h, 90);
-        }
-        if (text == null) {
-            text = decode(data, w, h, 270);
-        }
+        // QR 的三点定位本身对旋转不敏感，不需要把帧再旋转：省两次解码开销
+        String text = decode(data, w, h);
         if (text != null) {
             done = true;
             final String result = text;
@@ -412,16 +407,10 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         }
     }
 
-    private String decode(byte[] data, int w, int h, int rotateDegrees) {
+    private String decode(byte[] data, int w, int h) {
         try {
             PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(data, w, h, 0, 0, w, h, false);
-            PlanarYUVLuminanceSource rotated = source;
-            if (rotateDegrees == 90) {
-                rotated = source.rotateCounterClockwise();
-            } else if (rotateDegrees == 270) {
-                rotated = source.rotateCounterClockwise().rotateCounterClockwise().rotateCounterClockwise();
-            }
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(rotated));
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
             return reader.decodeWithState(bitmap).getText();
         } catch (Throwable t) {
             return null;
