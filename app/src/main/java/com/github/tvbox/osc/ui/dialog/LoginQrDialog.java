@@ -1,7 +1,10 @@
 package com.github.tvbox.osc.ui.dialog;
 
 import android.content.Context;
+import android.util.DisplayMetrics;
 import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageView;
 
 import androidx.annotation.NonNull;
 
@@ -23,8 +26,18 @@ public class LoginQrDialog extends BaseDialog {
         String address = ControlManager.get().getAddress(false);
         String token = QrLoginBridge.newToken();
         String content = address + "qrlogin?t=" + token;
-        ((android.widget.ImageView) findViewById(R.id.ivQr))
-                .setImageBitmap(QRCodeGen.generateBitmap(content, 520, 520, 2));
+
+        // v75：二维码边长按屏幕换算，固定尺寸会在小屏上把提示文字与手机扫码按钮挤出屏幕
+        ImageView ivQr = findViewById(R.id.ivQr);
+        DisplayMetrics dm = getContext().getResources().getDisplayMetrics();
+        int size = Math.min((int) (dm.heightPixels * 0.40f), (int) (dm.widthPixels * 0.34f));
+        size = Math.max(size, 180);
+        size = Math.min(size, 560);
+        ViewGroup.LayoutParams lp = ivQr.getLayoutParams();
+        lp.width = size;
+        lp.height = size;
+        ivQr.setLayoutParams(lp);
+        ivQr.setImageBitmap(QRCodeGen.generateBitmap(content, size, size, 2));
         findViewById(R.id.btnScanOnPhone).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
