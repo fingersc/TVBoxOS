@@ -84,6 +84,8 @@ public class HawkConfig {
     public static final String SYNC_WEBDAV_PASS = "sync_webdav_pass";
     /** 当前登录账号（JSON：owner/name/keyHex） */
     public static final String SYNC_ACCOUNT = "sync_account";
+    /** 账号方案版本：2 = 文件夹即账号（v74）；旧版本启动时自动登出 */
+    public static final String SYNC_SCHEME = "sync_scheme";
     /** 设备唯一标识（首次生成） */
     public static final String SYNC_DEVICE_ID = "sync_device_id";
     /** 上次同步时间 / 云端 epoch / 待同步标记 */

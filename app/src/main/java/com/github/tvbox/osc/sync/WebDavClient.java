@@ -78,6 +78,23 @@ public final class WebDavClient {
         }
     }
 
+    /** 目录是否存在（PROPFIND Depth 0）；404 返回 false，其它异常抛 IOException。 */
+    public boolean dirExists(String path) throws IOException {
+        Request req = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .header("Depth", "0")
+                .method("PROPFIND", RequestBody.create(null, new byte[0]))
+                .build();
+        try (Response resp = client.newCall(req).execute()) {
+            checkAuth(resp);
+            if (resp.code() == 404) {
+                return false;
+            }
+            return resp.code() == 207 || resp.code() == 200 || resp.code() == 204;
+        }
+    }
+
     /** 读取文件；不存在返回 null。etagOut[0] 会带回 ETag（若有）。 */
     public byte[] get(String path, String[] etagOut) throws IOException {
         Request req = new Request.Builder()

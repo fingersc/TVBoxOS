@@ -254,13 +254,21 @@ public final class HistorySyncManager {
         long now = System.currentTimeMillis();
         String deviceId = deviceId();
         SyncScopes scopes = SyncScopes.load();
-        String path = owner + "/data.bin";
+        // v74：云端目录 = <存储根目录>/<账号名>/，由管理员创建，App 不自动建
+        String accountName = AccountContext.displayName();
+        if (!AccountPaths.isValidName(accountName)) {
+            throw new IOException("账号名无效，请重新登录");
+        }
+        String path = AccountPaths.data(accountName);
 
         WebDavClient dav = new WebDavClient(
                 Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
                 Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
                 Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
-        dav.ensureDirs(owner);
+        if (!dav.dirExists(AccountPaths.dir(accountName))) {
+            throw new IOException("账号目录不存在（可能被管理员删除）");
+        }
+        AccountService.ensureProfile(dav, accountName, key);
 
         String[] etag = new String[1];
         byte[] remoteBytes = dav.get(path, etag);
@@ -468,6 +476,7 @@ public final class HistorySyncManager {
         }
         final byte[] key = AccountContext.key();
         final String owner = AccountContext.ownerKey();
+        final String accountName = AccountContext.displayName();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -478,14 +487,13 @@ public final class HistorySyncManager {
                             Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
                             Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
                             Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
-                    dav.ensureDirs(owner);
                     SyncPayload empty = new SyncPayload();
                     empty.owner = owner;
                     empty.epoch = Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L) + 1;
                     empty.updatedAt = System.currentTimeMillis();
                     empty.dev = deviceId();
                     byte[] out = Crypto.encrypt(key, GSON.toJson(empty).getBytes("UTF-8"));
-                    dav.put(owner + "/data.bin", out, null);
+                    dav.put(AccountPaths.data(accountName), out, null);
                     Hawk.put(HawkConfig.SYNC_LAST_EPOCH, empty.epoch);
                     Hawk.put(HawkConfig.SYNC_LAST_AT, System.currentTimeMillis());
                     Hawk.put(key(HawkConfig.SYNC_DIRTY), false);

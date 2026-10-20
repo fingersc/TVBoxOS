@@ -111,6 +111,25 @@ public final class Crypto {
         return cipher.doFinal(data, ctStart, macStart - ctStart);
     }
 
+    /** 账号校验值：用于在登录前判断密码是否正确（写进 profile.json，可公开）。 */
+    public static String accountVerify(byte[] key) {
+        try {
+            byte[] mac = hmac(slice(key, 32, 32), "tvbox-account-verify".getBytes("UTF-8"), 0,
+                    "tvbox-account-verify".getBytes("UTF-8").length);
+            return toHex(mac);
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    public static String toHex(byte[] data) {
+        StringBuilder sb = new StringBuilder(data.length * 2);
+        for (byte b : data) {
+            sb.append(String.format("%02x", b & 0xff));
+        }
+        return sb.toString();
+    }
+
     private static byte[] hmac(byte[] key, byte[] data, int off, int len) throws Exception {
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(key, "HmacSHA256"));

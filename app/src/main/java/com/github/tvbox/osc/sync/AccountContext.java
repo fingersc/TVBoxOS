@@ -31,6 +31,14 @@ public final class AccountContext {
             return;
         }
         loaded = true;
+        // v74：账号方案改为「文件夹即账号」，旧方案的登录态一律失效
+        int scheme = Hawk.get(HawkConfig.SYNC_SCHEME, 0);
+        if (scheme < 2) {
+            Hawk.delete(HawkConfig.SYNC_ACCOUNT);
+            Hawk.put(HawkConfig.SYNC_SCHEME, 2);
+            AppDataManager.switchOwner("");
+            return;
+        }
         try {
             String json = Hawk.get(HawkConfig.SYNC_ACCOUNT, "");
             if (json != null && json.length() > 0) {
@@ -66,7 +74,8 @@ public final class AccountContext {
     /** 登录（ownerKey 由 {@link Crypto#userKey(String)} 生成）。 */
     public static synchronized void login(String owner, String name, byte[] derivedKey) {
         ownerKey = owner;
-        displayName = name;
+        displayName = AccountPaths.normalize(name);
+        Hawk.put(HawkConfig.SYNC_SCHEME, 2);
         key = derivedKey;
         try {
             JSONObject o = new JSONObject();

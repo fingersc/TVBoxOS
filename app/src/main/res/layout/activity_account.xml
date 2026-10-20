@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+activity_account.xml<?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -71,6 +71,48 @@
                 android:textSize="@dimen/ts_22" />
         </LinearLayout>
 
+        <!-- 首次激活：再次输入密码 -->
+        <LinearLayout
+            android:id="@+id/llPassConfirm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_10"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <EditText
+                android:id="@+id/etPassConfirm"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/input_dialog_api_input"
+                android:hint="再次输入密码（首次激活）"
+                android:imeOptions="actionDone|flagNoExtractUi"
+                android:inputType="textPassword"
+                android:maxLines="1"
+                android:singleLine="true"
+                android:textColor="@android:color/white"
+                android:textColorHint="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_22" />
+        </LinearLayout>
+
+        <CheckBox
+            android:id="@+id/cbShowPass"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_5"
+            android:text="显示密码"
+            android:textColor="@color/color_CCFFFFFF"
+            android:textSize="@dimen/ts_20" />
+
+        <TextView
+            android:id="@+id/tvPathHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_5"
+            android:text="账号目录：&lt;存储根目录&gt;/&lt;账号名&gt;/（由管理员在网盘中创建）"
+            android:textColor="@color/color_CCFFFFFF"
+            android:textSize="@dimen/ts_20" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -85,7 +127,7 @@
                 android:background="@drawable/button_danmu_setting"
                 android:focusable="true"
                 android:gravity="center"
-                android:text="登录 / 注册"
+                android:text="登录"
                 android:textColor="@android:color/white"
                 android:textSize="@dimen/ts_24" />
 
