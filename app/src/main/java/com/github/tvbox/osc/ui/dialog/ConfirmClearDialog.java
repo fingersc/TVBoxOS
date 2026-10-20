@@ -41,7 +41,7 @@ public class ConfirmClearDialog extends BaseDialog {
                         CollectActivity.collectAdapter.setNewData(vodInfoList);
                         CollectActivity.collectAdapter.notifyDataSetChanged();
                     }
-                    RoomDataManger.deleteVodCollectAll();
+                    RoomDataManger.deleteVodCollectAllWithTombstones();
                     // if removing all History
                 } else if (type == "History") {
                     List<VodInfo> vodInfoList = new ArrayList<>();
@@ -49,7 +49,7 @@ public class ConfirmClearDialog extends BaseDialog {
                         HistoryActivity.historyAdapter.setNewData(vodInfoList);
                         HistoryActivity.historyAdapter.notifyDataSetChanged();
                     }
-                    RoomDataManger.deleteVodRecordAll();
+                    RoomDataManger.deleteVodRecordAllWithTombstones();
                 }
 
                 ConfirmClearDialog.this.dismiss();

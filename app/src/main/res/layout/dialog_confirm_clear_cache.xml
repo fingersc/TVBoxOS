@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:layout_gravity="center"
+    android:background="@drawable/shape_danmu_setting_bg"
+    android:orientation="vertical"
+    android:padding="@dimen/vs_30">
+
+    <TextView
+        android:id="@+id/tvMsg"
+        android:layout_width="@dimen/vs_520"
+        android:layout_height="wrap_content"
+        android:text="将清空本机的观看历史、播放进度与搜索记录，并重启应用。"
+        android:textColor="@color/dialog_text_primary"
+        android:textSize="@dimen/ts_24" />
+
+    <CheckBox
+        android:id="@+id/cbClearCloud"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/vs_20"
+        android:text="同时清空云端（其它设备下次同步也会清空）"
+        android:textColor="@color/dialog_text_primary"
+        android:textSize="@dimen/ts_22" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="@dimen/vs_30"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/btnCancel"
+            android:layout_width="@dimen/vs_0"
+            android:layout_height="@dimen/vs_60"
+            android:layout_weight="1"
+            android:background="@drawable/button_danmu_setting"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="取消"
+            android:textColor="@color/dialog_text_primary"
+            android:textSize="@dimen/ts_24" />
+
+        <TextView
+            android:id="@+id/btnConfirm"
+            android:layout_width="@dimen/vs_0"
+            android:layout_height="@dimen/vs_60"
+            android:layout_marginStart="@dimen/vs_20"
+            android:layout_marginLeft="@dimen/vs_20"
+            android:layout_weight="1"
+            android:background="@drawable/button_danmu_setting"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="确定清空"
+            android:textColor="@color/dialog_text_primary"
+            android:textSize="@dimen/ts_24" />
+    </LinearLayout>
+</LinearLayout>

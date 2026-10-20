@@ -7,8 +7,16 @@ import android.animation.IntEvaluator;
 import android.animation.ObjectAnimator;
 import android.annotation.SuppressLint;
 import android.content.DialogInterface;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkInfo;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
 import android.os.Handler;
 import android.util.TypedValue;
 import android.view.KeyEvent;
@@ -38,6 +46,7 @@ import com.github.tvbox.osc.bean.AbsSortXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.MovieSort;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.ui.adapter.HomePageAdapter;
@@ -667,12 +676,7 @@ public class HomeActivity extends BaseActivity {
     private void doExit() {
         // 如果两次返回间隔小于 2000 毫秒，则退出应用
         if (System.currentTimeMillis() - mExitTime < 2000) {
-            AppManager.getInstance().finishAllActivity();
-            unregisterEventBus();
-            ControlManager.get().stopServer();
-            finish();
-            android.os.Process.killProcess(android.os.Process.myPid());
-            System.exit(0);
+            exitWithSync();
         } else {
             // 否则仅提示用户，再按一次退出应用
             mExitTime = System.currentTimeMillis();
@@ -683,12 +687,20 @@ public class HomeActivity extends BaseActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        HistorySyncManager.onForeground();
         refreshTopInfoTextSize();
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
         mHandler.postDelayed(refreshTopInfoTextSizeRunnable, 350);
         mHandler.removeCallbacks(refreshTopLayoutRunnable);
         mHandler.postDelayed(refreshTopLayoutRunnable, 450);
         mHandler.post(mRunnable);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        unregisterNetworkListener();
+        HistorySyncManager.onBackground();
     }
 
 
@@ -698,6 +710,112 @@ public class HomeActivity extends BaseActivity {
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
         mHandler.removeCallbacks(refreshTopLayoutRunnable);
         mHandler.removeCallbacks(mRunnable);
+    }
+
+
+    /**
+     * v73：退出前尽量把未同步的改动传上去。
+     * 只在「有脏数据」时等，成功立即退出，最多等 2.5 秒；失败则保留脏标记，下次启动补。
+     */
+    private void exitWithSync() {
+        if (!HistorySyncManager.needsSyncBeforeExit()) {
+            killNow();
+            return;
+        }
+        Toast.makeText(mContext, "正在同步观看记录…", Toast.LENGTH_SHORT).show();
+        final boolean[] done = {false};
+        final Handler handler = new Handler(Looper.getMainLooper());
+        final Runnable timeout = new Runnable() {
+            @Override
+            public void run() {
+                if (!done[0]) {
+                    done[0] = true;
+                    killNow();
+                }
+            }
+        };
+        handler.postDelayed(timeout, 2500);
+        HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
+            @Override
+            public void onDone(boolean ok, String message) {
+                handler.removeCallbacks(timeout);
+                if (!done[0]) {
+                    done[0] = true;
+                    killNow();
+                }
+            }
+        });
+    }
+
+    private void killNow() {
+        AppManager.getInstance().finishAllActivity();
+        unregisterEventBus();
+        ControlManager.get().stopServer();
+        finish();
+        android.os.Process.killProcess(android.os.Process.myPid());
+        System.exit(0);
+    }
+
+    // ---------------------------------------------------------------- 前台网络恢复
+
+    private ConnectivityManager.NetworkCallback netCallback;
+    private BroadcastReceiver netReceiver;
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        registerNetworkListener();
+    }
+
+    /**
+     * 只在前台监听：App 退到后台/被杀后不会唤醒进程，零耗电。
+     * API 24+ 用 NetworkCallback；API 21~23 用动态广播（Android 5.0 盒子走这条）。
+     */
+    private void registerNetworkListener() {
+        try {
+            final ConnectivityManager cm =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 24) {
+                netCallback = new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        HistorySyncManager.onNetworkAvailable();
+                    }
+                };
+                cm.registerDefaultNetworkCallback(netCallback);
+            } else {
+                netReceiver = new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        NetworkInfo info = cm.getActiveNetworkInfo();
+                        if (info != null && info.isConnected()) {
+                            HistorySyncManager.onNetworkAvailable();
+                        }
+                    }
+                };
+                registerReceiver(netReceiver, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void unregisterNetworkListener() {
+        try {
+            ConnectivityManager cm =
+                    (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (netCallback != null && cm != null && Build.VERSION.SDK_INT >= 24) {
+                cm.unregisterNetworkCallback(netCallback);
+            }
+            netCallback = null;
+            if (netReceiver != null) {
+                unregisterReceiver(netReceiver);
+            }
+            netReceiver = null;
+        } catch (Throwable ignored) {
+        }
     }
 
     private void refreshTopInfoTextSize() {

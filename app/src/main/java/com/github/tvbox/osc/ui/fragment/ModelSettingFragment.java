@@ -1045,6 +1045,27 @@ public class ModelSettingFragment extends BaseLazyFragment {
 
     private void onClickClearCache(View v) {
         FastClickCheckUtil.check(v);
+        // v73：已登录时先确认「是否同时清空云端」，游客模式直接清本机
+        new com.github.tvbox.osc.ui.dialog.ConfirmClearCacheDialog(mActivity,
+                new com.github.tvbox.osc.ui.dialog.ConfirmClearCacheDialog.Callback() {
+                    @Override
+                    public void onConfirm(boolean clearCloud) {
+                        if (clearCloud) {
+                            com.github.tvbox.osc.sync.HistorySyncManager.clearCloud(
+                                    new com.github.tvbox.osc.sync.HistorySyncManager.Callback() {
+                                        @Override
+                                        public void onDone(boolean ok, String message) {
+                                            startLocalClear();
+                                        }
+                                    });
+                        } else {
+                            startLocalClear();
+                        }
+                    }
+                }).show();
+    }
+
+    private void startLocalClear() {
         String cachePath = FileUtils.getCachePath();
         File cacheDir = new File(cachePath);
         new Thread(() -> {

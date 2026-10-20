@@ -28,6 +28,10 @@ public interface PlayProgressDao {
     @Query("select * from play_progress where sourceKey = :sourceKey and vodId = :vodId")
     java.util.List<PlayProgress> getByVod(String sourceKey, String vodId);
 
+    /** 全量导出（同步用）。 */
+    @Query("select * from play_progress")
+    java.util.List<PlayProgress> getAllRows();
+
     /**
      * 清理"孤儿"进度行：所属影片已不在观看历史（vodRecord）中。
      * 历史记录被裁剪（超出上限自动删除）、同名合并删除、或清空历史后，

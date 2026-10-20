@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <SurfaceView
+        android:id="@+id/surface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:padding="@dimen/vs_20"
+        android:text="对着电视上的二维码扫描"
+        android:textColor="@android:color/white"
+        android:textSize="@dimen/ts_26" />
+
+    <TextView
+        android:id="@+id/tvScanTip"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:gravity="center"
+        android:padding="@dimen/vs_20"
+        android:text=""
+        android:textColor="@android:color/white"
+        android:textSize="@dimen/ts_22" />
+</FrameLayout>

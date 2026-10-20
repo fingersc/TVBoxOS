@@ -9,6 +9,7 @@ import com.github.tvbox.osc.callback.EmptyCallback;
 import com.github.tvbox.osc.callback.LoadingCallback;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.server.ControlManager;
+import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.util.AppManager;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
@@ -63,6 +64,8 @@ public class App extends MultiDexApplication {
         ControlManager.init(this);
         //初始化数据库
         AppDataManager.init();
+        // v73：恢复账号（决定用哪个数据库文件）+ 启动同步触发器（冷启动 10s / 前台 30min 兜底）
+        HistorySyncManager.start();
         LoadSir.beginBuilder()
                 .addCallback(new EmptyCallback())
                 .addCallback(new LoadingCallback())

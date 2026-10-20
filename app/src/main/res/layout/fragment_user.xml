@@ -42,7 +42,7 @@
                     android:layout_height="@dimen/vs_50"
                     android:layout_gravity="center"
                     android:alpha="0.75"
-                    android:src="@drawable/icon_history" />
+                    android:src="@drawable/icon_account" />
 
                 <TextView
                     android:layout_width="wrap_content"
@@ -52,7 +52,7 @@
                     android:focusable="false"
                     android:focusableInTouchMode="false"
                     android:gravity="center"
-                    android:text="历史"
+                    android:text="账号"
                     android:textAlignment="gravity"
                     android:textColor="@color/color_CCFFFFFF"
                     android:textSize="@dimen/ts_40" />

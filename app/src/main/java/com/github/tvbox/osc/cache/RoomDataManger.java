@@ -6,6 +6,8 @@ import com.github.tvbox.osc.api.ApiConfig;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.data.AppDataManager;
+import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
@@ -83,6 +85,7 @@ public class RoomDataManger {
         record.updateTime = System.currentTimeMillis();
         record.dataJson = getVodInfoGson().toJson(vodInfo);
         dao.insert(record);
+        HistorySyncManager.markDirty();
     }
 
     public static VodInfo getVodInfo(String sourceKey, String vodId) {
@@ -186,6 +189,9 @@ public class RoomDataManger {
         if (record != null) {
             AppDataManager.get().getVodRecordDao().delete(record);
         }
+        // v73：同步墓碑（用户主动删除，需传播到其它设备）
+        SyncTombstones.addRecord(sourceKey, vodId);
+        HistorySyncManager.markDirty();
     }
 
     public static List<VodInfo> getAllVodRecord(int limit) {
@@ -298,21 +304,44 @@ public class RoomDataManger {
         record.name = vodInfo.name;
         record.pic = vodInfo.pic;
         AppDataManager.get().getVodCollectDao().insert(record);
+        HistorySyncManager.markDirty();
     }
 
     public static void deleteVodCollect(int id) {
+        VodCollect record = AppDataManager.get().getVodCollectDao().getVodCollect(id);
         AppDataManager.get().getVodCollectDao().delete(id);
+        if (record != null) {
+            SyncTombstones.addCollect(record.sourceKey, record.vodId);
+            HistorySyncManager.markDirty();
+        }
     }
 
     public static void deleteVodCollect(String sourceKey, VodInfo vodInfo) {
         VodCollect record = AppDataManager.get().getVodCollectDao().getVodCollect(sourceKey, vodInfo.id);
         if (record != null) {
             AppDataManager.get().getVodCollectDao().delete(record);
+            SyncTombstones.addCollect(sourceKey, vodInfo.id);
+            HistorySyncManager.markDirty();
         }
     }
     
     public static void deleteVodCollectAll() {
         AppDataManager.get().getVodCollectDao().deleteAll();
+    }
+
+    /** 清空收藏并为每条写墓碑（用户在收藏页主动清空 ⇒ 应传播到其它设备）。 */
+    public static void deleteVodCollectAllWithTombstones() {
+        try {
+            List<VodCollect> all = AppDataManager.get().getVodCollectDao().getAll();
+            if (all != null) {
+                for (VodCollect c : all) {
+                    SyncTombstones.addCollect(c.sourceKey, c.vodId);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        AppDataManager.get().getVodCollectDao().deleteAll();
+        HistorySyncManager.markDirty();
     }
 
     /**
@@ -361,6 +390,22 @@ public class RoomDataManger {
     public static void deleteVodRecordAll() {
         PlayProgressManager.deleteAll();
         AppDataManager.get().getVodRecordDao().deleteAll();
+    }
+
+    /** 清空历史并为每条写墓碑（用户在历史页主动清空 ⇒ 应传播到其它设备）。 */
+    public static void deleteVodRecordAllWithTombstones() {
+        try {
+            List<VodRecord> all = AppDataManager.get().getVodRecordDao().getAll(Integer.MAX_VALUE);
+            if (all != null) {
+                for (VodRecord r : all) {
+                    SyncTombstones.addRecord(r.sourceKey, r.vodId);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        PlayProgressManager.deleteAll();
+        AppDataManager.get().getVodRecordDao().deleteAll();
+        HistorySyncManager.markDirty();
     }
 
     public static boolean isVodCollect(String sourceKey, String vodId) {

@@ -3,6 +3,8 @@ package com.github.tvbox.osc.cache;
 import android.text.TextUtils;
 
 import com.github.tvbox.osc.data.AppDataManager;
+import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncTombstones;
 
 /**
  * 播放进度的列存储门面：代替原 CacheManager + MD5(拼接串) 的进度存储。
@@ -34,6 +36,7 @@ public class PlayProgressManager {
             p.position = position;
             p.updateTime = System.currentTimeMillis();
             dao.save(p);
+            HistorySyncManager.markDirty();
         } catch (Throwable th) {
             th.printStackTrace();
         }
@@ -54,6 +57,8 @@ public class PlayProgressManager {
     public static void delete(String sourceKey, String vodId, String flag, int playIndex, String epName) {
         try {
             AppDataManager.get().getPlayProgressDao().delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+            SyncTombstones.addProgress(sourceKey, vodId, flag, playIndex, epName);
+            HistorySyncManager.markDirty();
         } catch (Throwable th) {
             th.printStackTrace();
         }

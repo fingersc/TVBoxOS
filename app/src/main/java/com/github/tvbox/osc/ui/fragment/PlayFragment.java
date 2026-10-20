@@ -84,6 +84,7 @@ import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.ImgUtil;
 import com.github.tvbox.osc.util.LOG;
+import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.PlayerHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
@@ -1886,6 +1887,9 @@ public class PlayFragment extends BaseLazyFragment {
             // mCurrentPosition（只在 getCurrentPosition() 被调用时更新），
             // 这里先按真实位置落一次盘，再释放。
             saveCurrentProgressNow();
+            // v73：退出播放页时进度刚落盘，立即补一次同步（60 秒门槛内部判断），
+            // 避免「看完就退出 App」时只能等下次启动补传。
+            HistorySyncManager.onPlaybackExit();
             mVideoView.release();
             mVideoView = null;
         }

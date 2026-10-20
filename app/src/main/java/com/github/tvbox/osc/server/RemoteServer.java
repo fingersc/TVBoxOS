@@ -15,6 +15,7 @@ import com.github.tvbox.osc.base.App;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.event.ServerEvent;
+import com.github.tvbox.osc.sync.QrLoginBridge;
 import com.github.tvbox.osc.receiver.PushReceiver;
 import com.github.tvbox.osc.util.FileUtils;
 import com.github.tvbox.osc.util.LOG;
@@ -311,6 +312,13 @@ public class RemoteServer extends NanoHTTPD {
                 }
                 try {
                     Map<String, String> params = session.getParms();
+                    if (fileName.equals("/qrlogin")) {
+                        // v73 扫码登录：手机把加密后的账号信息 POST 过来（一次性 token）
+                        String token = params == null ? null : params.get("t");
+                        String body = files == null ? null : files.get("postData");
+                        String result = QrLoginBridge.accept(token, body);
+                        return NanoHTTPD.newFixedLengthResponse(Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, result);
+                    }
                     if (fileName.equals("/upload")) {
                         String path = params.get("path");
                         for (String k : files.keySet()) {

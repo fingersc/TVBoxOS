@@ -76,5 +76,30 @@ public class HawkConfig {
     public static final String DANMU_SIZE_SCALE = "danmu_size_scale";
     public static final String DANMU_RANDOM_COLOR = "danmu_random_color";
     public static final String DANMU_API = "danmu_api";
+
+    // ── v73 账号与同步 ──────────────────────────────────────────────
+    /** WebDAV 服务器地址（含根目录） */
+    public static final String SYNC_WEBDAV_URL = "sync_webdav_url";
+    public static final String SYNC_WEBDAV_USER = "sync_webdav_user";
+    public static final String SYNC_WEBDAV_PASS = "sync_webdav_pass";
+    /** 当前登录账号（JSON：owner/name/keyHex） */
+    public static final String SYNC_ACCOUNT = "sync_account";
+    /** 设备唯一标识（首次生成） */
+    public static final String SYNC_DEVICE_ID = "sync_device_id";
+    /** 上次同步时间 / 云端 epoch / 待同步标记 */
+    public static final String SYNC_LAST_AT = "sync_last_at";
+    public static final String SYNC_LAST_EPOCH = "sync_last_epoch";
+    public static final String SYNC_DIRTY = "sync_dirty";
+    /** 仅 Wi-Fi 同步 */
+    public static final String SYNC_WIFI_ONLY = "sync_wifi_only";
+    /** 同步范围（JSON：history/progress/collect/settings） */
+    public static final String SYNC_SCOPES = "sync_scopes";
+    /** 上次同步时的设置快照（JSON），用于识别本机改过哪些设置键 */
+    public static final String SYNC_SETTINGS_SNAPSHOT = "sync_settings_snapshot";
+    /** 待上传的删除墓碑（JSON，按账号：sync_tombs.<owner>） */
+    public static final String SYNC_TOMBS = "sync_tombs";
+    /** 连续失败次数 / 退避截止时间（按账号） */
+    public static final String SYNC_FAIL_COUNT = "sync_fail_count";
+    public static final String SYNC_FAIL_UNTIL = "sync_fail_until";
     public static boolean hotVodDelete;
 }

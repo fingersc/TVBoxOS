@@ -24,7 +24,7 @@ import com.github.tvbox.osc.event.ServerEvent;
 import com.github.tvbox.osc.ui.activity.CollectActivity;
 import com.github.tvbox.osc.ui.activity.DetailActivity;
 import com.github.tvbox.osc.ui.activity.FastSearchActivity;
-import com.github.tvbox.osc.ui.activity.HistoryActivity;
+import com.github.tvbox.osc.ui.activity.AccountActivity;
 import com.github.tvbox.osc.ui.activity.LivePlayActivity;
 import com.github.tvbox.osc.ui.activity.PushActivity;
 import com.github.tvbox.osc.ui.activity.SearchActivity;
@@ -377,7 +377,8 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
         } else if (v.getId() == R.id.tvSetting) {
             jumpActivity(SettingActivity.class);
         } else if (v.getId() == R.id.tvHistory) {
-            jumpActivity(HistoryActivity.class);
+            // v73：首页「历史」改为「账号」，历史入口收进账号页
+            jumpActivity(AccountActivity.class);
         } else if (v.getId() == R.id.tvPush) {
             jumpActivity(PushActivity.class);
         } else if (v.getId() == R.id.tvFavorite) {
