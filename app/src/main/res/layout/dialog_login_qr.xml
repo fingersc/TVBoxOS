@@ -2,6 +2,7 @@
 <!-- v75：扫码弹窗改为自适应尺寸 —— 二维码边长在 Java 里按屏幕高度换算，
      避免固定 vs_400 在小屏上把「提示文字 + 手机扫码按钮」挤出屏幕。 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/llQrRoot"
     android:layout_width="wrap_content"
     android:layout_height="wrap_content"
     android:layout_gravity="center"
@@ -15,7 +16,7 @@
         android:gravity="center"
         android:text="扫码登录"
         android:textColor="@color/dialog_text_primary"
-        android:textSize="@dimen/ts_26" />
+        android:textSize="@dimen/ts_28" />
 
     <ImageView
         android:id="@+id/ivQr"
@@ -29,9 +30,10 @@
         android:id="@+id/tvQrTip"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="@dimen/vs_12"
+        android:layout_marginTop="@dimen/vs_14"
         android:gravity="center"
-        android:text="用手机上的本 App（需已登录）扫码，自动同步账号到本机"
+        android:lineSpacingMultiplier="1.25"
+        android:text="用手机上的本 App（需已登录）扫码&#10;自动把账号同步到本机"
         android:textColor="@color/dialog_text_primary"
         android:textSize="@dimen/ts_20" />
 
@@ -43,6 +45,7 @@
         android:background="@drawable/button_danmu_setting"
         android:focusable="true"
         android:gravity="center"
+        android:maxLines="1"
         android:text="我是手机，扫其它设备的码"
         android:textColor="@color/dialog_text_primary"
         android:textSize="@dimen/ts_22" />

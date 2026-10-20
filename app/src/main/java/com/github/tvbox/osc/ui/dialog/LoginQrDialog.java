@@ -27,10 +27,11 @@ public class LoginQrDialog extends BaseDialog {
         String token = QrLoginBridge.newToken();
         String content = address + "qrlogin?t=" + token;
 
-        // v75：二维码边长按屏幕换算，固定尺寸会在小屏上把提示文字与手机扫码按钮挤出屏幕
+        // v75：二维码与弹窗宽度都按「屏幕短边」换算 —— 手机横屏、电视、平板都不会走形
         ImageView ivQr = findViewById(R.id.ivQr);
         DisplayMetrics dm = getContext().getResources().getDisplayMetrics();
-        int size = Math.min((int) (dm.heightPixels * 0.40f), (int) (dm.widthPixels * 0.34f));
+        int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+        int size = (int) (shortSide * 0.45f);
         size = Math.max(size, 180);
         size = Math.min(size, 560);
         ViewGroup.LayoutParams lp = ivQr.getLayoutParams();
@@ -38,6 +39,15 @@ public class LoginQrDialog extends BaseDialog {
         lp.height = size;
         ivQr.setLayoutParams(lp);
         ivQr.setImageBitmap(QRCodeGen.generateBitmap(content, size, size, 2));
+
+        // 弹窗宽度不能由二维码决定：太窄会让提示文字和按钮竖着折行，看起来很局促
+        View root = findViewById(R.id.llQrRoot);
+        int width = Math.max((int) (size * 1.40f), (int) (dm.widthPixels * 0.34f));
+        width = Math.min(width, (int) (dm.widthPixels * 0.86f));
+        ViewGroup.LayoutParams rlp = root.getLayoutParams();
+        rlp.width = width;
+        root.setLayoutParams(rlp);
+
         findViewById(R.id.btnScanOnPhone).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {

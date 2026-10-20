@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- v75：扫码页。SurfaceView 居中交给 Java 按预览比例设尺寸（避免拉伸变形），
+     取景框尺寸也在 Java 里按屏幕宽度换算。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -7,25 +9,35 @@
     <SurfaceView
         android:id="@+id/surface"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <View
+        android:id="@+id/scanFrame"
+        android:layout_width="240dp"
+        android:layout_height="240dp"
+        android:layout_gravity="center"
+        android:background="@drawable/shape_scan_frame" />
 
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
-        android:padding="@dimen/vs_20"
-        android:text="对着电视上的二维码扫描"
+        android:background="#66000000"
+        android:padding="@dimen/vs_16"
+        android:text="对准电视上的二维码"
         android:textColor="@android:color/white"
-        android:textSize="@dimen/ts_26" />
+        android:textSize="@dimen/ts_22" />
 
     <TextView
         android:id="@+id/tvScanTip"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
+        android:background="#66000000"
         android:gravity="center"
-        android:padding="@dimen/vs_20"
+        android:padding="@dimen/vs_16"
         android:text=""
         android:textColor="@android:color/white"
-        android:textSize="@dimen/ts_22" />
+        android:textSize="@dimen/ts_20" />
 </FrameLayout>
