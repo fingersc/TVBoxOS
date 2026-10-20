@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v73：账号图标（线条风格）——与 icon_history / icon_collect / icon_setting 同规格：
+     1024 视口、白色、线宽 84、圆头端点 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+
+    <path
+        android:pathData="M512,330 m-140,0 a140,140 0 1,0 280,0 a140,140 0 1,0 -280,0"
+        android:fillColor="#00000000"
+        android:strokeColor="#ffffff"
+        android:strokeLineCap="round"
+        android:strokeWidth="84" />
+
+    <path
+        android:pathData="M232,848 C232,660 352,566 512,566 C672,566 792,660 792,848"
+        android:fillColor="#00000000"
+        android:strokeColor="#ffffff"
+        android:strokeLineCap="round"
+        android:strokeWidth="84" />
+</vector>

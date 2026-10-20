@@ -75,6 +75,13 @@
         <activity
             android:name=".ui.activity.LocalFileActivity"
             android:screenOrientation="sensorLandscape" />
+        <!-- v73：账号页（首页「账号」入口）/ 手机扫码页 -->
+        <activity
+            android:name=".ui.activity.AccountActivity"
+            android:screenOrientation="sensorLandscape" />
+        <activity
+            android:name=".ui.activity.QrScanActivity"
+            android:screenOrientation="portrait" />
 
         <service
             android:name=".dlna.DLNACastService"
