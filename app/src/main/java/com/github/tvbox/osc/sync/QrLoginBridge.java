@@ -10,6 +10,8 @@ import com.orhanobut.hawk.Hawk;
 import org.json.JSONObject;
 
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 扫码登录的中转：电视生成一次性 token 并展示二维码，手机把加密后的
@@ -23,6 +25,42 @@ public final class QrLoginBridge {
     private static final long TTL_MS = 5 * 60 * 1000L;
     private static String token;
     private static long expireAt;
+    private static final List<Listener> LISTENERS = new ArrayList<>();
+
+    /** 扫码登录成功回调（弹窗据此自动关闭并提示）。 */
+    public interface Listener {
+        void onLoginOk(String name);
+    }
+
+    public static void addListener(Listener l) {
+        if (l == null) {
+            return;
+        }
+        synchronized (LISTENERS) {
+            if (!LISTENERS.contains(l)) {
+                LISTENERS.add(l);
+            }
+        }
+    }
+
+    public static void removeListener(Listener l) {
+        synchronized (LISTENERS) {
+            LISTENERS.remove(l);
+        }
+    }
+
+    private static void notifyLoginOk(String name) {
+        List<Listener> copy;
+        synchronized (LISTENERS) {
+            copy = new ArrayList<>(LISTENERS);
+        }
+        for (Listener l : copy) {
+            try {
+                l.onLoginOk(name);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 
     private QrLoginBridge() {
     }
@@ -81,6 +119,8 @@ public final class QrLoginBridge {
                 public void run() {
                     AccountContext.login(owner, name, accountKey);
                     HistorySyncManager.syncNow(null);
+                    // v75：通知二维码弹窗关闭，否则用户以为「没反应」
+                    notifyLoginOk(name);
                 }
             });
             LOG.i("[Sync] qr login accepted user=" + name);

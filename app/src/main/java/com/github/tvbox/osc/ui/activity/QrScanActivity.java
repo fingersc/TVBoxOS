@@ -11,6 +11,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.widget.FrameLayout;
@@ -69,6 +70,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     private boolean autoFocusFallback;
     private int previewW;
     private int previewH;
+    /** 相机预览的显示旋转角度（按 CameraInfo 计算，不同机型可能是 90/270/0） */
+    private int displayOrientation = 90;
     private long lastDecodeAt;
 
     @Override
@@ -200,7 +203,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                 previewH = size.height;
             }
             camera.setParameters(params);
-            camera.setDisplayOrientation(90);
+            camera.setDisplayOrientation(calcDisplayOrientation());
             camera.setPreviewDisplay(surface.getHolder());
             camera.setPreviewCallback(new Camera.PreviewCallback() {
                 @Override
@@ -217,6 +220,42 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             LOG.e("[Sync] camera preview failed", t);
             tvScanTip.setText("相机初始化失败：" + t.getMessage());
             closeCamera();
+        }
+    }
+
+    /** 标准算法：后摄 (sensorOrientation - 屏幕旋转 + 360) % 360；前摄还要镜像一次。 */
+    private int calcDisplayOrientation() {
+        try {
+            Camera.CameraInfo info = new Camera.CameraInfo();
+            Camera.getCameraInfo(0, info);
+            int rotation = getWindowManager().getDefaultDisplay().getRotation();
+            int degrees = 0;
+            switch (rotation) {
+                case Surface.ROTATION_90:
+                    degrees = 90;
+                    break;
+                case Surface.ROTATION_180:
+                    degrees = 180;
+                    break;
+                case Surface.ROTATION_270:
+                    degrees = 270;
+                    break;
+                default:
+                    degrees = 0;
+                    break;
+            }
+            int result;
+            if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
+                result = (info.orientation + degrees) % 360;
+                result = (360 - result) % 360;
+            } else {
+                result = (info.orientation - degrees + 360) % 360;
+            }
+            displayOrientation = result;
+            return result;
+        } catch (Throwable t) {
+            displayOrientation = 90;
+            return 90;
         }
     }
 
@@ -275,7 +314,11 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             return;
         }
         int vw = getResources().getDisplayMetrics().widthPixels;
-        float displayRatio = (float) previewH / (float) previewW;
+        // 预览被旋转 90/270 显示时，显示宽 = previewH、显示高 = previewW
+        boolean swap = displayOrientation == 90 || displayOrientation == 270;
+        float displayRatio = swap
+                ? (float) previewW / (float) previewH
+                : (float) previewH / (float) previewW;
         int targetH = Math.round(vw * displayRatio);
         if (surface.getLayoutParams() instanceof FrameLayout.LayoutParams) {
             FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) surface.getLayoutParams();
@@ -350,9 +393,12 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     }
 
     private void decodeFrame(byte[] data, int w, int h) {
-        String text = decode(data, w, h, false);
+        String text = decode(data, w, h, 0);
         if (text == null) {
-            text = decode(data, w, h, true);
+            text = decode(data, w, h, 90);
+        }
+        if (text == null) {
+            text = decode(data, w, h, 270);
         }
         if (text != null) {
             done = true;
@@ -366,11 +412,16 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         }
     }
 
-    private String decode(byte[] data, int w, int h, boolean rotate) {
+    private String decode(byte[] data, int w, int h, int rotateDegrees) {
         try {
             PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(data, w, h, 0, 0, w, h, false);
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(
-                    rotate ? source.rotateCounterClockwise() : source));
+            PlanarYUVLuminanceSource rotated = source;
+            if (rotateDegrees == 90) {
+                rotated = source.rotateCounterClockwise();
+            } else if (rotateDegrees == 270) {
+                rotated = source.rotateCounterClockwise().rotateCounterClockwise().rotateCounterClockwise();
+            }
+            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(rotated));
             return reader.decodeWithState(bitmap).getText();
         } catch (Throwable t) {
             return null;

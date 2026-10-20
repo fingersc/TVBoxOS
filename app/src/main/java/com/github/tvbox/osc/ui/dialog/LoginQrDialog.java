@@ -5,6 +5,7 @@ import android.util.DisplayMetrics;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
+import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 
@@ -18,7 +19,7 @@ import com.github.tvbox.osc.util.FastClickCheckUtil;
 import org.jetbrains.annotations.NotNull;
 
 /** 电视端扫码登录：显示一次性二维码，手机扫走。 */
-public class LoginQrDialog extends BaseDialog {
+public class LoginQrDialog extends BaseDialog implements QrLoginBridge.Listener {
 
     public LoginQrDialog(@NonNull @NotNull Context context) {
         super(context);
@@ -48,6 +49,8 @@ public class LoginQrDialog extends BaseDialog {
         rlp.width = width;
         root.setLayoutParams(rlp);
 
+        QrLoginBridge.addListener(this);
+
         findViewById(R.id.btnScanOnPhone).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -59,5 +62,23 @@ public class LoginQrDialog extends BaseDialog {
                 }
             }
         });
+    }
+
+    /** 手机扫码成功后：关闭二维码并提示，避免看起来「没反应」。 */
+    @Override
+    public void onLoginOk(String name) {
+        if (isShowing()) {
+            dismiss();
+        }
+        try {
+            Toast.makeText(getContext(), "已登录：" + name, Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    public void dismiss() {
+        QrLoginBridge.removeListener(this);
+        super.dismiss();
     }
 }
