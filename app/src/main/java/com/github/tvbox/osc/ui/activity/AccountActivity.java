@@ -253,13 +253,14 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final String msg;
+                String result;
                 try {
                     new WebDavClient(url, user, pass).test();
-                    msg = "连接成功";
+                    result = "连接成功";
                 } catch (Throwable t) {
-                    msg = "连接失败：" + t.getMessage();
+                    result = "连接失败：" + t.getMessage();
                 }
+                final String msg = result;
                 main.post(new Runnable() {
                     @Override
                     public void run() {
