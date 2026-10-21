@@ -1020,7 +1020,10 @@ public class DetailActivity extends BaseActivity {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return;
         }
-        llPlayerFragmentContainer.setClipToOutline(enable);
+        // v98 P1-r2：容器装的是 SurfaceView，clipToOutline 会把画面裁成黑块。
+        //       此前 applyPreviewRoundCorners() 在 init 时已关掉，但这里 setFullPreview()
+        //       每次切源都会重新启用 ⇒ 切源后黑色遮罩一直都在。容器永远不裁。
+        llPlayerFragmentContainer.setClipToOutline(false);
         llPlayerFragmentContainerBlock.setClipToOutline(enable);
         llPlayerFragmentContainer.setBackgroundResource(enable ? R.drawable.preview_player_round : android.R.color.black);
     }
