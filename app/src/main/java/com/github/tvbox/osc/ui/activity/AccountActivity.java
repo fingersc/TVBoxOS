@@ -472,12 +472,16 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     }
 
     private void confirmRemoveAccount(final String name, final String owner) {
-        final TipDialog dialog = new TipDialog(this,
+        // 用数组持有弹窗：匿名监听器在 new TipDialog(...) 的实参里，直接引用 dialog 会「可能未初始化」
+        final TipDialog[] holder = new TipDialog[1];
+        holder[0] = new TipDialog(this,
                 "移除本机账号「" + name + "」？\n本机保存的历史/收藏/设置会被删除，云端数据不受影响。",
                 "移除", "取消", new TipDialog.OnListener() {
             @Override
             public void left() {
-                dialog.dismiss();
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
                 AccountSwitcher.remove(owner, new AccountSwitcher.Callback() {
                     @Override
                     public void onDone(boolean ok, String message) {
@@ -490,15 +494,19 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
             @Override
             public void right() {
-                dialog.dismiss();
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
             }
 
             @Override
             public void cancel() {
-                dialog.dismiss();
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
             }
         });
-        dialog.show();
+        holder[0].show();
     }
 
     private WebDavClient dav() {
