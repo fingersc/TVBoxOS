@@ -6,9 +6,12 @@ import android.os.Looper;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LiveConfigPrefetcher;
 import com.github.tvbox.osc.util.LOG;
 
 import org.greenrobot.eventbus.EventBus;
+
+import com.orhanobut.hawk.Hawk;
 
 /**
  * 账号切换编排（v76）。
@@ -68,6 +71,8 @@ public final class AccountSwitcher {
                         }
                         // 换了账号：让首页按新账号的接口地址重载配置
                         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                        // v77：直播配置后台预热，避免首次点直播长时间转圈
+                        LiveConfigPrefetcher.prefetch();
                         final String msg = message;
                         HistorySyncManager.pullNow(new HistorySyncManager.Callback() {
                             @Override
@@ -101,6 +106,7 @@ public final class AccountSwitcher {
                             AccountContext.logout();
                             SettingsProfile.load("");
                             EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                            LiveConfigPrefetcher.prefetch();
                         } catch (Throwable t) {
                             LOG.e("[Account] switch guest failed", t);
                         }
@@ -133,6 +139,14 @@ public final class AccountSwitcher {
                             AccountStore.remove(owner);
                             SettingsProfile.delete(owner);
                             AppDataManager.deleteOwnerDb(owner);
+                            // v77：移除最后一个账号 = 彻底退出，连网盘凭据一起清掉（不再单独提供"退出登录"）
+                            if (AccountStore.list().isEmpty()) {
+                                Hawk.delete(HawkConfig.SYNC_WEBDAV_URL);
+                                Hawk.delete(HawkConfig.SYNC_WEBDAV_USER);
+                                Hawk.delete(HawkConfig.SYNC_WEBDAV_PASS);
+                                post(cb, true, "已移除本机账号，并清空网盘配置");
+                                return;
+                            }
                         } catch (Throwable t) {
                             LOG.e("[Account] remove failed", t);
                             post(cb, false, "移除失败：" + t.getMessage());

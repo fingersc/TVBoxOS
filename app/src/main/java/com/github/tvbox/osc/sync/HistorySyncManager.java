@@ -23,8 +23,16 @@ import com.orhanobut.hawk.Hawk;
 import org.greenrobot.eventbus.EventBus;
 
 import java.io.IOException;
+import com.github.tvbox.osc.util.HistoryHelper;
+import com.github.tvbox.osc.util.LiveConfigPrefetcher;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -392,7 +400,23 @@ public final class HistorySyncManager {
         SyncPayload local = buildLocal(owner, deviceId, scopes, now);
         SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
         checkGeneration(gen);
+        truncateMergedHistory(merged, scopes);
         applyLocal(merged, scopes);
+
+        // v78：与云端内容完全一致时跳过上传（省流量 + 省一个 PUT 请求）
+        if (remoteBytes != null && remoteBytes.length > 0 && contentEquals(merged, remote)) {
+            Hawk.put(key(HawkConfig.SYNC_LAST_AT), now);
+            Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), merged.epoch);
+            Hawk.put(key(HawkConfig.SYNC_DIRTY), false);
+            SettingsProfile.setPendingPull(owner, false);
+            SyncTombstones.clear(now);
+            LOG.i("[Sync] no change, skip upload owner=" + owner
+                    + " rec=" + merged.records.size() + " prog=" + merged.progress.size());
+            return "同步完成（无变更）：历史 " + merged.records.size()
+                    + " / 进度 " + merged.progress.size()
+                    + " / 收藏 " + merged.collects.size()
+                    + " / 设置 " + merged.settings.size();
+        }
 
         byte[] out = Crypto.encrypt(key, GSON.toJson(merged).getBytes("UTF-8"));
         try {
@@ -439,7 +463,9 @@ public final class HistorySyncManager {
         AppDataManager.get();
         if (scopes.history) {
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-            List<VodRecord> rows = dao.getAll(Integer.MAX_VALUE);
+            // v77：同步只带当前档位的条数（本机 DB 也已按档位裁剪，这里再兜一层）
+            int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
+            List<VodRecord> rows = dao.getAll(keep > 0 ? keep : Integer.MAX_VALUE);
             if (rows != null) {
                 for (VodRecord r : rows) {
                     SyncPayload.RecordItem it = new SyncPayload.RecordItem();
@@ -503,6 +529,76 @@ public final class HistorySyncManager {
         return p;
     }
 
+    /**
+     * v78：比较两份包的内容是否一致（忽略每次都变的 updatedAt / dev）。
+     *
+     * <p>只用于"没必要上传"的判定：误判为不同最多多传一次，不会丢数据。</p>
+     */
+    private static boolean contentEquals(SyncPayload a, SyncPayload b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        try {
+            long at = a.updatedAt;
+            long bt = b.updatedAt;
+            String ad = a.dev;
+            String bd = b.dev;
+            a.updatedAt = 0L;
+            b.updatedAt = 0L;
+            a.dev = "";
+            b.dev = "";
+            String ja = GSON.toJson(a);
+            String jb = GSON.toJson(b);
+            a.updatedAt = at;
+            a.dev = ad;
+            b.updatedAt = bt;
+            b.dev = bd;
+            return ja.equals(jb);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * v77：云端包也按本机档位裁剪——只保留最新 N 条历史，并丢弃已不在列表里的进度行。
+     * 直接丢弃、不写墓碑：否则会把"裁剪"当成用户删除同步到别的设备。
+     */
+    private static void truncateMergedHistory(SyncPayload merged, SyncScopes scopes) {
+        if (!scopes.history || merged.records == null) {
+            return;
+        }
+        int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
+        if (keep > 0 && merged.records.size() > keep) {
+            List<SyncPayload.RecordItem> sorted = new ArrayList<>(merged.records);
+            Collections.sort(sorted, new Comparator<SyncPayload.RecordItem>() {
+                @Override
+                public int compare(SyncPayload.RecordItem a, SyncPayload.RecordItem b) {
+                    if (a.updateTime != b.updateTime) {
+                        return a.updateTime > b.updateTime ? -1 : 1;
+                    }
+                    String da = a.dev == null ? "" : a.dev;
+                    String db = b.dev == null ? "" : b.dev;
+                    return da.compareTo(db);
+                }
+            });
+            merged.records = new ArrayList<>(sorted.subList(0, keep));
+        }
+        if (scopes.progress && merged.progress != null) {
+            Set<String> alive = new HashSet<>();
+            for (SyncPayload.RecordItem r : merged.records) {
+                alive.add((r.sourceKey == null ? "" : r.sourceKey) + "\u0001" + (r.vodId == null ? "" : r.vodId));
+            }
+            List<SyncPayload.ProgressItem> kept = new ArrayList<>();
+            for (SyncPayload.ProgressItem p : merged.progress) {
+                String k = (p.sourceKey == null ? "" : p.sourceKey) + "\u0001" + (p.vodId == null ? "" : p.vodId);
+                if (alive.contains(k)) {
+                    kept.add(p);
+                }
+            }
+            merged.progress = kept;
+        }
+    }
+
     private static void applyLocal(SyncPayload merged, SyncScopes scopes) {
         SyncTombstones.suppress(true);
         try {
@@ -557,6 +653,8 @@ public final class HistorySyncManager {
                         public void run() {
                             EventBus.getDefault().post(
                                     new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                            // v77：配置变了（尤其 live_api_url），后台预热直播配置
+                            LiveConfigPrefetcher.prefetch();
                         }
                     });
                 }

@@ -4,7 +4,7 @@ import com.orhanobut.hawk.Hawk;
 import java.util.ArrayList;
 
 public class HistoryHelper {
-    private static final Integer[] hisNumArray = {30,50,100};
+    private static final Integer[] hisNumArray = {20,30,50};
     private static final String API_LINE_SPLIT = "\t";
 
     public static String getHistoryNumName(int index){

@@ -1,5 +1,8 @@
 package com.github.tvbox.osc.sync;
 
+import com.github.tvbox.osc.util.HawkConfig;
+import com.orhanobut.hawk.Hawk;
+
 import com.google.gson.Gson;
 
 import org.json.JSONObject;
@@ -96,8 +99,15 @@ public final class AccountService {
 
     /** 同步前确保 profile 存在（老数据/手动搬移时补写）。 */
     public static void ensureProfile(WebDavClient dav, String name, byte[] key) {
+        String normalized = AccountPaths.normalize(name);
+        String cacheKey = HawkConfig.PROFILE_OK_PREFIX + normalized;
+        // v78：本机已确认过 profile 存在就不再每次 GET（省 1 个请求）
+        if (Hawk.get(cacheKey, false)) {
+            return;
+        }
         try {
-            if (dav.get(AccountPaths.profile(name), null) != null) {
+            if (dav.get(AccountPaths.profile(normalized), null) != null) {
+                Hawk.put(cacheKey, true);
                 return;
             }
             JSONObject profile = new JSONObject();
@@ -106,8 +116,9 @@ public final class AccountService {
             profile.put("createdAt", System.currentTimeMillis());
             profile.put("kdf", "pbkdf2-sha1-200k");
             profile.put("verify", Crypto.accountVerify(key));
-            dav.put(AccountPaths.profile(AccountPaths.normalize(name)),
+            dav.put(AccountPaths.profile(normalized),
                     profile.toString().getBytes("UTF-8"), null);
+            Hawk.put(cacheKey, true);
         } catch (Throwable ignored) {
         }
     }

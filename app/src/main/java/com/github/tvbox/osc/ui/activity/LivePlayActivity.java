@@ -3061,10 +3061,25 @@ public class LivePlayActivity extends BaseActivity {
 
     private boolean loadingLiveConfigOnEnter = false;
 
+    /** v77：直播配置加载超过 12 秒就收起 loading 并提示，避免"一直转圈"没有任何反馈。 */
+    private final Runnable liveConfigTimeoutRun = new Runnable() {
+        @Override
+        public void run() {
+            if (loadingLiveConfigOnEnter) {
+                loadingLiveConfigOnEnter = false;
+                showEmpty();
+                Toast.makeText(LivePlayActivity.this,
+                        "直播源加载较慢，请稍后再试或切换直播源", Toast.LENGTH_LONG).show();
+            }
+        }
+    };
+
     private void loadLiveConfigOnEnter() {
         if (loadingLiveConfigOnEnter) return;
         loadingLiveConfigOnEnter = true;
         showLoading();
+        mHandler.removeCallbacks(liveConfigTimeoutRun);
+        mHandler.postDelayed(liveConfigTimeoutRun, 12 * 1000L);
         ApiConfig.get().loadLiveConfig(true, new ApiConfig.LoadConfigCallback() {
             @Override
             public void success() {
@@ -3072,6 +3087,7 @@ public class LivePlayActivity extends BaseActivity {
                     @Override
                     public void run() {
                         loadingLiveConfigOnEnter = false;
+                        mHandler.removeCallbacks(liveConfigTimeoutRun);
                         initLiveChannelList();
                         initLiveSettingGroupList();
                     }
@@ -3084,6 +3100,7 @@ public class LivePlayActivity extends BaseActivity {
                     @Override
                     public void run() {
                         loadingLiveConfigOnEnter = false;
+                        mHandler.removeCallbacks(liveConfigTimeoutRun);
                         setEmptyLiveChannelList();
                     }
                 });

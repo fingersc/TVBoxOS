@@ -458,7 +458,13 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                             .build();
                     try (Response resp = client.newCall(req).execute()) {
                         String text = resp.body() == null ? "" : resp.body().string();
-                        msg = text.contains("ok") ? "登录信息已发送，电视将自动登录" : "发送失败：" + text;
+                        if (text.contains("ok")) {
+                            msg = "登录信息已发送，电视将自动登录";
+                        } else if (text.contains("no_dir")) {
+                            msg = "电视上没有这个账号：请确认电视与本机用的是同一份网盘";
+                        } else {
+                            msg = "发送失败：" + text;
+                        }
                     }
                 } catch (Throwable t) {
                     LOG.e("[Sync] qr submit failed", t);

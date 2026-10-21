@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v77：添加账号卡片（虚线 + 更暗底），与真实账号区分 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="@dimen/vs_6" />
+    <solid android:color="#12161E" />
+    <stroke
+        android:width="@dimen/vs_2"
+        android:color="#4A5566"
+        android:dashGap="@dimen/vs_4"
+        android:dashWidth="@dimen/vs_8" />
+</shape>

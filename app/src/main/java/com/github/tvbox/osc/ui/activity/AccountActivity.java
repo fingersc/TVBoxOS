@@ -46,6 +46,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private View llPassConfirm;
     private TextView tvLoginHint;
     private LinearLayout llAccounts;
+    private View llLoginForm;
     /** 正在切换账号：忽略重复点击与并发的登录请求 */
     private boolean switching;
     private TextView btnLogin;
@@ -81,6 +82,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         llPassConfirm = findViewById(R.id.llPassConfirm);
         tvLoginHint = findViewById(R.id.tvLoginHint);
         llAccounts = findViewById(R.id.llAccounts);
+        llLoginForm = findViewById(R.id.llLoginForm);
         btnLogin = findViewById(R.id.btnLogin);
         btnQrLogin = findViewById(R.id.btnQrLogin);
         etDavUrl = findViewById(R.id.etDavUrl);
@@ -93,7 +95,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvWifiOnly = findViewById(R.id.tvWifiOnly);
         findViewById(R.id.btnLogin).setOnClickListener(this);
         findViewById(R.id.btnQrLogin).setOnClickListener(this);
-        findViewById(R.id.btnLogout).setOnClickListener(this);
+        findViewById(R.id.btnCancelAdd).setOnClickListener(this);
         findViewById(R.id.btnHistory).setOnClickListener(this);
         findViewById(R.id.btnCollect).setOnClickListener(this);
         findViewById(R.id.btnTestDav).setOnClickListener(this);
@@ -118,6 +120,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     /** 手机扫码把账号登到本机后：立刻刷新页面上的身份、存储配置与同步状态。 */
     @Override
     public void onLoginOk(String name) {
+        hideAddForm();
         refreshAll();
         tvSyncStatus.setText("已登录：" + name + "，正在同步…");
     }
@@ -163,8 +166,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             doLogin();
         } else if (id == R.id.btnQrLogin) {
             new LoginQrDialog(this).show();
-        } else if (id == R.id.btnLogout) {
-            doLogout();
+        } else if (id == R.id.btnCancelAdd) {
+            hideAddForm();
         } else if (id == R.id.btnTestDav) {
             testDav();
         } else if (id == R.id.btnSaveDav) {
@@ -327,6 +330,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                     @Override
                     public void onDone(boolean ok, String message) {
                         setBusy(false, null);
+                        if (ok) {
+                            hideAddForm();
+                        }
                         refreshAll();
                         tvSyncStatus.setText(message);
                     }
@@ -383,12 +389,15 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         TextView card = new TextView(this);
         boolean isCurrent = guest ? AccountContext.isGuest()
                 : (owner != null && owner.equals(AccountContext.ownerKey()));
-        card.setText(isCurrent ? text + " · 当前" : text);
-        card.setTextColor(0xFFFFFFFF);
+        boolean isAdd = owner == null;
+        card.setText(isCurrent ? "✓ " + text : (isAdd ? "+  " + text : text));
+        card.setTextColor(isAdd ? 0xFF8FA0B8 : 0xFFFFFFFF);
         card.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_22));
         card.setGravity(android.view.Gravity.CENTER);
         card.setFocusable(true);
-        card.setBackgroundResource(R.drawable.button_danmu_setting);
+        // v77：当前账号实心高亮、普通账号描边、添加账号虚线，三类视觉分级
+        card.setBackgroundResource(isCurrent ? R.drawable.shape_account_chip_current
+                : (isAdd ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
         int h = (int) getResources().getDimension(R.dimen.vs_64);
         int padH = (int) getResources().getDimension(R.dimen.vs_20);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -416,8 +425,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
     private void onAccountCardClick(String name, String owner, boolean guest) {
         if (owner == null) {
-            etUser.requestFocus();
-            toast("请在上方输入账号名与密码（账号需先由管理员在网盘中创建文件夹）");
+            showAddForm();
             return;
         }
         if (guest) {
@@ -451,6 +459,34 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 doSwitchAccount(n, o, key);
             }
         }).show();
+    }
+
+    /** 展开"添加账号"表单（只有这里才需要填账号密码）。 */
+    private void showAddForm() {
+        if (llLoginForm == null) {
+            return;
+        }
+        resetActivateUi();
+        etPass.setText("");
+        etPassConfirm.setText("");
+        llLoginForm.setVisibility(View.VISIBLE);
+        tvLoginHint.setVisibility(View.GONE);
+        tvSyncStatus.setText("账号需先由管理员在网盘中创建文件夹；首次登录会提示再次输入密码");
+        etUser.requestFocus();
+    }
+
+    private void hideAddForm() {
+        if (llLoginForm != null) {
+            llLoginForm.setVisibility(View.GONE);
+        }
+        resetActivateUi();
+        etUser.setText("");
+        etPass.setText("");
+        etPassConfirm.setText("");
+        tvLoginHint.setVisibility(View.GONE);
+        tvSyncStatus.setText(AccountContext.isGuest()
+                ? "登录后可跨设备同步"
+                : "上次同步：" + HistorySyncManager.lastSyncText());
     }
 
     private void doSwitchAccount(final String name, final String owner, byte[] key) {
@@ -522,66 +558,6 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             root = root.substring(0, root.length() - 1);
         }
         return root + "/" + AccountPaths.normalize(name) + "/";
-    }
-
-    /** 上次提示"有未同步改动"的时间：5 秒内再次点击视为确认。 */
-    private long logoutWarnAt;
-
-    private void doLogout() {
-        if (AccountContext.isGuest()) {
-            toast("当前是游客模式");
-            return;
-        }
-        // 有未同步改动：先试一次，成功即退；失败则二次确认（改动保留在本机，下次登录补传）
-        if (HistorySyncManager.needsSyncBeforeExit()) {
-            if (System.currentTimeMillis() - logoutWarnAt < 5000) {
-                performLogout();
-                return;
-            }
-            tvSyncStatus.setText("正在同步未上传的改动…");
-            final boolean[] done = {false};
-            final Handler handler = new Handler(Looper.getMainLooper());
-            final Runnable timeout = new Runnable() {
-                @Override
-                public void run() {
-                    if (!done[0]) {
-                        done[0] = true;
-                        logoutWarnAt = System.currentTimeMillis();
-                        tvSyncStatus.setText("同步未完成，改动已保留在本机");
-                        toast("同步未完成，再点一次「退出登录」确认（改动下次登录会补传）");
-                    }
-                }
-            };
-            handler.postDelayed(timeout, 2500);
-            HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
-                @Override
-                public void onDone(boolean ok, String message) {
-                    handler.removeCallbacks(timeout);
-                    if (!done[0]) {
-                        done[0] = true;
-                        performLogout();
-                    }
-                }
-            });
-            return;
-        }
-        performLogout();
-    }
-
-    private void performLogout() {
-        resetActivateUi();
-        setBusy(false, null);
-        AccountContext.logout();
-        // v75：退出后不再保留网盘凭据；下次扫码登录会由二维码自动填回
-        Hawk.delete(HawkConfig.SYNC_WEBDAV_URL);
-        Hawk.delete(HawkConfig.SYNC_WEBDAV_USER);
-        Hawk.delete(HawkConfig.SYNC_WEBDAV_PASS);
-        etDavUrl.setText("");
-        etDavUser.setText("");
-        etDavPass.setText("");
-        refreshAll();
-        tvSyncStatus.setText("已退出。网盘配置已清空，扫码登录会自动填回");
-        toast("已退出，网盘配置已清空");
     }
 
     private void testDav() {

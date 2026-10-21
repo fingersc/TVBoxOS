@@ -696,6 +696,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
                     public void click(Integer value, int pos) {
                         Hawk.put(HawkConfig.HISTORY_NUM, value);
                         tvHistoryNum.setText(HistoryHelper.getHistoryNumName(value));
+                        // v77：改小档位后立即裁剪本机历史
+                        RoomDataManger.pruneHistory();
                     }
 
                     @Override

@@ -110,9 +110,27 @@ public final class QrLoginBridge {
                     || accountKey == null || accountKey.length != 64) {
                 return "bad";
             }
-            Hawk.put(HawkConfig.SYNC_WEBDAV_URL, url);
-            Hawk.put(HawkConfig.SYNC_WEBDAV_USER, davUser);
-            Hawk.put(HawkConfig.SYNC_WEBDAV_PASS, davPass);
+            // v78：本机已配置存储时以本机为准，避免扫码把整台设备的网盘换掉（其它账号会瞬间"找不到"）。
+            // 仅当本机还没配置存储时，才采用手机带来的配置（相当于扫码顺手完成存储配置）。
+            String localUrl = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");
+            if (localUrl == null || localUrl.isEmpty()) {
+                Hawk.put(HawkConfig.SYNC_WEBDAV_URL, url);
+                Hawk.put(HawkConfig.SYNC_WEBDAV_USER, davUser);
+                Hawk.put(HawkConfig.SYNC_WEBDAV_PASS, davPass);
+            }
+            // 用"生效的存储"确认账号目录存在，避免切到一个不存在的账号上
+            try {
+                WebDavClient dav = new WebDavClient(
+                        Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
+                        Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
+                        Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
+                if (!dav.dirExists(AccountPaths.dir(name))) {
+                    return "no_dir";
+                }
+            } catch (Throwable t3) {
+                LOG.e("[Sync] qr storage check failed", t3);
+                return "bad";
+            }
             token = null;
             new Handler(Looper.getMainLooper()).post(new Runnable() {
                 @Override

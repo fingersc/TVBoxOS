@@ -86,6 +86,28 @@ public class RoomDataManger {
         record.dataJson = getVodInfoGson().toJson(vodInfo);
         dao.insert(record);
         HistorySyncManager.markDirty();
+        // v77：本机只保留当前档位的条数，超出的直接删（不写墓碑，避免传到别的设备误删）
+        pruneHistory();
+    }
+
+    /** 按「保留历史记录数量」裁剪本机历史（按 updateTime 倒序，保留最新 N 条）。 */
+    public static void pruneHistory() {
+        try {
+            int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
+            if (keep <= 0) {
+                return;
+            }
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+            if (all == null || all.size() <= keep) {
+                return;
+            }
+            for (int i = keep; i < all.size(); i++) {
+                dao.delete(all.get(i));
+            }
+            HistorySyncManager.markDirty();
+        } catch (Throwable ignored) {
+        }
     }
 
     public static VodInfo getVodInfo(String sourceKey, String vodId) {
