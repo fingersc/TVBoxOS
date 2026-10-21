@@ -447,6 +447,15 @@ public class HomeActivity extends BaseActivity {
             @Override
             public void success() {
                 dataInitOk = true;
+                // v88：启动静默期内被推迟的配置变更，等首屏出来后再补（不与起播抢资源）
+                if (HistorySyncManager.consumePendingConfigEvent()) {
+                    mHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            reloadConfigAfterSync();
+                        }
+                    }, 600);
+                }
                 if (ApiConfig.get().getSpider().isEmpty()) {
                     jarInitOk = true;
                 }
@@ -692,6 +701,16 @@ public class HomeActivity extends BaseActivity {
     protected void onResume() {
         super.onResume();
         activityResumed = true;
+        // v88：启动静默期内同步写回的配置变更，可能在"首屏已渲染完成"之后才置位
+        //      （那样就不会再有 loadConfig 的 success 回调），这里补一次消费，保证当前会话也会刷新
+        if (HistorySyncManager.consumePendingConfigEvent()) {
+            mHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    reloadConfigAfterSync();
+                }
+            }, 600);
+        }
         refreshDebugBadge();
         if (pendingConfigReload) {
             pendingConfigReload = false;
@@ -855,10 +874,13 @@ public class HomeActivity extends BaseActivity {
             refreshHome(false);
         } else if (event.type == RefreshEvent.TYPE_CONFIG_CHANGE) {
             // 同步把接口地址写回来了（首次安装登录后最常见）：配置没加载过就重新加载
-            if (activityResumed) {
-                reloadConfigAfterSync();
-            } else {
+            if (!activityResumed) {
                 pendingConfigReload = true;
+            } else if (!dataInitOk) {
+                // v88：首屏还在加载中，绝不能被重载打断（否则又从头拉一遍，起播/历史都变慢）
+                pendingConfigReload = true;
+            } else {
+                reloadConfigAfterSync();
             }
         }
     }

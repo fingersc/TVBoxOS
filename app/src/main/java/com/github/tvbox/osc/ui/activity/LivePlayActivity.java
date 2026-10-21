@@ -160,6 +160,22 @@ public class LivePlayActivity extends BaseActivity {
      * 只发了 HTTP 请求、完全没有 MediaCodec 初始化，5 秒后靠"同线路重连"才真正开始解码。</p>
      */
     private boolean livePlayerReadyOnce;
+    /**
+     * v85：首帧前的"快速重试"。
+     *
+     * <p>实测冷启动第一次 setUrl 时 Surface 还没就绪（5 秒无画面），5 秒后同线路重连
+     * 只要 0.4 秒就出画面。所以首次起播后 900ms 还没画面就直接重连，不必干等 5 秒。</p>
+     */
+    private final Runnable liveFastRetryRun = new Runnable() {
+        @Override
+        public void run() {
+            if (!liveFirstFrameShown && !livePlayerReadyOnce && liveBootRetryCount == 0) {
+                LOG.i("[live] fast retry (no frame in 900ms)");
+                liveBootRetryCount = 1;
+                retrySameSource();
+            }
+        }
+    };
     private int resolutionInfoRetryCount = 0;
     private boolean resolutionInfoPending = false;
     /**
@@ -2101,6 +2117,11 @@ public class LivePlayActivity extends BaseActivity {
             showResolutionAfterChannelSwitch();
             // v80：起播后立刻排兜底（不依赖播放器状态回调）
             armLiveBootTimeout();
+            // v85：本页第一次起播，900ms 没画面就立刻重连（Surface 常来不及就绪）
+            if (!livePlayerReadyOnce) {
+                mHandler.removeCallbacks(liveFastRetryRun);
+                mHandler.postDelayed(liveFastRetryRun, 900L);
+            }
         }
         loadEpgAfterChannelStarted();
         return true;
@@ -2566,6 +2587,7 @@ public class LivePlayActivity extends BaseActivity {
                             liveFirstFrameShown = true;
                             livePlayerReadyOnce = true;
                             liveBootRetryCount = 0;
+                            mHandler.removeCallbacks(liveFastRetryRun);
                             LOG.i("[live] first frame shown");
                             mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
                         }
@@ -2693,6 +2715,7 @@ public class LivePlayActivity extends BaseActivity {
      */
     private void retrySameSource() {
         try {
+            mHandler.removeCallbacks(liveFastRetryRun);
             mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
             if (mVideoView == null || currentLiveChannelItem == null) {
                 switchToNextLiveSource();
@@ -2713,6 +2736,7 @@ public class LivePlayActivity extends BaseActivity {
 
     /** v79：起播失败后往下一条线路 / 下一个频道走（原逻辑抽出来复用）。 */
     private void switchToNextLiveSource() {
+        mHandler.removeCallbacks(liveFastRetryRun);
         LOG.i("[live] switch to next source times=" + currentLiveChangeSourceTimes);
         // v80：换源会重新起播，先取消旧兜底，起播后再重新排（playChannel 内 arm）
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);

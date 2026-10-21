@@ -61,6 +61,21 @@ public final class HistorySyncManager {
     private static long lastPullAt;
     /** 账号切换代数：切换时 +1，在途同步发现代数变了就放弃写库（防串库）。 */
     private static volatile int generation;
+    /**
+     * v88：启动静默期。冷启动时同步会在 1.5 秒左右写回配置，如果此刻就发「重载首页/预热直播」，
+     * 正好和用户点开直播/历史的起播抢网络与 CPU（用户反馈"加了账号同步之后起播变慢"）。
+     * 静默期内只记录，等首页首次渲染完成后由 HomeActivity 消费。
+     */
+    private static final long APP_START_AT = System.currentTimeMillis();
+    private static final long STARTUP_GRACE_MS = 8 * 1000L;
+    private static volatile boolean pendingConfigEvent;
+
+    /** v88：取出并清除"启动期被推迟的配置变更"，返回 true 表示首页首屏后需要补一次重载。 */
+    public static boolean consumePendingConfigEvent() {
+        boolean v = pendingConfigEvent;
+        pendingConfigEvent = false;
+        return v;
+    }
 
     /** 切换账号时调用：让在途同步放弃写库。 */
     public static void bumpGeneration() {
@@ -656,18 +671,24 @@ public final class HistorySyncManager {
                 final boolean homeChanged = !homeBefore.equals(configSnapshot(HOME_RELOAD_KEYS));
                 final boolean liveChanged = !liveBefore.equals(configSnapshot(LIVE_ONLY_KEYS));
                 if (homeChanged || liveChanged) {
-                    MAIN.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (homeChanged) {
-                                // v79：只有接口地址/线路/首页源变了才整包重载首页
-                                EventBus.getDefault().post(
-                                        new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                    if (System.currentTimeMillis() - APP_START_AT < STARTUP_GRACE_MS) {
+                        // v88：启动静默期内不打扰首页首屏与起播
+                        pendingConfigEvent = true;
+                        LOG.i("[Sync] config changed during startup grace, deferred");
+                    } else {
+                        MAIN.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (homeChanged) {
+                                    // v79：只有接口地址/线路/首页源变了才整包重载首页
+                                    EventBus.getDefault().post(
+                                            new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                                }
+                                // 直播地址/EPG 变化：只预热，不动首页
+                                LiveConfigPrefetcher.prefetch();
                             }
-                            // 直播地址/EPG 变化：只预热，不动首页
-                            LiveConfigPrefetcher.prefetch();
-                        }
-                    });
+                        });
+                    }
                 }
             }
         } finally {
