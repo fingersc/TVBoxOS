@@ -2084,26 +2084,10 @@ public class LivePlayActivity extends BaseActivity {
                 hideSwitchChannelSnapshot();
             }
             String liveUrl = currentLiveChannelItem.getUrl();
-            // v97：双栈优选 —— 用真实端口并行探测 A/AAAA，挑最快可达的族。
-            //      探测失败/超时/IP 字面量/本地代理 ⇒ liveUrl 原样使用，不影响原有行为。
-            if (Hawk.get(HawkConfig.LIVE_DUALSTACK, true)) {
-                String dHost = DualStackResolver.hostOf(liveUrl);
-                int dPort = DualStackResolver.portOf(liveUrl);
-                if (!dHost.isEmpty() && dPort > 0) {
-                    DualStackResolver.Result dr = DualStackResolver.probeFastest(dHost, dPort);
-                    // v97-r2：只有"单地址"才把域名替换成 IP。CDN 多节点（totalAddrs>1）保留域名，
-                    //        让 OkHttp 按 DNS 顺序轮询 —— 固化单个 IP 会丢掉故障转移（实测 39.135.49.10
-                    //        固化后连续 8s 超时，而同一域名此前 0.7s 就能连上）。
-                    if (dr != null && dr.address != null && dr.totalAddrs <= 1) {
-                        String picked = DualStackResolver.replaceHost(liveUrl, dr.address);
-                        if (picked != null && !picked.isEmpty() && !picked.equals(liveUrl)) {
-                            LOG.i("[live] dual-stack picked " + dHost + ":" + dPort + " -> "
-                                    + dr.address.getHostAddress() + (dr.fromCache ? " (cache)" : ""));
-                            liveUrl = picked;
-                        }
-                    }
-                }
-            }
+            // v98 P1-r1：撤销直播侧的 IP 固化 —— 实测有害：
+            //   IPTV 的 CDN 多节点会轮换，固化单个 IP 丢掉 DNS 故障转移（39.135.49.25 连续 8s 超时，
+            //   而同一域名 0.7s 就能连上）；且 connectFailed 只能按 IP 作废缓存，无法命中域名键。
+            //   双栈优选保留在 DNS 层（CustomDns.order），覆盖点播/爬虫/公网请求。
             LOG.i("[live] start channel=" + currentLiveChannelItem.getChannelName()
                     + " source=" + currentLiveChannelItem.getSourceIndex() + " url=" + liveUrl);
             LOG.i("[live] play mode=" + (reusePlayer ? "replay" : "release+start"));
