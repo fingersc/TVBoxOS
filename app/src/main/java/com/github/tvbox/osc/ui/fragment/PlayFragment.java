@@ -3895,6 +3895,9 @@ public class PlayFragment extends BaseLazyFragment {
                     mXwalkWebView.stopLoading();
                     mXwalkWebView.loadUrl("about:blank");
                     if (destroy) {
+                        // v99-r4：destroy 时把它从窗口上摘下来（configWebView* 是 addContentView
+                        //         挂上去的，不移除就一直浮在所有视图之上）
+                        detachWebView(mXwalkWebView);
                         mXwalkWebView.clearCache(true);
                         mXwalkWebView.removeAllViews();
                         mXwalkWebView.onDestroy();
@@ -3905,6 +3908,7 @@ public class PlayFragment extends BaseLazyFragment {
                     mSysWebView.stopLoading();
                     mSysWebView.loadUrl("about:blank");
                     if (destroy) {
+                        detachWebView(mSysWebView);
                         mSysWebView.clearCache(true);
                         mSysWebView.removeAllViews();
                         mSysWebView.destroy();
@@ -3913,6 +3917,21 @@ public class PlayFragment extends BaseLazyFragment {
                 }
             }
         });
+    }
+
+    /** v99-r4：把 addContentView 挂上去的 WebView 从窗口移除（destroy 前必须先摘下来）。 */
+    private void detachWebView(View webView) {
+        try {
+            if (webView == null) {
+                return;
+            }
+            android.view.ViewParent p = webView.getParent();
+            if (p instanceof ViewGroup) {
+                ((ViewGroup) p).removeView(webView);
+            }
+        } catch (Throwable t) {
+            LOG.e("[play] detach webview failed", t);
+        }
     }
 
     boolean checkVideoFormat(String url) {
@@ -3973,9 +3992,13 @@ public class PlayFragment extends BaseLazyFragment {
         if (webView == null) {
             return;
         }
-        ViewGroup.LayoutParams layoutParams = Hawk.get(HawkConfig.DEBUG_OPEN, false)
-                ? new ViewGroup.LayoutParams(800, 400) :
-                new ViewGroup.LayoutParams(1, 1);
+        // v99-r4：WebView 用 addContentView 挂在窗口最上层。原版在「调试模式」下故意把它
+        //          放大成 800x400 方便看解析过程 —— 但 addContentView 永远在最上层，
+        //          又从不移除，于是开调试模式就会在屏幕左上角出现一块
+        //          「位置固定的 800x400 纯黑长方形」（viewtree 里显示为混淆类 o），
+        //          盖住视频画面和控制条的时间标，切源后一直都在。
+        //          解析过程本来就有日志可看，这里一律按 1x1 处理，不再遮挡画面。
+        ViewGroup.LayoutParams layoutParams = new ViewGroup.LayoutParams(1, 1);
         webView.setFocusable(false);
         webView.setFocusableInTouchMode(false);
         webView.clearFocus();
@@ -4158,9 +4181,8 @@ public class PlayFragment extends BaseLazyFragment {
         if (webView == null) {
             return;
         }
-        ViewGroup.LayoutParams layoutParams = Hawk.get(HawkConfig.DEBUG_OPEN, false)
-                ? new ViewGroup.LayoutParams(800, 400) :
-                new ViewGroup.LayoutParams(1, 1);
+        // v99-r4：与 configWebViewSys 同因 —— 调试模式下 800x400 的黑 WebView 会盖住画面
+        ViewGroup.LayoutParams layoutParams = new ViewGroup.LayoutParams(1, 1);
         webView.setFocusable(false);
         webView.setFocusableInTouchMode(false);
         webView.clearFocus();
