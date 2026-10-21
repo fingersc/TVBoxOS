@@ -2091,7 +2091,10 @@ public class LivePlayActivity extends BaseActivity {
                 int dPort = DualStackResolver.portOf(liveUrl);
                 if (!dHost.isEmpty() && dPort > 0) {
                     DualStackResolver.Result dr = DualStackResolver.probeFastest(dHost, dPort);
-                    if (dr != null && dr.address != null) {
+                    // v97-r2：只有"单地址"才把域名替换成 IP。CDN 多节点（totalAddrs>1）保留域名，
+                    //        让 OkHttp 按 DNS 顺序轮询 —— 固化单个 IP 会丢掉故障转移（实测 39.135.49.10
+                    //        固化后连续 8s 超时，而同一域名此前 0.7s 就能连上）。
+                    if (dr != null && dr.address != null && dr.totalAddrs <= 1) {
                         String picked = DualStackResolver.replaceHost(liveUrl, dr.address);
                         if (picked != null && !picked.isEmpty() && !picked.equals(liveUrl)) {
                             LOG.i("[live] dual-stack picked " + dHost + ":" + dPort + " -> "

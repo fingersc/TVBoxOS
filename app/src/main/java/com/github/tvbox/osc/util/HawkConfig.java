@@ -98,6 +98,8 @@ public class HawkConfig {
     public static final String SYNC_SCOPES = "sync_scopes";
     /** 上次同步时的设置快照（JSON，按账号：sync_settings_snapshot.<owner>） */
     public static final String SYNC_SETTINGS_SNAPSHOT = "sync_settings_snapshot";
+    /** v98 P1：是否启用新同步引擎（条件请求 304 + 事务化应用 + 退避熔断）；关闭则走旧 doSync 路径 */
+    public static final String SYNC_ENGINE_V2 = "sync_engine_v2";
     /** v97：直播起播是否启用 IPv4/IPv6 并行优选（默认开；出问题可关，退回 v94 行为） */
     public static final String LIVE_DUALSTACK = "live_dualstack";
     /** 该账号的 profile.json 已确认存在的缓存（v78：省掉每次同步的一次 GET） */

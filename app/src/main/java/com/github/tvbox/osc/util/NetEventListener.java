@@ -86,6 +86,11 @@ public final class NetEventListener extends EventListener {
                               Protocol protocol, IOException ioe) {
         long cost = now() - connectStart;
         LOG.i("[net] connectFailed " + inetSocketAddress + " after " + cost + "ms " + ioe);
+        // v97-r2：连不上就作废该 host 的探测缓存，下次重新解析/重新探测（IPTV CDN 节点会变）
+        try {
+            DualStackResolver.invalidate(call.request().url().host(), call.request().url().port());
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override

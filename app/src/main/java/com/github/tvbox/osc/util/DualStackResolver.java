@@ -30,7 +30,7 @@ import java.util.concurrent.Executors;
 public final class DualStackResolver {
 
     private static final int PROBE_TIMEOUT_MS = 1200;          // 单地址探测上限
-    private static final long CACHE_TTL_MS = 10 * 60 * 1000L;  // 缓存 10 分钟
+    private static final long CACHE_TTL_MS = 2 * 60 * 1000L;   // 缓存 2 分钟（IPTV 节点会变，别固化太久）
     private static final int CACHE_MAX = 128;                  // 缓存上限，防无限增长
 
     /** host:port → 上次最快可达（或真实连接观测到成功）的地址 */
@@ -46,11 +46,13 @@ public final class DualStackResolver {
         public long probeMs;          // 探测耗时
         public boolean viaV6;         // 是否 IPv6
         public boolean fromCache;     // 是否来自缓存（零探测开销）
+        public int totalAddrs;        // 该 host 解析出的地址总数（>1 说明是 CDN 多节点）
     }
 
     private static final class Entry {
         InetAddress address;
         long at;
+        int total;        // 该 host 解析出的地址总数（-1 = 未知）
     }
 
     // ------------------------------------------------------------------ 探测
@@ -72,6 +74,7 @@ public final class DualStackResolver {
                 r.address = cached.address;
                 r.fromCache = true;
                 r.viaV6 = cached.address instanceof Inet6Address;
+                r.totalAddrs = cached.total;
                 return r;
             }
 
@@ -82,6 +85,7 @@ public final class DualStackResolver {
                 else if (a instanceof Inet6Address) v6.add(a);
             }
             if (v4.isEmpty() || v6.isEmpty()) return null;   // 单栈无需优选
+            int total = v4.size() + v6.size();
 
             final Result[] best = new Result[1];
             final Object lock = new Object();
@@ -92,7 +96,8 @@ public final class DualStackResolver {
             }
             synchronized (lock) {
                 if (best[0] == null) return null;
-                CACHE.put(key, entry(best[0].address));
+                best[0].totalAddrs = total;
+                CACHE.put(key, entry(best[0].address, total));
                 trim();
                 LOG.i("[net] pick " + key + " " + best[0].address.getHostAddress()
                         + " " + best[0].probeMs + "ms v6=" + best[0].viaV6);
@@ -173,11 +178,27 @@ public final class DualStackResolver {
         }
     }
 
+    /**
+     * 作废某个 host:port 的探测缓存（由 NetEventListener.connectFailed 调用）。
+     *
+     * <p>IPTV 的 CDN 节点会变：固化一个 IP 后它可能很快失效，
+     * 这时必须立刻丢掉缓存，让下次重新解析/重新探测，否则会连着失败到缓存过期。</p>
+     */
+    public static void invalidate(String host, int port) {
+        try {
+            if (host == null || host.isEmpty() || port <= 0) return;
+            CACHE.remove(host + ":" + port);
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 真实连接成功时记录，供 {@link #order} 做粘性排序（由 NetEventListener.connectEnd 调用）。 */
     public static void recordSuccess(String host, int port, InetAddress addr) {
         try {
             if (host == null || host.isEmpty() || addr == null || port <= 0) return;
-            CACHE.put(host + ":" + port, entry(addr));
+            // recordSuccess 来自真实连接，地址总数未知（-1）⇒ 调用方按"可固化"处理，
+            // 但 connectFailed 会立即作废，所以不会长期固化在一个坏 IP 上
+            CACHE.put(host + ":" + port, entry(addr, -1));
             trim();
         } catch (Throwable ignored) {
         }
@@ -221,10 +242,11 @@ public final class DualStackResolver {
 
     // ------------------------------------------------------------------ 内部
 
-    private static Entry entry(InetAddress a) {
+    private static Entry entry(InetAddress a, int total) {
         Entry e = new Entry();
         e.address = a;
         e.at = now();
+        e.total = total;
         return e;
     }
 

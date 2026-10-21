@@ -49,7 +49,7 @@ public final class HistorySyncManager {
         void onDone(boolean ok, String message);
     }
 
-    private static final Gson GSON = new Gson();
+    static final Gson GSON = new Gson();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
     private static final long DEBOUNCE_MS = 5 * 60 * 1000L;
@@ -106,7 +106,7 @@ public final class HistorySyncManager {
         }
     }
 
-    private static void checkGeneration(int gen) throws IOException {
+    static void checkGeneration(int gen) throws IOException {
         if (gen != generation) {
             throw new SwitchAborted();
         }
@@ -171,6 +171,11 @@ public final class HistorySyncManager {
         }
         started = true;
         AccountContext.load();
+        // v98 P1：把旧的散键同步状态迁到 SyncState（只执行一次，带标记位）
+        String migrateOwner = AccountContext.ownerKey();
+        if (migrateOwner != null && migrateOwner.length() > 0) {
+            SyncState.migrateLegacyKeys(migrateOwner);
+        }
         MAIN.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -330,9 +335,20 @@ public final class HistorySyncManager {
                 boolean aborted = false;
                 String msg;
                 final int gen = generation;
+                boolean engineHandled = false;
                 try {
-                    msg = doSync(owner, key, manual, gen);
-                    ok = true;
+                    if (Hawk.get(HawkConfig.SYNC_ENGINE_V2, true)) {
+                        // v98 P1：新引擎（条件请求 304 + 事务化 + 退避熔断），
+                        //        成败状态由引擎自行维护，外层不再 noteFailure/clearFailure
+                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, manual);
+                        ok = r.ok;
+                        msg = r.message == null ? "同步完成" : r.message;
+                        engineHandled = true;
+                    } else {
+                        msg = doSync(owner, key, manual, gen);
+                        ok = true;
+                        engineHandled = false;
+                    }
                 } catch (SwitchAborted e) {
                     aborted = true;
                     msg = e.getMessage();
@@ -350,7 +366,9 @@ public final class HistorySyncManager {
                 } finally {
                     syncing = false;
                 }
-                if (ok) {
+                if (engineHandled) {
+                    // 引擎已把 lastAt / etag / dirty / failCount 写进 SyncState
+                } else if (ok) {
                     clearFailure();
                 } else if (!aborted) {
                     noteFailure();
@@ -474,7 +492,7 @@ public final class HistorySyncManager {
                 + " / 收藏 " + merged.collects.size() + " / 设置 " + merged.settings.size();
     }
 
-    private static SyncPayload buildLocal(String owner, String deviceId, SyncScopes scopes, long now) {
+    static SyncPayload buildLocal(String owner, String deviceId, SyncScopes scopes, long now) {
         SyncPayload p = new SyncPayload();
         p.owner = owner;
         p.dev = deviceId;
@@ -554,7 +572,7 @@ public final class HistorySyncManager {
      *
      * <p>只用于"没必要上传"的判定：误判为不同最多多传一次，不会丢数据。</p>
      */
-    private static boolean contentEquals(SyncPayload a, SyncPayload b) {
+    static boolean contentEquals(SyncPayload a, SyncPayload b) {
         if (a == null || b == null) {
             return false;
         }
@@ -583,7 +601,7 @@ public final class HistorySyncManager {
      * v77：云端包也按本机档位裁剪——只保留最新 N 条历史，并丢弃已不在列表里的进度行。
      * 直接丢弃、不写墓碑：否则会把"裁剪"当成用户删除同步到别的设备。
      */
-    private static void truncateMergedHistory(SyncPayload merged, SyncScopes scopes) {
+    static void truncateMergedHistory(SyncPayload merged, SyncScopes scopes) {
         if (!scopes.history || merged.records == null) {
             return;
         }
@@ -619,10 +637,12 @@ public final class HistorySyncManager {
         }
     }
 
-    private static void applyLocal(SyncPayload merged, SyncScopes scopes) {
+    static void applyLocal(SyncPayload merged, SyncScopes scopes) {
         SyncTombstones.suppress(true);
         try {
             AppDataManager.get();
+            // v98 P1：三张表放进同一个 Room 事务 —— 失败即整体回滚，不再留下"半套数据"
+            AppDataManager.get().runInTransaction(() -> {
             if (scopes.history) {
                 VodRecordDao dao = AppDataManager.get().getVodRecordDao();
                 dao.deleteAll();
@@ -663,6 +683,8 @@ public final class HistorySyncManager {
                     dao.insert(c);
                 }
             }
+            });
+            // Hawk 写在事务之后：Room 事务回滚不了 Hawk，故此处必须幂等（重复执行结果一致）
             if (scopes.settings) {
                 String homeBefore = configSnapshot(HOME_RELOAD_KEYS);
                 String liveBefore = configSnapshot(LIVE_ONLY_KEYS);
@@ -697,7 +719,7 @@ public final class HistorySyncManager {
     }
 
     /** 云端 epoch 变化（整库重置）时清空本机该账号的同步范围数据。 */
-    private static void wipeLocal(SyncScopes scopes) {
+    static void wipeLocal(SyncScopes scopes) {
         SyncTombstones.suppress(true);
         try {
             AppDataManager.get();

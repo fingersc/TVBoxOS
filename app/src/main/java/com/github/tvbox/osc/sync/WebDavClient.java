@@ -117,6 +117,45 @@ public final class WebDavClient {
         }
     }
 
+    /** HTTP 304：条件请求命中（内容未变） */
+    public static final int HTTP_NOT_MODIFIED = 304;
+
+    /**
+     * 条件读取（v98 P1）：带 {@code If-None-Match}。
+     *
+     * <p>ETag 未变时服务端返回 304，此时返回 null 且 {@code notModified[0]=true}，
+     * 调用方据此"零下载 / 零解密 / 零解析 / 零写库"早退 —— 稳态同步从
+     * 3~4 个请求 + 23~56KB 传输降到 1 个小请求 + 0 传输。</p>
+     */
+    public byte[] getIfNoneMatch(String path, String etag, boolean[] notModified, String[] etagOut) throws IOException {
+        Request.Builder b = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .get();
+        if (etag != null && !etag.isEmpty()) {
+            b.header("If-None-Match", etag);
+        }
+        try (Response resp = client.newCall(b.build()).execute()) {
+            checkAuth(resp);
+            if (resp.code() == HTTP_NOT_MODIFIED) {
+                if (notModified != null && notModified.length > 0) {
+                    notModified[0] = true;
+                }
+                return null;
+            }
+            if (resp.code() == 404) {
+                return null;
+            }
+            if (!resp.isSuccessful()) {
+                throw new IOException("读取失败：" + resp.code());
+            }
+            if (etagOut != null && etagOut.length > 0) {
+                etagOut[0] = resp.header("ETag");
+            }
+            return resp.body() == null ? new byte[0] : resp.body().bytes();
+        }
+    }
+
     /** 写入文件；ifMatch 非空时带 If-Match（并发写冲突会抛 ConflictException）。 */
     public void put(String path, byte[] data, String ifMatch) throws IOException {
         Request.Builder b = new Request.Builder()

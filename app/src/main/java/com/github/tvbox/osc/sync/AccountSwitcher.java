@@ -55,6 +55,8 @@ public final class AccountSwitcher {
                         try {
                             HistorySyncManager.bumpGeneration();
                             AccountContext.login(owner, name, key);
+                            // v98 P1：目标账号的旧散键状态迁到 SyncState（每账号只做一次）
+                            SyncState.migrateLegacyKeys(owner);
                             AccountStore.add(name, owner);
                             AccountStore.touch(owner);
                             boolean loaded = SettingsProfile.load(owner);
