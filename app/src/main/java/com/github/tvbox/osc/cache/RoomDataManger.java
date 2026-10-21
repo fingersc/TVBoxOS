@@ -7,6 +7,7 @@ import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScope;
 import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
@@ -85,7 +86,8 @@ public class RoomDataManger {
         record.updateTime = System.currentTimeMillis();
         record.dataJson = getVodInfoGson().toJson(vodInfo);
         dao.insert(record);
-        HistorySyncManager.markDirty();
+        // v98 P2：只脏「历史」——写一条观看记录不该把收藏/设置也拖下水
+        HistorySyncManager.markDirty(SyncScope.HISTORY);
         // v77：本机只保留当前档位的条数，超出的直接删（不写墓碑，避免传到别的设备误删）
         pruneHistory();
     }
@@ -105,7 +107,7 @@ public class RoomDataManger {
             for (int i = keep; i < all.size(); i++) {
                 dao.delete(all.get(i));
             }
-            HistorySyncManager.markDirty();
+            HistorySyncManager.markDirty(SyncScope.HISTORY);
         } catch (Throwable ignored) {
         }
     }
@@ -213,7 +215,8 @@ public class RoomDataManger {
         }
         // v73：同步墓碑（用户主动删除，需传播到其它设备）
         SyncTombstones.addRecord(sourceKey, vodId);
-        HistorySyncManager.markDirty();
+        // v98 P2：删历史会连带清掉该片的进度（上面 deleteByVod），故两个 scope 都要脏
+        HistorySyncManager.markDirty(SyncScope.HISTORY, SyncScope.PROGRESS);
     }
 
     public static List<VodInfo> getAllVodRecord(int limit) {
@@ -326,7 +329,7 @@ public class RoomDataManger {
         record.name = vodInfo.name;
         record.pic = vodInfo.pic;
         AppDataManager.get().getVodCollectDao().insert(record);
-        HistorySyncManager.markDirty();
+        HistorySyncManager.markDirty(SyncScope.COLLECT);
     }
 
     public static void deleteVodCollect(int id) {
@@ -334,7 +337,7 @@ public class RoomDataManger {
         AppDataManager.get().getVodCollectDao().delete(id);
         if (record != null) {
             SyncTombstones.addCollect(record.sourceKey, record.vodId);
-            HistorySyncManager.markDirty();
+            HistorySyncManager.markDirty(SyncScope.COLLECT);
         }
     }
 
@@ -343,7 +346,7 @@ public class RoomDataManger {
         if (record != null) {
             AppDataManager.get().getVodCollectDao().delete(record);
             SyncTombstones.addCollect(sourceKey, vodInfo.id);
-            HistorySyncManager.markDirty();
+            HistorySyncManager.markDirty(SyncScope.COLLECT);
         }
     }
     
@@ -363,7 +366,7 @@ public class RoomDataManger {
         } catch (Throwable ignored) {
         }
         AppDataManager.get().getVodCollectDao().deleteAll();
-        HistorySyncManager.markDirty();
+        HistorySyncManager.markDirty(SyncScope.COLLECT);
     }
 
     /**
@@ -427,7 +430,7 @@ public class RoomDataManger {
         }
         PlayProgressManager.deleteAll();
         AppDataManager.get().getVodRecordDao().deleteAll();
-        HistorySyncManager.markDirty();
+        HistorySyncManager.markDirty(SyncScope.HISTORY, SyncScope.PROGRESS);
     }
 
     public static boolean isVodCollect(String sourceKey, String vodId) {

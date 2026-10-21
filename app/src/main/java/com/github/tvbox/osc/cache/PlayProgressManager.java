@@ -4,6 +4,7 @@ import android.text.TextUtils;
 
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScope;
 import com.github.tvbox.osc.sync.SyncTombstones;
 
 /**
@@ -36,7 +37,8 @@ public class PlayProgressManager {
             p.position = position;
             p.updateTime = System.currentTimeMillis();
             dao.save(p);
-            HistorySyncManager.markDirty();
+            // v98 P2：只看剧不动历史/收藏/设置 —— 只脏「进度」
+            HistorySyncManager.markDirty(SyncScope.PROGRESS);
         } catch (Throwable th) {
             th.printStackTrace();
         }
@@ -58,7 +60,7 @@ public class PlayProgressManager {
         try {
             AppDataManager.get().getPlayProgressDao().delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
             SyncTombstones.addProgress(sourceKey, vodId, flag, playIndex, epName);
-            HistorySyncManager.markDirty();
+            HistorySyncManager.markDirty(SyncScope.PROGRESS);
         } catch (Throwable th) {
             th.printStackTrace();
         }

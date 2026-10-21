@@ -16,6 +16,7 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.base.App;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScope;
 import com.github.tvbox.osc.ui.adapter.BackupAdapter;
 import com.github.tvbox.osc.util.FileUtils;
 import com.hjq.permissions.OnPermissionCallback;
@@ -133,7 +134,9 @@ public class BackupDialog extends BaseDialog {
                 File db = new File(backup, "sqlite");
                 if (AppDataManager.restore(db)) {
                     // v73：恢复后数据整体被替换，标记待同步，下次启动补传
-                    HistorySyncManager.markDirty();
+                    // v98 P2：DB（历史/进度/收藏）+ Hawk（设置）都被整体换掉 ⇒ 四个 scope 全脏
+                    HistorySyncManager.markDirty(SyncScope.HISTORY, SyncScope.PROGRESS,
+                            SyncScope.COLLECT, SyncScope.SETTINGS);
                     byte[] data = FileUtils.readSimple(new File(backup, "hawk"));
                     if (data != null) {
                         String hawkJson = new String(data, "UTF-8");

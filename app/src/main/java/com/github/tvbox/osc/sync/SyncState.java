@@ -63,6 +63,18 @@ public final class SyncState {
         }
     }
 
+    /** v98 P2：该账号是否已经有过 SyncState 记录（用于决定能否读旧散键兜底）。 */
+    public static boolean exists(String owner) {
+        if (owner == null || owner.isEmpty()) {
+            return false;
+        }
+        try {
+            return Hawk.contains(PREFIX + owner);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     // ---------------------------------------------------------------- scope
 
     /** v98 P2 起按 scope 标脏；P1 阶段等价于全局脏。 */

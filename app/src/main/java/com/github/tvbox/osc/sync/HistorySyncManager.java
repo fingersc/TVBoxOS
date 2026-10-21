@@ -14,17 +14,13 @@ import com.github.tvbox.osc.cache.VodCollectDao;
 import com.github.tvbox.osc.cache.VodRecord;
 import com.github.tvbox.osc.cache.VodRecordDao;
 import com.github.tvbox.osc.data.AppDataManager;
-import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.google.gson.Gson;
 import com.orhanobut.hawk.Hawk;
 
-import org.greenrobot.eventbus.EventBus;
-
 import java.io.IOException;
 import com.github.tvbox.osc.util.HistoryHelper;
-import com.github.tvbox.osc.util.LiveConfigPrefetcher;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -36,10 +32,11 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * 同步编排：导出 → 拉取 → 解密 → 合并 → 写回 → 加密上传。
+ * 同步编排（数据面）：导出 → 拉取 → 解密 → 合并 → 写回 → 加密上传。
  *
- * <p>触发：登录成功 / 冷启动 10s / 回前台（≥10min）/ 数据变更（5min 节流）/
- * 进后台（≥60s，尽力）/ 手动 / 前台每 30min 兜底。</p>
+ * <p>触发（v98 P2 起全部经由 {@link SyncScheduler}）：冷启动 1.5s / 回前台 /
+ * 数据变更（60s 防抖 + 合并）/ 自适应间隔轮询（5→10→20→30min，后台不轮询）/
+ * 手动 / 退出播放 / 网络恢复 / 切换账号。</p>
  *
  * <p>不引入任何后台调度组件：进程被杀就等下次打开补，数据不丢（dirty 已落盘）。</p>
  */
@@ -52,7 +49,7 @@ public final class HistorySyncManager {
     static final Gson GSON = new Gson();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
-    private static final long DEBOUNCE_MS = 5 * 60 * 1000L;
+    /** 两次自动同步的最小间隔（手动同步不受此限）。 */
     private static final long MIN_GAP_MS = 60 * 1000L;
 
     private static volatile boolean syncing;
@@ -61,21 +58,9 @@ public final class HistorySyncManager {
     private static long lastPullAt;
     /** 账号切换代数：切换时 +1，在途同步发现代数变了就放弃写库（防串库）。 */
     private static volatile int generation;
-    /**
-     * v88：启动静默期。冷启动时同步会在 1.5 秒左右写回配置，如果此刻就发「重载首页/预热直播」，
-     * 正好和用户点开直播/历史的起播抢网络与 CPU（用户反馈"加了账号同步之后起播变慢"）。
-     * 静默期内只记录，等首页首次渲染完成后由 HomeActivity 消费。
-     */
-    private static final long APP_START_AT = System.currentTimeMillis();
-    private static final long STARTUP_GRACE_MS = 8 * 1000L;
-    private static volatile boolean pendingConfigEvent;
-
-    /** v88：取出并清除"启动期被推迟的配置变更"，返回 true 表示首页首屏后需要补一次重载。 */
-    public static boolean consumePendingConfigEvent() {
-        boolean v = pendingConfigEvent;
-        pendingConfigEvent = false;
-        return v;
-    }
+    // v98 P3：原先的「8 秒启动静默期 + pendingConfigEvent」已删除 ——
+    //         它由 ConfigCenter 的 homeReady / uiReady 两个门控取代，口径更准
+    //         （不是拍一个 8 秒常数，而是真的等首屏数据加载完）。
 
     /** 切换账号时调用：让在途同步放弃写库。 */
     public static void bumpGeneration() {
@@ -112,57 +97,48 @@ public final class HistorySyncManager {
         }
     }
 
-    /** 同步状态按账号隔离（读取时回退到旧的全局键，兼容升级）。 */
+    /**
+     * v98 P2：同步状态统一读 {@link SyncState}（每账号一份），
+     * 只有「还没迁过」时才回退到旧的散键（start() 与 AccountSwitcher 都会迁）。
+     */
+    private static String owner() {
+        return AccountContext.ownerKey();
+    }
+
     private static long lastSyncAt() {
+        String owner = owner();
+        if (owner != null && owner.length() > 0) {
+            SyncState st = SyncState.load(owner);
+            if (st.lastAt > 0) {
+                return st.lastAt;
+            }
+        }
         long v = Hawk.get(key(HawkConfig.SYNC_LAST_AT), -1L);
         return v >= 0 ? v : Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
     }
 
     private static long lastEpoch() {
+        String owner = owner();
+        if (owner != null && owner.length() > 0) {
+            SyncState st = SyncState.load(owner);
+            if (st.lastEpoch > 0) {
+                return st.lastEpoch;
+            }
+        }
         long v = Hawk.get(key(HawkConfig.SYNC_LAST_EPOCH), -1L);
         return v >= 0 ? v : Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L);
     }
 
-    private static final Runnable DEBOUNCE_TASK = new Runnable() {
-        @Override
-        public void run() {
-            sync(false, false, null);
-        }
-    };
-
-    private static final Runnable PERIODIC_TASK = new Runnable() {
-        @Override
-        public void run() {
-            sync(false, false, null);
-            MAIN.postDelayed(this, 30 * 60 * 1000L);
-        }
-    };
+    // v98 P2：原先的 DEBOUNCE_TASK（5 分钟防抖）与 PERIODIC_TASK（固定 30 分钟周期）
+    //         已由 SyncScheduler 接管：前者变成 60 秒防抖 + 合并，后者变成自适应间隔
+    //         （5→10→20→30 分钟，且后台不轮询）。这里不再自己 postDelayed。
 
     private HistorySyncManager() {
     }
 
-    /**
-     * 与首页加载直接相关的配置键：这些键变化后首页必须重新 loadConfig，
-     * 否则「首次安装 → 登录 → 同步写回接口地址」后首页仍然是空的。
-     */
-    /** v79：需要「整包重载首页」的键（接口地址 / 线路 / 首页源）。 */
-    private static final String[] HOME_RELOAD_KEYS = {
-            HawkConfig.API_URL, HawkConfig.API_LINE_SOURCE, HawkConfig.HOME_API,
-    };
-
-    /** v79：只需预热直播配置、完全不必碰首页的键。 */
-    private static final String[] LIVE_ONLY_KEYS = {
-            HawkConfig.LIVE_API_URL, HawkConfig.EPG_URL,
-    };
-
-    private static String configSnapshot(String[] keys) {
-        StringBuilder sb = new StringBuilder();
-        for (String k : keys) {
-            Object v = Hawk.contains(k) ? Hawk.get(k) : null;
-            sb.append(k).append('=').append(v == null ? "" : String.valueOf(v)).append('\n');
-        }
-        return sb.toString();
-    }
+    // v98 P3：原先的 HOME_RELOAD_KEYS / LIVE_ONLY_KEYS / configSnapshot 已搬到
+    //         ConfigPlan（键 → 动作分类表）与 ConfigCenter（前后快照 diff）。
+    //         这里不再关心「哪些键需要动界面」——那是界面的事，不是同步的事。
 
     /** App 启动时调用一次。 */
     public static void start() {
@@ -176,13 +152,9 @@ public final class HistorySyncManager {
         if (migrateOwner != null && migrateOwner.length() > 0) {
             SyncState.migrateLegacyKeys(migrateOwner);
         }
-        MAIN.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                sync(false, false, null);
-            }
-        }, 1500L);
-        MAIN.postDelayed(PERIODIC_TASK, 30 * 60 * 1000L);
+        // v98 P2：冷启动那一次交给调度器（1.5 秒内必跑一次）；此后的周期轮询
+        //         由调度器按自适应间隔接管，App 不再自己持有 30 分钟的定时器。
+        SyncScheduler.requestWithin(migrateOwner, "boot", 1500L);
     }
 
     /** 按账号命名空间取 Hawk 键（游客用原键）。 */
@@ -191,17 +163,44 @@ public final class HistorySyncManager {
         return (owner == null || owner.length() == 0) ? base : base + "." + owner;
     }
 
-    /** 数据变更时调用：置脏 + 5 分钟后合并成一次同步。 */
+    /**
+     * 数据变更时调用（旧签名）：默认标脏「历史 + 进度 + 收藏」。
+     *
+     * <p>保留旧签名是为了让既有调用点零改动；需要精确标脏的地方请用
+     * {@link #markDirty(SyncScope...)}。</p>
+     */
     public static void markDirty() {
+        markDirty(SyncScope.HISTORY, SyncScope.PROGRESS, SyncScope.COLLECT);
+    }
+
+    /**
+     * v98 P2：按 scope 标脏 —— 「改一个设置」不再等价于「四张表全脏」。
+     *
+     * <p>当前引擎还没按 scope 裁剪请求体（协议不变、行为等价），按 scope 标脏
+     * 立刻生效的是<b>调度层</b>：只有真脏的账号才走 60 秒防抖的立即档，
+     * 其余走自适应间隔。</p>
+     */
+    public static void markDirty(SyncScope... scopes) {
+        // 旧键仍写一份：回退到旧引擎（SYNC_ENGINE_V2=false）时仍然看得到脏标记
         Hawk.put(key(HawkConfig.SYNC_DIRTY), true);
         if (AccountContext.isGuest()) {
             return;
         }
-        MAIN.removeCallbacks(DEBOUNCE_TASK);
-        MAIN.postDelayed(DEBOUNCE_TASK, DEBOUNCE_MS);
+        SyncState st = SyncState.load(owner());
+        st.markDirty(scopes);
+        st.save();
+        SyncScheduler.request(owner(), "dirty");
     }
 
     public static boolean isDirty() {
+        String owner = owner();
+        if (owner == null || owner.length() == 0) {
+            return false;
+        }
+        if (SyncState.exists(owner)) {
+            return SyncState.load(owner).anyDirty();
+        }
+        // 还没迁过（理论上不会发生）⇒ 读旧键兜底
         return Hawk.get(key(HawkConfig.SYNC_DIRTY), false);
     }
 
@@ -210,23 +209,31 @@ public final class HistorySyncManager {
         return !AccountContext.isGuest() && isDirty() && hasConfig();
     }
 
-    /** 退出播放页（进度刚落盘）：距上次 ≥60 秒就立即补一次。 */
+    /** 退出播放页（进度刚落盘）：有改动就交给调度器（防抖窗口内必跑一次）。 */
     public static void onPlaybackExit() {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        long last = lastSyncAt();
-        if (System.currentTimeMillis() - last >= 60 * 1000L) {
-            sync(false, false, null);
-        }
+        SyncScheduler.request(owner(), "playback-exit");
     }
 
-    /** 前台网络从断到通：补一次（自动同步的 3 分钟门槛仍然生效）。 */
+    /**
+     * 前台网络从断到通：1 秒内补一次。
+     *
+     * <p>v98 P2：若之前是「网络抖动」造成的失败（连续失败 ≤2 次）就顺手解除熔断 ——
+     * 网都回来了还白等 30 秒 / 2 分钟没有意义。<b>认证失败（failCount=3）不解除</b>：
+     * 否则网一恢复就拿错误的应用密码去撞 15 分钟。</p>
+     */
     public static void onNetworkAvailable() {
-        if (AccountContext.isGuest() || !isDirty()) {
+        if (AccountContext.isGuest() || !hasConfig()) {
             return;
         }
-        sync(false, false, null);
+        SyncState st = SyncState.load(owner());
+        if (st.failCount > 0 && st.failCount <= 2) {
+            st.clearFailure();
+            st.save();
+        }
+        SyncScheduler.requestWithin(owner(), "net-up", 1000L);
     }
 
     /** 页面主动拉取（历史页 onResume）：绕过自动同步的最小间隔，自带 20 秒节流。 */
@@ -242,29 +249,28 @@ public final class HistorySyncManager {
             }
             lastPullAt = now;
         }
-        sync(true, false, cb);
+        SyncScheduler.requestNow(owner(), "pull", cb);
     }
 
-    /** 回到前台（首页 onResume）：距上次同步 ≥2 分钟才拉。 */
+    /**
+     * 回到前台（首页 onResume）。
+     *
+     * <p>v98 P2：不再自己算「距上次 ≥2 分钟」，改由调度器按自适应间隔判断 ——
+     * 脏 ⇒ 防抖窗口内跑；不脏 ⇒ 5/10/20/30 分钟档。</p>
+     */
     public static void onForeground() {
         if (AccountContext.isGuest()) {
             return;
         }
-        long last = lastSyncAt();
-        if (System.currentTimeMillis() - last >= 2 * 60 * 1000L) {
-            sync(false, false, null);
-        }
+        SyncScheduler.request(owner(), "fg");
     }
 
-    /** 进后台：有改动且距上次 ≥60 秒时尽力同步一次（不保证完成）。 */
+    /** 进后台：有改动就尽快补一次（不保证完成）；纯轮询任务由调度器取消。 */
     public static void onBackground() {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        long last = lastSyncAt();
-        if (System.currentTimeMillis() - last >= 60 * 1000L) {
-            sync(false, true, null);
-        }
+        SyncScheduler.requestWithin(owner(), "bg", 0L);
     }
 
     public static boolean isSyncing() {
@@ -280,54 +286,108 @@ public final class HistorySyncManager {
         return f.format(new java.util.Date(last)) + (isDirty() ? "（有未同步改动）" : "");
     }
 
+    /**
+     * v98 P3：账号页展示的完整状态 —— 时间 + 正常 / 有未同步改动 / 重试中 / 已暂停。
+     *
+     * <p>熔断期间用户此前是完全看不到的（只显示「上次同步：xx」），
+     * 会误以为同步还在正常工作。</p>
+     */
+    public static String syncStatusText() {
+        if (AccountContext.isGuest()) {
+            return "登录后可跨设备同步";
+        }
+        SyncState st = SyncState.load(owner());
+        StringBuilder sb = new StringBuilder("上次同步：");
+        if (st.lastAt <= 0) {
+            sb.append("尚未同步");
+        } else {
+            java.text.SimpleDateFormat f =
+                    new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US);
+            sb.append(f.format(new java.util.Date(st.lastAt)));
+        }
+        if (st.inBackoff()) {
+            long left = (st.failUntil - System.currentTimeMillis()) / 1000L;
+            sb.append("（已暂停，").append(Math.max(1, left)).append(" 秒后重试）");
+        } else if (st.failCount > 0) {
+            sb.append("（重试中）");
+        } else if (st.anyDirty()) {
+            sb.append("（有未同步改动）");
+        } else {
+            sb.append("（正常）");
+        }
+        return sb.toString();
+    }
+
+    /** 手动同步：立即执行，绕过最小间隔与「仅 Wi-Fi」。 */
     public static void syncNow(Callback cb) {
-        sync(true, false, cb);
+        if (AccountContext.isGuest() || !hasConfig()) {
+            // 调度器对游客 / 未配置是静默忽略的，这里必须直接走一次，让页面拿到提示
+            sync(true, false, cb);
+            return;
+        }
+        SyncScheduler.requestNow(owner(), "manual", cb);
     }
 
     // ---------------------------------------------------------------- 主流程
 
-    private static void sync(final boolean manual, final boolean background, final Callback cb) {
+    /**
+     * 真正跑一次同步（包可见：由 {@link SyncScheduler} 的任务线程调用）。
+     *
+     * <p>v98 P2：所有「这次没跑成」的分支都要回调 {@link SyncScheduler#skipped}，
+     * 否则调度器的自适应轮询链条会断掉（旧代码靠一个 30 分钟定时器兜底，现在没有了）。</p>
+     */
+    static void sync(final boolean manual, final boolean background, final Callback cb) {
+        final String owner = AccountContext.ownerKey();
         if (AccountContext.isGuest()) {
             post(cb, false, "游客模式：登录后才能同步");
+            SyncScheduler.skipped(owner, "guest");
             return;
         }
         if (!hasConfig()) {
             post(cb, false, "请先配置 WebDAV 存储");
+            SyncScheduler.skipped(owner, "no-config");
             return;
         }
-        if (!manual && !background && AccountContext.isGuest()) {
+        final byte[] key = AccountContext.key();
+        if (key == null || owner == null || owner.length() == 0) {
+            post(cb, false, "登录状态异常，请重新登录");
+            SyncScheduler.skipped(owner, "bad-account");
             return;
         }
+        boolean taken = false;
         synchronized (LOCK) {
-            if (syncing) {
-                // 被占用时必须给回调，否则页面会一直停在「正在同步…」
-                post(cb, false, "正在同步，请稍后再试");
-                return;
+            if (!syncing) {
+                syncing = true;
+                taken = true;
             }
-            syncing = true;
+        }
+        if (!taken) {
+            // 被占用时必须给回调，否则页面会一直停在「正在同步…」
+            post(cb, false, "正在同步，请稍后再试");
+            SyncScheduler.skipped(owner, "busy");
+            return;
         }
         if (!manual) {
             long last = lastSyncAt();
             if (System.currentTimeMillis() - last < MIN_GAP_MS) {
                 syncing = false;
+                SyncScheduler.skipped(owner, "min-gap");
                 return;
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {
                 syncing = false;
+                SyncScheduler.skipped(owner, "wifi-only");
                 return;
             }
-            if (System.currentTimeMillis() < Hawk.get(key(HawkConfig.SYNC_FAIL_UNTIL), 0L)) {
+            // v98 P2：新引擎自己在内部判断熔断（0 请求早退 + 给"已暂停"文案）；
+            //         只有回退到旧 doSync 时才需要在这里挡一道。
+            if (!Hawk.get(HawkConfig.SYNC_ENGINE_V2, true) && SyncState.load(owner).inBackoff()) {
                 syncing = false;
+                SyncScheduler.skipped(owner, "backoff");
                 return;
             }
         }
-        final byte[] key = AccountContext.key();
-        final String owner = AccountContext.ownerKey();
-        if (key == null || owner == null || owner.length() == 0) {
-            syncing = false;
-            post(cb, false, "登录状态异常，请重新登录");
-            return;
-        }
+        final long t0 = System.currentTimeMillis();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -336,6 +396,10 @@ public final class HistorySyncManager {
                 String msg;
                 final int gen = generation;
                 boolean engineHandled = false;
+                int requests = -1;   // -1 = 旧路径未统计
+                long down = 0L;
+                long up = 0L;
+                boolean notModified = false;
                 try {
                     if (Hawk.get(HawkConfig.SYNC_ENGINE_V2, true)) {
                         // v98 P1：新引擎（条件请求 304 + 事务化 + 退避熔断），
@@ -344,6 +408,10 @@ public final class HistorySyncManager {
                         ok = r.ok;
                         msg = r.message == null ? "同步完成" : r.message;
                         engineHandled = true;
+                        requests = r.requests;
+                        down = r.bytesDown;
+                        up = r.bytesUp;
+                        notModified = r.notModified;
                     } else {
                         msg = doSync(owner, key, manual, gen);
                         ok = true;
@@ -373,7 +441,20 @@ public final class HistorySyncManager {
                 } else if (!aborted) {
                     noteFailure();
                 }
+                // v98 P2：结构化日志 —— 一眼看出这次同步到底发了几个请求、跑了多少字节
+                String state = !ok ? "FAIL"
+                        : (engineHandled && requests == 0 ? "BACKOFF" : "OK");
+                LOG.i("[sync] owner=" + owner + " reason=" + (manual ? "manual" : "auto")
+                        + " req=" + requests + " down=" + down + " up=" + up
+                        + " skip=" + (notModified ? "304" : (up > 0 ? "no" : "same"))
+                        + " state=" + state + " dur=" + (System.currentTimeMillis() - t0) + "ms");
                 post(cb, ok, msg);
+                if (aborted) {
+                    // 账号切换作废：不算一次有效同步，不升降档
+                    SyncScheduler.skipped(owner, "aborted");
+                } else {
+                    SyncScheduler.onSyncResult(owner, ok && (up > 0 || !notModified), up > 0);
+                }
             }
         }, "tvbox-sync").start();
     }
@@ -686,32 +767,13 @@ public final class HistorySyncManager {
             });
             // Hawk 写在事务之后：Room 事务回滚不了 Hawk，故此处必须幂等（重复执行结果一致）
             if (scopes.settings) {
-                String homeBefore = configSnapshot(HOME_RELOAD_KEYS);
-                String liveBefore = configSnapshot(LIVE_ONLY_KEYS);
-                SyncSettings.apply(merged.settingsMap());
-                SyncSettings.saveSnapshot(merged.settingsMap());
-                final boolean homeChanged = !homeBefore.equals(configSnapshot(HOME_RELOAD_KEYS));
-                final boolean liveChanged = !liveBefore.equals(configSnapshot(LIVE_ONLY_KEYS));
-                if (homeChanged || liveChanged) {
-                    if (System.currentTimeMillis() - APP_START_AT < STARTUP_GRACE_MS) {
-                        // v88：启动静默期内不打扰首页首屏与起播
-                        pendingConfigEvent = true;
-                        LOG.i("[Sync] config changed during startup grace, deferred");
-                    } else {
-                        MAIN.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                if (homeChanged) {
-                                    // v79：只有接口地址/线路/首页源变了才整包重载首页
-                                    EventBus.getDefault().post(
-                                            new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
-                                }
-                                // 直播地址/EPG 变化：只预热，不动首页
-                                LiveConfigPrefetcher.prefetch();
-                            }
-                        });
-                    }
-                }
+                // v98 P3：写 Hawk + 判定「需要哪些界面动作」交给 ConfigCenter：
+                //   · 键 → 动作的分类表（reload / home / live）在 ConfigPlan
+                //   · 何时真正执行（首屏已就绪 / 首页在前台 / 60 秒节流 + 合并）由 flush() 决定
+                // 取代原先「8 秒启动静默期 + pendingConfigEvent + 无条件直播预热」的老三件套：
+                // 老实现里 homeChanged || liveChanged 都会去预热直播，改个首页源也白跑一趟网络。
+                ConfigCenter.apply(merged.settingsMap());
+                ConfigCenter.flush();
             }
         } finally {
             SyncTombstones.suppress(false);
@@ -767,6 +829,12 @@ public final class HistorySyncManager {
                     empty.dev = deviceId();
                     byte[] out = Crypto.encrypt(key, GSON.toJson(empty).getBytes("UTF-8"));
                     dav.put(AccountPaths.data(accountName), out, null);
+                    SyncState st = SyncState.load(owner);
+                    st.lastEpoch = empty.epoch;
+                    st.lastAt = System.currentTimeMillis();
+                    st.clearDirty();
+                    st.clearFailure();
+                    st.save();
                     Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), empty.epoch);
                     Hawk.put(key(HawkConfig.SYNC_LAST_AT), System.currentTimeMillis());
                     Hawk.put(key(HawkConfig.SYNC_DIRTY), false);
@@ -782,16 +850,27 @@ public final class HistorySyncManager {
 
     // ---------------------------------------------------------------- 失败退避
 
+    /**
+     * v98 P2：失败退避统一写 {@link SyncState}。
+     *
+     * <p>此前只写旧的散键，而 {@code sync()} 的熔断判断已经改读 SyncState，
+     * 会导致「回退到旧引擎后熔断失效，失败一次就无限重试」。新旧两份都写，
+     * 保证两条路径看到的是同一份状态。</p>
+     */
     private static void noteFailure() {
-        int count = Hawk.get(key(HawkConfig.SYNC_FAIL_COUNT), 0) + 1;
-        long delay = Math.min(30 * 60 * 1000L, 60 * 1000L * (1L << Math.min(count - 1, 5)));
-        Hawk.put(key(HawkConfig.SYNC_FAIL_COUNT), count);
-        Hawk.put(key(HawkConfig.SYNC_FAIL_UNTIL), System.currentTimeMillis() + delay);
+        SyncState st = SyncState.load(owner());
+        st.noteFailure();
+        st.save();
+        Hawk.put(key(HawkConfig.SYNC_FAIL_COUNT), st.failCount);
+        Hawk.put(key(HawkConfig.SYNC_FAIL_UNTIL), st.failUntil);
     }
 
     private static void clearFailure() {
-        Hawk.delete(key(HawkConfig.SYNC_FAIL_COUNT));
-        Hawk.delete(key(HawkConfig.SYNC_FAIL_UNTIL));
+        SyncState st = SyncState.load(owner());
+        st.clearFailure();
+        st.save();
+        Hawk.put(key(HawkConfig.SYNC_FAIL_COUNT), 0);
+        Hawk.put(key(HawkConfig.SYNC_FAIL_UNTIL), 0L);
     }
 
     // ---------------------------------------------------------------- 工具

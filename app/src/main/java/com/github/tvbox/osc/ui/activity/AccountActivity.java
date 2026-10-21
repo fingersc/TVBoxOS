@@ -150,9 +150,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvScopeCollect.setText("收藏 " + (scopes.collect ? "开" : "关"));
         tvScopeSettings.setText("设置 " + (scopes.settings ? "开" : "关"));
         tvWifiOnly.setText("仅 Wi-Fi " + (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) ? "开" : "关"));
-        tvSyncStatus.setText(AccountContext.isGuest()
-                ? "登录后可跨设备同步"
-                : "上次同步：" + HistorySyncManager.lastSyncText());
+        // v98 P3：展示 SyncState 的完整状态（时间 + 正常 / 有未同步改动 / 重试中 / 已暂停）
+        tvSyncStatus.setText(HistorySyncManager.syncStatusText());
         buildAccountCards();
     }
 
@@ -494,9 +493,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etPass.setText("");
         etPassConfirm.setText("");
         tvLoginHint.setVisibility(View.GONE);
-        tvSyncStatus.setText(AccountContext.isGuest()
-                ? "登录后可跨设备同步"
-                : "上次同步：" + HistorySyncManager.lastSyncText());
+        // v98 P3：展示 SyncState 的完整状态（时间 + 正常 / 有未同步改动 / 重试中 / 已暂停）
+        tvSyncStatus.setText(HistorySyncManager.syncStatusText());
     }
 
     private void doSwitchAccount(final String name, final String owner, byte[] key) {

@@ -4,12 +4,8 @@ import android.os.Handler;
 import android.os.Looper;
 
 import com.github.tvbox.osc.data.AppDataManager;
-import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.util.HawkConfig;
-import com.github.tvbox.osc.util.LiveConfigPrefetcher;
 import com.github.tvbox.osc.util.LOG;
-
-import org.greenrobot.eventbus.EventBus;
 
 import com.orhanobut.hawk.Hawk;
 
@@ -47,6 +43,8 @@ public final class AccountSwitcher {
                 // 等当前账号的同步收尾（最多 1.5 秒），避免切换瞬间把旧数据写进新库
                 HistorySyncManager.awaitIdle(1500);
                 final String previous = AccountContext.ownerKey();
+                // v98 P2：取消旧账号排队中的同步任务 —— 它一旦跑起来就会用新账号的库
+                SyncScheduler.cancel(previous);
                 SettingsProfile.save(previous == null ? "" : previous);
                 MAIN.post(new Runnable() {
                     @Override
@@ -71,12 +69,15 @@ public final class AccountSwitcher {
                             post(cb, false, "切换失败：" + t.getMessage());
                             return;
                         }
-                        // 换了账号：让首页按新账号的接口地址重载配置
-                        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
-                        // v77：直播配置后台预热，避免首次点直播长时间转圈
-                        LiveConfigPrefetcher.prefetch();
+                        // v98 P3：换了账号 ⇒ 接口地址整套变了（整包重载）+ 直播配置要重新预热。
+                        //         交给 ConfigCenter：首页不在前台 / 首屏还没就绪时会自动推迟，
+                        //         不会像以前那样在账号页背后偷偷重载首页。
+                        ConfigCenter.requestReload("switch");
+                        ConfigCenter.requestPrewarmLive("switch");
                         final String msg = message;
-                        HistorySyncManager.pullNow(new HistorySyncManager.Callback() {
+                        // v98 P2：切换账号是「必须立刻拉一次」的场景，
+                        //        走调度器的立即档（不再借用历史页 pullNow 的 20 秒节流）
+                        SyncScheduler.requestNow(owner, "switch", new HistorySyncManager.Callback() {
                             @Override
                             public void onDone(boolean ok, String text) {
                                 post(cb, true, ok ? msg : msg + "；同步未完成，稍后会自动重试");
@@ -99,6 +100,7 @@ public final class AccountSwitcher {
             public void run() {
                 HistorySyncManager.awaitIdle(1500);
                 final String previous = AccountContext.ownerKey();
+                SyncScheduler.cancel(previous);
                 SettingsProfile.save(previous == null ? "" : previous);
                 MAIN.post(new Runnable() {
                     @Override
@@ -107,8 +109,8 @@ public final class AccountSwitcher {
                             HistorySyncManager.bumpGeneration();
                             AccountContext.logout();
                             SettingsProfile.load("");
-                            EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
-                            LiveConfigPrefetcher.prefetch();
+                            ConfigCenter.requestReload("guest");
+                            ConfigCenter.requestPrewarmLive("guest");
                         } catch (Throwable t) {
                             LOG.e("[Account] switch guest failed", t);
                         }
@@ -129,6 +131,7 @@ public final class AccountSwitcher {
             @Override
             public void run() {
                 HistorySyncManager.awaitIdle(1200);
+                SyncScheduler.cancel(owner);
                 MAIN.post(new Runnable() {
                     @Override
                     public void run() {

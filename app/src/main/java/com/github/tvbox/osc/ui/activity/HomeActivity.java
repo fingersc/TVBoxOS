@@ -46,7 +46,9 @@ import com.github.tvbox.osc.bean.AbsSortXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.MovieSort;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.sync.ConfigCenter;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScheduler;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.server.ControlManager;
 import com.github.tvbox.osc.ui.adapter.HomePageAdapter;
@@ -117,7 +119,8 @@ public class HomeActivity extends BaseActivity {
     /** v75：同步写回接口地址后需要重载配置；页面不可见时先记下来，onResume 再执行。 */
     private boolean pendingConfigReload = false;
     private boolean activityResumed = false;
-    private long lastConfigReloadAt = 0L;
+    // v98 P3：lastConfigReloadAt（60 秒节流）已上移到 ConfigCenter ——
+    //         那里把所有界面动作合并成一份计划后再节流，口径统一。
     // 首页时钟每秒刷新一次。Date/SimpleDateFormat 提到字段复用，避免每秒 new 两个对象。
     // （SimpleDateFormat 非线程安全，但此处仅在主线程 Handler 中使用。）
     private final Date mClockDate = new Date();
@@ -447,15 +450,10 @@ public class HomeActivity extends BaseActivity {
             @Override
             public void success() {
                 dataInitOk = true;
-                // v88：启动静默期内被推迟的配置变更，等首屏出来后再补（不与起播抢资源）
-                if (HistorySyncManager.consumePendingConfigEvent()) {
-                    mHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            reloadConfigAfterSync();
-                        }
-                    }, 600);
-                }
+                // v98 P3：首屏数据已就绪 ⇒ 通知 ConfigCenter。
+                //         它内部再补 1.5 秒缓冲后才执行被推迟的配置重载，
+                //         不会和 initData() / jar 加载抢资源（v88 的核心约束）。
+                ConfigCenter.markHomeReady();
                 if (ApiConfig.get().getSpider().isEmpty()) {
                     jarInitOk = true;
                 }
@@ -701,21 +699,15 @@ public class HomeActivity extends BaseActivity {
     protected void onResume() {
         super.onResume();
         activityResumed = true;
-        // v88：启动静默期内同步写回的配置变更，可能在"首屏已渲染完成"之后才置位
-        //      （那样就不会再有 loadConfig 的 success 回调），这里补一次消费，保证当前会话也会刷新
-        if (HistorySyncManager.consumePendingConfigEvent()) {
-            mHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    reloadConfigAfterSync();
-                }
-            }, 600);
-        }
+        // v98 P3：首页回到前台 ⇒ 放行被推迟的配置重载（ConfigCenter 内部立刻 flush 一次）
+        ConfigCenter.setUiReady(true);
         refreshDebugBadge();
         if (pendingConfigReload) {
             pendingConfigReload = false;
             reloadConfigAfterSync();
         }
+        // v98 P2：前台 ⇒ 恢复自适应轮询；onForeground 内部已 request("fg")
+        SyncScheduler.setForeground(true);
         HistorySyncManager.onForeground();
         refreshTopInfoTextSize();
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
@@ -729,6 +721,9 @@ public class HomeActivity extends BaseActivity {
     protected void onStop() {
         super.onStop();
         unregisterNetworkListener();
+        // v98 P2：离开首页 ⇒ 取消「纯轮询」任务（盒子上的 App 常年不死，
+        //         旧的 30 分钟定时器会在后台一直发请求）。脏数据的补传任务不受影响。
+        SyncScheduler.setForeground(false);
         HistorySyncManager.onBackground();
     }
 
@@ -737,6 +732,8 @@ public class HomeActivity extends BaseActivity {
     protected void onPause() {
         super.onPause();
         activityResumed = false;
+        // v98 P3：首页不可见 ⇒ 暂不执行配置重载（用户在看详情页/直播时不要被打扰）
+        ConfigCenter.setUiReady(false);
         mHandler.removeCallbacks(refreshTopInfoTextSizeRunnable);
         mHandler.removeCallbacks(refreshTopLayoutRunnable);
         mHandler.removeCallbacks(mRunnable);
@@ -875,10 +872,15 @@ public class HomeActivity extends BaseActivity {
         } else if (event.type == RefreshEvent.TYPE_CONFIG_CHANGE) {
             // 同步把接口地址写回来了（首次安装登录后最常见）：配置没加载过就重新加载
             if (!activityResumed) {
+                // 页面不可见 ⇒ 记下来，onResume 再执行
                 pendingConfigReload = true;
             } else if (!dataInitOk) {
-                // v88：首屏还在加载中，绝不能被重载打断（否则又从头拉一遍，起播/历史都变慢）
-                pendingConfigReload = true;
+                // v98 P3：首屏还在加载中，此刻重载会把正在解析的首页推倒重来（v88 的教训）。
+                //         把动作还给 ConfigCenter，由它等首屏就绪后重新派发；
+                //         不能像以前那样只置一个 pendingConfigReload 标志 ——
+                //         那标志只有 onResume 才消费，在「首屏一直没成功」时会永远丢掉
+                //         （首次安装就是这条链路：还没有 api_url，首屏根本成功不了）。
+                ConfigCenter.requestReload("home-not-ready");
             } else {
                 reloadConfigAfterSync();
             }
@@ -904,11 +906,8 @@ public class HomeActivity extends BaseActivity {
         if (isActivityUnavailable()) {
             return;
         }
-        long now = System.currentTimeMillis();
-        if (now - lastConfigReloadAt < 60 * 1000L) {
-            return;
-        }
-        lastConfigReloadAt = now;
+        // v98 P3：这里不再自己算 60 秒节流 —— ConfigCenter 已经把所有界面动作
+        //         合并成一份计划后再节流；此处再挡一道会把合并好的动作漏掉。
         // v79：接口地址没变 → 只刷新首页数据，不重新解析配置（避免十几秒空转）
         String curApi = Hawk.get(HawkConfig.API_URL, "");
         if (!curApi.isEmpty() && curApi.equals(ApiConfig.get().getLoadedApiUrl())) {
