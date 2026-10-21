@@ -164,6 +164,7 @@ public class OkGoHelper {
 
 //        builder.dns(dnsOverHttps);
         builder.dns(new CustomDns());
+        builder.eventListener(new NetEventListener());
         ItvClient=builder.build();
 
         ExoMediaSourceHelper.getInstance(App.getInstance()).setOkClient(ItvClient);
@@ -280,7 +281,22 @@ public class OkGoHelper {
             }
             else {
                 Dns dns = dnsOverHttps != null ? dnsOverHttps : Dns.SYSTEM;
-                return  dns.lookup(hostname);
+                List<InetAddress> all = dns.lookup(hostname);
+                // v87：优先 IPv4。本机/路由器没有可用 IPv6 时，OkHttp 仍会先试 v6，
+                //      每条连接都要等满 connectTimeout 才回退（实测 20.8 秒），
+                //      过滤掉 v6 可直接省掉这段等待。
+                if (all != null && all.size() > 1) {
+                    List<InetAddress> v4 = new ArrayList<>();
+                    for (InetAddress a : all) {
+                        if (a instanceof java.net.Inet4Address) {
+                            v4.add(a);
+                        }
+                    }
+                    if (!v4.isEmpty()) {
+                        return v4;
+                    }
+                }
+                return all;
             }
         }
 
@@ -371,6 +387,8 @@ public class OkGoHelper {
         builder.dns(new CustomDns());
         builder.proxySelector(proxySelector());
         builder.proxyAuthenticator(proxyAuthenticator());
+        // v87：网络分段计时（DNS/建连/TLS/TTFB），只在慢时打印
+        builder.eventListener(new NetEventListener());
         try {
             setOkHttpSsl(builder);
         } catch (Throwable th) {
@@ -407,6 +425,7 @@ public class OkGoHelper {
         builder.dns(new CustomDns());
         builder.proxySelector(proxySelector());
         builder.proxyAuthenticator(proxyAuthenticator());
+        builder.eventListener(new NetEventListener());
         try {
             setOkHttpSsl(builder);
         } catch (Throwable th) {

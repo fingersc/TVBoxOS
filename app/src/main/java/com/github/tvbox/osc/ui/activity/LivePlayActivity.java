@@ -152,7 +152,6 @@ public class LivePlayActivity extends BaseActivity {
     /** v80：探测是否在进行（放后台线程，避免阻塞主线程） */
     private boolean liveProbeInFlight;
     /** v81：本次起播是否已经做过"同线路快速重连" */
-    private int liveBootRetryCount;
     /**
      * v83：本页是否成功出过画面。
      *
@@ -160,22 +159,6 @@ public class LivePlayActivity extends BaseActivity {
      * 只发了 HTTP 请求、完全没有 MediaCodec 初始化，5 秒后靠"同线路重连"才真正开始解码。</p>
      */
     private boolean livePlayerReadyOnce;
-    /**
-     * v85：首帧前的"快速重试"。
-     *
-     * <p>实测冷启动第一次 setUrl 时 Surface 还没就绪（5 秒无画面），5 秒后同线路重连
-     * 只要 0.4 秒就出画面。所以首次起播后 900ms 还没画面就直接重连，不必干等 5 秒。</p>
-     */
-    private final Runnable liveFastRetryRun = new Runnable() {
-        @Override
-        public void run() {
-            if (!liveFirstFrameShown && !livePlayerReadyOnce && liveBootRetryCount == 0) {
-                LOG.i("[live] fast retry (no frame in 900ms)");
-                liveBootRetryCount = 1;
-                retrySameSource();
-            }
-        }
-    };
     private int resolutionInfoRetryCount = 0;
     private boolean resolutionInfoPending = false;
     /**
@@ -264,9 +247,8 @@ public class LivePlayActivity extends BaseActivity {
     /** 起播失败的重试间隔：源侧失败判定很快（实测 80ms），没必要空等 3.5s。 */
     private static final long LIVE_RETRY_BOOT_FAIL_MS = 800L;
     /** v79：起播阶段的最长等待（配置再大也不超过它），出画面后仍按配置 */
-    private static final long LIVE_BOOT_TIMEOUT_MAX_MS = 10_000L;
+    private static final long LIVE_BOOT_TIMEOUT_MAX_MS = 15_000L;
     /** v81：同线路重连的等待时间 */
-    private static final long LIVE_RETRY_TIMEOUT_MS = 8_000L;
     /** 播放中失败的重试间隔：给网络一点恢复时间，沿用原节奏。 */
     private static final long LIVE_RETRY_PLAYING_FAIL_MS = 3500L;
     private LiveChannelItem currentLiveChannelItem = null;
@@ -2102,7 +2084,6 @@ public class LivePlayActivity extends BaseActivity {
             }
             String liveUrl = currentLiveChannelItem.getUrl();
             // v81：换台/换线路都是全新一次起播，重试计数归零
-            liveBootRetryCount = 0;
             LOG.i("[live] start channel=" + currentLiveChannelItem.getChannelName()
                     + " source=" + currentLiveChannelItem.getSourceIndex() + " url=" + liveUrl);
             LOG.i("[live] play mode=" + (reusePlayer ? "replay" : "release+start"));
@@ -2117,10 +2098,9 @@ public class LivePlayActivity extends BaseActivity {
             showResolutionAfterChannelSwitch();
             // v80：起播后立刻排兜底（不依赖播放器状态回调）
             armLiveBootTimeout();
+            showConnectingTip(true);
             // v85：本页第一次起播，900ms 没画面就立刻重连（Surface 常来不及就绪）
             if (!livePlayerReadyOnce) {
-                mHandler.removeCallbacks(liveFastRetryRun);
-                mHandler.postDelayed(liveFastRetryRun, 900L);
             }
         }
         loadEpgAfterChannelStarted();
@@ -2163,6 +2143,17 @@ public class LivePlayActivity extends BaseActivity {
      * PREPARING/BUFFERING，原来的"靠状态回调安排超时"就永远不触发，起播卡 39 秒。
      * 所以在 setUrl 之后直接排一次，任何状态（首帧/错误）到达时再取消。</p>
      */
+    /** v94：起播等待期间给出文字提示，避免用户以为卡死。 */
+    private void showConnectingTip(boolean show) {
+        try {
+            View tip = findViewById(R.id.tvConnectingTip);
+            if (tip != null) {
+                tip.setVisibility(show ? View.VISIBLE : View.GONE);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void armLiveBootTimeout() {
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
         long ms = liveBootTimeoutMs();
@@ -2171,8 +2162,12 @@ public class LivePlayActivity extends BaseActivity {
     }
 
     private long liveBootTimeoutMs() {
-        long configured = (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L;
-        return liveFirstFrameShown ? configured : Math.min(configured, LIVE_BOOT_TIMEOUT_MAX_MS);
+        // v94：起播阶段固定等 15 秒（IPTV 首包本来就慢，早掐断等于打断服务端的建流）；
+        //       出过首帧后按配置值（那是"播放中断"的超时，语义不同）。
+        if (!liveFirstFrameShown) {
+            return LIVE_BOOT_TIMEOUT_MAX_MS;
+        }
+        return (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L;
     }
 
     private long delayForLiveFailure() {
@@ -2586,9 +2581,8 @@ public class LivePlayActivity extends BaseActivity {
                             // （中途断流 / 解码器问题，值得换播放器重试）
                             liveFirstFrameShown = true;
                             livePlayerReadyOnce = true;
-                            liveBootRetryCount = 0;
-                            mHandler.removeCallbacks(liveFastRetryRun);
                             LOG.i("[live] first frame shown");
+                            showConnectingTip(false);
                             mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
                         }
                         break;
@@ -2664,18 +2658,17 @@ public class LivePlayActivity extends BaseActivity {
     private Runnable mConnectTimeoutChangeSourceRun = new Runnable() {
         @Override
         public void run() {
-            LOG.i("[live] boot timeout fired firstFrame=" + liveFirstFrameShown
-                    + " retry=" + liveBootRetryCount);
-            // v81：冷启动首次建连可能偏慢（DNS/握手），先在同一线路上快速重连一次，
-            //      避免"还没连上就被判定为线路不通"（实测线路本身可用）。
-            if (!liveFirstFrameShown && liveBootRetryCount == 0 && currentLiveChannelItem != null) {
-                liveBootRetryCount = 1;
-                LOG.i("[live] boot timeout, retry same source once");
-                retrySameSource();
+            LOG.i("[live] timeout fired firstFrame=" + liveFirstFrameShown);
+            if (!liveFirstFrameShown) {
+                // v94：起播阶段只等不猜 —— 等满 15 秒直接换下一条源；
+                //      不做 2 秒探测、不换播放器：IPTV 首包本来就慢，探测必然误判"线路不通"，
+                //      提前取消请求还会打断服务端的建流过程。
+                LOG.i("[live] boot timeout after " + LIVE_BOOT_TIMEOUT_MAX_MS + "ms, switch source");
+                switchToNextLiveSource();
                 return;
             }
-            // v80：首帧没出来时先判原因（探测放后台，2 秒内必回，不阻塞主线程）
-            if (!liveFirstFrameShown && currentLiveChannelItem != null && !liveProbeInFlight) {
+            // v94：已出首帧后又失败，才判原因（探测放后台，2 秒内必回，不阻塞主线程）
+            if (currentLiveChannelItem != null && !liveProbeInFlight) {
                 liveProbeInFlight = true;
                 final String probeUrl = currentLiveChannelItem.getUrl();
                 new Thread(new Runnable() {
@@ -2707,36 +2700,9 @@ public class LivePlayActivity extends BaseActivity {
         }
     };
 
-    /**
-     * v81：同一条线路快速重连（不换源、不换播放器）。
-     *
-     * <p>冷启动第一次请求常因 DNS/握手慢而没起来，但线路本身是好的；
-     * 这里立刻用同一 URL 重新起播一次，失败后才进入"换播放器/换线路"的判定。</p>
-     */
-    private void retrySameSource() {
-        try {
-            mHandler.removeCallbacks(liveFastRetryRun);
-            mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
-            if (mVideoView == null || currentLiveChannelItem == null) {
-                switchToNextLiveSource();
-                return;
-            }
-            lastHandledPlayState = -1;
-            liveFirstFrameShown = false;
-            String url = currentLiveChannelItem.getUrl();
-            mVideoView.release();
-            mVideoView.setUrl(url, liveChannelHeader());
-            mVideoView.start();
-            LOG.i("[live] retry same source, wait " + LIVE_RETRY_TIMEOUT_MS + "ms");
-            mHandler.postDelayed(mConnectTimeoutChangeSourceRun, LIVE_RETRY_TIMEOUT_MS);
-        } catch (Throwable t) {
-            switchToNextLiveSource();
-        }
-    }
 
     /** v79：起播失败后往下一条线路 / 下一个频道走（原逻辑抽出来复用）。 */
     private void switchToNextLiveSource() {
-        mHandler.removeCallbacks(liveFastRetryRun);
         LOG.i("[live] switch to next source times=" + currentLiveChangeSourceTimes);
         // v80：换源会重新起播，先取消旧兜底，起播后再重新排（playChannel 内 arm）
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
