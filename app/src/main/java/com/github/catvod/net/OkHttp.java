@@ -21,6 +21,8 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import okhttp3.Dns;
+import okhttp3.logging.HttpLoggingInterceptor;
+import java.util.logging.Level;
 
 import java.net.InetAddress;
 import java.util.ArrayList;
@@ -33,6 +35,14 @@ public class OkHttp {
     private static OkDns dns;
     private static OkHttpClient client;
 
+    /** v97：爬虫链路专用日志拦截器（tag: Spider），与 OkGo / OkExoPlayer 区分来源 */
+    private static HttpLoggingInterceptor newHttpLogInterceptor(String tag) {
+        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor(tag);
+        loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BASIC);
+        loggingInterceptor.setColorLevel(Level.INFO);
+        return loggingInterceptor;
+    }
+
     public static synchronized OkDns dns() {
         if (dns == null) dns = new OkDns();
         return dns;
@@ -41,7 +51,9 @@ public class OkHttp {
     public static synchronized OkHttpClient client() {
         if (client != null) return client;
         OkHttpClient base = OkGoHelper.getDefaultClient();
-        if (base != null) return client = base.newBuilder().dns(dns()).build();
+        // v97：爬虫复用默认 client，日志 tag 会与 OkGo 混在一起；追加独立 tag 便于区分来源
+        if (base != null) return client = base.newBuilder().dns(dns())
+                .addInterceptor(newHttpLogInterceptor("Spider")).build();
         OkHttpClient.Builder builder = new OkHttpClient.Builder().dns(dns()).proxySelector(OkGoHelper.proxySelector()).proxyAuthenticator(OkGoHelper.proxyAuthenticator()).connectTimeout(TIMEOUT, TimeUnit.MILLISECONDS).readTimeout(TIMEOUT, TimeUnit.MILLISECONDS).writeTimeout(TIMEOUT, TimeUnit.MILLISECONDS);
         setOkHttpSsl(builder);
         return client = builder.build();

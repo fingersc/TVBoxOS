@@ -57,6 +57,7 @@ public final class NetEventListener extends EventListener {
                 sb.append(a.getHostAddress());
             }
             LOG.i("[net] dns " + domainName + " " + cost + "ms -> " + sb);
+            LOG.i("[net] dns-list " + domainName + " " + sb);
         }
     }
 
@@ -71,6 +72,12 @@ public final class NetEventListener extends EventListener {
         long cost = now() - connectStart;
         if (cost >= SLOW_MS) {
             LOG.i("[net] connect " + connectAddr + " " + cost + "ms " + protocol);
+        }
+        // v97：连接成功即证明该地址/该族可用，回填给双栈优选做粘性排序
+        try {
+            DualStackResolver.recordSuccess(call.request().url().host(),
+                    call.request().url().port(), inetSocketAddress.getAddress());
+        } catch (Throwable ignored) {
         }
     }
 

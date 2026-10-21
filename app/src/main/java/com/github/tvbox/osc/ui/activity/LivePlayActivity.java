@@ -59,6 +59,7 @@ import com.github.tvbox.osc.ui.tv.widget.ViewObj;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
+import com.github.tvbox.osc.util.DualStackResolver;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LiveFailureDiagnoser;
 import com.github.tvbox.osc.util.LOG;
@@ -2083,7 +2084,23 @@ public class LivePlayActivity extends BaseActivity {
                 hideSwitchChannelSnapshot();
             }
             String liveUrl = currentLiveChannelItem.getUrl();
-            // v81：换台/换线路都是全新一次起播，重试计数归零
+            // v97：双栈优选 —— 用真实端口并行探测 A/AAAA，挑最快可达的族。
+            //      探测失败/超时/IP 字面量/本地代理 ⇒ liveUrl 原样使用，不影响原有行为。
+            if (Hawk.get(HawkConfig.LIVE_DUALSTACK, true)) {
+                String dHost = DualStackResolver.hostOf(liveUrl);
+                int dPort = DualStackResolver.portOf(liveUrl);
+                if (!dHost.isEmpty() && dPort > 0) {
+                    DualStackResolver.Result dr = DualStackResolver.probeFastest(dHost, dPort);
+                    if (dr != null && dr.address != null) {
+                        String picked = DualStackResolver.replaceHost(liveUrl, dr.address);
+                        if (picked != null && !picked.isEmpty() && !picked.equals(liveUrl)) {
+                            LOG.i("[live] dual-stack picked " + dHost + ":" + dPort + " -> "
+                                    + dr.address.getHostAddress() + (dr.fromCache ? " (cache)" : ""));
+                            liveUrl = picked;
+                        }
+                    }
+                }
+            }
             LOG.i("[live] start channel=" + currentLiveChannelItem.getChannelName()
                     + " source=" + currentLiveChannelItem.getSourceIndex() + " url=" + liveUrl);
             LOG.i("[live] play mode=" + (reusePlayer ? "replay" : "release+start"));

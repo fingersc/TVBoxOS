@@ -55,6 +55,14 @@ import xyz.doikki.videoplayer.exo.ExoMediaSourceHelper;
 
 public class OkGoHelper {
     public static final long DEFAULT_MILLISECONDS = 20000;      //默认的超时时间
+    /**
+     * v97：建连（TCP + TLS）超时，单位毫秒。
+     *
+     * <p>与 read/write 分开管理：connect 表达"一个连不上的地址最多浪费多久"。
+     * 从 20s 收到 8s —— 本机/路由器没有可用 IPv6 时 OkHttp 会先试 AAAA，
+     * 那条连接要挂满 connectTimeout 才回退 IPv4（实测 20.8 秒黑洞）。</p>
+     */
+    public static final long CONNECT_TIMEOUT_MS = 8000L;
 
     // 内置doh json
     private static final String dnsConfigJson = "["
@@ -134,7 +142,7 @@ public class OkGoHelper {
         //     10 秒内没吐出下一个字节就抛 SocketTimeoutException → Exo 判定
         //     该分片失败 → 走 HlsErrorHandlingPolicy 重试/跳过 → 观众看到卡顿
         //     甚至跳片。放宽到 30s 让"慢但有响应"的源有机会把数据送完。
-        //     connectTimeout 保持 15s：连不上就该快速失败并让上层换线，
+        //     connectTimeout 8s：连不上就快速失败并让上层换线，
         //     拉长只会让用户在"黑屏等起播"上浪费时间。
         //     writeTimeout 对流媒体无实际意义（请求体为空），保留默认即可。
         //
@@ -145,8 +153,8 @@ public class OkGoHelper {
         //     对慢源反而不利（每个连接分到的速率更低，更易触发欠载）。
         try {
             builder.connectionPool(new ConnectionPool(12, 5, TimeUnit.MINUTES));
-            builder.connectTimeout(15, TimeUnit.SECONDS);
-            builder.readTimeout(30, TimeUnit.SECONDS);
+            builder.connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);   // 15s → 8s
+            builder.readTimeout(30, TimeUnit.SECONDS);                            // 30s 保持不动
             Dispatcher dispatcher = new Dispatcher();
             dispatcher.setMaxRequests(64);
             dispatcher.setMaxRequestsPerHost(10);
@@ -282,19 +290,11 @@ public class OkGoHelper {
             else {
                 Dns dns = dnsOverHttps != null ? dnsOverHttps : Dns.SYSTEM;
                 List<InetAddress> all = dns.lookup(hostname);
-                // v87：优先 IPv4。本机/路由器没有可用 IPv6 时，OkHttp 仍会先试 v6，
-                //      每条连接都要等满 connectTimeout 才回退（实测 20.8 秒），
-                //      过滤掉 v6 可直接省掉这段等待。
+                // v97：双栈优选 —— 只排序、不删除地址。
+                //      未命中缓存时 IPv4 排前、AAAA 保留在尾部（配合 8s connect 仍有兜底价值）；
+                //      缓存命中（含真实连接观测）时把上次最快可达的地址排最前。
                 if (all != null && all.size() > 1) {
-                    List<InetAddress> v4 = new ArrayList<>();
-                    for (InetAddress a : all) {
-                        if (a instanceof java.net.Inet4Address) {
-                            v4.add(a);
-                        }
-                    }
-                    if (!v4.isEmpty()) {
-                        return v4;
-                    }
+                    return DualStackResolver.order(all, hostname, 443);
                 }
                 return all;
             }
@@ -380,9 +380,9 @@ public class OkGoHelper {
 
         builder.addInterceptor(loggingInterceptor);
 
-        builder.readTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
-        builder.writeTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
-        builder.connectTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
+        builder.readTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);      // 读：20s 不动
+        builder.writeTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);     // 写：20s 不动
+        builder.connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);     // 连：20s → 8s
 
         builder.dns(new CustomDns());
         builder.proxySelector(proxySelector());
@@ -404,6 +404,8 @@ public class OkGoHelper {
 
         builder.followRedirects(false);
         builder.followSslRedirects(false);
+        // v97：给无重定向客户端独立 tag，便于和默认 client / 爬虫 / 播放器区分
+        builder.addInterceptor(newHttpLogInterceptor("OkNoRedirect"));
         noRedirectClient = builder.build();
 
         initExoOkHttpClient();
@@ -418,9 +420,9 @@ public class OkGoHelper {
 
         builder.addInterceptor(loggingInterceptor);
 
-        builder.readTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
-        builder.writeTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
-        builder.connectTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);
+        builder.readTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);      // 读：20s 不动
+        builder.writeTimeout(DEFAULT_MILLISECONDS, TimeUnit.MILLISECONDS);     // 写：20s 不动
+        builder.connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);     // 连：20s → 8s
 
         builder.dns(new CustomDns());
         builder.proxySelector(proxySelector());
@@ -441,6 +443,8 @@ public class OkGoHelper {
 
         builder.followRedirects(false);
         builder.followSslRedirects(false);
+        // v97：给无重定向客户端独立 tag，便于和默认 client / 爬虫 / 播放器区分
+        builder.addInterceptor(newHttpLogInterceptor("OkNoRedirect"));
         noRedirectClient = builder.build();
 
         initExoOkHttpClient();
