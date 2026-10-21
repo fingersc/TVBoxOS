@@ -33,6 +33,21 @@
             android:textColor="@android:color/white"
             android:textSize="@dimen/ts_22" />
 
+        <!-- v76：账号卡片（数量不限，横向滚动；末尾固定「+ 添加账号」） -->
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_14"
+            android:focusable="false"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:id="@+id/llAccounts"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -153,6 +153,14 @@ public final class SyncSettings {
     }
 
     /** 生成本次同步后的快照（写入 Hawk，供下次识别改动）。 */
+    /** 设置快照按账号隔离（游客用原键），避免切换账号后拿别人的快照做 diff。 */
+    private static String snapshotKey() {
+        String owner = AccountContext.ownerKey();
+        return (owner == null || owner.isEmpty())
+                ? HawkConfig.SYNC_SETTINGS_SNAPSHOT
+                : HawkConfig.SYNC_SETTINGS_SNAPSHOT + "." + owner;
+    }
+
     public static void saveSnapshot(Map<String, SyncPayload.SettingValue> merged) {
         try {
             JSONObject o = new JSONObject();
@@ -164,7 +172,7 @@ public final class SyncSettings {
                 item.put("t", v.t);
                 o.put(e.getKey(), item);
             }
-            Hawk.put(HawkConfig.SYNC_SETTINGS_SNAPSHOT, o.toString());
+            Hawk.put(snapshotKey(), o.toString());
         } catch (Throwable ignored) {
         }
     }
@@ -172,7 +180,7 @@ public final class SyncSettings {
     public static Map<String, SyncPayload.SettingValue> loadSnapshot() {
         Map<String, SyncPayload.SettingValue> out = new LinkedHashMap<>();
         try {
-            String json = Hawk.get(HawkConfig.SYNC_SETTINGS_SNAPSHOT, "");
+            String json = Hawk.get(snapshotKey(), "");
             if (json == null || json.length() == 0) {
                 return out;
             }

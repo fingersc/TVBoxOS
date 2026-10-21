@@ -4,8 +4,10 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
+import android.util.TypedValue;
 import android.view.View;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -13,6 +15,8 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.base.BaseActivity;
 import com.github.tvbox.osc.sync.AccountContext;
 import com.github.tvbox.osc.sync.AccountPaths;
+import com.github.tvbox.osc.sync.AccountStore;
+import com.github.tvbox.osc.sync.AccountSwitcher;
 import com.github.tvbox.osc.sync.AccountService;
 import com.github.tvbox.osc.sync.Crypto;
 import com.github.tvbox.osc.sync.HistorySyncManager;
@@ -20,6 +24,8 @@ import com.github.tvbox.osc.sync.QrLoginBridge;
 import com.github.tvbox.osc.sync.SyncScopes;
 import com.github.tvbox.osc.sync.WebDavClient;
 import com.github.tvbox.osc.ui.dialog.LoginQrDialog;
+import com.github.tvbox.osc.ui.dialog.SwitchAccountDialog;
+import com.github.tvbox.osc.ui.dialog.TipDialog;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
@@ -39,6 +45,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private EditText etPassConfirm;
     private View llPassConfirm;
     private TextView tvLoginHint;
+    private LinearLayout llAccounts;
+    /** 正在切换账号：忽略重复点击与并发的登录请求 */
+    private boolean switching;
     private TextView btnLogin;
     private TextView btnQrLogin;
     /** 首次激活阶段：等待二次输入密码 */
@@ -71,6 +80,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etPassConfirm = findViewById(R.id.etPassConfirm);
         llPassConfirm = findViewById(R.id.llPassConfirm);
         tvLoginHint = findViewById(R.id.tvLoginHint);
+        llAccounts = findViewById(R.id.llAccounts);
         btnLogin = findViewById(R.id.btnLogin);
         btnQrLogin = findViewById(R.id.btnQrLogin);
         etDavUrl = findViewById(R.id.etDavUrl);
@@ -138,6 +148,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvSyncStatus.setText(AccountContext.isGuest()
                 ? "登录后可跨设备同步"
                 : "上次同步：" + HistorySyncManager.lastSyncText());
+        buildAccountCards();
     }
 
     @Override
@@ -305,20 +316,21 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     }
 
     private void loginWith(String user, byte[] key) {
-        AccountContext.login(Crypto.userKey(user), user, key);
         resetActivateUi();
         etPass.setText("");
         etPassConfirm.setText("");
-        refreshAll();
         toast("已登录：" + user);
-        setBusy(true, "正在同步…");
-        HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
-            @Override
-            public void onDone(boolean ok, String message) {
-                setBusy(false, null);
-                tvSyncStatus.setText(message);
-            }
-        });
+        setBusy(true, "正在登录…");
+        // v76：登录即「切换/加入账号」——保存当前（游客）设置快照、切库、拉取云端
+        AccountSwitcher.switchTo(Crypto.userKey(user), user, key,
+                new AccountSwitcher.Callback() {
+                    @Override
+                    public void onDone(boolean ok, String message) {
+                        setBusy(false, null);
+                        refreshAll();
+                        tvSyncStatus.setText(message);
+                    }
+                });
     }
 
     private void resetActivateUi() {
@@ -351,6 +363,142 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 }
             }
         });
+    }
+
+    // ---------------------------------------------------------------- v76 账号卡片
+
+    private void buildAccountCards() {
+        if (llAccounts == null) {
+            return;
+        }
+        llAccounts.removeAllViews();
+        addAccountCard("游客", "", true);
+        for (AccountStore.Item it : AccountStore.list()) {
+            addAccountCard(it.name, it.owner, false);
+        }
+        addAccountCard("+ 添加账号", null, false);
+    }
+
+    private void addAccountCard(final String text, final String owner, final boolean guest) {
+        TextView card = new TextView(this);
+        boolean isCurrent = guest ? AccountContext.isGuest()
+                : (owner != null && owner.equals(AccountContext.ownerKey()));
+        card.setText(isCurrent ? text + " · 当前" : text);
+        card.setTextColor(0xFFFFFFFF);
+        card.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_22));
+        card.setGravity(android.view.Gravity.CENTER);
+        card.setFocusable(true);
+        card.setBackgroundResource(R.drawable.button_danmu_setting);
+        int h = (int) getResources().getDimension(R.dimen.vs_64);
+        int padH = (int) getResources().getDimension(R.dimen.vs_20);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, h);
+        lp.setMargins(0, 0, (int) getResources().getDimension(R.dimen.vs_12), 0);
+        card.setLayoutParams(lp);
+        card.setPadding(padH, 0, padH, 0);
+        card.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onAccountCardClick(text, owner, guest);
+            }
+        });
+        card.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                if (owner != null) {
+                    confirmRemoveAccount(text, owner);
+                }
+                return true;
+            }
+        });
+        llAccounts.addView(card);
+    }
+
+    private void onAccountCardClick(String name, String owner, boolean guest) {
+        if (owner == null) {
+            etUser.requestFocus();
+            toast("请在上方输入账号名与密码（账号需先由管理员在网盘中创建文件夹）");
+            return;
+        }
+        if (guest) {
+            if (AccountContext.isGuest()) {
+                toast("当前已是游客模式");
+                return;
+            }
+            if (switching) {
+                return;
+            }
+            switching = true;
+            setBusy(true, "正在切换到游客…");
+            AccountSwitcher.switchToGuest(new AccountSwitcher.Callback() {
+                @Override
+                public void onDone(boolean ok, String message) {
+                    switching = false;
+                    setBusy(false, null);
+                    refreshAll();
+                    tvSyncStatus.setText(message);
+                }
+            });
+            return;
+        }
+        if (owner.equals(AccountContext.ownerKey())) {
+            toast("已经是当前账号");
+            return;
+        }
+        new SwitchAccountDialog(this, name, owner, new SwitchAccountDialog.Listener() {
+            @Override
+            public void onAuthed(String n, String o, byte[] key) {
+                doSwitchAccount(n, o, key);
+            }
+        }).show();
+    }
+
+    private void doSwitchAccount(final String name, final String owner, byte[] key) {
+        if (switching) {
+            return;
+        }
+        switching = true;
+        setBusy(true, "正在切换到：" + name + "…");
+        AccountSwitcher.switchTo(owner, name, key, new AccountSwitcher.Callback() {
+            @Override
+            public void onDone(boolean ok, String message) {
+                switching = false;
+                setBusy(false, null);
+                refreshAll();
+                tvSyncStatus.setText(message);
+                toast(message);
+            }
+        });
+    }
+
+    private void confirmRemoveAccount(final String name, final String owner) {
+        final TipDialog dialog = new TipDialog(this,
+                "移除本机账号「" + name + "」？\n本机保存的历史/收藏/设置会被删除，云端数据不受影响。",
+                "移除", "取消", new TipDialog.OnListener() {
+            @Override
+            public void left() {
+                dialog.dismiss();
+                AccountSwitcher.remove(owner, new AccountSwitcher.Callback() {
+                    @Override
+                    public void onDone(boolean ok, String message) {
+                        refreshAll();
+                        tvSyncStatus.setText(message);
+                        toast(message);
+                    }
+                });
+            }
+
+            @Override
+            public void right() {
+                dialog.dismiss();
+            }
+
+            @Override
+            public void cancel() {
+                dialog.dismiss();
+            }
+        });
+        dialog.show();
     }
 
     private WebDavClient dav() {

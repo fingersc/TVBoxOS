@@ -117,10 +117,15 @@ public final class QrLoginBridge {
             new Handler(Looper.getMainLooper()).post(new Runnable() {
                 @Override
                 public void run() {
-                    AccountContext.login(owner, name, accountKey);
-                    HistorySyncManager.syncNow(null);
-                    // v75：通知二维码弹窗关闭，否则用户以为「没反应」
-                    notifyLoginOk(name);
+                    // v76：统一走账号切换编排（保存当前设置快照 / 切库 / 恢复目标快照 / 拉一次）
+                    AccountSwitcher.switchTo(owner, name, accountKey, new AccountSwitcher.Callback() {
+                        @Override
+                        public void onDone(boolean ok, String message) {
+                            if (ok) {
+                                notifyLoginOk(name);
+                            }
+                        }
+                    });
                 }
             });
             LOG.i("[Sync] qr login accepted user=" + name);

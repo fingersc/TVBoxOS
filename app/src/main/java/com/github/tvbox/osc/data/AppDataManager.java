@@ -158,6 +158,33 @@ public class AppDataManager {
         return dbSuffix;
     }
 
+    /** 某个账号的数据库文件（不切换当前库）。 */
+    private static java.io.File dbFileFor(String ownerKey) {
+        String suffix = (ownerKey == null || ownerKey.isEmpty()) ? "" : "." + ownerKey;
+        // Room 用 databaseBuilder 时文件落在 databases/ 目录，删除必须用同一路径口径
+        return App.getInstance().getDatabasePath(
+                DB_NAME + ".v" + DB_FILE_VERSION + suffix + ".db");
+    }
+
+    /** v76：移除本机账号时删除它的数据库文件（若正在使用，先关闭）。 */
+    public static synchronized void deleteOwnerDb(String ownerKey) {
+        String suffix = (ownerKey == null || ownerKey.isEmpty()) ? "" : "." + ownerKey;
+        if (suffix.equals(dbSuffix) && dbInstance != null) {
+            try {
+                dbInstance.close();
+            } catch (Throwable ignored) {
+            }
+            dbInstance = null;
+        }
+        try {
+            java.io.File f = dbFileFor(ownerKey);
+            if (f.exists()) {
+                f.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static AppDataBase get() {
         if (manager == null) {
             throw new RuntimeException("AppDataManager is no init");

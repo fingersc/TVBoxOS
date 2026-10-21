@@ -96,8 +96,14 @@ public class HawkConfig {
     public static final String SYNC_WIFI_ONLY = "sync_wifi_only";
     /** 同步范围（JSON：history/progress/collect/settings） */
     public static final String SYNC_SCOPES = "sync_scopes";
-    /** 上次同步时的设置快照（JSON），用于识别本机改过哪些设置键 */
+    /** 上次同步时的设置快照（JSON，按账号：sync_settings_snapshot.<owner>） */
     public static final String SYNC_SETTINGS_SNAPSHOT = "sync_settings_snapshot";
+    /** 本机账号清单（JSON 数组：name/owner/addedAt/lastUsedAt），v76 */
+    public static final String ACCOUNT_LIST = "account_list";
+    /** 账号级设置快照（JSON，按账号：settings_profile.<owner>），v76 */
+    public static final String SYNC_SETTINGS_PROFILE = "settings_profile";
+    /** 该账号尚未从云端拉过设置（首次加入）：首次同步只拉不推，v76 */
+    public static final String SYNC_SETTINGS_PENDING = "sync_settings_pending";
     /** 待上传的删除墓碑（JSON，按账号：sync_tombs.<owner>） */
     public static final String SYNC_TOMBS = "sync_tombs";
     /** 连续失败次数 / 退避截止时间（按账号） */

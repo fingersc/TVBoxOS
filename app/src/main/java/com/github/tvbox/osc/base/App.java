@@ -67,6 +67,8 @@ public class App extends MultiDexApplication {
         AppDataManager.init();
         // v73：恢复账号（决定用哪个数据库文件）+ 启动同步触发器（冷启动 10s / 前台 30min 兜底）
         HistorySyncManager.start();
+        // v76：老用户升级后把当前登录账号播种进账号清单
+        com.github.tvbox.osc.sync.AccountStore.migrateIfNeeded();
         LoadSir.beginBuilder()
                 .addCallback(new EmptyCallback())
                 .addCallback(new LoadingCallback())

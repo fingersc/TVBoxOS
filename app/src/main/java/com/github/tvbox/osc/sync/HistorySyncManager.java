@@ -51,6 +51,54 @@ public final class HistorySyncManager {
     private static boolean started;
     /** 页面主动拉取的节流时间戳（避免来回切页面刷请求）。 */
     private static long lastPullAt;
+    /** 账号切换代数：切换时 +1，在途同步发现代数变了就放弃写库（防串库）。 */
+    private static volatile int generation;
+
+    /** 切换账号时调用：让在途同步放弃写库。 */
+    public static void bumpGeneration() {
+        generation++;
+    }
+
+    public static int currentGeneration() {
+        return generation;
+    }
+
+    /** 等当前同步收尾（最多 ms 毫秒），供账号切换前调用。 */
+    public static void awaitIdle(long ms) {
+        long end = System.currentTimeMillis() + ms;
+        while (syncing && System.currentTimeMillis() < end) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /** 账号切换导致本次同步作废：不记失败、不写库。 */
+    static class SwitchAborted extends IOException {
+        SwitchAborted() {
+            super("账号已切换，本次同步已放弃");
+        }
+    }
+
+    private static void checkGeneration(int gen) throws IOException {
+        if (gen != generation) {
+            throw new SwitchAborted();
+        }
+    }
+
+    /** 同步状态按账号隔离（读取时回退到旧的全局键，兼容升级）。 */
+    private static long lastSyncAt() {
+        long v = Hawk.get(key(HawkConfig.SYNC_LAST_AT), -1L);
+        return v >= 0 ? v : Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+    }
+
+    private static long lastEpoch() {
+        long v = Hawk.get(key(HawkConfig.SYNC_LAST_EPOCH), -1L);
+        return v >= 0 ? v : Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L);
+    }
 
     private static final Runnable DEBOUNCE_TASK = new Runnable() {
         @Override
@@ -134,7 +182,7 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+        long last = lastSyncAt();
         if (System.currentTimeMillis() - last >= 60 * 1000L) {
             sync(false, false, null);
         }
@@ -169,7 +217,7 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest()) {
             return;
         }
-        long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+        long last = lastSyncAt();
         if (System.currentTimeMillis() - last >= 2 * 60 * 1000L) {
             sync(false, false, null);
         }
@@ -180,7 +228,7 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+        long last = lastSyncAt();
         if (System.currentTimeMillis() - last >= 60 * 1000L) {
             sync(false, true, null);
         }
@@ -191,7 +239,7 @@ public final class HistorySyncManager {
     }
 
     public static String lastSyncText() {
-        long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+        long last = lastSyncAt();
         if (last <= 0) {
             return "尚未同步";
         }
@@ -219,12 +267,14 @@ public final class HistorySyncManager {
         }
         synchronized (LOCK) {
             if (syncing) {
+                // 被占用时必须给回调，否则页面会一直停在「正在同步…」
+                post(cb, false, "正在同步，请稍后再试");
                 return;
             }
             syncing = true;
         }
         if (!manual) {
-            long last = Hawk.get(HawkConfig.SYNC_LAST_AT, 0L);
+            long last = lastSyncAt();
             if (System.currentTimeMillis() - last < MIN_GAP_MS) {
                 syncing = false;
                 return;
@@ -249,10 +299,15 @@ public final class HistorySyncManager {
             @Override
             public void run() {
                 boolean ok = false;
+                boolean aborted = false;
                 String msg;
+                final int gen = generation;
                 try {
-                    msg = doSync(owner, key, manual);
+                    msg = doSync(owner, key, manual, gen);
                     ok = true;
+                } catch (SwitchAborted e) {
+                    aborted = true;
+                    msg = e.getMessage();
                 } catch (WebDavClient.AuthException e) {
                     msg = "认证失败：请检查网盘账号与应用密码";
                 } catch (SecurityException e) {
@@ -269,7 +324,7 @@ public final class HistorySyncManager {
                 }
                 if (ok) {
                     clearFailure();
-                } else {
+                } else if (!aborted) {
                     noteFailure();
                 }
                 post(cb, ok, msg);
@@ -289,7 +344,8 @@ public final class HistorySyncManager {
         });
     }
 
-    private static String doSync(String owner, byte[] key, boolean manual) throws Exception {
+    private static String doSync(String owner, byte[] key, boolean manual, int gen) throws Exception {
+        checkGeneration(gen);
         long now = System.currentTimeMillis();
         String deviceId = deviceId();
         SyncScopes scopes = SyncScopes.load();
@@ -326,14 +382,16 @@ public final class HistorySyncManager {
             }
         }
 
-        long lastEpoch = Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L);
-        boolean resetLocal = remote.epoch > lastEpoch;
+        long lastEp = lastEpoch();
+        boolean resetLocal = remote.epoch > lastEp;
+        checkGeneration(gen);
         if (resetLocal) {
             wipeLocal(scopes);
         }
 
         SyncPayload local = buildLocal(owner, deviceId, scopes, now);
         SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
+        checkGeneration(gen);
         applyLocal(merged, scopes);
 
         byte[] out = Crypto.encrypt(key, GSON.toJson(merged).getBytes("UTF-8"));
@@ -350,6 +408,7 @@ public final class HistorySyncManager {
                         r2.deleted = new SyncPayload.Deleted();
                     }
                     merged = SyncMerge.merge(buildLocal(owner, deviceId, scopes, now), r2, deviceId, now);
+                    checkGeneration(gen);
                     applyLocal(merged, scopes);
                     out = Crypto.encrypt(key, GSON.toJson(merged).getBytes("UTF-8"));
                 }
@@ -357,9 +416,12 @@ public final class HistorySyncManager {
             dav.put(path, out, null);
         }
 
-        Hawk.put(HawkConfig.SYNC_LAST_AT, now);
-        Hawk.put(HawkConfig.SYNC_LAST_EPOCH, merged.epoch);
+        checkGeneration(gen);
+        Hawk.put(key(HawkConfig.SYNC_LAST_AT), now);
+        Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), merged.epoch);
         Hawk.put(key(HawkConfig.SYNC_DIRTY), false);
+        // 首次加入的账号已完成「只拉不推」，之后正常参与 LWW
+        SettingsProfile.setPendingPull(owner, false);
         SyncTombstones.clear(now);
         LOG.i("[Sync] done owner=" + owner + " rec=" + merged.records.size()
                 + " prog=" + merged.progress.size() + " col=" + merged.collects.size()
@@ -373,7 +435,7 @@ public final class HistorySyncManager {
         p.owner = owner;
         p.dev = deviceId;
         p.updatedAt = now;
-        p.epoch = Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L);
+        p.epoch = lastEpoch();
         AppDataManager.get();
         if (scopes.history) {
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
@@ -383,7 +445,8 @@ public final class HistorySyncManager {
                     SyncPayload.RecordItem it = new SyncPayload.RecordItem();
                     it.sourceKey = r.sourceKey;
                     it.vodId = r.vodId;
-                    it.dataJson = r.dataJson;
+                    // S2：同步包只带 10 个必需字段（本地库仍是完整 VodInfo）
+                    it.dataJson = HistorySyncJson.slim(r.dataJson);
                     it.updateTime = r.updateTime;
                     it.dev = deviceId;
                     p.records.add(it);
@@ -426,7 +489,15 @@ public final class HistorySyncManager {
         }
         if (scopes.settings) {
             // payload.settings 是 List<SettingItem>（规避 R8 收紧 Map 字段），Map 需经适配器转换
-            p.setSettingsMap(SyncSettings.detectChanges(SyncSettings.loadSnapshot(), now));
+            Map<String, SyncPayload.SettingValue> settingMap =
+                    SyncSettings.detectChanges(SyncSettings.loadSnapshot(), now);
+            if (SettingsProfile.isPendingPull(owner)) {
+                // 首次加入本机的账号：只看云端，不拿默认值覆盖对方设置
+                for (SyncPayload.SettingValue sv : settingMap.values()) {
+                    sv.t = 0;
+                }
+            }
+            p.setSettingsMap(settingMap);
         }
         SyncTombstones.fill(p);
         return p;
@@ -539,13 +610,13 @@ public final class HistorySyncManager {
                             Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
                     SyncPayload empty = new SyncPayload();
                     empty.owner = owner;
-                    empty.epoch = Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L) + 1;
+                    empty.epoch = lastEpoch() + 1;
                     empty.updatedAt = System.currentTimeMillis();
                     empty.dev = deviceId();
                     byte[] out = Crypto.encrypt(key, GSON.toJson(empty).getBytes("UTF-8"));
                     dav.put(AccountPaths.data(accountName), out, null);
-                    Hawk.put(HawkConfig.SYNC_LAST_EPOCH, empty.epoch);
-                    Hawk.put(HawkConfig.SYNC_LAST_AT, System.currentTimeMillis());
+                    Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), empty.epoch);
+                    Hawk.put(key(HawkConfig.SYNC_LAST_AT), System.currentTimeMillis());
                     Hawk.put(key(HawkConfig.SYNC_DIRTY), false);
                     ok = true;
                     msg = "已清空云端（其它设备下次同步会跟随清空）";
