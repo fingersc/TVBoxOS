@@ -95,13 +95,15 @@ public class SwitchAccountDialog extends BaseDialog {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final byte[] key = Crypto.deriveKey(name, pass);
-                final AccountService.Result result;
+                // deriveKey 抛的是受检异常，必须一起放进 try（v76 编译修复）
+                byte[] keyTmp;
+                AccountService.Result resultTmp;
                 try {
-                    result = AccountService.check(new WebDavClient(
+                    keyTmp = Crypto.deriveKey(name, pass);
+                    resultTmp = AccountService.check(new WebDavClient(
                             Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
                             Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
-                            Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, "")), name, key);
+                            Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, "")), name, keyTmp);
                 } catch (final Throwable t) {
                     main.post(new Runnable() {
                         @Override
@@ -112,6 +114,8 @@ public class SwitchAccountDialog extends BaseDialog {
                     });
                     return;
                 }
+                final byte[] key = keyTmp;
+                final AccountService.Result result = resultTmp;
                 main.post(new Runnable() {
                     @Override
                     public void run() {
