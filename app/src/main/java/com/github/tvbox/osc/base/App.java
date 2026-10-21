@@ -87,14 +87,13 @@ public class App extends MultiDexApplication {
         Hawk.init(this).build();
         // v73：修复被早期版本写坏的设置类型（集合/浮点被存成 String），必须早于任何读取
         SyncSettings.repairCorruptedTypes();
-        // 调试模式每次启动重置为关：避免上次忘了关、日志一直刷影响日常使用。
-        // 需要抓日志时「设置 → 关于 → 调试模式」打开即可，当次会话内全量输出。
-        Hawk.put(HawkConfig.DEBUG_OPEN, false);
-        // release 构建：调试关（LOG 全通道静默 + Exo 内部日志静默 + OkHttp 拦截器 NONE）；
-        // dev 构建（BuildConfig.DEBUG）：日志常开，方便开发期排障。
-        LOG.setDebugEnabled(BuildConfig.DEBUG);
-        com.github.tvbox.osc.player.ExoPlayer.setExoLogEnabled(BuildConfig.DEBUG);
-        OkGoHelper.applyHttpDebug(BuildConfig.DEBUG);
+        // v81：调试开关改为**持久化**。
+        // 原先每次启动都强制置 false，导致「清理后台再进」抓冷启动日志时永远是关的，
+        // 反而让排查冷启动问题没法取证。现在记住用户的选择（默认仍是关）。
+        boolean debugOpen = BuildConfig.DEBUG || Hawk.get(HawkConfig.DEBUG_OPEN, false);
+        LOG.setDebugEnabled(debugOpen);
+        com.github.tvbox.osc.player.ExoPlayer.setExoLogEnabled(debugOpen);
+        OkGoHelper.applyHttpDebug(debugOpen);
         Hawk.put(HawkConfig.PLAYER_IS_LIVE, false);
         if (!Hawk.contains(HawkConfig.PLAY_TYPE)) {
             Hawk.put(HawkConfig.PLAY_TYPE, 2);

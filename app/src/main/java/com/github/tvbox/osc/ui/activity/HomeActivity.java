@@ -692,6 +692,7 @@ public class HomeActivity extends BaseActivity {
     protected void onResume() {
         super.onResume();
         activityResumed = true;
+        refreshDebugBadge();
         if (pendingConfigReload) {
             pendingConfigReload = false;
             reloadConfigAfterSync();
@@ -866,6 +867,17 @@ public class HomeActivity extends BaseActivity {
      * v75：同步写回了接口地址（api_url 等），首页需要重新走一遍 loadConfig。
      * 只在配置真的变化时由事件触发；1 分钟内最多执行一次。
      */
+    /** v82：调试模式开着时，首页顶部显示「调试模式」徽标（提醒日志正在全量输出）。 */
+    private void refreshDebugBadge() {
+        try {
+            View badge = findViewById(R.id.tvDebugBadge);
+            if (badge != null) {
+                badge.setVisibility(LOG.isDebugEnabled() ? View.VISIBLE : View.GONE);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void reloadConfigAfterSync() {
         if (isActivityUnavailable()) {
             return;
