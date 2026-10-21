@@ -52,7 +52,7 @@ public final class SyncSettings {
             HawkConfig.DOH_URL, HawkConfig.DOH_JSON,
             // 直播偏好
             HawkConfig.LIVE_CHANNEL_REVERSE, HawkConfig.LIVE_CROSS_GROUP,
-            HawkConfig.LIVE_CONNECT_TIMEOUT, HawkConfig.LIVE_SHOW_NET_SPEED,
+            HawkConfig.LIVE_SHOW_NET_SPEED,
             HawkConfig.LIVE_SHOW_RESOLUTION, HawkConfig.LIVE_SHOW_TIME,
             HawkConfig.LIVE_WEB_HEADER,
     };

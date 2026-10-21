@@ -130,14 +130,19 @@ public final class HistorySyncManager {
      * 与首页加载直接相关的配置键：这些键变化后首页必须重新 loadConfig，
      * 否则「首次安装 → 登录 → 同步写回接口地址」后首页仍然是空的。
      */
-    private static final String[] HOME_CONFIG_KEYS = {
+    /** v79：需要「整包重载首页」的键（接口地址 / 线路 / 首页源）。 */
+    private static final String[] HOME_RELOAD_KEYS = {
             HawkConfig.API_URL, HawkConfig.API_LINE_SOURCE, HawkConfig.HOME_API,
+    };
+
+    /** v79：只需预热直播配置、完全不必碰首页的键。 */
+    private static final String[] LIVE_ONLY_KEYS = {
             HawkConfig.LIVE_API_URL, HawkConfig.EPG_URL,
     };
 
-    private static String configSnapshot() {
+    private static String configSnapshot(String[] keys) {
         StringBuilder sb = new StringBuilder();
-        for (String k : HOME_CONFIG_KEYS) {
+        for (String k : keys) {
             Object v = Hawk.contains(k) ? Hawk.get(k) : null;
             sb.append(k).append('=').append(v == null ? "" : String.valueOf(v)).append('\n');
         }
@@ -644,16 +649,22 @@ public final class HistorySyncManager {
                 }
             }
             if (scopes.settings) {
-                String before = configSnapshot();
+                String homeBefore = configSnapshot(HOME_RELOAD_KEYS);
+                String liveBefore = configSnapshot(LIVE_ONLY_KEYS);
                 SyncSettings.apply(merged.settingsMap());
                 SyncSettings.saveSnapshot(merged.settingsMap());
-                if (!before.equals(configSnapshot())) {
+                final boolean homeChanged = !homeBefore.equals(configSnapshot(HOME_RELOAD_KEYS));
+                final boolean liveChanged = !liveBefore.equals(configSnapshot(LIVE_ONLY_KEYS));
+                if (homeChanged || liveChanged) {
                     MAIN.post(new Runnable() {
                         @Override
                         public void run() {
-                            EventBus.getDefault().post(
-                                    new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
-                            // v77：配置变了（尤其 live_api_url），后台预热直播配置
+                            if (homeChanged) {
+                                // v79：只有接口地址/线路/首页源变了才整包重载首页
+                                EventBus.getDefault().post(
+                                        new RefreshEvent(RefreshEvent.TYPE_CONFIG_CHANGE));
+                            }
+                            // 直播地址/EPG 变化：只预热，不动首页
                             LiveConfigPrefetcher.prefetch();
                         }
                     });

@@ -50,8 +50,15 @@ public class ApiDialog extends BaseDialog {
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void refresh(RefreshEvent event) {
         if (event.type == RefreshEvent.TYPE_API_URL_CHANGE) {
-            inputApi.setText((String) event.obj);
-            inputApiLive.setText((String) event.obj);
+            // v79：只有直播地址为空、或原本就跟点播一致时，才跟着变
+            String oldApi = inputApi.getText() == null ? "" : inputApi.getText().toString().trim();
+            String liveNow = inputApiLive.getText() == null ? "" : inputApiLive.getText().toString().trim();
+            boolean liveFollows = liveNow.isEmpty() || liveNow.equals(oldApi);
+            String newApi = (String) event.obj;
+            inputApi.setText(newApi);
+            if (liveFollows) {
+                inputApiLive.setText(newApi);
+            }
         } else if (event.type == RefreshEvent.TYPE_LIVE_API_URL_CHANGE) {
             inputApiLive.setText((String) event.obj);
         }
@@ -195,7 +202,11 @@ public class ApiDialog extends BaseDialog {
         String newLiveApi = inputApiLive.getText().toString().trim();
         if (!newApi.isEmpty()) {
             HistoryHelper.setApiHistory(newApi);
-            if (!newApi.equals(Hawk.get(HawkConfig.API_URL, newApi))) {
+            String oldApi = Hawk.get(HawkConfig.API_URL, "");
+            String oldLive = Hawk.get(HawkConfig.LIVE_API_URL, "");
+            // v79：只有"直播为空"或"直播原本等于旧点播地址"时才跟随，避免覆盖用户单独填的直播地址
+            boolean liveFollowsApi = newLiveApi.isEmpty() || newLiveApi.equals(oldApi);
+            if (!newApi.equals(oldApi) && liveFollowsApi) {
                 inputApiLive.setText(newApi);
                 newLiveApi = newApi;
             }

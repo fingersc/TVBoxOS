@@ -875,10 +875,18 @@ public class HomeActivity extends BaseActivity {
             return;
         }
         lastConfigReloadAt = now;
+        // v79：接口地址没变 → 只刷新首页数据，不重新解析配置（避免十几秒空转）
+        String curApi = Hawk.get(HawkConfig.API_URL, "");
+        if (!curApi.isEmpty() && curApi.equals(ApiConfig.get().getLoadedApiUrl())) {
+            LOG.i("[Sync] config event, same api url, refresh home only");
+            refreshHome(false);
+            return;
+        }
         LOG.i("[Sync] config changed, reload home config");
         dataInitOk = false;
         jarInitOk = false;
-        useCacheConfig = false;
+        // v79：优先用缓存；URL 真变了缓存 key 不同，自然走网络
+        useCacheConfig = true;
         initData();
     }
 

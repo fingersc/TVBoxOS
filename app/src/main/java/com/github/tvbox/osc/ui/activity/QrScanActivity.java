@@ -462,6 +462,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                             msg = "登录信息已发送，电视将自动登录";
                         } else if (text.contains("no_dir")) {
                             msg = "电视上没有这个账号：请确认电视与本机用的是同一份网盘";
+                        } else if (text.contains("mismatch")) {
+                            msg = "电视要登录的不是这个账号：请先在手机上切换到目标账号再扫";
                         } else {
                             msg = "发送失败：" + text;
                         }

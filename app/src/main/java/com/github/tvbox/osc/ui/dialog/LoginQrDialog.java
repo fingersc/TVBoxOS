@@ -22,8 +22,23 @@ import org.jetbrains.annotations.NotNull;
 public class LoginQrDialog extends BaseDialog implements QrLoginBridge.Listener {
 
     public LoginQrDialog(@NonNull @NotNull Context context) {
+        this(context, null, null);
+    }
+
+    /**
+     * v79：指定目标账号的扫码（切换账号用）。
+     * 手机回传的账号若不是这个账号，服务端会回 mismatch 并拒绝切换。
+     */
+    public LoginQrDialog(@NonNull @NotNull Context context, String targetName, String targetOwner) {
         super(context);
         setContentView(R.layout.dialog_login_qr);
+        if (targetOwner != null && !targetOwner.isEmpty()) {
+            QrLoginBridge.setExpectedOwner(targetOwner);
+            ((android.widget.TextView) findViewById(R.id.tvQrTitle))
+                    .setText("扫码登录「" + targetName + "」");
+        } else {
+            QrLoginBridge.clearExpectedOwner();
+        }
         String address = ControlManager.get().getAddress(false);
         String token = QrLoginBridge.newToken();
         String content = address + "qrlogin?t=" + token;
@@ -79,6 +94,8 @@ public class LoginQrDialog extends BaseDialog implements QrLoginBridge.Listener 
     @Override
     public void dismiss() {
         QrLoginBridge.removeListener(this);
+        // v79：弹窗关了就不再限制"期望账号"，避免下一次扫码被误判 mismatch
+        QrLoginBridge.clearExpectedOwner();
         super.dismiss();
     }
 }

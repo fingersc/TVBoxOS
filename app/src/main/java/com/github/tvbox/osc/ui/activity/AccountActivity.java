@@ -47,6 +47,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private TextView tvLoginHint;
     private LinearLayout llAccounts;
     private View llLoginForm;
+    /** 卡片行里的"扫码登录"入口（不是真实账号） */
+    private static final String SCAN_ENTRY = "__SCAN_ENTRY__";
     /** 正在切换账号：忽略重复点击与并发的登录请求 */
     private boolean switching;
     private TextView btnLogin;
@@ -382,7 +384,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         for (AccountStore.Item it : AccountStore.list()) {
             addAccountCard(it.name, it.owner, false);
         }
-        addAccountCard("+ 添加账号", null, false);
+        addAccountCard("添加账号", null, false);
+        addAccountCard("扫码登录", SCAN_ENTRY, false);
     }
 
     private void addAccountCard(final String text, final String owner, final boolean guest) {
@@ -390,14 +393,16 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         boolean isCurrent = guest ? AccountContext.isGuest()
                 : (owner != null && owner.equals(AccountContext.ownerKey()));
         boolean isAdd = owner == null;
+        boolean isScan = SCAN_ENTRY.equals(owner);
+        // v79：加号只加一次（原来文案自带 "+" 又加前缀 ⇒ 出现两个加号）
         card.setText(isCurrent ? "✓ " + text : (isAdd ? "+  " + text : text));
-        card.setTextColor(isAdd ? 0xFF8FA0B8 : 0xFFFFFFFF);
+        card.setTextColor((isAdd || isScan) ? 0xFF8FA0B8 : 0xFFFFFFFF);
         card.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_22));
         card.setGravity(android.view.Gravity.CENTER);
         card.setFocusable(true);
         // v77：当前账号实心高亮、普通账号描边、添加账号虚线，三类视觉分级
         card.setBackgroundResource(isCurrent ? R.drawable.shape_account_chip_current
-                : (isAdd ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
+                : ((isAdd || isScan) ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
         int h = (int) getResources().getDimension(R.dimen.vs_64);
         int padH = (int) getResources().getDimension(R.dimen.vs_20);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -414,7 +419,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         card.setOnLongClickListener(new View.OnLongClickListener() {
             @Override
             public boolean onLongClick(View v) {
-                if (owner != null) {
+                if (owner != null && !SCAN_ENTRY.equals(owner)) {
                     confirmRemoveAccount(text, owner);
                 }
                 return true;
@@ -424,6 +429,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     }
 
     private void onAccountCardClick(String name, String owner, boolean guest) {
+        if (SCAN_ENTRY.equals(owner)) {
+            // v79：第一层扫码入口 —— 用手机上的账号登录本机（已存在则切，不存在则新增）
+            new LoginQrDialog(this).show();
+            return;
+        }
         if (owner == null) {
             showAddForm();
             return;

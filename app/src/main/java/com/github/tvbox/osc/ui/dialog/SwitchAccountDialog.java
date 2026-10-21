@@ -49,6 +49,7 @@ public class SwitchAccountDialog extends BaseDialog {
         this.listener = listener;
         setContentView(R.layout.dialog_switch_account);
         ((TextView) findViewById(R.id.tvSwitchTitle)).setText("切换到「" + name + "」");
+        ((TextView) findViewById(R.id.btnSwitchQr)).setText("扫码登录此账号");
         tvStatus = findViewById(R.id.tvSwitchStatus);
         etPass = findViewById(R.id.etSwitchPass);
 
@@ -64,7 +65,8 @@ public class SwitchAccountDialog extends BaseDialog {
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
                 dismiss();
-                new LoginQrDialog(getContext()).show();
+                // v79：扫码登录"这个账号"，服务端会校验手机账号是否一致
+                new LoginQrDialog(getContext(), name, owner).show();
             }
         });
         findViewById(R.id.btnSwitchCancel).setOnClickListener(new View.OnClickListener() {

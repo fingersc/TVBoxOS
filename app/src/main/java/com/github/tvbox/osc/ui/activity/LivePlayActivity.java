@@ -60,6 +60,7 @@ import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.EpgUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LiveFailureDiagnoser;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.PlayerHelper;
@@ -146,6 +147,8 @@ public class LivePlayActivity extends BaseActivity {
 
     public static  int currentChannelGroupIndex = 0;
     private Handler mHandler = new Handler();
+    /** v79：起播失败原因判定（探测流地址是否可达） */
+    private final LiveFailureDiagnoser liveDiagnoser = new LiveFailureDiagnoser();
     private int resolutionInfoRetryCount = 0;
     private boolean resolutionInfoPending = false;
     /**
@@ -233,6 +236,8 @@ public class LivePlayActivity extends BaseActivity {
     private boolean liveFirstFrameShown = false;
     /** 起播失败的重试间隔：源侧失败判定很快（实测 80ms），没必要空等 3.5s。 */
     private static final long LIVE_RETRY_BOOT_FAIL_MS = 800L;
+    /** v79：起播阶段的最长等待（配置再大也不超过它），出画面后仍按配置 */
+    private static final long LIVE_BOOT_TIMEOUT_MAX_MS = 10_000L;
     /** 播放中失败的重试间隔：给网络一点恢复时间，沿用原节奏。 */
     private static final long LIVE_RETRY_PLAYING_FAIL_MS = 3500L;
     private LiveChannelItem currentLiveChannelItem = null;
@@ -2102,6 +2107,17 @@ public class LivePlayActivity extends BaseActivity {
      *
      * <p>线路本身是否可用、谁排前面，由下发线路的服务端决定，客户端不做记忆与重排。</p>
      */
+    /**
+     * v79：起播阶段超时 = min(配置值, 10 秒)。
+     *
+     * <p>{@code LIVE_CONNECT_TIMEOUT} 已移出同步白名单，但本机历史值仍可能很大，
+     * 起播时统一加上限，避免"等 20 秒才换源"。</p>
+     */
+    private long liveBootTimeoutMs() {
+        long configured = (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L;
+        return liveFirstFrameShown ? configured : Math.min(configured, LIVE_BOOT_TIMEOUT_MAX_MS);
+    }
+
     private long delayForLiveFailure() {
         return liveFirstFrameShown ? LIVE_RETRY_PLAYING_FAIL_MS : LIVE_RETRY_BOOT_FAIL_MS;
     }
@@ -2524,7 +2540,7 @@ public class LivePlayActivity extends BaseActivity {
                     case VideoView.STATE_PREPARING:
                     case VideoView.STATE_BUFFERING:
                         // 正在准备或缓冲状态：表示当前源正在加载中
-                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L);
+                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, liveBootTimeoutMs());
                         break;
                     default:
                         break;
@@ -2583,21 +2599,32 @@ public class LivePlayActivity extends BaseActivity {
     private Runnable mConnectTimeoutChangeSourceRun = new Runnable() {
         @Override
         public void run() {
+            // v79：首帧没出来时先判原因 —— 流地址连不上就换线路（换播放器没用）
+            if (!liveFirstFrameShown && currentLiveChannelItem != null
+                    && liveDiagnoser.isUrlUnreachable(currentLiveChannelItem.getUrl())) {
+                switchToNextLiveSource();
+                return;
+            }
             if (switchLivePlayerAndReplay()) {
                 return;
             }
             // 走到这里说明播放器已经不给机会了：从头到尾没出过画面
             // （起播超时 / 坏流 / 一直 buffering），交给换源流程往下一条线路走。
-            currentLiveChangeSourceTimes++;
-            if (currentLiveChannelItem.getSourceNum() == currentLiveChangeSourceTimes) {
-                currentLiveChangeSourceTimes = 0;
-                Integer[] groupChannelIndex = getNextChannel(Hawk.get(HawkConfig.LIVE_CHANNEL_REVERSE, false) ? -1 : 1);
-                playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
-            } else {
-                playNextSource();
-            }
+            switchToNextLiveSource();
         }
     };
+
+    /** v79：起播失败后往下一条线路 / 下一个频道走（原逻辑抽出来复用）。 */
+    private void switchToNextLiveSource() {
+        currentLiveChangeSourceTimes++;
+        if (currentLiveChannelItem.getSourceNum() == currentLiveChangeSourceTimes) {
+            currentLiveChangeSourceTimes = 0;
+            Integer[] groupChannelIndex = getNextChannel(Hawk.get(HawkConfig.LIVE_CHANNEL_REVERSE, false) ? -1 : 1);
+            playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
+        } else {
+            playNextSource();
+        }
+    }
 
     private void initChannelGroupView() {
         mChannelGroupView.setHasFixedSize(true);

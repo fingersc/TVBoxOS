@@ -25,6 +25,8 @@ public final class QrLoginBridge {
     private static final long TTL_MS = 5 * 60 * 1000L;
     private static String token;
     private static long expireAt;
+    /** v79：这次扫码期望登录的账号（切换指定账号时设置），null = 不校验 */
+    private static volatile String expectedOwner;
     private static final List<Listener> LISTENERS = new ArrayList<>();
 
     /** 扫码登录成功回调（弹窗据此自动关闭并提示）。 */
@@ -78,6 +80,15 @@ public final class QrLoginBridge {
         return token;
     }
 
+    /** v79：切换指定账号时，要求手机回传的就是这个账号。 */
+    public static void setExpectedOwner(String owner) {
+        expectedOwner = owner;
+    }
+
+    public static void clearExpectedOwner() {
+        expectedOwner = null;
+    }
+
     public static synchronized boolean isValid(String t) {
         return t != null && token != null && t.equals(token) && System.currentTimeMillis() < expireAt;
     }
@@ -110,6 +121,11 @@ public final class QrLoginBridge {
                     || accountKey == null || accountKey.length != 64) {
                 return "bad";
             }
+            // v79：切换指定账号时校验目标，避免"点了张三却登成手机上的李四"
+            if (expectedOwner != null && !expectedOwner.equals(owner)) {
+                return "mismatch";
+            }
+            expectedOwner = null;
             // v78：本机已配置存储时以本机为准，避免扫码把整台设备的网盘换掉（其它账号会瞬间"找不到"）。
             // 仅当本机还没配置存储时，才采用手机带来的配置（相当于扫码顺手完成存储配置）。
             String localUrl = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");

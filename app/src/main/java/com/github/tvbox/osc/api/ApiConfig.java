@@ -762,7 +762,15 @@ public class ApiConfig {
     }
 
     private static  String jarCache ="true";
+    /** v79：最近一次成功解析的接口地址，用于「同步后是否需要整包重载」的判断。 */
+    private String loadedApiUrl = "";
+
+    public String getLoadedApiUrl() {
+        return loadedApiUrl == null ? "" : loadedApiUrl;
+    }
+
     private void parseJson(String apiUrl, String jsonStr) {
+        loadedApiUrl = apiUrl;
         resetConfigData();
         JsonObject infoJson = gson.fromJson(jsonStr, JsonObject.class);
         // spider
