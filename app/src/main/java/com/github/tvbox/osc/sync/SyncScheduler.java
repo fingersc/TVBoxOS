@@ -117,10 +117,24 @@ public final class SyncScheduler {
 
     /**
      * 本次没有真正发请求（游客 / 未配置存储 / 正在同步 / 最小间隔内 / 仅 Wi-Fi 未满足）。
-     * 只重排，不改档位 —— 被节流掉不代表「云端没变化」。
+     *
+     * <p>v99-r5 ★：被挡掉的如果是「脏数据」的同步，60 秒后重试，而不是按自适应档位
+     * （最长 30 分钟）—— 否则冷启动 / 网络抖动正好撞上最小间隔时，本地改动可能半小时都传不上去。</p>
+     *
+     * <p>只在<b>前台</b>重试：后台不打扰（脏标记已落盘，回前台时 onForeground 会按脏优先排队）。</p>
      */
     public static void skipped(String owner, String reason) {
         LOG.i("[sync] skip owner=" + owner + " reason=" + reason);
+        if (foreground && owner != null && !owner.isEmpty()) {
+            try {
+                if (SyncState.load(owner).anyDirty()) {
+                    schedule(owner, "retry-dirty", PRI_DIRTY, Long.MAX_VALUE, null);
+                    return;
+                }
+            } catch (Throwable t) {
+                LOG.e("[sync] retry check failed", t);
+            }
+        }
         armIdle(owner);
     }
 

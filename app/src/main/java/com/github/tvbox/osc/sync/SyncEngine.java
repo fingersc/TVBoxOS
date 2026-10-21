@@ -82,21 +82,31 @@ public final class SyncEngine {
         // 3) profile 校验（v78 起有缓存，命中后 0 请求）
         AccountService.ensureProfile(dav, accountName, key);
 
-        // 4) 条件读取
+        // 4) 读取云端
+        //    v99-r5 ★：本地有未上传改动时**不能**走条件请求（If-None-Match）——
+        //    304 只说明"云端没变"，却拿不到云端内容，而合并+上传必须有云端内容。
+        //    旧实现在这里 304 早退后顺手 clearDirty()，把本地刚标的脏洗掉了：
+        //    表现为云端 data.bin 一直不更新，App 却显示「上次同步：xx（正常）」。
+        //    所以：脏 ⇒ 完整 GET（合并后上传）；不脏 ⇒ 条件 GET（304 早退省流量）。
         HistorySyncManager.checkGeneration(gen);
+        boolean localDirty = st.anyDirty();
         boolean[] notModified = new boolean[1];
         String[] etagOut = new String[1];
         o.requests++;
-        byte[] remoteBytes = dav.getIfNoneMatch(path, st.etag, notModified, etagOut);
+        byte[] remoteBytes = localDirty
+                ? dav.get(path, etagOut)
+                : dav.getIfNoneMatch(path, st.etag, notModified, etagOut);
         o.bytesDown = remoteBytes == null ? 0 : remoteBytes.length;
 
-        // 5) 304 早退：零下载 / 零解密 / 零解析 / 零写库
+        // 5) 304 早退：零下载 / 零解密 / 零解析 / 零写库（只有"本地不脏"才可能走到这）
         if (notModified[0]) {
             st.lastAt = now;
             if (etagOut[0] != null && !etagOut[0].isEmpty()) {
                 st.etag = etagOut[0];
             }
-            st.clearDirty();
+            // v99-r5 ★：这里**不能** clearDirty()。304 只证明"云端没变"；
+            // 请求期间用户可能刚 markDirty（竞态），清掉就会把本地改动洗丢。
+            // dirty 的清除只发生在完整流程成功后的 finish()。
             st.clearFailure();
             st.save();
             LOG.i("[Sync] 304 not modified owner=" + owner + " req=" + o.requests);
