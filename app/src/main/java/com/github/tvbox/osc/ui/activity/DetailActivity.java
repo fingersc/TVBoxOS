@@ -5784,7 +5784,8 @@ public class DetailActivity extends BaseActivity {
             public void run() {
                 try {
                     StringBuilder sb = new StringBuilder();
-                    walkTree(root, sb, 0, 0);
+                    // 第 4 个参数是"已打印条数"计数器（int[]，跨递归共享）
+                    walkTree(root, sb, 0, new int[1]);
                     LOG.longI("[viewtree] " + tag, sb.toString());
                 } catch (Throwable t) {
                     LOG.e("[viewtree] walk failed", t);
