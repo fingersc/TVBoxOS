@@ -1,6 +1,5 @@
 package com.github.tvbox.osc.sync;
 
-import com.github.tvbox.osc.base.AccountContext;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
 import com.orhanobut.hawk.Hawk;
