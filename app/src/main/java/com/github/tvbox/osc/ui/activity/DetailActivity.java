@@ -14,6 +14,8 @@ import android.text.Html;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.view.KeyEvent;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -5726,6 +5728,135 @@ public class DetailActivity extends BaseActivity {
             }
         }
         toggleSubtitleTextSize();
+        // v99-r3：预览/全屏切换后量一次真实层级（仅调试模式）。
+        // 「预览框里一块位置固定的黑长方形」到底是谁，看这份日志就能定性：
+        //  · container 尺寸不等于 fragmentRoot / video 尺寸 ⇒ 容器没跟着变大（黑底露出）
+        //  · video 尺寸不等于 container ⇒ SurfaceView 没跟着重新布局（洞/画面错位）
+        dumpPreviewLayout("setFullPreview(" + full + ")");
+        dumpViewTree("setFullPreview(" + full + ")");
+    }
+
+    /**
+     * v99-r3 取证：把预览链路的实测尺寸 / 屏幕位置 / 可见性打进日志（仅调试模式）。
+     *
+     * <p>布局在 setFullPreview 返回时往往还没走完 measure/layout，所以延后 600ms 再量一次。</p>
+     */
+    private void dumpPreviewLayout(final String tag) {
+        if (!LOG.isDebugEnabled()) {
+            return;
+        }
+        llPlayerFragmentContainer.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    StringBuilder sb = new StringBuilder("[preview] ").append(tag);
+                    sb.append(rect("container", llPlayerFragmentContainer));
+                    sb.append(rect("block", llPlayerFragmentContainerBlock));
+                    View fragRoot = playFragment == null ? null : playFragment.getView();
+                    sb.append(rect("fragRoot", fragRoot));
+                    View vv = fragRoot == null ? null : fragRoot.findViewById(R.id.mVideoView);
+                    sb.append(rect("video", vv));
+                    sb.append(" full=").append(fullWindows).append(" showPreview=").append(showPreview);
+                    LOG.i(sb.toString());
+                } catch (Throwable t) {
+                    LOG.e("[preview] dump failed", t);
+                }
+            }
+        }, 600L);
+    }
+
+    /**
+     * v99-r3 取证（二）：**扫描整棵视图树**，把「可见且够大」的视图全打出来。
+     *
+     * <p>为什么必须扫整棵树：那块黑长方形会**盖住控制条的时间标**（用户实测），
+     * 说明它的 z 序在控制条之上，是浮在上层的视图，而不是"容器背景露出来"。
+     * 只 dump 已知的几个视图抓不到它 —— 只能整棵树扫。</p>
+     *
+     * <p>拿到日志后直接找 `宽x高` 接近 547x273、`@(0,0~20)` 的那一行，它的 id 就是答案。</p>
+     */
+    private void dumpViewTree(final String tag) {
+        if (!LOG.isDebugEnabled()) {
+            return;
+        }
+        final View root = getWindow().getDecorView();
+        root.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    StringBuilder sb = new StringBuilder();
+                    walkTree(root, sb, 0, 0);
+                    LOG.longI("[viewtree] " + tag, sb.toString());
+                } catch (Throwable t) {
+                    LOG.e("[viewtree] walk failed", t);
+                }
+            }
+        }, 600L);
+    }
+
+    private void walkTree(View v, StringBuilder sb, int depth, int[] shown) {
+        if (v == null || depth > 10 || shown[0] > 120) {
+            return;
+        }
+        if (v.getVisibility() == View.VISIBLE && v.getWidth() >= 80 && v.getHeight() >= 80) {
+            shown[0]++;
+            int[] loc = new int[2];
+            v.getLocationOnScreen(loc);
+            String id;
+            try {
+                id = v.getId() == View.NO_ID ? "-" : getResources().getResourceEntryName(v.getId());
+            } catch (Throwable t) {
+                id = "#" + v.getId();
+            }
+            sb.append('\n').append(v.getClass().getSimpleName()).append('#').append(id)
+                    .append(' ').append(v.getWidth()).append('x').append(v.getHeight())
+                    .append("@(").append(loc[0]).append(',').append(loc[1]).append(')')
+                    .append(" bg=").append(bgOf(v));
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                walkTree(g.getChildAt(i), sb, depth + 1, shown);
+            }
+        }
+    }
+
+    /** 背景简述：ColorDrawable 给 #AARRGGBB，其余给类名（够判断是不是黑色）。 */
+    private static String bgOf(View v) {
+        try {
+            Drawable d = v.getBackground();
+            if (d == null) {
+                return "null";
+            }
+            if (d instanceof ColorDrawable) {
+                return "#" + Integer.toHexString(((ColorDrawable) d).getColor()).toUpperCase();
+            }
+            return d.getClass().getSimpleName();
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 视图的实测尺寸 + 屏幕坐标 + 可见性（不可见返回 ——）。 */
+    private static String rect(String name, View v) {
+        if (v == null) {
+            return " " + name + "=null";
+        }
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        String vis;
+        switch (v.getVisibility()) {
+            case View.VISIBLE:
+                vis = "VISIBLE";
+                break;
+            case View.INVISIBLE:
+                vis = "INVISIBLE";
+                break;
+            default:
+                vis = "GONE";
+                break;
+        }
+        return " " + name + "=" + v.getWidth() + "x" + v.getHeight()
+                + "@(" + loc[0] + "," + loc[1] + ")" + vis;
     }
 
     @Override

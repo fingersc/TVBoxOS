@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <shape xmlns:android="http://schemas.android.com/apk/res/android">
-    <solid android:color="@android:color/black" />
+    <!-- v99-r3：原来是 solid black。预览框里装的是 SurfaceView，Surface 在没出首帧之前
+         本身就是黑的；容器再来一层不透明纯黑 ⇒ 只要预览没起来，看到的就是「一块位置
+         固定的黑色长方形」（用户反馈的"遮罩"）。背景改透明后，没出画面时露出的是
+         详情页背景，而不是一个突兀的黑块。圆角由上面那层 Block 视图负责。 -->
+    <solid android:color="@android:color/transparent" />
     <corners android:radius="@dimen/preview_player_radius" />
 </shape>
