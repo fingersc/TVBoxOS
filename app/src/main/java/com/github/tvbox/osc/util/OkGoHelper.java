@@ -94,6 +94,8 @@ public class OkGoHelper {
                     ? HttpLoggingInterceptor.Level.BODY : HttpLoggingInterceptor.Level.NONE);
             interceptor.setColorLevel(open ? Level.INFO : Level.OFF);
         }
+        // v97：爬虫 client 的拦截器等级是创建时固定的，切换调试模式后重建一次让它跟上
+        com.github.catvod.net.OkHttp.resetClient();
     }
 
     public static synchronized OkProxySelector proxySelector() {

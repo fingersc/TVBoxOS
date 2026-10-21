@@ -3,6 +3,8 @@ package com.github.catvod.net;
 import androidx.collection.ArrayMap;
 
 import com.github.tvbox.osc.util.SSL.SSLSocketFactoryCompat;
+import com.github.tvbox.osc.util.LOG;
+import com.lzy.okgo.interceptor.HttpLoggingInterceptor;
 import com.github.tvbox.osc.util.OkGoHelper;
 
 import java.util.Map;
@@ -21,7 +23,6 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import okhttp3.Dns;
-import okhttp3.logging.HttpLoggingInterceptor;
 import java.util.logging.Level;
 
 import java.net.InetAddress;
@@ -35,12 +36,14 @@ public class OkHttp {
     private static OkDns dns;
     private static OkHttpClient client;
 
-    /** v97：爬虫链路专用日志拦截器（tag: Spider），与 OkGo / OkExoPlayer 区分来源 */
+    /** v97：爬虫链路专用日志拦截器（tag: Spider），与 OkGo / OkExoPlayer 区分来源。
+     *   等级跟随调试模式：关=NONE 完全静默，开=BODY 全量打印（与 OkGoHelper 口径一致）。 */
     private static HttpLoggingInterceptor newHttpLogInterceptor(String tag) {
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor(tag);
-        loggingInterceptor.setPrintLevel(HttpLoggingInterceptor.Level.BASIC);
-        loggingInterceptor.setColorLevel(Level.INFO);
-        return loggingInterceptor;
+        HttpLoggingInterceptor interceptor = new HttpLoggingInterceptor(tag);
+        interceptor.setPrintLevel(LOG.isDebugEnabled()
+                ? HttpLoggingInterceptor.Level.BODY : HttpLoggingInterceptor.Level.NONE);
+        interceptor.setColorLevel(LOG.isDebugEnabled() ? Level.INFO : Level.OFF);
+        return interceptor;
     }
 
     public static synchronized OkDns dns() {
