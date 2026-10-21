@@ -1001,8 +1001,10 @@ public class DetailActivity extends BaseActivity {
                 outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), radius);
             }
         };
-        llPlayerFragmentContainer.setClipToOutline(true);
-        llPlayerFragmentContainer.setOutlineProvider(provider);
+        // v84：容器里装的是 SurfaceView，clipToOutline 会把画面裁成黑块（Surface 不参与 outline 裁剪）。
+        //       圆角交给上面那层透明的 Block 视图即可，容器保持不裁剪。
+        llPlayerFragmentContainer.setClipToOutline(false);
+        llPlayerFragmentContainer.setOutlineProvider(null);
         llPlayerFragmentContainerBlock.setClipToOutline(true);
         llPlayerFragmentContainerBlock.setOutlineProvider(provider);
     }

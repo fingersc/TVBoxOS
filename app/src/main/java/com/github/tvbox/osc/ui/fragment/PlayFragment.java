@@ -1198,6 +1198,8 @@ public class PlayFragment extends BaseLazyFragment {
                             mVideoView.setUrl(url);
                         }
                         startSwitchLinePlayTimeout();
+                        LOG.i("[vod] start reuse=" + reusePlayer + " url=" + url);
+                        vodFirstFrameLogged = false;
                         if (reusePlayer) {
                             mVideoView.skipPositionWhenPlay((int) playTimeoutBasePosition);
                             mVideoView.replay(false);
@@ -3274,15 +3276,25 @@ public class PlayFragment extends BaseLazyFragment {
      *       {@code BUFFERING_DEBOUNCE_MS} 的注释），所以不需要在这里再做一次。</li>
      * </ol>
      */
+    /** v84：点播首帧是否已记录（每次起播重置） */
+    private boolean vodFirstFrameLogged;
+
     private void trackPlayStall(int playState) {
         try {
             if (playState == VideoView.STATE_PLAYING) {
+                if (!vodFirstFrameLogged) {
+                    vodFirstFrameLogged = true;
+                    LOG.i("[vod] first frame");
+                }
                 // 开始渲染 = 出画面了。此后才允许统计卡顿。
                 stallGateOpen = true;
                 settlePendingStall();          // 保险：能播就说明卡顿已经结束
                 return;
             }
             if (playState == VideoView.STATE_ERROR || playState == VideoView.STATE_IDLE) {
+                if (playState == VideoView.STATE_ERROR) {
+                    LOG.i("[vod] error state");
+                }
                 // 卡到报错 / 播放器释放：把没结算的那次补记上
                 // （用户往往正是因为卡了才退出的，这种样本最该被记录）
                 settlePendingStall();

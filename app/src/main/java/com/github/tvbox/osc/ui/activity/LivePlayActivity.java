@@ -153,6 +153,13 @@ public class LivePlayActivity extends BaseActivity {
     private boolean liveProbeInFlight;
     /** v81：本次起播是否已经做过"同线路快速重连" */
     private int liveBootRetryCount;
+    /**
+     * v83：本页是否成功出过画面。
+     *
+     * <p>没出过画面时不能走 {@code replay(true)} 复用路径：实测冷启动第一次起播
+     * 只发了 HTTP 请求、完全没有 MediaCodec 初始化，5 秒后靠"同线路重连"才真正开始解码。</p>
+     */
+    private boolean livePlayerReadyOnce;
     private int resolutionInfoRetryCount = 0;
     private boolean resolutionInfoPending = false;
     /**
@@ -2068,7 +2075,9 @@ public class LivePlayActivity extends BaseActivity {
         ll_right_top_huikan.setVisibility(View.GONE);
         if(mVideoView!=null){
             if(liveChannelHeader()!=null)LOG.i("echo-"+liveChannelHeader().toString());
-            boolean reusePlayer = canReusePlayer(previousLivePlayerType);
+            // v83：只有"本页已经成功播放过"才复用播放器；否则一律 release + start，
+            // 否则冷启动第一次会卡在"请求已发出但没 prepare"的状态，白等 5 秒兜底。
+            boolean reusePlayer = livePlayerReadyOnce && canReusePlayer(previousLivePlayerType);
             boolean keepExoFrame = reusePlayer && previousLivePlayerType == 2;
             if (showPreviousFrame && !keepExoFrame) {
                 showSwitchChannelSnapshot();
@@ -2080,6 +2089,7 @@ public class LivePlayActivity extends BaseActivity {
             liveBootRetryCount = 0;
             LOG.i("[live] start channel=" + currentLiveChannelItem.getChannelName()
                     + " source=" + currentLiveChannelItem.getSourceIndex() + " url=" + liveUrl);
+            LOG.i("[live] play mode=" + (reusePlayer ? "replay" : "release+start"));
             if (reusePlayer) {
                 mVideoView.setUrl(liveUrl, liveChannelHeader());
                 mVideoView.replay(true);
@@ -2554,6 +2564,7 @@ public class LivePlayActivity extends BaseActivity {
                             // 真的出画面了：后续若再失败就按「播放中断」处理
                             // （中途断流 / 解码器问题，值得换播放器重试）
                             liveFirstFrameShown = true;
+                            livePlayerReadyOnce = true;
                             liveBootRetryCount = 0;
                             LOG.i("[live] first frame shown");
                             mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
