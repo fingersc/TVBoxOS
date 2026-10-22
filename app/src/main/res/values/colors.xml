@@ -56,6 +56,13 @@
 
 
     <!-- v99-r6b：账号页区块卡片底（淡蓝半透明，透出页面背景 ⇒ 与整体更协调） -->
-    <color name="account_section_bg">#3D353744</color>
-    <color name="account_section_stroke">#22FFFFFF</color>
+    <!-- v99-r13：按账号页透明度统一原则重设 ——
+         小卡片 50% / 按钮 50% / 输入框 40% / 大卡片（区块卡片）30%，
+         区块卡片描边 20%；聚焦态一律不变。
+         底色 RGB 保持 #353744（与输入框、按钮同一底色），只调 alpha。 -->
+    <color name="account_section_bg">#4C353744</color>
+    <color name="account_section_stroke">#33FFFFFF</color>
+    <!-- v99-r13：输入框常态描边（专用色，不动共用的 dialog_panel_stroke，
+         避免把其它对话框的描边一起改亮） -->
+    <color name="account_input_stroke">#4CFFFFFF</color>
 </resources>

@@ -261,7 +261,7 @@
                         android:background="@drawable/button_danmu_setting"
                         android:focusable="true"
                         android:gravity="center"
-                        android:text="二维码"
+                        android:text="二维码登录"
                         android:textColor="@android:color/white"
                         android:textSize="@dimen/ts_22" />
 

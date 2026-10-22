@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- v77：添加账号卡片（虚线 + 更暗底），与真实账号区分 -->
+<!-- v99-r13：底色由 100% 不透明改为 50%（账号页小卡片统一档位）；
+     虚线描边保持不透明 —— 虚线本身就是「可点击添加」的语义信号。 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
     <corners android:radius="@dimen/vs_6" />
-    <solid android:color="#12161E" />
+    <solid android:color="#8012161E" />
     <stroke
         android:width="@dimen/vs_2"
         android:color="#4A5566"

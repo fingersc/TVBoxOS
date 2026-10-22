@@ -20,7 +20,7 @@
             <solid android:color="@color/dialog_input_bg" />
             <stroke
                 android:width="@dimen/vs_1"
-                android:color="@color/dialog_panel_stroke" />
+                android:color="@color/account_input_stroke" />
         </shape>
     </item>
 </selector>
