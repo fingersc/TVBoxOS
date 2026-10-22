@@ -1897,18 +1897,17 @@ public class PlayFragment extends BaseLazyFragment {
             mHandler.removeCallbacks(progressTickRun);
             mHandler.postDelayed(progressTickRun, PROGRESS_TICK_MS);
         }
-        // ★ v99-r17：播放页可见 ⇒ App 在前台。
+        // ★ v99-r18：播放页可见 ⇒ App 在前台。
         //
-        // setForeground() 原先只挂在 HomeActivity.onResume/onStop 上，而播放页在
-        // DetailActivity 里 —— 打开详情页时 HomeActivity 已经 onStop，于是「用户正盯着
-        // 屏幕看片」被判成后台：armIdle 不排轮询、skipped() 也不重试脏数据。
-        // 整部片子期间云端有变更完全拉不到，只能等退出播放回首页。
+        // 播放页在 DetailActivity 里，打开详情页时 HomeActivity 已经 onStop，于是
+        // 「用户正盯着屏幕看片」被判成后台：armIdle 不排轮询、skipped() 也不重试脏数据，
+        // 整部片子期间云端有变更完全拉不到。
         //
-        // 这里只置 true，**不**在 onStop 里置 false —— 那是 HomeActivity 的职责
-        //（它才是 App 真正退到后台的信号）。若在播放页 onStop 里置 false，
-        // 「详情页 → 返回首页」的顺序是 Home.onResume(true) 再 Detail.onStop(false)，
-        // 结果停在 false，首页明明可见却成了后台。
-        SyncScheduler.setForeground(true);
+        // r17 直接复用 setForeground(true)，但被 HomeActivity.onStop 的 false 覆盖掉了 ——
+        // 真实顺序是 Play.onResume(true) → Home.onStop(false)，后者必然赢（实测命中率 100%）。
+        // 所以改成独立的 setPlaying()，由调度器把「首页可见」与「播放页可见」取或，互不覆盖。
+        // 对应的 setPlaying(false) 在 onStop 里，见下方。
+        SyncScheduler.setPlaying(true);
         // 与首页 onResume 同一套：onForeground 内部会 request("fg")，
         // 把被 HomeActivity.onStop 取消掉的自适应轮询链条重新接上。
         HistorySyncManager.onForeground();
@@ -1958,6 +1957,11 @@ public class PlayFragment extends BaseLazyFragment {
         }
         HistorySyncManager.onBackground();
         LOG.i("echo-lifecycle onStop -> requestBackgroundSync");
+        // ★ v99-r18：播放页不可见 ⇒ 撤掉「播放」这个前台来源。
+        // 必须在 onBackground() 之后 —— 补传请求要借这一刻的前台状态排上队。
+        // 返回首页时 HomeActivity.onResume 已先把「首页可见」置真，合并结果仍是前台；
+        // 直接退到桌面则两个来源都为假，正确地落入后台。
+        SyncScheduler.setPlaying(false);
     }
 
     @Override

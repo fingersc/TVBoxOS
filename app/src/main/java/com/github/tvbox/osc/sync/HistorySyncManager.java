@@ -53,6 +53,15 @@ public final class HistorySyncManager {
     /** 两次自动同步的最小间隔（手动同步不受此限）。 */
     private static final long MIN_GAP_MS = 60 * 1000L;
 
+    /**
+     * ★ v99-r18：切后台/退出播放页那「最后一次补传」的最小间隔。
+     *
+     * <p>用 60s 的话实测 100% 被挡：退出播放距上一次同步往往只有几十秒，而进程随时可能被杀，
+     * 等满 60s 就等于没传。降到 10s 既能立刻落盘，又不至于被「反复进出播放页」刷成高频同步。
+     * 注意它<b>只放宽最小间隔，「仅 Wi-Fi」门禁照旧生效</b> —— 后台自动同步绝不能烧移动流量。</p>
+     */
+    private static final long MIN_GAP_BACKGROUND_MS = 10 * 1000L;
+
     private static volatile boolean syncing;
     private static boolean started;
     /** 页面主动拉取的节流时间戳（避免来回切页面刷请求）。 */
@@ -271,7 +280,7 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        SyncScheduler.requestWithin(owner(), "bg", 0L);
+        SyncScheduler.requestWithin(owner(), SyncScheduler.REASON_BG, 0L);
     }
 
     public static boolean isSyncing() {
@@ -375,9 +384,11 @@ public final class HistorySyncManager {
         }
         if (!manual) {
             long last = lastSyncAt();
-            if (System.currentTimeMillis() - last < MIN_GAP_MS) {
+            // r18：切后台的补传走更短的最小间隔（见 MIN_GAP_BACKGROUND_MS）。
+            long gap = background ? MIN_GAP_BACKGROUND_MS : MIN_GAP_MS;
+            if (System.currentTimeMillis() - last < gap) {
                 syncing = false;
-                SyncScheduler.skipped(owner, "min-gap");
+                SyncScheduler.skipped(owner, background ? "min-gap-bg" : "min-gap");
                 return;
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {

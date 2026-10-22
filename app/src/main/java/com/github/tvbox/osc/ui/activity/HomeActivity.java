@@ -115,6 +115,16 @@ public class HomeActivity extends BaseActivity {
     private boolean refreshHomeRec = false;
     private final Handler mHandler = new Handler();
     private long mExitTime = 0;
+    /**
+     * ★ v99-r18：退出同步的重入锁。
+     *
+     * <p>双击退出时第二次按返回会再进一次 {@link #exitWithSync()}，它的 syncNow 撞上第一次
+     * 正在跑的同步，而 {@code HistorySyncManager.sync()} 的 busy 分支会<b>立即</b>回调
+     * onDone ⇒ 这里立刻 killNow()，把第一次同步杀在半路。实测后果：{@code [Sync] done}
+     * 从未打出、SyncState 没落盘 ⇒ 下次启动重复上传；若收藏/设置也脏则本次直接丢失。
+     * 加了这把锁后第二次直接返回，交给第一次的「成功回调 or 2.5s 超时」收尾。</p>
+     */
+    private boolean exiting = false;
     private boolean eventBusRegistered = false;
     /** v75：同步写回接口地址后需要重载配置；页面不可见时先记下来，onResume 再执行。 */
     private boolean pendingConfigReload = false;
@@ -745,6 +755,11 @@ public class HomeActivity extends BaseActivity {
      * 只在「有脏数据」时等，成功立即退出，最多等 2.5 秒；失败则保留脏标记，下次启动补。
      */
     private void exitWithSync() {
+        // 见字段 exiting 的注释：第二次按返回什么都不做，避免把第一次同步杀在半路。
+        if (exiting) {
+            return;
+        }
+        exiting = true;
         if (!HistorySyncManager.needsSyncBeforeExit()) {
             killNow();
             return;

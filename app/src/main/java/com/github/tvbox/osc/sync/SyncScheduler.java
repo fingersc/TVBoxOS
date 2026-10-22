@@ -58,12 +58,38 @@ public final class SyncScheduler {
      */
     static final long NO_CAP = -1L;
 
+    /**
+     * 「进后台补一次」的 reason。与 {@code HistorySyncManager.onBackground()} 对应 ——
+     * 调度层据此把 {@code background=true} 传给执行层，让它走更短的最小间隔。
+     */
+    public static final String REASON_BG = "bg";
+
     private static final Object LOCK = new Object();
     private static final Map<String, Task> TASKS = new HashMap<>();
 
     /** 延迟到首次使用时再建：类初始化不碰 Android，纯策略方法才能在 JVM 上单测。 */
     private static volatile Handler main;
-    private static volatile boolean foreground;
+
+    /**
+     * ★ v99-r18：前台判定拆成两个独立来源，取「或」。
+     *
+     * <p>r17 只用一个 {@code foreground} 标志：播放页 onResume 置 true、HomeActivity.onStop
+     * 置 false。而「首页 → 打开详情页」的真实顺序是
+     * <b>Play.onResume(true) → Home.onStop(false)</b>，后执行的 false 必然盖掉前面的 true
+     * ⇒ 播放期间 100% 被判成后台。实测证据：每次进播放页约 200ms 后就会打出
+     * {@code [sync] background: cancelled 1 idle task(s)}，播放中一直是
+     * {@code idle chain paused (background)}。</p>
+     *
+     * <p>拆成两个来源后各自独立，只要有一个为真就是前台，谁也不会覆盖谁。</p>
+     */
+    private static volatile boolean homeVisible;
+    /** 播放页是否在前台（PlayFragment 置位）。见 {@link #homeVisible}。 */
+    private static volatile boolean playing;
+
+    /** 当前是否算前台：首页可见 或 播放页在前台，两者取或。 */
+    public static boolean isForeground() {
+        return homeVisible || playing;
+    }
 
     private SyncScheduler() {
     }
@@ -139,7 +165,7 @@ public final class SyncScheduler {
      */
     public static void skipped(String owner, String reason) {
         LOG.i("[sync] skip owner=" + owner + " reason=" + reason);
-        if (foreground && owner != null && !owner.isEmpty()) {
+        if (isForeground() && owner != null && !owner.isEmpty()) {
             try {
                 if (SyncState.load(owner).anyDirty()) {
                     schedule(owner, "retry-dirty", PRI_DIRTY, NO_CAP, null);
@@ -152,13 +178,30 @@ public final class SyncScheduler {
         armIdle(owner);
     }
 
+    /** HomeActivity 的可见性变化（onResume / onStop）。 */
+    public static void setForeground(boolean fg) {
+        homeVisible = fg;
+        applyForegroundState();
+    }
+
     /**
-     * 前台状态：{@code false} 时取消所有「纯轮询」任务（脏数据的合并任务保留，
+     * 播放页的前台状态变化（v99-r18）。
+     *
+     * <p>只在本 Fragment 真的可见/不可见时置位，与首页可见性互不覆盖 —— 详见
+     * {@link #homeVisible}。退出播放页时置 false：此刻首页若已可见（返回首页），
+     * 合并结果仍是前台；若直接退到桌面，则正确地落入后台。</p>
+     */
+    public static void setPlaying(boolean p) {
+        playing = p;
+        applyForegroundState();
+    }
+
+    /**
+     * 前台状态：合并结果为 {@code false} 时取消所有「纯轮询」任务（脏数据的合并任务保留，
      * 它自己会在防抖窗口内跑完），并且不再排新的轮询。
      */
-    public static void setForeground(boolean fg) {
-        foreground = fg;
-        if (fg) {
+    private static void applyForegroundState() {
+        if (isForeground()) {
             return;
         }
         int n = 0;
@@ -266,7 +309,7 @@ public final class SyncScheduler {
         if (owner == null || owner.isEmpty()) {
             return;
         }
-        if (!foreground) {
+        if (!isForeground()) {
             LOG.i("[sync] idle chain paused (background) owner=" + owner);
             return;
         }
@@ -377,7 +420,11 @@ public final class SyncScheduler {
             }
             // 立即任务（手动 / 切换账号 / 退出 App 前）按 manual 处理：
             // 绕过最小间隔与「仅 Wi-Fi」，否则用户点了「立即同步」却什么都不发生。
-            HistorySyncManager.sync(pri == PRI_NOW, false, cb);
+            //
+            // background：r17 只把「进后台补一次」提前到 0ms，执行层却仍被 60s 最小间隔
+            // 挡回来（实测 3 次退出播放 100% 命中 min-gap）。进后台是最后一次机会，
+            // 进程随时可能被杀，这里告诉执行层走更短的最小间隔（仍保留「仅 Wi-Fi」门禁）。
+            HistorySyncManager.sync(pri == PRI_NOW, REASON_BG.equals(reason), cb);
         }
     }
 }
