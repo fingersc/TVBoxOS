@@ -85,6 +85,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.ImgUtil;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScheduler;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.PlayerHelper;
 import com.github.tvbox.osc.util.SourceQualityStore;
@@ -1896,6 +1897,21 @@ public class PlayFragment extends BaseLazyFragment {
             mHandler.removeCallbacks(progressTickRun);
             mHandler.postDelayed(progressTickRun, PROGRESS_TICK_MS);
         }
+        // ★ v99-r17：播放页可见 ⇒ App 在前台。
+        //
+        // setForeground() 原先只挂在 HomeActivity.onResume/onStop 上，而播放页在
+        // DetailActivity 里 —— 打开详情页时 HomeActivity 已经 onStop，于是「用户正盯着
+        // 屏幕看片」被判成后台：armIdle 不排轮询、skipped() 也不重试脏数据。
+        // 整部片子期间云端有变更完全拉不到，只能等退出播放回首页。
+        //
+        // 这里只置 true，**不**在 onStop 里置 false —— 那是 HomeActivity 的职责
+        //（它才是 App 真正退到后台的信号）。若在播放页 onStop 里置 false，
+        // 「详情页 → 返回首页」的顺序是 Home.onResume(true) 再 Detail.onStop(false)，
+        // 结果停在 false，首页明明可见却成了后台。
+        SyncScheduler.setForeground(true);
+        // 与首页 onResume 同一套：onForeground 内部会 request("fg")，
+        // 把被 HomeActivity.onStop 取消掉的自适应轮询链条重新接上。
+        HistorySyncManager.onForeground();
         exitingPreview = false;
         // ★ 关键闸门：用户主动暂停过 → 回到前台也不恢复播放，保持暂停画面。
         // 之前这里无条件 resume()，导致「暂停 → 回桌面 → 切回来自动播放」。

@@ -49,6 +49,15 @@ public final class SyncScheduler {
      */
     private static final long DIRTY_DEBOUNCE_MS = 60_000L;
 
+    /**
+     * 「没有上限」的 capMs 哨兵。
+     *
+     * <p>★ v99-r17：这里<b>不能</b>沿用 {@code Long.MAX_VALUE} —— 判提前时要算
+     * {@code now + capMs}，MAX_VALUE 会溢出成负数，比较恒真，把在途任务推到永不执行。
+     * 负数既不会溢出，又能被 {@code capMs >= 0} 一道判定干净地排除。</p>
+     */
+    static final long NO_CAP = -1L;
+
     private static final Object LOCK = new Object();
     private static final Map<String, Task> TASKS = new HashMap<>();
 
@@ -82,12 +91,17 @@ public final class SyncScheduler {
      * @param reason 仅用于日志
      */
     public static void request(String owner, String reason) {
-        schedule(owner, reason, priorityOf(owner), Long.MAX_VALUE, null);
+        schedule(owner, reason, priorityOf(owner), NO_CAP, null);
     }
 
     /**
      * 同上，但「最多等 capMs 毫秒」——冷启动（1.5s）、进后台、网络刚恢复时用它，
      * 保证该跑的那一次不会被自适应间隔推到 5 分钟以后。
+     *
+     * <p>★ v99-r17：这个「最多等」在合并分支里同样兑现 —— 已在途的任务会被
+     * <b>提前</b>到 capMs（见 {@link #pullForwardMs}），而不是被合并掉就当作没说过。
+     * 之所以必须提前：{@code onBackground()} 传的是 0，若被 60 秒防抖任务吞掉，
+     * 「退出播放页 / 上滑清理后台」就成了等 60 秒才上传，进程早死了。</p>
      */
     public static void requestWithin(String owner, String reason, long capMs) {
         schedule(owner, reason, priorityOf(owner), capMs, null);
@@ -128,7 +142,7 @@ public final class SyncScheduler {
         if (foreground && owner != null && !owner.isEmpty()) {
             try {
                 if (SyncState.load(owner).anyDirty()) {
-                    schedule(owner, "retry-dirty", PRI_DIRTY, Long.MAX_VALUE, null);
+                    schedule(owner, "retry-dirty", PRI_DIRTY, NO_CAP, null);
                     return;
                 }
             } catch (Throwable t) {
@@ -211,9 +225,23 @@ public final class SyncScheduler {
         synchronized (LOCK) {
             Task pending = TASKS.get(owner);
             if (!shouldReplace(pending == null ? -1 : pending.pri, pri)) {
-                // 已有更早的任务在排队 ⇒ 合并掉这次请求（防抖的关键：不推后在途任务）
-                LOG.i("[sync] coalesce owner=" + owner + " reason=" + reason
-                        + " pri=" + pri + " -> keep " + pending.reason);
+                // 已有更早的任务在排队 ⇒ 合并掉这次请求（防抖的关键：不推后在途任务）。
+                //
+                // ★ v99-r17：合并 ≠ 把「最多等 capMs」当作没说过。
+                //   传入 capMs 的请求（进后台 0ms / 网络恢复 1s / 冷启动 1.5s）即便不替换任务，
+                //   也要把在途任务**提前**到 capMs —— 只提前，绝不推后（推后会让秒级写入
+                //   把防抖窗口无限延后，一次都发不出去）。
+                long pf = pullForwardMs(pending == null ? -1L : pending.runAt, now, capMs);
+                if (pf >= 0) {
+                    main().removeCallbacks(pending);
+                    pending.runAt = now + pf;
+                    main().postDelayed(pending, pf);
+                    LOG.i("[sync] pull-forward owner=" + owner + " reason=" + reason
+                            + " capMs=" + capMs + " -> keep " + pending.reason + " in " + pf + "ms");
+                } else {
+                    LOG.i("[sync] coalesce owner=" + owner + " reason=" + reason
+                            + " pri=" + pri + " -> keep " + pending.reason);
+                }
                 return;
             }
             if (pending != null) {
@@ -221,7 +249,7 @@ public final class SyncScheduler {
                 TASKS.remove(owner);
             }
             long delay = delayOf(pri, SyncState.load(owner).intervalIdx);
-            if (capMs < delay) {
+            if (capMs >= 0 && capMs < delay) {
                 delay = capMs;
             }
             Task t = new Task(owner, reason, pri, cb);
@@ -249,7 +277,7 @@ public final class SyncScheduler {
         } catch (Throwable t) {
             return;
         }
-        schedule(owner, "idle", PRI_IDLE, Long.MAX_VALUE, null);
+        schedule(owner, "idle", PRI_IDLE, NO_CAP, null);
     }
 
     // ---------------------------------------------------------------- 纯策略（可 JVM 单测）
@@ -269,6 +297,27 @@ public final class SyncScheduler {
             return true;
         }
         return newPri < pendingPri;
+    }
+
+    /**
+     * 合并分支里「是否把在途任务提前」，返回新的延迟毫秒；{@code <0} 表示不提前。
+     *
+     * <p>只在「新请求要求得更早」时提前，且<b>永远不推后</b>。三道门：</p>
+     * <ul>
+     *   <li>{@code capMs < 0}：{@link #NO_CAP} / 无上限请求 ⇒ 不提前；</li>
+     *   <li>{@code pendingRunAt < 0}：没有在途任务 ⇒ 无从提前（调用方会走正常排期）；</li>
+     *   <li>{@code pendingRunAt <= now + capMs}：在途任务本来就比 capMs 更早 ⇒ 不提前。</li>
+     * </ul>
+     *
+     * @param pendingRunAt 在途任务的原定执行时刻（{@code <0} 表示没有在途任务）
+     * @param now          当前时刻
+     * @param capMs        本次请求要求的最长等待（{@link #NO_CAP} 表示无要求）
+     */
+    static long pullForwardMs(long pendingRunAt, long now, long capMs) {
+        if (capMs < 0 || pendingRunAt < 0 || pendingRunAt <= now + capMs) {
+            return -1L;
+        }
+        return capMs;
     }
 
     static int clampIdx(int idx) {
