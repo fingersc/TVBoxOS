@@ -274,16 +274,21 @@ public final class SyncScheduler {
                 //   传入 capMs 的请求（进后台 0ms / 网络恢复 1s / 冷启动 1.5s）即便不替换任务，
                 //   也要把在途任务**提前**到 capMs —— 只提前，绝不推后（推后会让秒级写入
                 //   把防抖窗口无限延后，一次都发不出去）。
+                // ★ v99-r19：不管走「提前」还是「纯合并」，紧急性都要跟着传给在途任务。
+                //   只增不减（|=）—— 已经紧急的任务不会因为后来一次普通请求而退回慢档。
+                pending.background |= REASON_BG.equals(reason);
                 long pf = pullForwardMs(pending == null ? -1L : pending.runAt, now, capMs);
                 if (pf >= 0) {
                     main().removeCallbacks(pending);
                     pending.runAt = now + pf;
                     main().postDelayed(pending, pf);
                     LOG.i("[sync] pull-forward owner=" + owner + " reason=" + reason
-                            + " capMs=" + capMs + " -> keep " + pending.reason + " in " + pf + "ms");
+                            + " capMs=" + capMs + " -> keep " + pending.reason + " in " + pf + "ms"
+                            + (pending.background ? " bg=1" : ""));
                 } else {
                     LOG.i("[sync] coalesce owner=" + owner + " reason=" + reason
-                            + " pri=" + pri + " -> keep " + pending.reason);
+                            + " pri=" + pri + " -> keep " + pending.reason
+                            + (pending.background ? " bg=1" : ""));
                 }
                 return;
             }
@@ -296,11 +301,12 @@ public final class SyncScheduler {
                 delay = capMs;
             }
             Task t = new Task(owner, reason, pri, cb);
+            t.background = REASON_BG.equals(reason);
             t.runAt = now + delay;
             TASKS.put(owner, t);
             main().postDelayed(t, delay);
             LOG.i("[sync] schedule owner=" + owner + " reason=" + reason
-                    + " pri=" + pri + " in " + delay + "ms");
+                    + " pri=" + pri + " in " + delay + "ms" + (t.background ? " bg=1" : ""));
         }
     }
 
@@ -403,6 +409,19 @@ public final class SyncScheduler {
         final HistorySyncManager.Callback cb;
         long runAt;
 
+        /**
+         * ★ v99-r19：这个任务是否带有「进后台补一次」的紧急性（决定走 10s 还是 60s 最小间隔）。
+         *
+         * <p>不能靠 {@link #reason} 判断 —— reason 是 final，而 pull-forward 分支
+         * <b>只改 {@code runAt}、不改 reason</b>。于是被提前的任务 reason 仍是 "dirty"，
+         * r18 的 {@code REASON_BG.equals(reason)} 恒为 false，10 秒档形同虚设。
+         * 实测（03:15:49）：三次 {@code pull-forward reason=bg} 全部仍被 60s 的
+         * {@code min-gap} 挡回，日志里打的是 {@code keep dirty} 而不是 {@code keep bg}。</p>
+         *
+         * <p>改用独立字段，并在合并/提前时「只增不减」地传播。</p>
+         */
+        boolean background;
+
         Task(String owner, String reason, int pri, HistorySyncManager.Callback cb) {
             this.owner = owner;
             this.reason = reason;
@@ -424,7 +443,10 @@ public final class SyncScheduler {
             // background：r17 只把「进后台补一次」提前到 0ms，执行层却仍被 60s 最小间隔
             // 挡回来（实测 3 次退出播放 100% 命中 min-gap）。进后台是最后一次机会，
             // 进程随时可能被杀，这里告诉执行层走更短的最小间隔（仍保留「仅 Wi-Fi」门禁）。
-            HistorySyncManager.sync(pri == PRI_NOW, REASON_BG.equals(reason), cb);
+            //
+            // ★ r19：必须读独立字段而不是 reason —— 被 pull-forward 提前的任务
+            // reason 仍是 "dirty"，读 reason 会让 10s 档永远不生效。
+            HistorySyncManager.sync(pri == PRI_NOW, background, cb);
         }
     }
 }
