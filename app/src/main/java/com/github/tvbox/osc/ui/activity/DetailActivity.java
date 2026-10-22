@@ -1884,6 +1884,20 @@ public class DetailActivity extends BaseActivity {
         // 接续决定的是落点，两者一叠加，走完一圈后看到的顺序就与得分毫无关系。
         // 这正是「循环一圈后再切源，感觉没按得分顺序切」的根因。
         int startIdx = 0;
+        // ★ v99-r15（P2-2）：记录每个源为什么被跳过。
+        //
+        //   此前这里只有 4 个静默的 continue，用户报「为什么切到第 5 名」时，
+        //   日志里只有最终 picked 那一条，前 4 个各因为什么被跳过无从回答。
+        //   现在把原因收集起来，随 pollPick 一起打出来（全部跳过时也打）。
+        //
+        //   四类原因（与下面四个 continue 一一对应）：
+        //     soft  = 本圈已试过的站点（软失败）
+        //     cur   = 当前正在播放的源（allowCurrent=false 时跳过）
+        //     novid = 该站取不到可用的候选 videoId（全是 MV/预告/被拉黑）
+        final int SKIP_LOG_MAX = 6;
+        List<String> skipSoft = new ArrayList<>();
+        List<String> skipCur = new ArrayList<>();
+        List<String> skipNovid = new ArrayList<>();
         for (int step = 0; step < total; step++) {
             int index = (startIdx + step) % total;
             String cycleKey = orderedSources.get(index);
@@ -1894,21 +1908,39 @@ public class DetailActivity extends BaseActivity {
             // 软失败：本圈已试过的站点（开新圈时该集合会被清空）。
             // ★ 粒度必须与写入侧一致（都是站点 key，见 finishDetailFallbackDetailOnTimeout）。
             if (detailFallbackSoftTriedKeys.contains(cycleKey)) {
+                if (skipSoft.size() < SKIP_LOG_MAX) {
+                    skipSoft.add(cycleKey);
+                }
                 continue;
             }
             if (!allowCurrent && isCurrentPlayingSource(cycleKey)) {
+                if (skipCur.size() < SKIP_LOG_MAX) {
+                    skipCur.add(cycleKey);
+                }
                 continue;
             }
-            // 整站被拉黑（历史遗留的粗粒度记录，兼容）
-            if (detailFallbackDeadKeys.contains(cycleKey)) {
-                continue;
-            }
+            // ★ v99-r15（P2-1）：删掉此处原先的「整站被拉黑」判断。
+            //
+            //   那是一句<b>恒为 false 的死判断</b>：detailFallbackDeadKeys 里存的是
+            //   getDetailFallbackKey(sourceKey, videoId) 形式的 "源key|视频id"（见
+            //   写入侧 finishDetailFallbackDetailOnTimeout），而这里比较的 cycleKey
+            //   是纯 sourceKey —— contains(纯key) 永远不命中。
+            //
+            //   功能上不影响行为（真正生效的粗粒度过滤在 detailFallbackFirstAliveId
+            //   内部，它按正确粒度逐个候选过滤；整站全死时返回空串、外层 continue），
+            //   但留着它有两个害处：① 注释声称「整站被拉黑」会误导后来人以为这道关卡
+            //   在起作用；② 一旦有人调整判断顺序（先判 dead 再取 id），缺陷立刻暴露。
+            //   故连同注释一并删除。
+            //
             // ★ 取该站「最优」的未拉黑候选：某站第 1 条是 MV/预告、后面才是正片时，
             //   只认第一条会让该站的正片永远轮不到（表现为「明明有片却切不过去」）。
             //   ★ v66：同站多资源时按与「基准资源」的相似度择优（含年份硬矛盾排除），
             //   全部无信号时退回第一条 —— 详见 detailFallbackFirstAliveId 内注释。
             String videoId = detailFallbackFirstAliveId(cycleKey);
             if (TextUtils.isEmpty(videoId)) {
+                if (skipNovid.size() < SKIP_LOG_MAX) {
+                    skipNovid.add(cycleKey);
+                }
                 continue;
             }
             detailFallbackCycleKeys.add(cycleKey);
@@ -1919,10 +1951,48 @@ public class DetailActivity extends BaseActivity {
                     + " id=" + videoId
                     + " idx=" + index + "/" + total
                     + " allowCurrent=" + allowCurrent
-                    + " cycleKeys=" + detailFallbackCycleKeys.size());
+                    + " cycleKeys=" + detailFallbackCycleKeys.size()
+                    // ★ v99-r15（P2-2）：本轮跳过了谁、为什么
+                    + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
+                    + buildSkipReasonLog(skipCur, "cur", skipCur.size())
+                    + buildSkipReasonLog(skipNovid, "novid", skipNovid.size()));
             return cycleKey;
         }
+        // ★ v99-r15（P2-2）：一个都没选上时也必须打日志 —— 这正是最需要排查的场景
+        //   （用户点切源却没反应），此前它是完全静默的。
+        LOG.sw("[FB] pollPick none idx=0/" + total
+                + " allowCurrent=" + allowCurrent
+                + " cycleKeys=" + detailFallbackCycleKeys.size()
+                + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
+                + buildSkipReasonLog(skipCur, "cur", skipCur.size())
+                + buildSkipReasonLog(skipNovid, "novid", skipNovid.size()));
         return "";
+    }
+
+    /**
+     * ★ v99-r15（P2-2）：把一类跳过原因拼成日志片段。
+     *
+     * <p>格式：{@code soft=a,b,c(+3)}；没有跳过该类时返回空串（不占日志宽度）。</p>
+     *
+     * @param names  已收集的来源 key（最多 {@code SKIP_LOG_MAX} 条）
+     * @param label  原因标签
+     * @param actual 实际跳过总数（用于显示被截断的 "+N"）
+     */
+    private String buildSkipReasonLog(List<String> names, String label, int actual) {
+        if (names == null || names.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(" skip").append(label).append('=');
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(names.get(i));
+        }
+        if (actual > names.size()) {
+            sb.append("(+").append(actual - names.size()).append(')');
+        }
+        return sb.toString();
     }
 
     /**
@@ -2266,10 +2336,6 @@ public class DetailActivity extends BaseActivity {
         //   每次进入本方法先作废，避免池子为空时残留上一份、把日志打到错误的分数上。
         detailFallbackCycleOrderSnapshot = null;
         Map<String, Movie.Video> byKey = new LinkedHashMap<>();
-        // 显示名去重只在本次构建内有效，必须放局部：
-        // 早先用的是实例字段，一旦两条路径重入（探路回调与轮转并发）就会互相污染，
-        // 表现为「偶尔莫名其妙少一个站」。
-        Set<String> dedupedNames = new HashSet<>();
         for (Movie.Video video : cachedCandidates) {
             if (video == null || TextUtils.isEmpty(video.id) || TextUtils.isEmpty(video.sourceKey)) {
                 continue;
@@ -2281,15 +2347,15 @@ public class DetailActivity extends BaseActivity {
             if (byKey.containsKey(video.sourceKey)) {
                 continue;
             }
-            // 显示名完全相同的站点只保留先出现的那一个（通常是质量更好的，见下方排序）
-            String displayName = source.getName();
-            if (!TextUtils.isEmpty(displayName)
-                    && dedupedNames.contains(displayName)) {
-                continue;
-            }
-            if (!TextUtils.isEmpty(displayName)) {
-                dedupedNames.add(displayName);
-            }
+            // ★ v99-r15（P1-4）：显示名去重已移到排序之后。
+            //
+            //   原先在这里就去重（保留先出现的那个），但此刻还没有质量分 ——
+            //   「保留先出现的」实际取决于聚合搜索哪个站先返回，纯粹是网络快慢、
+            //   随机。两个 key 不同、显示名相同的站（多个「量子资源」很常见）
+            //   于是可能丢掉真正能用的那个，表现为「明明有片却切不过去」。
+            //
+            //   顺带修掉一处注释与实现的矛盾：原注释写「通常是质量更好的，
+            //   见下方排序」，但排序在去重之后才发生，这个前提根本不成立。
             byKey.put(video.sourceKey, video);
         }
         if (byKey.isEmpty()) {
@@ -2303,10 +2369,12 @@ public class DetailActivity extends BaseActivity {
             detailFallbackCycleOrderSnapshot = snapshot;
             if (!snapshot.hasAnyHistory()) {
                 // 冷启动：所有源都是中性分，排序不会改变任何顺序，省下这轮 O(n log n)
+                // （探索加成在无历史时恒为 0，见 Snapshot.exploreBonus）
                 return keys;
             }
             // ★ P2-2：把显示名一次性预取成 Map，避免比较器内 O(n log n) 次
             //   ApiConfig.get().getSource() 查表（每次比较都要查两遍）。
+            // ★ v99-r15：这张表现在还兼作「排序后按名去重」的查找表。
             final Map<String, String> nameByKey = new LinkedHashMap<>(keys.size() * 2);
             for (String k : keys) {
                 nameByKey.put(k, detailFallbackDisplayName(k));
@@ -2314,7 +2382,10 @@ public class DetailActivity extends BaseActivity {
             java.util.Collections.sort(keys, new Comparator<String>() {
                 @Override
                 public int compare(String a, String b) {
-                    int byQuality = Double.compare(snapshot.get(b), snapshot.get(a));
+                    // ★ v99-r15（P1-2）：用「质量分 + 探索加成」排序，
+                    //   让样本少的新源也有机会进前列（否则永远 0.5 排尾）。
+                    //   加成只依赖构造时定死的 samples/lnTotal ⇒ 纯函数，传递性有保证。
+                    int byQuality = Double.compare(snapshot.sortScore(b), snapshot.sortScore(a));
                     if (byQuality != 0) {
                         return byQuality;
                     }
@@ -2329,6 +2400,23 @@ public class DetailActivity extends BaseActivity {
                     return na.compareTo(nb);
                 }
             });
+            // ★ v99-r15（P1-4）：同名站去重放在排序之后 —— 保留分数更高的那个。
+            //   走到这里 keys 已按 sortScore 降序，所以「第一次出现」就是最高分。
+            //   同分时上面已按显示名升序稳定排序，故同分同名仍按 key 字典序稳定。
+            List<String> deduped = new ArrayList<>(keys.size());
+            Set<String> seenNames = new java.util.HashSet<>();
+            for (String k : keys) {
+                String name = nameByKey.get(k);
+                if (name == null || name.isEmpty()) {
+                    // 取不到显示名的不参与去重（宁可留着一个，也不要误删）
+                    deduped.add(k);
+                    continue;
+                }
+                if (seenNames.add(name)) {
+                    deduped.add(k);
+                }
+            }
+            return deduped;
         } catch (Throwable th) {
             LOG.e("buildFallbackCycleOrder sort fail: " + th);
         }

@@ -3290,6 +3290,37 @@ public class PlayFragment extends BaseLazyFragment {
      * <p>只有「有起点、有源 key」才记账；结算后立即清空起点，
      * 因此重复调用（例如 PREPARED 后又收到 BUFFERED）不会重复计数。</p>
      *
+     * <p><b>★ v99-r15（P3-6）：什么算 playFail —— 口径在此明确。</b></p>
+     *
+     * <p>本方法是 {@code SourceQualityStore.recordPlay(key, ok, ...)} 的<b>唯一</b>入口，
+     * 所以「一次尝试算成功还是失败」完全由调用方传进来的 {@code ok} 决定。
+     * 三个调用点的语义如下：</p>
+     *
+     * <table border="1">
+     *   <caption>playFail 记账口径</caption>
+     *   <tr><th>场景</th><th>调用点</th><th>记什么</th></tr>
+     *   <tr><td>出首帧（播放器回调）</td><td>{@link #recordPlaybackReady}</td>
+     *       <td><b>playOk</b> + 首帧耗时</td></tr>
+     *   <tr><td>解析失败 / 起播超时 / 播放器报错</td>
+     *       <td>{@link #recordPlaybackFailure}</td><td><b>playFail</b>（不计耗时）</td></tr>
+     *   <tr><td>还没起播就被切走，且没等够</td>
+     *       <td>{@code settlePlayQualityIfPending(false, 0, "superseded", true)}</td>
+     *       <td><b>不记账</b>（用户主动放弃，见 {@link #PLAY_QUALITY_ABANDON_MIN_MS}）</td></tr>
+     *   <tr><td>耗时明显不合理（被系统挂起数分钟）</td><td>本方法内</td>
+     *       <td><b>不记账</b>（{@code [PQ] drop}，避免污染均值）</td></tr>
+     * </table>
+     *
+     * <p><b>「解析成功但一直转圈」算不算 fail？</b>算 —— 但它不是由本方法判定的，
+     * 而是由调用方在<b>超时后</b>主动调 {@link #recordPlaybackFailure}：
+     * 播放页对「拿到地址却迟迟不出首帧」有起播超时兜底
+     * （{@code cancelPlayTimeout} 一族），超时即按失败结算，
+     * 于是「解析成功但转圈到超时」记 playFail，与「解析直接失败」同等对待。
+     * 这是刻意的：对用户而言两者体验相同（都没看到画面）。</p>
+     *
+     * <p><b>起播成功之后的卡顿不算 fail</b>：它走
+     * {@code SourceQualityStore.recordStall}，只影响流畅度系数，不动成功率。
+     * 「能播但卡」与「播不了」是两种不同的失败，不该混在一个计数器里。</p>
+     *
      * @param elapsedHint      调用方已知的耗时；<=0 时用当前时间减去起点
      * @param abandonIfTooFast 为 true 时，耗时短于 {@link #PLAY_QUALITY_ABANDON_MIN_MS}
      *                         视为「用户主动放弃」，直接作废不记账（仅 superseded 场景使用）
