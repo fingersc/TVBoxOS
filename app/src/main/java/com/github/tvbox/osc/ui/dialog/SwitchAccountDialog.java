@@ -49,7 +49,7 @@ public class SwitchAccountDialog extends BaseDialog {
         this.listener = listener;
         setContentView(R.layout.dialog_switch_account);
         ((TextView) findViewById(R.id.tvSwitchTitle)).setText("切换到「" + name + "」");
-        ((TextView) findViewById(R.id.btnSwitchQr)).setText("扫码登录此账号");
+        ((TextView) findViewById(R.id.btnSwitchQr)).setText("二维码登录");
         tvStatus = findViewById(R.id.tvSwitchStatus);
         etPass = findViewById(R.id.etSwitchPass);
 
