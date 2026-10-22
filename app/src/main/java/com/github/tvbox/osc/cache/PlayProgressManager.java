@@ -28,6 +28,37 @@ public class PlayProgressManager {
 
     /** 保存/覆盖某一集的进度；position <= 0 等价于清除该集记忆（对应完成播放写 0 的旧语义） */
     public static void save(String sourceKey, String vodId, String flag, int playIndex, String epName, long position) {
+        save(sourceKey, vodId, flag, playIndex, epName, position, true);
+    }
+
+    /**
+     * 保存/覆盖某一集的进度。
+     *
+     * <p><b>★ v99-r16：新增 {@code markDirty} 参数，用于把「写本地库」与「触发同步」解耦。</b></p>
+     *
+     * <p><b>为什么必须解耦</b>：v99-r14 加了播放中的周期落盘（30 秒一次，防进程被强杀丢进度），
+     * 但落盘走的是本方法，而本方法每次都 {@code markDirty(PROGRESS)} ⇒
+     * 每 60 秒防抖窗口就触发一次同步，每次都要把<b>整个 progress.bin</b>
+     * 完整 GET + PUT（实测 30~50 部片约 33~55KB）。</p>
+     *
+     * <p>实测流量（用户坚果云反馈「一分钟同步一次」）：</p>
+     * <ul>
+     *   <li>每天看 2 小时 ⇒ 月上传约 <b>144MB</b></li>
+     *   <li>盒子 24h 挂机暂停 ⇒ 月上传约 <b>1.7GB</b>，<b>超出坚果云免费版 1GB/月限额</b></li>
+     * </ul>
+     *
+     * <p><b>周期落盘传 {@code false}</b>：它的目的是「强杀不丢进度」，而<b>本地 Room 写了
+     * 就已经达成</b>，不需要传云端。不标脏 ⇒ 不触发同步 ⇒ 流量回到加周期落盘之前的水平。
+     * 退出播放页仍由 {@code PlayFragment.onDestroyView} 的
+     * {@code saveCurrentProgressNow()} + {@code onPlaybackExit()} 无条件落盘 + 标脏 + 同步兜底。</p>
+     *
+     * <p><b>删除路径（{@code position <= 0}）不受该参数影响，一律标脏</b>：
+     * 删除是用户可见的语义变化，且周期落盘的调用方都有 {@code pos <= 0} 守卫，永远不会走到删除分支。</p>
+     *
+     * @param markDirty false = 只写本地库，不触发同步（仅周期落盘用）
+     */
+    public static void save(String sourceKey, String vodId, String flag, int playIndex,
+                            String epName, long position, boolean markDirty) {
         try {
             if (TextUtils.isEmpty(vodId) || TextUtils.isEmpty(epName)) {
                 return;
@@ -35,6 +66,8 @@ public class PlayProgressManager {
             PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
             if (position <= 0) {
                 dao.delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+                // 删除必须标脏：否则别的设备永远不知道这一集被清除了
+                HistorySyncManager.markDirty(SyncScope.PROGRESS);
                 return;
             }
             PlayProgress p = new PlayProgress();
@@ -51,7 +84,9 @@ public class PlayProgressManager {
             //   而同步是整包上传 progress.bin ⇒ 每次改善进度都要传上百 KB。
             trimByVod(p.sourceKey, p.vodId, HistorySyncManager.KEEP_PROGRESS_EPISODES);
             // v98 P2：只看剧不动历史/收藏/设置 —— 只脏「进度」
-            HistorySyncManager.markDirty(SyncScope.PROGRESS);
+            if (markDirty) {
+                HistorySyncManager.markDirty(SyncScope.PROGRESS);
+            }
         } catch (Throwable th) {
             th.printStackTrace();
         }

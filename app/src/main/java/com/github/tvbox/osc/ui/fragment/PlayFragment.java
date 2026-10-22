@@ -246,8 +246,17 @@ public class PlayFragment extends BaseLazyFragment {
     private final Runnable progressTickRun = new Runnable() {
         @Override
         public void run() {
-            // 节流版落盘：位置没怎么变时是空操作，不会重复写库 / 重复标脏
-            saveProgressOnInterrupt();
+            // ★ v99-r16：markDirty = false —— 周期落盘只写本地库，不触发同步。
+            //
+            //   它的目的是「进程被强杀时不丢进度」，而本地 Room 写了就已经达成。
+            //   若这里也标脏，每 60 秒防抖窗口就会同步一次，每次完整上传整个
+            //   progress.bin（33~55KB）⇒ 月流量可达 1.7GB，超出坚果云免费版 1GB 限额。
+            //
+            //   退出播放页 / 切后台的上传由 onDestroyView（saveCurrentProgressNow +
+            //   onPlaybackExit）与 onStop（onBackground）兜底，不会漏。
+            //
+            // 节流版落盘：位置没怎么变时是空操作，不会重复写库
+            saveProgressOnInterrupt(false);
             if (mHandler != null) {
                 mHandler.postDelayed(this, PROGRESS_TICK_MS);
             }
@@ -386,15 +395,42 @@ public class PlayFragment extends BaseLazyFragment {
      *
      * <p>与 {@link #saveCurrentProgressNow()} 的区别：那个是无条件落盘，用在
      * 「这一轮播放确定结束」的入口（detach / hidden / destroyView）；这个用在
-     * {@link #onPause()}，而 onPause 会被<b>系统瞬时抢焦点</b>反复触发
+     * {@link #onPause()} 与播放中的周期落盘，而 onPause 会被<b>系统瞬时抢焦点</b>反复触发
      * （覆盖层闪现 / 其它应用短暂前台 / HDMI-CEC）。本项目数据库开了
      * {@code allowMainThreadQueries}，写盘就发生在主线程 —— 抖动期间位置几乎没变，
      * 每次都同步写同一个值只是白白拖慢主线程。</p>
      *
+     * <p><b>★ v99-r16 修了一个 AND/OR 写反的节流。</b>
+     * 改前两个跳过条件是 <b>AND</b>：</p>
+     * <pre>
+     *   if (距上次 &lt; 1s &amp;&amp; 位置变化 &lt; 5s) return;   // 跳过
+     * </pre>
+     * <p>⇒ <b>只要距上次 ≥ 1 秒就永不跳过，不管位置有没有变</b>。
+     * 而上面注释说的明明是「位置几乎没变就别写」—— 那个意图从未兑现过。</p>
+     *
+     * <p>在只有 onPause 调用它时这个问题被掩盖（用户手动暂停播放不会触发 onPause）；
+     * v99-r14 加了周期落盘后，{@link #progressTickRun} 每 30 秒无条件调它一次，
+     * 于是<b>暂停时位置不变也照样写库 + 标脏</b>，60 秒防抖一到就同步一次
+     * —— 表现为「视频暂停了还在一分钟同步一次进度」，
+     * 且每次同步都要完整上传整个 progress.bin（实测月流量可达 1.7GB，超坚果云免费版限额）。</p>
+     *
+     * <p>改为 <b>OR</b> 后语义才与注释一致：</p>
+     * <pre>
+     *   if (距上次 &lt; 1s <b>||</b> 位置变化 &lt; 5s) return;   // 跳过
+     * </pre>
+     * <ul>
+     *   <li><b>暂停时</b>位置不变 ⇒ 直接跳过，不写库、不标脏、不同步；</li>
+     *   <li><b>播放中</b>位置在变（30s 周期内必超过 5s）⇒ 照常落盘；</li>
+     *   <li><b>onPause 瞬时抖动</b>位置没变 ⇒ 跳过（这才是原本想要的行为）。</li>
+     * </ul>
+     *
      * <p>节流不影响正确性：真正的退出还有 {@link #onDestroyView()} 那次
      * 无条件落盘兜底，退出时刻的位置照样会被记下。</p>
+     *
+     * @param markDirty false = 只写本地库、不触发同步（仅周期落盘用，见
+     *                  {@link PlayProgressManager#save(String, String, String, int, String, long, boolean)}）
      */
-    private void saveProgressOnInterrupt() {
+    private void saveProgressOnInterrupt(boolean markDirty) {
         try {
             if (mVideoView == null) return;
             long pos = mVideoView.getCurrentPosition();
@@ -403,14 +439,14 @@ public class PlayFragment extends BaseLazyFragment {
             if (pos <= 0) return;
             long now = System.currentTimeMillis();
             if (lastProgressSavePos >= 0
-                    && now - lastProgressSaveMs < PROGRESS_SAVE_MIN_INTERVAL_MS
-                    && Math.abs(pos - lastProgressSavePos) < PROGRESS_SAVE_MIN_DELTA_MS) {
+                    && (now - lastProgressSaveMs < PROGRESS_SAVE_MIN_INTERVAL_MS
+                        || Math.abs(pos - lastProgressSavePos) < PROGRESS_SAVE_MIN_DELTA_MS)) {
                 return;
             }
             lastProgressSaveMs = now;
             lastProgressSavePos = pos;
             if (!TextUtils.isEmpty(pkVodId)) {
-                PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, pos);
+                PlayProgressManager.save(pkSourceKey, pkVodId, pkFlag, pkPlayIndex, pkEpName, pos, markDirty);
             }
         } catch (Throwable th) {
             th.printStackTrace();
@@ -1823,7 +1859,13 @@ public class PlayFragment extends BaseLazyFragment {
         //   每次都同步写库（本项目开了 allowMainThreadQueries，写盘就发生在主线程）
         //   会白白拖慢主线程。抖动期间位置几乎没变，重复写同一个值没有意义。
         //   真正的退出由 onDestroyView() 那次无条件落盘兜底，不会漏记。
-        saveProgressOnInterrupt();
+        //
+        // ★ v99-r16：这里必须标脏（markDirty = true）。
+        //   onPause 是「用户真的要离开播放画面」的信号（按 Home / 切到别的应用 /
+        //   退到详情页），此时应当让进度尽快同步，否则会出现
+        //   「电视上看的进度，手机上要等下次打开播放页才看得到」。
+        //   位置没变时节流会直接跳过，所以瞬时抖动依然不会触发同步。
+        saveProgressOnInterrupt(true);
         // ★ 不立即暂停，改成「延迟确认」。
         //
         //   播放过程中 Activity 会被系统短暂抢走焦点（覆盖层闪现 / 其它应用短暂前台 /
