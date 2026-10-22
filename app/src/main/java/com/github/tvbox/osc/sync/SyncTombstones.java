@@ -16,7 +16,17 @@ import java.util.List;
  */
 public final class SyncTombstones {
 
-    private static boolean suppress;
+    /**
+     * ★ v99-r7 P2-1：必须是 <b>ThreadLocal</b>，不能用静态 boolean。
+     *
+     * <p>原实现是 {@code private static boolean suppress}（进程级）。同步线程在
+     * {@code applyLocal()} / {@code wipeLocal()} 期间置 true，而这两处会做全表 deleteAll
+     * 重写（几十~几百 ms）；若此刻用户在 UI 线程删了一条历史，{@code addRecord()} 就会
+     * 看到 suppress=true 而<b>跳过记墓碑</b> ⇒ 该删除不会同步出去 ⇒ 下次从云端"复活"。</p>
+     *
+     * <p>改成 ThreadLocal 后语义不变（同线程内的抑制照常生效），但不再跨线程污染。</p>
+     */
+    private static final ThreadLocal<Boolean> SUPPRESS = new ThreadLocal<>();
 
     /** 按账号命名空间取键：A 账号的删除墓碑绝不能混进 B 账号的同步包。 */
     private static String key() {
@@ -29,29 +39,33 @@ public final class SyncTombstones {
     }
 
     public static void suppress(boolean value) {
-        suppress = value;
+        if (value) {
+            SUPPRESS.set(Boolean.TRUE);
+        } else {
+            SUPPRESS.remove();
+        }
     }
 
     public static boolean isSuppressed() {
-        return suppress;
+        return Boolean.TRUE.equals(SUPPRESS.get());
     }
 
     public static void addRecord(String sourceKey, String vodId) {
-        if (suppress) {
+        if (isSuppressed()) {
             return;
         }
         add("r", SyncMerge.recordKey(sourceKey, vodId));
     }
 
     public static void addProgress(String sourceKey, String vodId, String flag, int index, String epName) {
-        if (suppress) {
+        if (isSuppressed()) {
             return;
         }
         add("p", SyncMerge.progressKey(sourceKey, vodId, flag, index, epName));
     }
 
     public static void addCollect(String sourceKey, String vodId) {
-        if (suppress) {
+        if (isSuppressed()) {
             return;
         }
         add("c", SyncMerge.collectKey(sourceKey, vodId));

@@ -512,11 +512,12 @@ public final class HistorySyncManager {
         long lastEp = lastEpoch();
         boolean resetLocal = remote.epoch > lastEp;
         checkGeneration(gen);
-        if (resetLocal) {
-            wipeLocal(scopes);
-        }
-
-        SyncPayload local = buildLocal(owner, deviceId, scopes, now);
+        // ★ v99-r7 P0-3：与 SyncEngine 同一修法 —— 不再物理删库，
+        //   改用「空包参与合并」。旧实现在这里就删掉三张表，而流程此刻还没有任何成功保证：
+        //   "epoch 变更 + 上传失败" ⇒ lastEpoch 不更新 ⇒ 下次又删一次，把期间新数据也清掉。
+        SyncPayload local = resetLocal
+                ? emptyLocal(owner, deviceId, now)
+                : buildLocal(owner, deviceId, scopes, now);
         SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
         checkGeneration(gen);
         truncateMergedHistory(merged, scopes);
@@ -571,6 +572,25 @@ public final class HistorySyncManager {
                 + " set=" + merged.settings.size() + " epoch=" + merged.epoch);
         return "同步完成：历史 " + merged.records.size() + " / 进度 " + merged.progress.size()
                 + " / 收藏 " + merged.collects.size() + " / 设置 " + merged.settings.size();
+    }
+
+    /**
+     * ★ v99-r7 P0-3：整库重置（云端 epoch 变化）时参与合并的「空本地视图」。
+     *
+     * <p>不在这里物理删库 —— 删除要等 {@code applyLocal(merged)} 在事务里完成。
+     * 否则「本地已清空但上传失败」会让用户数据凭空消失，且下次同步还会再清一次。</p>
+     *
+     * <p>为什么必须用空包代替本地数据：merge 时 remote 是空包，
+     * 若仍拿真实本地数据参与合并，{@code pickRecord(a, null)} 会返回 a，
+     * 本地旧条目全部胜出 ⇒ 等于把整库重置抵消掉了。</p>
+     */
+    static SyncPayload emptyLocal(String owner, String deviceId, long now) {
+        SyncPayload p = new SyncPayload();
+        p.owner = owner;
+        p.dev = deviceId;
+        p.updatedAt = now;
+        p.epoch = 0;   // merge 取 max ⇒ 云端的新 epoch 胜出
+        return p;
     }
 
     static SyncPayload buildLocal(String owner, String deviceId, SyncScopes scopes, long now) {
@@ -722,6 +742,23 @@ public final class HistorySyncManager {
         SyncTombstones.suppress(true);
         try {
             AppDataManager.get();
+            // ★ v99-r7 P0-1：merged 里的 dataJson 是「同步包精简格式」（HistorySyncJson.slim，只留 10 个字段）。
+            //   原先这里 deleteAll 后把精简版原样写回 ⇒ **同步一次就把本机完整 VodInfo 降级成 10 字段**，
+            //   与 HistorySyncJson 头部承诺的「本机数据库仍保存完整 VodInfo」相反，而且不可逆
+            //   （后续上传的也是精简版，云端与所有设备一起降级）。
+            //   修法：落库前先按 (sourceKey|vodId) 把本机现有的完整 dataJson 读出来，
+            //        命中则保留本机完整版，其余字段（updateTime 等）仍用合并结果。
+            final Map<String, String> localFullJson = new java.util.HashMap<>();
+            if (scopes.history) {
+                List<VodRecord> olds = AppDataManager.get().getVodRecordDao().getAll(Integer.MAX_VALUE);
+                if (olds != null) {
+                    for (VodRecord r : olds) {
+                        if (r != null && r.dataJson != null && r.dataJson.length() > 0) {
+                            localFullJson.put(SyncMerge.recordKey(r.sourceKey, r.vodId), r.dataJson);
+                        }
+                    }
+                }
+            }
             // v98 P1：三张表放进同一个 Room 事务 —— 失败即整体回滚，不再留下"半套数据"
             AppDataManager.get().runInTransaction(() -> {
             if (scopes.history) {
@@ -731,7 +768,8 @@ public final class HistorySyncManager {
                     VodRecord r = new VodRecord();
                     r.sourceKey = it.sourceKey;
                     r.vodId = it.vodId;
-                    r.dataJson = it.dataJson;
+                    String full = localFullJson.get(SyncMerge.recordKey(it.sourceKey, it.vodId));
+                    r.dataJson = full != null ? full : it.dataJson;
                     r.updateTime = it.updateTime;
                     dao.insert(r);
                 }
@@ -780,7 +818,12 @@ public final class HistorySyncManager {
         }
     }
 
-    /** 云端 epoch 变化（整库重置）时清空本机该账号的同步范围数据。 */
+    /**
+     * 清空本机该账号的同步范围数据。
+     *
+     * <p>★ v99-r7 起<b>不再由同步流程调用</b>（改为 {@link #emptyLocal} + applyLocal 事务内重写）——
+     * 提前物理删除在"上传失败"时会造成数据反复丢失。保留本方法供将来"用户主动清空本机数据"使用。</p>
+     */
     static void wipeLocal(SyncScopes scopes) {
         SyncTombstones.suppress(true);
         try {
