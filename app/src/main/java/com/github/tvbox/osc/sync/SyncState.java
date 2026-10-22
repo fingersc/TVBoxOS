@@ -22,8 +22,20 @@ public final class SyncState {
     public long lastAt;
     /** 上次同步时的云端 epoch */
     public long lastEpoch;
-    /** data.bin 的 ETag（条件请求 If-None-Match 用） */
+    /**
+     * 旧的单文件 ETag（schema ≤2 的 data.bin）。
+     *
+     * <p>★ v99-r8 起云端按 scope 分文件，改用 {@link #etags}；
+     * 本字段仅为兼容旧 Hawk 数据保留，不再参与条件请求。</p>
+     */
     public String etag;
+    /**
+     * ★ v99-r8：各 scope 文件的 ETag（下标 = {@link SyncScope#ordinal()}）。
+     *
+     * <p>拆文件后每个文件有自己的版本号，条件请求要逐文件带自己的 ETag ——
+     * 否则改一个收藏就把历史也整包重传，拆文件等于白拆。</p>
+     */
+    public String[] etags = new String[SyncScope.COUNT];
     /** 按 scope 的脏标记：history / progress / collect / settings */
     public boolean[] dirty = new boolean[4];
     /** 连续失败次数 */
@@ -32,6 +44,13 @@ public final class SyncState {
     public long failUntil;
     /** 自适应间隔档位（0=5min … 3=30min） */
     public int intervalIdx;
+    /**
+     * ★ v99-r8：是否已把旧单文件 {@code data.bin} 迁移成 4 个 scope 文件。
+     *
+     * <p>迁移成功后置 true，之后不再读 data.bin（文件保留作人工备份）。
+     * 账号切换/清空缓存不会清这个标记 —— 它描述的是「云端格式是否已升级」。</p>
+     */
+    public boolean splitMigrated;
 
     public SyncState() {
     }
@@ -49,11 +68,36 @@ public final class SyncState {
                 if (st.dirty == null || st.dirty.length != 4) {
                     st.dirty = new boolean[4];
                 }
+                // v99-r8：旧数据没有 etags 字段（Gson 给 null）或长度不符 ⇒ 重建
+                if (st.etags == null || st.etags.length != SyncScope.COUNT) {
+                    st.etags = new String[SyncScope.COUNT];
+                }
                 return st;
             }
         } catch (Throwable ignored) {
         }
         return new SyncState(owner);
+    }
+
+    // ---------------------------------------------------------------- 分 scope 的 ETag
+
+    /** 取某个 scope 的 ETag（无则返回 null）。 */
+    public String getEtag(SyncScope s) {
+        if (s == null || etags == null || s.index >= etags.length) {
+            return null;
+        }
+        return etags[s.index];
+    }
+
+    /** 设置某个 scope 的 ETag（null/空串表示清除）。 */
+    public void setEtag(SyncScope s, String value) {
+        if (s == null) {
+            return;
+        }
+        if (etags == null || etags.length != SyncScope.COUNT) {
+            etags = new String[SyncScope.COUNT];
+        }
+        etags[s.index] = (value == null || value.isEmpty()) ? null : value;
     }
 
     public void save() {
@@ -84,12 +128,12 @@ public final class SyncState {
             return;
         }
         for (SyncScope s : scopes) {
-            if (s != null && s.ordinal() < dirty.length) dirty[s.ordinal()] = true;
+            if (s != null && s.index < dirty.length) dirty[s.index] = true;
         }
     }
 
     public boolean isDirty(SyncScope s) {
-        return s != null && s.ordinal() < dirty.length && dirty[s.ordinal()];
+        return s != null && s.index < dirty.length && dirty[s.index];
     }
 
     public boolean anyDirty() {
@@ -127,8 +171,24 @@ public final class SyncState {
         failUntil = 0L;
     }
 
+    /**
+     * ★ v99-r10 P3-4：连续失败达到这个次数就<b>彻底停止自动同步</b>，只等用户手动同步。
+     */
+    public static final int MAX_FAIL_BEFORE_MANUAL = 10;
+
     public boolean inBackoff() {
+        // ★ P3-4：连续失败到上限 ⇒ 永久熔断，直到用户手动同步（或重新登录）把它清零。
+        //   原来是 failCount>=3 就固定 15 分钟、**永远不停**：网盘密码改了但 App 里没改时，
+        //   会每 15 分钟发一次注定失败的请求，一直白耗电和流量。
+        if (failCount >= MAX_FAIL_BEFORE_MANUAL) {
+            return true;
+        }
         return System.currentTimeMillis() < failUntil;
+    }
+
+    /** 是否已进入「需要手动同步才能恢复」的状态（供账号页提示）。 */
+    public boolean needsManualSync() {
+        return failCount >= MAX_FAIL_BEFORE_MANUAL;
     }
 
     // ---------------------------------------------------------------- 迁移

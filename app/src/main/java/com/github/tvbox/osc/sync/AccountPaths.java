@@ -54,4 +54,15 @@ public final class AccountPaths {
     public static String data(String name) {
         return normalize(name) + "/data.bin";
     }
+
+    /**
+     * ★ v99-r8：按 scope 分文件后的云端路径。
+     *
+     * <p>schema 3 起，每个 scope 一个文件（history.bin / progress.bin /
+     * collects.bin / settings.bin），各自独立 ETag，只上传脏的那几个。
+     * 旧的单文件 {@link #data(String)} 仅用于一次性迁移读取。</p>
+     */
+    public static String scopeFile(String name, com.github.tvbox.osc.sync.SyncScope scope) {
+        return normalize(name) + "/" + scope.fileName;
+    }
 }

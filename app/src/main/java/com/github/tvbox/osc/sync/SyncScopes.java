@@ -13,6 +13,45 @@ public final class SyncScopes {
     public boolean collect = true;
     public boolean settings = true;
 
+    /** ★ v99-r8：该 scope 是否启用（拆文件后要逐个判断）。 */
+    public boolean isEnabled(SyncScope s) {
+        if (s == null) {
+            return false;
+        }
+        switch (s) {
+            case HISTORY:
+                return history;
+            case PROGRESS:
+                return progress;
+            case COLLECT:
+                return collect;
+            case SETTINGS:
+                return settings;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * ★ v99-r8：只启用某一个 scope 的视图。
+     *
+     * <p>拆文件后每次只处理一个 scope，而 {@code buildLocal/applyLocal} 的签名
+     * 收的是 SyncScopes —— 用这个"单 scope 视图"传进去即可，不必改动这两个方法。</p>
+     */
+    public static SyncScopes only(SyncScope s) {
+        SyncScopes o = new SyncScopes();
+        o.history = (s == SyncScope.HISTORY);
+        o.progress = (s == SyncScope.PROGRESS);
+        o.collect = (s == SyncScope.COLLECT);
+        o.settings = (s == SyncScope.SETTINGS);
+        return o;
+    }
+
+    /** 是否至少启用了一个 scope。 */
+    public boolean anyEnabled() {
+        return history || progress || collect || settings;
+    }
+
     public static SyncScopes load() {
         SyncScopes s = new SyncScopes();
         try {

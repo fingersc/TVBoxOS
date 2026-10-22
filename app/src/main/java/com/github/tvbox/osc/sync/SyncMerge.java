@@ -1,6 +1,7 @@
 package com.github.tvbox.osc.sync;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -268,6 +269,61 @@ public final class SyncMerge {
         }
         if (b != null) {
             out.addAll(b);
+        }
+        return out;
+    }
+
+    // ---------------------------------------------------------------- 进度裁剪
+
+    /**
+     * ★ v99-r10：每部片只保留最近 {@code keepPerVod} 条播放进度记录。
+     *
+     * <p><b>按「记录」计数，不按「集」聚合</b>（用户明确要求）：同一部片下各线路（flag）
+     * 的记录合在一起只留最新的 N 条。理由是「切换线路」和「切源」目的相同（都为了更快的播放），
+     * 所以换线路时旧线路的记录会整批迁到新线路并丢弃
+     * （见 {@code PlayProgressManager.migrateByFlag}）—— 稳态下每片就是
+     * 「N 集 × 当前那一条线路」，不需要再为每条线路各留 N 集。</p>
+     *
+     * <p>纯函数、无 Android 依赖：本地落库（{@code PlayProgressManager.trimByVod}）
+     * 与同步包（{@code HistorySyncManager.truncateMergedProgress}）共用同一套规则。</p>
+     */
+    public static List<SyncPayload.ProgressItem> keepRecent(
+            List<SyncPayload.ProgressItem> all, int keepPerVod) {
+        if (all == null || all.isEmpty() || keepPerVod <= 0) {
+            return all;
+        }
+        // 1) 按片分组
+        Map<String, List<SyncPayload.ProgressItem>> byVod = new LinkedHashMap<>();
+        for (SyncPayload.ProgressItem it : all) {
+            if (it == null) {
+                continue;
+            }
+            String k = recordKey(it.sourceKey, it.vodId);
+            List<SyncPayload.ProgressItem> list = byVod.get(k);
+            if (list == null) {
+                list = new ArrayList<>();
+                byVod.put(k, list);
+            }
+            list.add(it);
+        }
+        List<SyncPayload.ProgressItem> out = new ArrayList<>(all.size());
+        for (List<SyncPayload.ProgressItem> list : byVod.values()) {
+            if (list.size() <= keepPerVod) {
+                out.addAll(list);   // 未超限，整片原样保留
+                continue;
+            }
+            // 2) 片内按 updateTime 降序取前 N 条
+            List<SyncPayload.ProgressItem> sorted = new ArrayList<>(list);
+            Collections.sort(sorted, new java.util.Comparator<SyncPayload.ProgressItem>() {
+                @Override
+                public int compare(SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
+                    if (a.updateTime == b.updateTime) {
+                        return 0;
+                    }
+                    return a.updateTime > b.updateTime ? -1 : 1;
+                }
+            });
+            out.addAll(sorted.subList(0, keepPerVod));
         }
         return out;
     }

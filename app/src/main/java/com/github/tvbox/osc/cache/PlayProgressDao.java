@@ -20,6 +20,14 @@ public interface PlayProgressDao {
     @Query("delete from play_progress where sourceKey = :sourceKey and vodId = :vodId")
     int deleteByVod(String sourceKey, String vodId);
 
+    /** ★ v99-r10：某片在指定线路下的全部集进度（换线路整批迁移用）。 */
+    @Query("select * from play_progress where sourceKey = :sourceKey and vodId = :vodId and flag = :flag")
+    java.util.List<PlayProgress> getByVodFlag(String sourceKey, String vodId, String flag);
+
+    /** ★ v99-r10：删掉某片在某条线路下的全部进度（换线路后旧线路整体抛弃）。 */
+    @Query("delete from play_progress where sourceKey = :sourceKey and vodId = :vodId and flag = :flag")
+    int deleteByVodFlag(String sourceKey, String vodId, String flag);
+
     /**
      * 取某部影片在某个源下的<b>全部集</b>进度行。
      * <p>用于换源时把整部片的进度整体搬到新源——此前只在详情回调里迁移"当前播的那一集"，

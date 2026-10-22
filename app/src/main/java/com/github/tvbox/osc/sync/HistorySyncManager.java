@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -305,7 +306,12 @@ public final class HistorySyncManager {
                     new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US);
             sb.append(f.format(new java.util.Date(st.lastAt)));
         }
-        if (st.inBackoff()) {
+        if (st.needsManualSync()) {
+            // ★ P3-4：永久熔断时必须明确告诉用户「不会自动恢复」——
+            //   否则沿用下面的「N 秒后重试」文案，用户会一直等一个永远不会到来的重试。
+            sb.append("（已停止自动同步：连续失败 ").append(st.failCount)
+                    .append(" 次，请检查网盘配置后点「立即同步」）");
+        } else if (st.inBackoff()) {
             long left = (st.failUntil - System.currentTimeMillis()) / 1000L;
             sb.append("（已暂停，").append(Math.max(1, left)).append(" 秒后重试）");
         } else if (st.failCount > 0) {
@@ -401,9 +407,11 @@ public final class HistorySyncManager {
                 long up = 0L;
                 boolean notModified = false;
                 try {
-                    if (Hawk.get(HawkConfig.SYNC_ENGINE_V2, true)) {
-                        // v98 P1：新引擎（条件请求 304 + 事务化 + 退避熔断），
-                        //        成败状态由引擎自行维护，外层不再 noteFailure/clearFailure
+                    // ★ v99-r8：云端已改为「按 scope 分文件」（schema 3），旧引擎 doSync 只认
+                    //   单文件 data.bin，回退过去会读到过期数据 ⇒ 这里强制走新引擎，
+                    //   SYNC_ENGINE_V2 开关不再生效（doSync 代码保留仅供查阅，不再调用）。
+                    //   成败状态由引擎自行维护，外层不再 noteFailure/clearFailure。
+                    {
                         SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, manual);
                         ok = r.ok;
                         msg = r.message == null ? "同步完成" : r.message;
@@ -412,10 +420,6 @@ public final class HistorySyncManager {
                         down = r.bytesDown;
                         up = r.bytesUp;
                         notModified = r.notModified;
-                    } else {
-                        msg = doSync(owner, key, manual, gen);
-                        ok = true;
-                        engineHandled = false;
                     }
                 } catch (SwitchAborted e) {
                     aborted = true;
@@ -738,6 +742,34 @@ public final class HistorySyncManager {
         }
     }
 
+    /**
+     * ★ v99-r10：每部片最多保留多少条播放进度<b>记录</b>（不分线路）。
+     *
+     * <p>本地落库（{@code PlayProgressManager.trimByVod}）与云端同步包
+     * （{@link #truncateMergedProgress}）共用这一个口径，避免两边不一致。</p>
+     *
+     * <p>换线路时旧线路的记录会整批迁到新线路并丢弃
+     * （{@code PlayProgressManager.migrateByFlag}），所以稳态下每片就是
+     * 「N 集 × 当前那一条线路」，不需要为每条线路各留 N 套。</p>
+     */
+    public static final int KEEP_PROGRESS_EPISODES = 10;
+
+    /**
+     * ★ v99-r10：把同步包里的进度也裁到「每片最近 {@link #KEEP_PROGRESS_EPISODES} 集」。
+     *
+     * <p><b>为什么本地裁了还要裁这里</b>：云端可能还存着裁之前的老数据（几十上百条），
+     * 一次 {@code merge(local 10 条, remote 100 条)} 会按 LWW 求并集又变回 100 条，
+     * 然后 {@code applyLocal} 把它写回本地 —— 本地刚裁掉的全被"复活"。
+     * 所以在 applyLocal 之前先裁 merged，云端才能被真正收敛。</p>
+     */
+    static void truncateMergedProgress(SyncPayload merged, SyncScopes scopes) {
+        if (!scopes.progress || merged.progress == null || merged.progress.isEmpty()) {
+            return;
+        }
+        // 规则在 SyncMerge.keepRecent（纯函数，本地落库与这里共用同一套）
+        merged.progress = SyncMerge.keepRecent(merged.progress, KEEP_PROGRESS_EPISODES);
+    }
+
     static void applyLocal(SyncPayload merged, SyncScopes scopes) {
         SyncTombstones.suppress(true);
         try {
@@ -854,39 +886,21 @@ public final class HistorySyncManager {
         }
         final byte[] key = AccountContext.key();
         final String owner = AccountContext.ownerKey();
-        final String accountName = AccountContext.displayName();
+        final int gen = generation;
         new Thread(new Runnable() {
             @Override
             public void run() {
-                boolean ok = false;
-                String msg;
-                try {
-                    WebDavClient dav = new WebDavClient(
-                            Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
-                            Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
-                            Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
-                    SyncPayload empty = new SyncPayload();
-                    empty.owner = owner;
-                    empty.epoch = lastEpoch() + 1;
-                    empty.updatedAt = System.currentTimeMillis();
-                    empty.dev = deviceId();
-                    byte[] out = Crypto.encrypt(key, GSON.toJson(empty).getBytes("UTF-8"));
-                    dav.put(AccountPaths.data(accountName), out, null);
+                // ★ v99-r8：改为走引擎（原来这里自己 new WebDavClient + put(...,null)：
+                //   不查熔断、不带 If-Match，与正在同步的设备可能互相覆盖；
+                //   而且只清云端不清本机，下次同步又把数据传回去，等于没清）。
+                SyncEngine.Outcome r = SyncEngine.clearCloud(owner, key, gen);
+                if (r.ok) {
                     SyncState st = SyncState.load(owner);
-                    st.lastEpoch = empty.epoch;
-                    st.lastAt = System.currentTimeMillis();
-                    st.clearDirty();
-                    st.clearFailure();
-                    st.save();
-                    Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), empty.epoch);
-                    Hawk.put(key(HawkConfig.SYNC_LAST_AT), System.currentTimeMillis());
+                    Hawk.put(key(HawkConfig.SYNC_LAST_EPOCH), st.lastEpoch);
+                    Hawk.put(key(HawkConfig.SYNC_LAST_AT), st.lastAt);
                     Hawk.put(key(HawkConfig.SYNC_DIRTY), false);
-                    ok = true;
-                    msg = "已清空云端（其它设备下次同步会跟随清空）";
-                } catch (Throwable t) {
-                    msg = "清空失败：" + t.getMessage();
                 }
-                post(cb, ok, msg);
+                post(cb, r.ok, r.message == null ? (r.ok ? "已清空云端" : "清空失败") : r.message);
             }
         }, "tvbox-sync-clear").start();
     }

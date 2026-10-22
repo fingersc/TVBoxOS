@@ -11,7 +11,13 @@ import java.util.Map;
 @Keep
 public class SyncPayload {
 
-    public static final int SCHEMA = 2;
+    /**
+     * 同步包 schema。
+     *
+     * <p>2 = 单文件 data.bin 全量；<b>3 = 按 scope 分文件</b>（history/progress/collects/settings.bin）。</p>
+     * <p>读旧数据（schema 2）仍可正常反序列化 —— 字段是一致的，只是拆成了 4 份。</p>
+     */
+    public static final int SCHEMA = 3;
 
     public int schema = SCHEMA;
     public String owner = "";
@@ -64,6 +70,51 @@ public class SyncPayload {
                 settings.add(it);
             }
         }
+    }
+
+    /**
+     * ★ v99-r8：只保留某个 scope 的数据，其余置空 —— 用于「按 scope 分文件」序列化。
+     *
+     * <p>拆文件后每个文件只该装自己那一类数据；若不裁剪，四个文件会各装全量，
+     * 流量反而变成原来的 4 倍。</p>
+     */
+    public SyncPayload forScope(SyncScope scope) {
+        SyncPayload p = new SyncPayload();
+        p.schema = SCHEMA;
+        p.owner = owner;
+        p.epoch = epoch;
+        p.updatedAt = updatedAt;
+        p.dev = dev;
+        if (scope == SyncScope.HISTORY) {
+            if (records != null) {
+                p.records = records;
+            }
+            if (deleted != null && deleted.records != null) {
+                p.deleted.records = deleted.records;
+            }
+        } else if (scope == SyncScope.PROGRESS) {
+            if (progress != null) {
+                p.progress = progress;
+            }
+            if (deleted != null && deleted.progress != null) {
+                p.deleted.progress = deleted.progress;
+            }
+        } else if (scope == SyncScope.COLLECT) {
+            if (collects != null) {
+                p.collects = collects;
+            }
+            if (deleted != null && deleted.collects != null) {
+                p.deleted.collects = deleted.collects;
+            }
+        } else if (scope == SyncScope.SETTINGS) {
+            if (settings != null) {
+                p.settings = settings;
+            }
+            if (deleted != null && deleted.settings != null) {
+                p.deleted.settings = deleted.settings;
+            }
+        }
+        return p;
     }
 
     @Keep

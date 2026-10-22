@@ -633,6 +633,23 @@ public class DetailActivity extends BaseActivity {
                         routeSwitchSeries = switchedSeries;
                         // 跨线路迁移播放时间（hhyun -> hhm3u8 等）：先落盘实时进度，再把旧线路 key 的时间复制到新线路 key
                         if (playFragment != null) playFragment.saveCurrentProgressNow();
+                        // ★ v99-r10/r11：换线路与换源同义（都为更快的播放）——
+                        //   旧线路「最近 N 条」进度迁到新线路（覆盖新线路原有），然后旧线路整个抛弃。
+                        //   否则同一集会同时留下「旧线路 + 新线路」两条记录，
+                        //   而裁剪是按「每片最多 N 条记录」算的，等于白占一半名额。
+                        //   ★ 迁移要在 saveCurrentProgressNow() 之后：当前这一集的进度是刚写的，
+                        //     必须能被当作「最近的一条」一起迁走。
+                        try {
+                            List<String> epNames = new ArrayList<>();
+                            for (VodInfo.VodSeries s : newSeriesList) {
+                                if (s != null && !TextUtils.isEmpty(s.name)) {
+                                    epNames.add(s.name);
+                                }
+                            }
+                            PlayProgressManager.migrateByFlag(sourceKey, vodId, actualOldFlag, newFlag, epNames);
+                        } catch (Throwable th) {
+                            LOG.e("migrateByFlag fail", th);
+                        }
                         migratePlaybackTimeAcrossFlags(actualOldFlag, actualOldIndex,
                                 currentSeries == null ? "" : currentSeries.name,
                                 newFlag, vodInfo.playIndex, switchedSeries.name);

@@ -34,6 +34,35 @@ public final class WebDavClient {
     private final HttpUrl base;
     private final String auth;
 
+    /**
+     * 进程级共享的 OkHttpClient。
+     *
+     * <p>★ v99-r9（审查 P1-4）：原来每个 WebDavClient 实例都 {@code new OkHttpClient.Builder()...}，
+     * 而同步一次会新建 WebDavClient，于是 <b>每次同步都重建连接池与线程池</b>，
+     * 一条同步里的 4~6 个请求（4 个 scope 的 GET + PUT）本来能复用同一条 TLS 连接，
+     * 结果每次都要重新握手。改成进程级单例后，连接可跨次同步复用。</p>
+     */
+    private static volatile OkHttpClient SHARED;
+
+    private static OkHttpClient sharedClient() {
+        OkHttpClient c = SHARED;
+        if (c == null) {
+            synchronized (WebDavClient.class) {
+                c = SHARED;
+                if (c == null) {
+                    c = new OkHttpClient.Builder()
+                            .connectTimeout(10, TimeUnit.SECONDS)
+                            .readTimeout(20, TimeUnit.SECONDS)
+                            .writeTimeout(20, TimeUnit.SECONDS)
+                            .retryOnConnectionFailure(true)
+                            .build();
+                    SHARED = c;
+                }
+            }
+        }
+        return c;
+    }
+
     public WebDavClient(String url, String user, String password) {
         HttpUrl parsed = url == null ? null : HttpUrl.parse(url.trim());
         if (parsed == null) {
@@ -41,12 +70,35 @@ public final class WebDavClient {
         }
         this.base = parsed;
         this.auth = Credentials.basic(user == null ? "" : user, password == null ? "" : password);
-        this.client = new OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(20, TimeUnit.SECONDS)
-                .writeTimeout(20, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true)
-                .build();
+        this.client = sharedClient();
+    }
+
+    /** 5xx 起手就重试的间隔：服务端抖动很常见，不值得为此走 30 秒退避。 */
+    private static final long SERVER_ERR_RETRY_DELAY_MS = 500L;
+
+    /**
+     * ★ v99-r10 P3-3：执行请求；遇到 <b>5xx</b> 立即重试一次。
+     *
+     * <p>原来 500/502/503 会直接抛 IOException ⇒ 计一次失败 ⇒ 整个同步退避 30 秒，
+     * 而这类错误多半是服务端瞬时抖动，隔 500ms 再试基本就好。
+     * GET / 条件 GET / PUT 都是幂等的，重试安全。</p>
+     *
+     * <p>只重试一次：连两次 5xx 说明不是抖动，交给上层的退避熔断处理。</p>
+     */
+    private Response exec(Request req) throws IOException {
+        Response resp = client.newCall(req).execute();
+        int code = resp.code();
+        if (code >= 500 && code < 600) {
+            resp.close();
+            try {
+                Thread.sleep(SERVER_ERR_RETRY_DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("重试被中断");
+            }
+            resp = client.newCall(req).execute();
+        }
+        return resp;
     }
 
     private HttpUrl url(String path) {
@@ -69,7 +121,7 @@ public final class WebDavClient {
                 .header("Depth", "0")
                 .method("PROPFIND", RequestBody.create(null, new byte[0]))
                 .build();
-        try (Response resp = client.newCall(req).execute()) {
+        try (Response resp = exec(req)) {
             checkAuth(resp);
             int code = resp.code();
             if (code != 207 && code != 200 && code != 204) {
@@ -86,7 +138,7 @@ public final class WebDavClient {
                 .header("Depth", "0")
                 .method("PROPFIND", RequestBody.create(null, new byte[0]))
                 .build();
-        try (Response resp = client.newCall(req).execute()) {
+        try (Response resp = exec(req)) {
             checkAuth(resp);
             if (resp.code() == 404) {
                 return false;
@@ -102,7 +154,7 @@ public final class WebDavClient {
                 .header("Authorization", auth)
                 .get()
                 .build();
-        try (Response resp = client.newCall(req).execute()) {
+        try (Response resp = exec(req)) {
             checkAuth(resp);
             if (resp.code() == 404) {
                 return null;
@@ -135,7 +187,7 @@ public final class WebDavClient {
         if (etag != null && !etag.isEmpty()) {
             b.header("If-None-Match", etag);
         }
-        try (Response resp = client.newCall(b.build()).execute()) {
+        try (Response resp = exec(b.build())) {
             checkAuth(resp);
             if (resp.code() == HTTP_NOT_MODIFIED) {
                 if (notModified != null && notModified.length > 0) {
@@ -156,8 +208,15 @@ public final class WebDavClient {
         }
     }
 
-    /** 写入文件；ifMatch 非空时带 If-Match（并发写冲突会抛 ConflictException）。 */
-    public void put(String path, byte[] data, String ifMatch) throws IOException {
+    /**
+     * 写入文件；ifMatch 非空时带 If-Match（并发写冲突会抛 ConflictException）。
+     *
+     * <p>★ v99-r8：返回服务端在响应里给的新 ETag（可能为 null）。
+     * 调用方应把它记进 {@code SyncState.etags} —— 原来不返回 ETag，
+     * 结果本地一直留着「PUT 之前」的旧 ETag，下一次条件请求必然 200（整包重下）。
+     * </p>
+     */
+    public String put(String path, byte[] data, String ifMatch) throws IOException {
         Request.Builder b = new Request.Builder()
                 .url(url(path))
                 .header("Authorization", auth)
@@ -165,14 +224,15 @@ public final class WebDavClient {
         if (ifMatch != null && ifMatch.length() > 0) {
             b.header("If-Match", ifMatch);
         }
-        try (Response resp = client.newCall(b.build()).execute()) {
+        try (Response resp = exec(b.build())) {
             checkAuth(resp);
-            if (resp.code() == 412 || resp.code() == 409 && ifMatch != null) {
+            if (resp.code() == 412 || (resp.code() == 409 && ifMatch != null)) {
                 throw new ConflictException();
             }
             if (!resp.isSuccessful()) {
                 throw new IOException("写入失败：" + resp.code());
             }
+            return resp.header("ETag");
         }
     }
 
@@ -193,7 +253,7 @@ public final class WebDavClient {
                         .header("Authorization", auth)
                         .method("MKCOL", RequestBody.create(null, new byte[0]))
                         .build();
-                try (Response resp = client.newCall(req).execute()) {
+                try (Response resp = exec(req)) {
                     // 201 创建成功；405 已存在；401 由后续 PUT 统一报错
                 }
             } catch (Throwable ignored) {

@@ -5,7 +5,16 @@ import android.text.TextUtils;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.sync.SyncScope;
+import com.github.tvbox.osc.sync.SyncMerge;
+import com.github.tvbox.osc.sync.SyncPayload;
 import com.github.tvbox.osc.sync.SyncTombstones;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
  * 播放进度的列存储门面：代替原 CacheManager + MD5(拼接串) 的进度存储。
@@ -37,10 +46,211 @@ public class PlayProgressManager {
             p.position = position;
             p.updateTime = System.currentTimeMillis();
             dao.save(p);
+            // ★ v99-r10/r11：每部片只保留最近 KEEP_PROGRESS_EPISODES 条进度记录（不分线路）。
+            //   原来是一集一行、永不上限：50 集 × 20 部 = 1000 行（同集换线路还会再翻倍），
+            //   而同步是整包上传 progress.bin ⇒ 每次改善进度都要传上百 KB。
+            trimByVod(p.sourceKey, p.vodId, HistorySyncManager.KEEP_PROGRESS_EPISODES);
             // v98 P2：只看剧不动历史/收藏/设置 —— 只脏「进度」
             HistorySyncManager.markDirty(SyncScope.PROGRESS);
         } catch (Throwable th) {
             th.printStackTrace();
+        }
+    }
+
+    /**
+     * ★ v99-r10/r11：每部片只保留最近 {@link HistorySyncManager#KEEP_PROGRESS_EPISODES} 条<b>进度记录</b>。
+     *
+     * <p><b>按「记录」计数，不按「集」聚合</b>：同一部片下各线路（flag）的记录合起来
+     * 只留最新的 N 条。理由是「切换线路」与「切源」目的相同（都是为了更快的播放），
+     * 换线路时旧线路的记录会整批迁到新线路并丢弃（{@link #migrateByFlag}），
+     * 稳态下每片就是「N 集 × 当前那一条线路」。</p>
+     *
+     * <p>规则实现在 {@link SyncMerge#keepRecent}（纯函数），本地落库与云端同步包共用同一套。</p>
+     *
+     * @return 实际删除的行数
+     */
+    public static int trimByVod(String sourceKey, String vodId, int keep) {
+        try {
+            if (keep <= 0 || TextUtils.isEmpty(vodId)) {
+                return 0;
+            }
+            PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
+            final String sk = s(sourceKey);
+            final String vid = s(vodId);
+            List<PlayProgress> rows = dao.getByVod(sk, vid);
+            if (rows == null || rows.size() <= keep) {
+                return 0;
+            }
+            // 转成同步包条目，交给 SyncMerge.keepRecent 算「保留哪几条记录」——
+            // 本地落库与云端同步包共用同一套规则，避免两边裁出不同结果。
+            List<SyncPayload.ProgressItem> items = new ArrayList<>(rows.size());
+            for (PlayProgress r : rows) {
+                if (r == null) {
+                    continue;
+                }
+                items.add(toItem(r));
+            }
+            List<SyncPayload.ProgressItem> kept = SyncMerge.keepRecent(items, keep);
+            if (kept == null || kept.size() >= items.size()) {
+                return 0;
+            }
+            Set<String> keepKeys = new HashSet<>();
+            for (SyncPayload.ProgressItem it : kept) {
+                keepKeys.add(rowKey(it.flag, it.playIndex, it.epName));
+            }
+            int removed = 0;
+            for (PlayProgress r : rows) {
+                if (r == null || keepKeys.contains(rowKey(r.flag, r.playIndex, r.epName))) {
+                    continue;
+                }
+                removed += dao.delete(r.sourceKey, r.vodId, r.flag, r.playIndex, r.epName);
+            }
+            return removed;
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
+        }
+    }
+
+    private static String rowKey(String flag, int playIndex, String epName) {
+        return s(flag) + "\u0001" + playIndex + "\u0001" + s(epName);
+    }
+
+    private static SyncPayload.ProgressItem toItem(PlayProgress r) {
+        SyncPayload.ProgressItem it = new SyncPayload.ProgressItem();
+        it.sourceKey = r.sourceKey;
+        it.vodId = r.vodId;
+        it.flag = r.flag;
+        it.playIndex = r.playIndex;
+        it.epName = r.epName;
+        it.position = r.position;
+        it.updateTime = r.updateTime;
+        return it;
+    }
+
+    /**
+     * ★ v99-r11：同站「换线路」时把旧线路<b>最近 {@code keep} 条</b>进度迁到新线路，然后旧线路整体抛弃。
+     *
+     * <p><b>为什么换线路等于换源</b>：两者目的相同（都是为了更快的播放），
+     * 所以旧线路的记录留着只会占名额——裁剪是「每片最多 N 条记录」（不分线路），
+     * 旧线路的记录会白白吃掉一半名额。</p>
+     *
+     * <p><b>三条规则（用户确认）</b>：</p>
+     * <ol>
+     *   <li>只迁旧线路<b>最近 {@code keep} 条</b>（按 updateTime 降序），不是整片所有集；</li>
+     *   <li>新线路<b>已有该集 ⇒ 覆盖</b>（用旧线路的播放位置覆盖新线路的）；</li>
+     *   <li>迁完旧线路整条删除，并登记墓碑（否则云端那份会被 LWW 合并"复活"）。</li>
+     * </ol>
+     *
+     * <p><b>对称性</b>：A→B 后 A 的行被清空、B 持有这 N 条；再 B→A 时旧=B 新=A，
+     * 于是 B 的这 N 条又整批搬回 A（A 此刻是空的）——来回切换不丢数据、位置保持不变。</p>
+     *
+     * <p><b>集名对齐</b>：新线路集名写法可能不同（{@code 第01集} vs {@code 01}），
+     * 用 {@link com.github.tvbox.osc.util.EpisodeNameMatcher} 跨写法对齐，
+     * 对齐后以<b>新线路的集名与集序号</b>落库（对齐不到才退回旧值）。</p>
+     *
+     * @return 实际迁移的条数
+     */
+    public static int migrateByFlag(String sourceKey, String vodId,
+                                    String fromFlag, String toFlag,
+                                    java.util.List<String> toEpNames) {
+        try {
+            final String sk = s(sourceKey);
+            final String vid = s(vodId);
+            final String ff = s(fromFlag);
+            final String tf = s(toFlag);
+            if (TextUtils.isEmpty(vid) || TextUtils.isEmpty(ff) || TextUtils.isEmpty(tf)
+                    || TextUtils.equals(ff, tf)) {
+                return 0;
+            }
+            final int keep = HistorySyncManager.KEEP_PROGRESS_EPISODES;
+            PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
+            List<PlayProgress> rows = dao.getByVodFlag(sk, vid, ff);
+            if (rows == null || rows.isEmpty()) {
+                return 0;
+            }
+            // 1) 候选：只取有播放位置的，并按 updateTime 降序
+            List<PlayProgress> cand = new ArrayList<>();
+            for (PlayProgress row : rows) {
+                if (row != null && row.position > 0) {
+                    cand.add(row);
+                }
+            }
+            if (cand.isEmpty()) {
+                dao.deleteByVodFlag(sk, vid, ff);
+                return 0;
+            }
+            Collections.sort(cand, new java.util.Comparator<PlayProgress>() {
+                @Override
+                public int compare(PlayProgress a, PlayProgress b) {
+                    if (a.updateTime == b.updateTime) {
+                        return 0;
+                    }
+                    return a.updateTime > b.updateTime ? -1 : 1;
+                }
+            });
+            if (cand.size() > keep) {
+                cand = new ArrayList<>(cand.subList(0, keep));
+            }
+            // 2) 新线路现有行（用于「覆盖」：同集序号的老行要删掉，否则会留下两条）
+            List<PlayProgress> toRows = dao.getByVodFlag(sk, vid, tf);
+            // 3) 新线路集名 → 序号
+            java.util.Map<String, Integer> toIdx = new HashMap<>();
+            if (toEpNames != null) {
+                for (int i = 0; i < toEpNames.size(); i++) {
+                    String nm = toEpNames.get(i);
+                    if (!TextUtils.isEmpty(nm) && !toIdx.containsKey(nm)) {
+                        toIdx.put(nm, i);
+                    }
+                }
+            }
+            final long now = System.currentTimeMillis();
+            int moved = 0;
+            int ordinal = 0;
+            for (PlayProgress row : cand) {
+                // 3.1 目标集（序号 + 名称）：优先完全一致，其次跨写法对齐
+                int idx = toIdx.containsKey(row.epName) ? toIdx.get(row.epName) : -1;
+                if (idx < 0 && toEpNames != null && !toEpNames.isEmpty()) {
+                    idx = com.github.tvbox.osc.util.EpisodeNameMatcher.findIndex(row.epName, toEpNames);
+                }
+                String targetEp = (idx >= 0) ? toEpNames.get(idx) : row.epName;
+                int targetIndex = (idx >= 0) ? idx : row.playIndex;
+                // 3.2 覆盖：删掉新线路同集序号的旧行（集名写法不同时是另一行）
+                if (toRows != null) {
+                    for (PlayProgress tr : toRows) {
+                        if (tr != null && tr.playIndex == targetIndex
+                                && !TextUtils.equals(tr.epName, targetEp)) {
+                            dao.delete(sk, vid, tf, tr.playIndex, tr.epName);
+                        }
+                    }
+                }
+                // 3.3 写入新线路（updateTime 用当前时间 ⇒ 本地/云端 LWW 都以迁移结果为准）
+                PlayProgress np = new PlayProgress();
+                np.sourceKey = sk;
+                np.vodId = vid;
+                np.flag = tf;
+                np.playIndex = targetIndex;
+                np.epName = targetEp;
+                np.position = row.position;
+                np.updateTime = now + ordinal;
+                dao.save(np);
+                ordinal++;
+                moved++;
+            }
+            // 4) 旧线路整体抛弃 + 登记墓碑（防止云端那份被 LWW 合并复活）
+            for (PlayProgress row : rows) {
+                if (row != null) {
+                    SyncTombstones.addProgress(sk, vid, ff, row.playIndex, row.epName);
+                }
+            }
+            dao.deleteByVodFlag(sk, vid, ff);
+            // 5) 按「每片最多 N 条记录」裁剪一次（迁移来的这批时间戳最新，优先保留）
+            trimByVod(sk, vid, keep);
+            HistorySyncManager.markDirty(SyncScope.PROGRESS);
+            return moved;
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
         }
     }
 
