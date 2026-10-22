@@ -227,6 +227,33 @@ public class PlayFragment extends BaseLazyFragment {
     private long lastProgressSaveMs = 0L;
     private long lastProgressSavePos = -1L;
 
+    /**
+     * ★ v99-r14：播放中的周期落盘间隔。
+     *
+     * <p><b>为什么需要：</b>原先进度只在 {@code onPause / onHiddenChanged / onDestroyView /
+     * 换集换源} 时落盘，播放过程中没有任何定时保存。一旦进程被「不走生命周期」的方式杀掉
+     * （系统 LMKD 回收内存、进程崩溃、个别 ROM 直接杀），
+     * 丢失的是「自上次落盘以来的全部时长」——连续播放 40 分钟不切后台就可能整段回退。</p>
+     *
+     * <p>有了周期落盘，最坏丢失从「整段」降到「一个周期」。</p>
+     *
+     * <p>取 30 秒的理由：项目数据库开了 {@code allowMainThreadQueries}，写盘发生在主线程；
+     * 30 秒一次的主线程开销可以忽略，而 30 秒的进度回退对用户几乎无感。</p>
+     */
+    private static final long PROGRESS_TICK_MS = 30_000L;
+
+    /** v99-r14：播放中的周期落盘任务（自续期，见 {@link #progressTickRun}）。 */
+    private final Runnable progressTickRun = new Runnable() {
+        @Override
+        public void run() {
+            // 节流版落盘：位置没怎么变时是空操作，不会重复写库 / 重复标脏
+            saveProgressOnInterrupt();
+            if (mHandler != null) {
+                mHandler.postDelayed(this, PROGRESS_TICK_MS);
+            }
+        }
+    };
+
     /** 延迟确认的暂停动作：只有失焦持续超过 {@link #PAUSE_CONFIRM_DELAY_MS} 才会执行。 */
     private final Runnable deferredPauseRun = new Runnable() {
         @Override
@@ -1821,6 +1848,11 @@ public class PlayFragment extends BaseLazyFragment {
         //   若已经暂停过（超过窗口），下面的 resume() 会照常把它播回来。
         if (mHandler != null) {
             mHandler.removeCallbacks(deferredPauseRun);
+            // ★ v99-r14：启动播放中的周期落盘。放在 onResume 而不是「开始播放」回调里，
+            //   是因为落盘本身有节流（位置没变就是空操作），不需要精确对齐播放状态；
+            //   而 onResume 是「本 Fragment 真的在前台」的唯一可靠信号。
+            mHandler.removeCallbacks(progressTickRun);
+            mHandler.postDelayed(progressTickRun, PROGRESS_TICK_MS);
         }
         exitingPreview = false;
         // ★ 关键闸门：用户主动暂停过 → 回到前台也不恢复播放，保持暂停画面。
@@ -1830,6 +1862,44 @@ public class PlayFragment extends BaseLazyFragment {
         }
         LOG.i("echo-lifecycle onResume userPaused=" + userPaused
                 + " state=" + (mVideoView == null ? -1 : mVideoView.getCurrentPlayState()));
+    }
+
+    /**
+     * ★ v99-r14：界面不可见 ⇒ 立刻排一次同步。
+     *
+     * <p><b>为什么必须放在 onStop 而不是原先设想的 onPause：</b></p>
+     *
+     * <p>onPause 会被系统<b>瞬时抢焦点</b>反复触发（覆盖层闪现 / HDMI-CEC / 其它应用短暂前台），
+     * 在那里直接发同步会把这些抖动全变成同步请求；而原先打算用的
+     * {@link #deferredPauseRun}（300ms 延迟确认）又有一个致命问题 ——
+     * {@link #onDestroyView()} 末尾的 {@code mHandler.removeCallbacksAndMessages(null)}
+     * 会把所有在排消息一起取消。<b>「上滑到多任务 → 划掉」这个手势通常 300ms 内就完成</b>，
+     * 于是 deferredPauseRun 根本来不及执行，同步请求从未发出。</p>
+     *
+     * <p>onStop 恰好避开这两点：</p>
+     * <ul>
+     *   <li>它不被瞬时抢焦点触发（那是 onPause only）⇒ 不会因弹窗抖动发同步；</li>
+     *   <li>它在「界面不可见」时就触发 —— <b>上滑手势一开始、recents 一可见就触发</b>，
+     *       远早于划掉那一下，给上传留出了时间；</li>
+     *   <li>Fragment 生命周期是 onPause → <b>onStop</b> → onDestroyView → onDestroy，
+     *       onStop 早于那句 removeCallbacksAndMessages，<b>不会被它取消</b>。</li>
+     * </ul>
+     *
+     * <p>覆盖的场景：按 Home、上滑到多任务（含随后划掉）、被全屏 Activity 覆盖、
+     * 正常退出播放页。四种情况下脏数据都会在进程还活着的时候就开始上传。</p>
+     *
+     * <p>用 {@link HistorySyncManager#onBackground()}（capMs=0 立即档）而不是
+     * {@link HistorySyncManager#onPlaybackExit()}（60 秒防抖）：后者等轮到的时候进程早死了。</p>
+     */
+    @Override
+    public void onStop() {
+        super.onStop();
+        // 周期落盘：离开界面就不需要了（onDestroyView 的 removeCallbacksAndMessages 也会兜底）
+        if (mHandler != null) {
+            mHandler.removeCallbacks(progressTickRun);
+        }
+        HistorySyncManager.onBackground();
+        LOG.i("echo-lifecycle onStop -> requestBackgroundSync");
     }
 
     @Override

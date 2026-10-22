@@ -122,4 +122,49 @@ public final class AccountService {
         } catch (Throwable ignored) {
         }
     }
+
+    /**
+     * ★ v99-r14：只用 {@code profile.json} 复核密码是否正确。
+     *
+     * <p><b>为什么需要这个独立通道：</b></p>
+     *
+     * <ul>
+     *   <li>{@code profile.json} 是<b>明文 JSON</b>，其中的 {@code verify} 字段是
+     *       {@link Crypto#accountVerify(byte[])}（由密钥派生的 HMAC）的 hex。
+     *       校验方式就是「本地算一遍、和明文里的字符串比」，<b>完全不解密</b>。</li>
+     *   <li>它由 {@link #activate} 在首次激活时写一次，之后<b>永不再上传</b>
+     *       （{@link #ensureProfile} 只在文件缺失时才补写）——
+     *       所以它是一条稳定、独立于数据文件的密码校验通道。</li>
+     *   <li>相比之下，4 个 scope 文件（progress/history/collect/settings {@code .bin}）
+     *       才是 {@link Crypto#encrypt} 加密的，它们解密失败<b>不能</b>推断密码错误。</li>
+     * </ul>
+     *
+     * <p><b>用途：</b>同步时某个 scope 文件解密失败，先用本方法复核 ——
+     * 复核通过说明密钥是对的，那失败原因只能是<b>云端文件损坏</b>（服务端部分写入 /
+     * 磁盘故障 / 被人手动改过），应当用本机数据重传修复；
+     * 复核失败才是真的密钥不匹配（账号被管理员重置、用别的密码登了同名目录）。</p>
+     *
+     * @return true = 密码/密钥正确；false = 不匹配，或 profile 缺失/不可读（无法证明正确）
+     */
+    public static boolean verifyPassword(WebDavClient dav, String name, byte[] key) {
+        if (dav == null || key == null || key.length == 0) {
+            return false;
+        }
+        try {
+            byte[] profile = dav.get(AccountPaths.profile(name), null);
+            if (profile == null || profile.length == 0) {
+                // 没有 profile ⇒ 无法证明密钥正确，按「不匹配」处理（调用方不会去覆盖云端）
+                return false;
+            }
+            String expected = new JSONObject(new String(profile, "UTF-8")).optString("verify", "");
+            if (expected.length() == 0) {
+                return false;
+            }
+            String actual = Crypto.accountVerify(key);
+            return actual.length() > 0 && actual.equalsIgnoreCase(expected);
+        } catch (Throwable t) {
+            // 读 profile 本身就失败（网络/认证）⇒ 同样无法证明正确
+            return false;
+        }
+    }
 }

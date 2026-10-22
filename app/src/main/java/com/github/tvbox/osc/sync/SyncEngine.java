@@ -5,6 +5,7 @@ import com.github.tvbox.osc.util.LOG;
 import com.orhanobut.hawk.Hawk;
 
 import java.io.IOException;
+import java.security.GeneralSecurityException;
 
 /**
  * 同步引擎 —— 单账号一次同步的编排内核。
@@ -120,6 +121,8 @@ public final class SyncEngine {
         boolean anyUploaded = false;
         boolean allNotModified = true;
         SyncPayload lastMerged = null;
+        // ★ v99-r14：本次是否修复过损坏的云端文件（用于最终提示，见下方 message）
+        boolean repaired = false;
 
         for (SyncScope sc : SyncScope.values()) {
             if (!enabled.isEnabled(sc)) {
@@ -145,7 +148,38 @@ public final class SyncEngine {
             allNotModified = false;
             o.bytesDown += remoteBytes == null ? 0 : remoteBytes.length;
 
-            SyncPayload remote = decode(key, remoteBytes, owner);
+            // ★ v99-r14：解密失败先定性，再决定怎么办。
+            //
+            //   decrypt() 有三种失败形态：
+            //     · SecurityException("bad mac")            —— HMAC 不匹配
+            //     · IllegalArgumentException("bad magic/length") —— 文件结构坏（被截断的典型症状）
+            //     · GeneralSecurityException(BadPadding)    —— 密文被改
+            //
+            //   旧代码把它们一律算作失败，前一种还被 runSafe 归成「账号或密码不正确」——
+            //   这是误判：密码校验本该走 profile.json（明文 + 派生 verify，独立通道），
+            //   数据文件解密失败推不出密码错误。
+            //
+            //   现在先用 profile.json 复核：
+            //     · 复核通过 ⇒ 密钥是对的 ⇒ 只能是云端文件损坏 ⇒ 用本机数据重传覆盖（自愈）
+            //     · 复核失败 ⇒ 才是真的密钥不匹配（账号被重置 / 用别的密码登同名目录）
+            //                 ⇒ 抛错，且【不重传】，避免用错密钥的数据覆盖云端
+            SyncPayload remote;
+            try {
+                remote = decode(key, remoteBytes, owner);
+            } catch (SecurityException | GeneralSecurityException
+                    | IllegalArgumentException corrupt) {
+                if (AccountService.verifyPassword(dav, accountName, key)) {
+                    LOG.i("[Sync] scope=" + sc + " cloud file corrupt ("
+                            + corrupt.getClass().getSimpleName() + "), repair by re-upload");
+                    // 以「空远端」继续：5.3 合并后等于本机数据，5.5 的 same 判定必然为 false
+                    //   ⇒ 走上传分支，用本机完整数据覆盖掉损坏的文件。
+                    remote = HistorySyncManager.emptyLocal(owner, deviceId, now);
+                    repaired = true;
+                } else {
+                    throw new IOException("账号密钥与云端不匹配（账号可能被管理员重置，"
+                            + "或用了不同密码登录同名目录）");
+                }
+            }
 
             // 5.2 epoch 变化 ⇒ 整库重置（以 history.bin 为准，清空云端时 4 个文件一起清）
             boolean reset = (sc == SyncScope.HISTORY) && remote.epoch > st.lastEpoch;
@@ -218,9 +252,14 @@ public final class SyncEngine {
         String tail = lastMerged == null ? "" :
                 "（历史 " + lastMerged.records.size() + " / 进度 " + lastMerged.progress.size()
                         + " / 收藏 " + lastMerged.collects.size() + " / 设置 " + lastMerged.settings.size() + "）";
-        o.message = allNotModified ? "同步完成（无变更）" : ("同步完成" + tail);
+        // ★ v99-r14：修复过云端损坏文件时明确告知用户 —— 否则用户只会看到一次普通的
+        //   「同步完成」，不会知道云端曾经坏过、以及自己的数据已被用来覆盖修复。
+        String repairTip = repaired ? "（已修复损坏的云端数据文件）" : "";
+        o.message = allNotModified ? ("同步完成（无变更）" + repairTip)
+                : ("同步完成" + tail + repairTip);
         LOG.i("[Sync] done owner=" + owner + " req=" + o.requests
-                + " down=" + o.bytesDown + " up=" + o.bytesUp + " uploaded=" + anyUploaded);
+                + " down=" + o.bytesDown + " up=" + o.bytesUp + " uploaded=" + anyUploaded
+                + " repaired=" + repaired);
         return o;
     }
 
