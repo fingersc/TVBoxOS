@@ -32,6 +32,16 @@ public final class SyncEngine {
         public long bytesDown;
         public long bytesUp;
         public String message;
+        /**
+         * ★ v99-r11-fix：本次同步是否因「切换账号」而作废。
+         *
+         * <p>{@link #runSafe} <b>不抛异常</b>（所有异常都在内部转成 Outcome），
+         * 所以上层 {@code HistorySyncManager} 的 try 体里没有任何受检异常可抛 ——
+         * 那些 {@code catch (IOException)} / {@code catch (SwitchAborted)} 全部不可达，
+         * javac 会报 "exception X is never thrown in body of corresponding try statement"。
+         * 作废这个语义必须通过返回值传递，不能靠抛异常。</p>
+         */
+        public boolean aborted;
 
         static Outcome backoff() {
             Outcome o = new Outcome();
@@ -380,7 +390,10 @@ public final class SyncEngine {
             return run(owner, key, gen, forceUpload);
         } catch (HistorySyncManager.SwitchAborted e) {
             // 切换账号作废：不计失败
-            return fail(e.getMessage() == null ? "已取消" : e.getMessage());
+            // ★ v99-r11-fix：通过返回值告知上层"这是作废、不是失败"（runSafe 不抛异常）
+            Outcome o = fail(e.getMessage() == null ? "已取消" : e.getMessage());
+            o.aborted = true;
+            return o;
         } catch (WebDavClient.AuthException e) {
             recordFailure(owner, true);
             return fail("认证失败：请检查网盘账号与应用密码");

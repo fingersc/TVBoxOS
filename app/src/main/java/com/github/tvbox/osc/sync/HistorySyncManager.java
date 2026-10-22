@@ -411,6 +411,12 @@ public final class HistorySyncManager {
                     //   单文件 data.bin，回退过去会读到过期数据 ⇒ 这里强制走新引擎，
                     //   SYNC_ENGINE_V2 开关不再生效（doSync 代码保留仅供查阅，不再调用）。
                     //   成败状态由引擎自行维护，外层不再 noteFailure/clearFailure。
+                    // ★ v99-r11-fix：runSafe **不抛异常**（内部把异常全转成 Outcome），
+                    //   所以本 try 体里没有任何受检异常可抛 ⇒ 原来那批
+                    //   catch(SwitchAborted/AuthException/ConflictException/IOException)
+                    //   全部不可达，javac 直接编译失败
+                    //   （"exception X is never thrown in body of corresponding try statement"）。
+                    //   改为：只 catch Throwable 兜底，具体的错误语义由 Outcome.message 承载。
                     {
                         SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, manual);
                         ok = r.ok;
@@ -420,19 +426,11 @@ public final class HistorySyncManager {
                         down = r.bytesDown;
                         up = r.bytesUp;
                         notModified = r.notModified;
+                        // ★ 作废（切换账号）必须由返回值传递，不能靠 catch
+                        aborted = r.aborted;
                     }
-                } catch (SwitchAborted e) {
-                    aborted = true;
-                    msg = e.getMessage();
-                } catch (WebDavClient.AuthException e) {
-                    msg = "认证失败：请检查网盘账号与应用密码";
-                } catch (SecurityException e) {
-                    msg = "账号或密码不正确（解密失败）";
-                } catch (WebDavClient.ConflictException e) {
-                    msg = "云端被其它设备修改，重试后仍冲突";
-                } catch (IOException e) {
-                    msg = "网络或服务器错误：" + e.getMessage();
                 } catch (Throwable t) {
+                    // 兜底：runSafe 理论上不抛，但真抛了也不能让同步线程静默死掉
                     msg = "同步失败：" + t.getClass().getSimpleName();
                     LOG.e("[Sync] failed", t);
                 } finally {
