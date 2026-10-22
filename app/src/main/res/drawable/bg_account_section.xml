@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v99-r6b：账号页区块卡片底（深色半透明 + 细描边 + 圆角）。
+     为什么不复用 bg_dialog_rounded：那个是"对话框底板"语义（#88000000 半透明黑 + 16dp 固定圆角
+     + 内建 10dp padding），套在账号页会显得凹陷、且内建 padding 无法按 vs 比例控制。
+     这里只新建这一个背景，颜色仍沿用现有的 dialog_panel_bg / dialog_panel_stroke 体系。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="@dimen/vs_10" />
+    <solid android:color="@color/account_section_bg" />
+    <stroke
+        android:width="@dimen/vs_1"
+        android:color="@color/account_section_stroke" />
+</shape>

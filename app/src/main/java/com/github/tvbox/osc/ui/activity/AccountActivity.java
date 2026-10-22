@@ -38,7 +38,6 @@ import com.orhanobut.hawk.Hawk;
  */
 public class AccountActivity extends BaseActivity implements View.OnClickListener, QrLoginBridge.Listener {
 
-    private TextView tvIdentity;
     private TextView tvSyncStatus;
     private EditText etUser;
     private EditText etPass;
@@ -76,7 +75,6 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
     @Override
     protected void init() {
-        tvIdentity = findViewById(R.id.tvIdentity);
         tvSyncStatus = findViewById(R.id.tvSyncStatus);
         etUser = findViewById(R.id.etUser);
         etPass = findViewById(R.id.etPass);
@@ -138,12 +136,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
     private void refreshAll() {
         AccountContext.load();
-        if (AccountContext.isGuest()) {
-            tvIdentity.setText("游客模式：记录仅保存在本机，不参与同步");
-        } else {
-            tvIdentity.setText("已登录：" + AccountContext.displayName()
-                    + "（切换账号需重新输入密码或扫码）");
-        }
+        // v99-r6b：页面标题下那行身份说明已删除（用户要求），登录状态改由账号卡片的
+        //          「当前账号」高亮体现，不再单独占一行文字
         etDavUrl.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""));
         etDavUser.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""));
         etDavPass.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
@@ -449,11 +443,12 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         slp.topMargin = (int) getResources().getDimension(R.dimen.vs_6);
         card.addView(state, slp);
 
-        int h = (int) getResources().getDimension(R.dimen.vs_76);
+        // v99-r6b：高度改 wrap_content —— 固定高度会把第二行「未登录 / 当前账号」压到裁切，
+        //          改由 padding 撑开，字号或字体变化也不会再压字
         int padH = (int) getResources().getDimension(R.dimen.vs_20);
-        int padV = (int) getResources().getDimension(R.dimen.vs_12);
+        int padV = (int) getResources().getDimension(R.dimen.vs_14);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, h);
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.setMargins(0, 0, (int) getResources().getDimension(R.dimen.vs_12), 0);
         card.setLayoutParams(lp);
         card.setPadding(padH, padV, padH, padV);
