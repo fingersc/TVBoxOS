@@ -56,6 +56,6 @@
 
 
     <!-- v99-r6b：账号页区块卡片底（淡蓝半透明，透出页面背景 ⇒ 与整体更协调） -->
-    <color name="account_section_bg">#4D20395C</color>
-    <color name="account_section_stroke">#404A78A8</color>
+    <color name="account_section_bg">#3D353744</color>
+    <color name="account_section_stroke">#22FFFFFF</color>
 </resources>

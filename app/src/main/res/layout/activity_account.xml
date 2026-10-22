@@ -168,7 +168,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
 
                     <EditText
@@ -191,7 +191,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
                 </LinearLayout>
 
@@ -229,7 +229,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
                 </LinearLayout>
 
@@ -430,7 +430,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
                 </FrameLayout>
 
@@ -458,7 +458,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
                 </FrameLayout>
 
@@ -484,7 +484,7 @@
                         android:paddingEnd="@dimen/vs_20"
                         android:singleLine="true"
                         android:textColor="@android:color/white"
-                        android:textColorHint="@color/color_99FFFFFF"
+                        android:textColorHint="@color/dialog_text_hint"
                         android:textSize="@dimen/ts_22" />
                 </FrameLayout>
             </LinearLayout>
