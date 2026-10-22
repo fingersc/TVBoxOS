@@ -66,17 +66,9 @@ public class LoginQrDialog extends BaseDialog implements QrLoginBridge.Listener 
 
         QrLoginBridge.addListener(this);
 
-        findViewById(R.id.btnScanOnPhone).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                FastClickCheckUtil.check(v);
-                dismiss();
-                try {
-                    getContext().startActivity(new android.content.Intent(getContext(), QrScanActivity.class));
-                } catch (Throwable ignored) {
-                }
-            }
-        });
+        // v99-r6：原来这里有个「我是手机，扫其它设备的码」按钮，跳 QrScanActivity。
+        //          现在两个入口已拆开（扫一扫=摄像头扫码，二维码=显示二维码），
+        //          本弹窗只负责「显示二维码，让手机来扫」，不再做跳转。
     }
 
     /** 手机扫码成功后：关闭二维码并提示，避免看起来「没反应」。 */

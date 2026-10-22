@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- v75 账号页排版：输入框与按钮统一 vs_56 行高；去掉「显示密码」与「账号目录」；
-     服务器地址示例改为 base 地址。 -->
+<!-- v99-r6 账号页改版：
+     1. 四个区块（账号管理 / 我的内容 / WebDAV 存储 / 同步设置），区块标题与灰色说明同一行；
+     2. 所有成行控件统一「4 等分栅格」：外层 FrameLayout 按 weight 严格分槽（1/2 槽），
+        内层元素用 marginEnd 造缝 —— 槽边界严格落在 25%/50%/75%，
+        所以 WebDAV 用户名左侧的缝、同步设置「进度|收藏」之间的缝、各按钮之间的缝严格重合。
+        （不能直接用 margin 排：三列有 2 道缝、两列只有 1 道，同一 gap 下必然差 gap/2）
+     3. 按钮/输入框样式沿用现有 button_danmu_setting / input_account_field，未新建任何 drawable；
+        区块分隔用 vs_1 细线（color/dialog_panel_stroke），也不用卡片背景。
+     4. 「扫一扫」= 摄像头扫码（QrScanActivity）；「二维码」= 显示二维码（LoginQrDialog），两个入口独立。 -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -15,14 +22,28 @@
         android:paddingRight="@dimen/vs_50"
         android:paddingBottom="@dimen/vs_40">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="@dimen/vs_50"
-            android:gravity="center"
-            android:text="账号"
-            android:textColor="@android:color/white"
-            android:textSize="@dimen/ts_34"
-            android:textStyle="bold" />
+        <!-- ==================== 页标题 ==================== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <View
+                android:layout_width="@dimen/vs_6"
+                android:layout_height="@dimen/vs_40"
+                android:background="#5B9BFF" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_16"
+                android:layout_marginLeft="@dimen/vs_16"
+                android:text="账号与同步"
+                android:textColor="@android:color/white"
+                android:textSize="@dimen/ts_34"
+                android:textStyle="bold" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/tvIdentity"
@@ -30,10 +51,73 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="@dimen/vs_10"
             android:text="游客模式：记录仅保存在本机，不参与同步"
-            android:textColor="@android:color/white"
+            android:textColor="@color/color_CCFFFFFF"
             android:textSize="@dimen/ts_22" />
 
-        <!-- v76：账号卡片（数量不限，横向滚动；末尾固定「+ 添加账号」） -->
+        <!-- ==================== 区块一：账号管理 ==================== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_24"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="账号管理"
+                android:textColor="@android:color/white"
+                android:textSize="@dimen/ts_26"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="管理你的登录账号，支持扫码登录或手动添加。"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_18" />
+
+            <TextView
+                android:id="@+id/btnScanEntry"
+                android:layout_width="wrap_content"
+                android:layout_height="@dimen/vs_48"
+                android:background="@drawable/button_danmu_setting"
+                android:focusable="true"
+                android:gravity="center"
+                android:maxLines="1"
+                android:paddingLeft="@dimen/vs_16"
+                android:paddingRight="@dimen/vs_16"
+                android:paddingStart="@dimen/vs_16"
+                android:paddingEnd="@dimen/vs_16"
+                android:text="扫一扫"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_20" />
+
+            <TextView
+                android:id="@+id/btnAddAccount"
+                android:layout_width="wrap_content"
+                android:layout_height="@dimen/vs_48"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
+                android:background="@drawable/button_danmu_setting"
+                android:focusable="true"
+                android:gravity="center"
+                android:maxLines="1"
+                android:paddingLeft="@dimen/vs_16"
+                android:paddingRight="@dimen/vs_16"
+                android:paddingStart="@dimen/vs_16"
+                android:paddingEnd="@dimen/vs_16"
+                android:text="+ 添加账号"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_20" />
+        </LinearLayout>
+
+        <!-- 账号卡片（数量不限，横向滚动；「游客」+ 已保存的账号） -->
         <HorizontalScrollView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -48,7 +132,7 @@
                 android:orientation="horizontal" />
         </HorizontalScrollView>
 
-        <!-- v77：登录表单默认收起，只有点「+ 添加账号」才展开（日常切换走卡片） -->
+        <!-- 登录表单默认收起，只有点「+ 添加账号」才展开（日常切换走卡片） -->
         <LinearLayout
             android:id="@+id/llLoginForm"
             android:layout_width="match_parent"
@@ -76,17 +160,19 @@
                     android:maxLines="1"
                     android:paddingLeft="@dimen/vs_20"
                     android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
                     android:singleLine="true"
                     android:textColor="@android:color/white"
-                    android:textColorHint="@color/color_CCFFFFFF"
+                    android:textColorHint="@color/color_99FFFFFF"
                     android:textSize="@dimen/ts_22" />
 
                 <EditText
                     android:id="@+id/etPass"
                     android:layout_width="@dimen/vs_0"
                     android:layout_height="@dimen/vs_56"
-                    android:layout_marginLeft="@dimen/vs_16"
-                    android:layout_marginStart="@dimen/vs_16"
+                    android:layout_marginStart="@dimen/vs_10"
+                    android:layout_marginLeft="@dimen/vs_10"
                     android:layout_weight="1"
                     android:background="@drawable/input_account_field"
                     android:gravity="center_vertical"
@@ -97,9 +183,11 @@
                     android:maxLines="1"
                     android:paddingLeft="@dimen/vs_20"
                     android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
                     android:singleLine="true"
                     android:textColor="@android:color/white"
-                    android:textColorHint="@color/color_CCFFFFFF"
+                    android:textColorHint="@color/color_99FFFFFF"
                     android:textSize="@dimen/ts_22" />
             </LinearLayout>
 
@@ -109,15 +197,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="@dimen/vs_8"
                 android:text=""
-                android:textColor="@color/dialog_control_stroke_focused"
-                android:textSize="@dimen/ts_20"
-                android:visibility="gone" />
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_20" />
 
             <LinearLayout
                 android:id="@+id/llPassConfirm"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="@dimen/vs_12"
+                android:layout_marginTop="@dimen/vs_10"
                 android:orientation="horizontal"
                 android:visibility="gone">
 
@@ -134,9 +221,11 @@
                     android:maxLines="1"
                     android:paddingLeft="@dimen/vs_20"
                     android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
                     android:singleLine="true"
                     android:textColor="@android:color/white"
-                    android:textColorHint="@color/color_CCFFFFFF"
+                    android:textColorHint="@color/color_99FFFFFF"
                     android:textSize="@dimen/ts_22" />
             </LinearLayout>
 
@@ -168,7 +257,7 @@
                     android:background="@drawable/button_danmu_setting"
                     android:focusable="true"
                     android:gravity="center"
-                    android:text="扫码登录"
+                    android:text="二维码"
                     android:textColor="@android:color/white"
                     android:textSize="@dimen/ts_22" />
 
@@ -188,261 +277,420 @@
             </LinearLayout>
         </LinearLayout>
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_24"
-            android:text="我的内容"
-            android:textColor="@color/color_CCFFFFFF"
-            android:textSize="@dimen/ts_20" />
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/vs_1"
+            android:layout_marginTop="@dimen/vs_20"
+            android:layout_marginBottom="@dimen/vs_16"
+            android:background="@color/dialog_panel_stroke" />
 
+        <!-- ==================== 区块二：我的内容 ==================== -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_10"
-            android:orientation="horizontal">
-
-            <TextView
-                android:id="@+id/btnHistory"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_64"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="观看历史  ›"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
-
-            <TextView
-                android:id="@+id/btnCollect"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_64"
-                android:layout_marginLeft="@dimen/vs_16"
-                android:layout_marginStart="@dimen/vs_16"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="收藏  ›"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
-        </LinearLayout>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_24"
-            android:text="存储（WebDAV，本机配置一次）"
-            android:textColor="@color/color_CCFFFFFF"
-            android:textSize="@dimen/ts_20" />
-
-        <EditText
-            android:id="@+id/etDavUrl"
-            android:layout_width="match_parent"
-            android:layout_height="@dimen/vs_56"
-            android:layout_marginTop="@dimen/vs_10"
-            android:background="@drawable/input_account_field"
             android:gravity="center_vertical"
-            android:hint="https://dav.jianguoyun.com/dav/"
-            android:imeOptions="actionNext|flagNoExtractUi"
-            android:includeFontPadding="false"
-            android:inputType="textUri"
-            android:maxLines="1"
-            android:paddingLeft="@dimen/vs_20"
-            android:paddingRight="@dimen/vs_20"
-            android:singleLine="true"
-            android:textColor="@android:color/white"
-            android:textColorHint="@color/color_CCFFFFFF"
-            android:textSize="@dimen/ts_22" />
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_12"
             android:orientation="horizontal">
 
-            <EditText
-                android:id="@+id/etDavUser"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="我的内容"
+                android:textColor="@android:color/white"
+                android:textSize="@dimen/ts_26"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
                 android:layout_weight="1"
-                android:background="@drawable/input_account_field"
-                android:gravity="center_vertical"
-                android:hint="网盘账号"
-                android:imeOptions="actionNext|flagNoExtractUi"
-                android:includeFontPadding="false"
-                android:inputType="text"
+                android:ellipsize="end"
                 android:maxLines="1"
-                android:paddingLeft="@dimen/vs_20"
-                android:paddingRight="@dimen/vs_20"
-                android:singleLine="true"
-                android:textColor="@android:color/white"
-                android:textColorHint="@color/color_CCFFFFFF"
-                android:textSize="@dimen/ts_22" />
+                android:text="查看和管理你的历史记录与收藏内容。"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_18" />
+        </LinearLayout>
 
-            <EditText
-                android:id="@+id/etDavPass"
+        <!-- 4 等分栅格：观看历史 2 槽 + 收藏 2 槽 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_14"
+            android:orientation="horizontal">
+
+            <FrameLayout
                 android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
-                android:layout_marginLeft="@dimen/vs_16"
-                android:layout_marginStart="@dimen/vs_16"
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
+
+                <TextView
+                    android:id="@+id/btnHistory"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="观看历史  ›"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
+
+                <TextView
+                    android:id="@+id/btnCollect"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="收藏  ›"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/vs_1"
+            android:layout_marginTop="@dimen/vs_20"
+            android:layout_marginBottom="@dimen/vs_16"
+            android:background="@color/dialog_panel_stroke" />
+
+        <!-- ==================== 区块三：WebDAV 存储 ==================== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="WebDAV 存储"
+                android:textColor="@android:color/white"
+                android:textSize="@dimen/ts_26"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
                 android:layout_weight="1"
-                android:background="@drawable/input_account_field"
-                android:gravity="center_vertical"
-                android:hint="应用密码"
-                android:imeOptions="actionDone|flagNoExtractUi"
-                android:includeFontPadding="false"
-                android:inputType="textPassword"
+                android:ellipsize="end"
                 android:maxLines="1"
-                android:paddingLeft="@dimen/vs_20"
-                android:paddingRight="@dimen/vs_20"
-                android:singleLine="true"
-                android:textColor="@android:color/white"
-                android:textColorHint="@color/color_CCFFFFFF"
-                android:textSize="@dimen/ts_22" />
+                android:text="配置 WebDAV 服务器地址，用于访问远程存储。"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_18" />
         </LinearLayout>
 
+        <!-- 4 等分栅格：地址 2 槽 + 用户名 1 槽 + 密码 1 槽 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_14"
+            android:orientation="horizontal">
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
+
+                <EditText
+                    android:id="@+id/etDavUrl"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/input_account_field"
+                    android:gravity="center_vertical"
+                    android:hint="https://dav.jianguoyun.com/dav/"
+                    android:imeOptions="actionNext|flagNoExtractUi"
+                    android:includeFontPadding="false"
+                    android:inputType="textUri"
+                    android:maxLines="1"
+                    android:paddingLeft="@dimen/vs_20"
+                    android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
+                    android:singleLine="true"
+                    android:textColor="@android:color/white"
+                    android:textColorHint="@color/color_99FFFFFF"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <EditText
+                    android:id="@+id/etDavUser"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/input_account_field"
+                    android:gravity="center_vertical"
+                    android:hint="网盘账号"
+                    android:imeOptions="actionNext|flagNoExtractUi"
+                    android:includeFontPadding="false"
+                    android:inputType="text"
+                    android:maxLines="1"
+                    android:paddingLeft="@dimen/vs_20"
+                    android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
+                    android:singleLine="true"
+                    android:textColor="@android:color/white"
+                    android:textColorHint="@color/color_99FFFFFF"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <EditText
+                    android:id="@+id/etDavPass"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:background="@drawable/input_account_field"
+                    android:gravity="center_vertical"
+                    android:hint="应用密码"
+                    android:imeOptions="actionDone|flagNoExtractUi"
+                    android:includeFontPadding="false"
+                    android:inputType="textPassword"
+                    android:maxLines="1"
+                    android:paddingLeft="@dimen/vs_20"
+                    android:paddingRight="@dimen/vs_20"
+                    android:paddingStart="@dimen/vs_20"
+                    android:paddingEnd="@dimen/vs_20"
+                    android:singleLine="true"
+                    android:textColor="@android:color/white"
+                    android:textColorHint="@color/color_99FFFFFF"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+        </LinearLayout>
+
+        <!-- 4 等分栅格：测试连接 2 槽 + 保存配置 2 槽（缝与上一行严格重合） -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="@dimen/vs_12"
             android:orientation="horizontal">
 
-            <TextView
-                android:id="@+id/btnTestDav"
+            <FrameLayout
                 android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="测试连接"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
 
-            <TextView
-                android:id="@+id/btnSaveDav"
+                <TextView
+                    android:id="@+id/btnTestDav"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="测试连接"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+
+            <FrameLayout
                 android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
-                android:layout_marginLeft="@dimen/vs_16"
-                android:layout_marginStart="@dimen/vs_16"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="保存存储配置"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
+
+                <TextView
+                    android:id="@+id/btnSaveDav"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="保存配置"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
         </LinearLayout>
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_24"
-            android:text="同步"
-            android:textColor="@color/color_CCFFFFFF"
-            android:textSize="@dimen/ts_20" />
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/vs_1"
+            android:layout_marginTop="@dimen/vs_20"
+            android:layout_marginBottom="@dimen/vs_16"
+            android:background="@color/dialog_panel_stroke" />
 
+        <!-- ==================== 区块四：同步设置 ==================== -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_10"
+            android:gravity="center_vertical"
             android:orientation="horizontal">
 
             <TextView
-                android:id="@+id/tvScopeHistory"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_48"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="历史 开"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="同步设置"
                 android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_20" />
+                android:textSize="@dimen/ts_26"
+                android:textStyle="bold" />
 
             <TextView
-                android:id="@+id/tvScopeProgress"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_48"
-                android:layout_marginLeft="@dimen/vs_10"
-                android:layout_marginStart="@dimen/vs_10"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
                 android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="进度 开"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_20" />
-
-            <TextView
-                android:id="@+id/tvScopeCollect"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_48"
-                android:layout_marginLeft="@dimen/vs_10"
-                android:layout_marginStart="@dimen/vs_10"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="收藏 开"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_20" />
-
-            <TextView
-                android:id="@+id/tvScopeSettings"
-                android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_48"
-                android:layout_marginLeft="@dimen/vs_10"
-                android:layout_marginStart="@dimen/vs_10"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="设置 开"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_20" />
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="设置同步方式与时间，确保数据及时更新。"
+                android:textColor="@color/color_CCFFFFFF"
+                android:textSize="@dimen/ts_18" />
         </LinearLayout>
 
+        <!-- 4 等分栅格：历史/进度/收藏/设置 各 1 槽 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_14"
+            android:orientation="horizontal">
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <TextView
+                    android:id="@+id/tvScopeHistory"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_48"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="历史 开"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_20" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <TextView
+                    android:id="@+id/tvScopeProgress"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_48"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="进度 开"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_20" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <TextView
+                    android:id="@+id/tvScopeCollect"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_48"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="收藏 开"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_20" />
+            </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="wrap_content"
+                android:layout_weight="1">
+
+                <TextView
+                    android:id="@+id/tvScopeSettings"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_48"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="设置 开"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_20" />
+            </FrameLayout>
+        </LinearLayout>
+
+        <!-- 4 等分栅格：立即同步 2 槽 + 仅 Wi-Fi 2 槽 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="@dimen/vs_12"
             android:orientation="horizontal">
 
-            <TextView
-                android:id="@+id/btnSyncNow"
+            <FrameLayout
                 android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="立即同步"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
 
-            <TextView
-                android:id="@+id/tvWifiOnly"
+                <TextView
+                    android:id="@+id/btnSyncNow"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:layout_marginEnd="@dimen/vs_10"
+                    android:layout_marginRight="@dimen/vs_10"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="立即同步"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
+
+            <FrameLayout
                 android:layout_width="@dimen/vs_0"
-                android:layout_height="@dimen/vs_56"
-                android:layout_marginLeft="@dimen/vs_16"
-                android:layout_marginStart="@dimen/vs_16"
-                android:layout_weight="1"
-                android:background="@drawable/button_danmu_setting"
-                android:focusable="true"
-                android:gravity="center"
-                android:text="仅 Wi-Fi 关"
-                android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_22" />
+                android:layout_height="wrap_content"
+                android:layout_weight="2">
+
+                <TextView
+                    android:id="@+id/tvWifiOnly"
+                    android:layout_width="match_parent"
+                    android:layout_height="@dimen/vs_56"
+                    android:background="@drawable/button_danmu_setting"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:text="仅 Wi-Fi 关"
+                    android:textColor="@android:color/white"
+                    android:textSize="@dimen/ts_22" />
+            </FrameLayout>
         </LinearLayout>
 
         <TextView
             android:id="@+id/tvSyncStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="@dimen/vs_12"
+            android:layout_marginTop="@dimen/vs_14"
             android:text=""
             android:textColor="@color/color_CCFFFFFF"
             android:textSize="@dimen/ts_20" />

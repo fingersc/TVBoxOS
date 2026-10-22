@@ -95,6 +95,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvScopeCollect = findViewById(R.id.tvScopeCollect);
         tvScopeSettings = findViewById(R.id.tvScopeSettings);
         tvWifiOnly = findViewById(R.id.tvWifiOnly);
+        // v99-r6：二维码入口移到区块右上角 —— 「扫一扫」= 摄像头扫码，「+ 添加账号」= 展开表单
+        findViewById(R.id.btnScanEntry).setOnClickListener(this);
+        findViewById(R.id.btnAddAccount).setOnClickListener(this);
         findViewById(R.id.btnLogin).setOnClickListener(this);
         findViewById(R.id.btnQrLogin).setOnClickListener(this);
         findViewById(R.id.btnCancelAdd).setOnClickListener(this);
@@ -166,7 +169,18 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         } else if (id == R.id.btnLogin) {
             doLogin();
         } else if (id == R.id.btnQrLogin) {
+            // 「二维码」：只负责显示二维码（手机扫本机）
             new LoginQrDialog(this).show();
+        } else if (id == R.id.btnScanEntry) {
+            // 「扫一扫」：用本机摄像头扫手机上的二维码。与「二维码」完全独立，不再互相跳转。
+            // 盒子/电视通常没有摄像头 —— 先探一下，否则进去就是黑屏。
+            if (hasCamera()) {
+                jumpActivity(QrScanActivity.class);
+            } else {
+                toast("本机没有摄像头，请用手机上的 App 登录后扫码同步");
+            }
+        } else if (id == R.id.btnAddAccount) {
+            showAddForm();
         } else if (id == R.id.btnCancelAdd) {
             hideAddForm();
         } else if (id == R.id.btnTestDav) {
@@ -374,6 +388,15 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
 
     // ---------------------------------------------------------------- v76 账号卡片
 
+    /** v99-r6：本机是否有摄像头（盒子/电视一般没有，摄像头扫码入口要先探一下）。 */
+    private boolean hasCamera() {
+        try {
+            return android.hardware.Camera.getNumberOfCameras() > 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void buildAccountCards() {
         if (llAccounts == null) {
             return;
@@ -383,32 +406,58 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         for (AccountStore.Item it : AccountStore.list()) {
             addAccountCard(it.name, it.owner, false);
         }
-        addAccountCard("添加账号", null, false);
-        addAccountCard("扫码登录", SCAN_ENTRY, false);
+        // v99-r6：「+ 添加账号」「扫码登录」两个 chip 已移到区块右上角（btnAddAccount / btnScanEntry），
+        //          卡片列表这里只保留「游客」与已保存的账号
     }
 
+    /**
+     * 账号卡片：两行（名称 + 状态）。
+     *
+     * <p>v99-r6：原来是一行文字 chip，改为两行是为了显示「当前账号 / 未登录 / 仅本机」，
+     * 视觉分级仍沿用原来的两个 drawable（实心高亮的 shape_account_chip_current、细线描边的
+     * button_danmu_setting），没有新增资源。</p>
+     */
     private void addAccountCard(final String text, final String owner, final boolean guest) {
-        TextView card = new TextView(this);
         boolean isCurrent = guest ? AccountContext.isGuest()
                 : (owner != null && owner.equals(AccountContext.ownerKey()));
         boolean isAdd = owner == null;
         boolean isScan = SCAN_ENTRY.equals(owner);
-        // v79：加号只加一次（原来文案自带 "+" 又加前缀 ⇒ 出现两个加号）
-        card.setText(isCurrent ? "✓ " + text : (isAdd ? "+  " + text : text));
-        card.setTextColor((isAdd || isScan) ? 0xFF8FA0B8 : 0xFFFFFFFF);
-        card.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_22));
-        card.setGravity(android.view.Gravity.CENTER);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
         card.setFocusable(true);
-        // v77：当前账号实心高亮、普通账号描边、添加账号虚线，三类视觉分级
+        card.setGravity(android.view.Gravity.CENTER_VERTICAL);
         card.setBackgroundResource(isCurrent ? R.drawable.shape_account_chip_current
                 : ((isAdd || isScan) ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
-        int h = (int) getResources().getDimension(R.dimen.vs_64);
+
+        TextView name = new TextView(this);
+        name.setText(isCurrent ? "✓ " + text : (isAdd ? "+  " + text : text));
+        name.setTextColor((isAdd || isScan) ? 0xFF8FA0B8 : 0xFFFFFFFF);
+        name.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_22));
+        name.setSingleLine(true);
+        card.addView(name);
+
+        // 当前账号优先显示「当前账号」，其次是游客的「仅本机」
+        String stateText = isCurrent ? "当前账号" : (guest ? "仅本机" : "未登录");
+        TextView state = new TextView(this);
+        state.setText(stateText);
+        state.setTextColor(isCurrent ? 0xFF3FBF7F : 0xFF7D8EA6);
+        state.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.ts_18));
+        state.setSingleLine(true);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = (int) getResources().getDimension(R.dimen.vs_6);
+        card.addView(state, slp);
+
+        int h = (int) getResources().getDimension(R.dimen.vs_76);
         int padH = (int) getResources().getDimension(R.dimen.vs_20);
+        int padV = (int) getResources().getDimension(R.dimen.vs_12);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, h);
         lp.setMargins(0, 0, (int) getResources().getDimension(R.dimen.vs_12), 0);
         card.setLayoutParams(lp);
-        card.setPadding(padH, 0, padH, 0);
+        card.setPadding(padH, padV, padH, padV);
+        card.setMinimumWidth((int) getResources().getDimension(R.dimen.vs_180));
         card.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {

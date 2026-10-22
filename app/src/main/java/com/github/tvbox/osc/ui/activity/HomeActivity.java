@@ -303,7 +303,7 @@ public class HomeActivity extends BaseActivity {
                     File cspCacheDir = new File(FileUtils.getFilePath() + "/csp/" + MD5.string2MD5(jarSource) + ".jar");
                     File jarCacheDir = new File(FileUtils.getCachePath() + "/jar/" + MD5.string2MD5(jarSource) + ".jar");
                     File jarFullCacheDir = new File(FileUtils.getCachePath() + "/jar/" + MD5.string2MD5(jarUrl) + ".jar");
-                    Toast.makeText(mContext, "缓存已清除", Toast.LENGTH_LONG).show();
+                    Toast.makeText(mContext, "已清除本站点jar缓存，正在重新加载", Toast.LENGTH_LONG).show();
                     new Thread(() -> {
                         try {
                             FileUtils.deleteFile(cspCacheDir);

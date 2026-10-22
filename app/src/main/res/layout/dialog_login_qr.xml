@@ -37,17 +37,4 @@
         android:text="用手机上的本 App（需已登录）扫码&#10;自动把账号同步到本机"
         android:textColor="@color/dialog_text_primary"
         android:textSize="@dimen/ts_20" />
-
-    <TextView
-        android:id="@+id/btnScanOnPhone"
-        android:layout_width="match_parent"
-        android:layout_height="@dimen/vs_56"
-        android:layout_marginTop="@dimen/vs_16"
-        android:background="@drawable/button_danmu_setting"
-        android:focusable="true"
-        android:gravity="center"
-        android:maxLines="1"
-        android:text="我是手机，扫其它设备的码"
-        android:textColor="@color/dialog_text_primary"
-        android:textSize="@dimen/ts_22" />
 </LinearLayout>
