@@ -399,9 +399,14 @@ public final class HistorySyncManager {
             long last = lastSyncAt();
             // r18：切后台的补传走更短的最小间隔（见 MIN_GAP_BACKGROUND_MS）。
             long gap = background ? MIN_GAP_BACKGROUND_MS : MIN_GAP_MS;
-            if (System.currentTimeMillis() - last < gap) {
+            long elapsed = System.currentTimeMillis() - last;
+            if (elapsed < gap) {
                 syncing = false;
-                SyncScheduler.skipped(owner, background ? "min-gap-bg" : "min-gap");
+                // ★ v99-r39：按「真实剩余时间」重排，而不是套用 retry-dirty 的固定 60 秒档。
+                //   距上次同步只差几秒时却被推到 60 秒后，退出播放那一刻的进度就传不上去了。
+                //   留 300ms 余量：避免算出来 0 导致同一毫秒内反复重试。
+                long wait = Math.max(gap - elapsed, 300L);
+                SyncScheduler.skipped(owner, background ? "min-gap-bg" : "min-gap", wait);
                 return;
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {

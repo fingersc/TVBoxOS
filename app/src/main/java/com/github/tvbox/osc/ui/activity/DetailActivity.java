@@ -4888,8 +4888,14 @@ public class DetailActivity extends BaseActivity {
             //   模糊打分相同 ⇒ 取了先出现的衍生条目。预热直播是预热栏目，不是正片。
             //
             //   取不到正片就返回 -1（保持原集不动）：切错集用户毫无察觉，保持不动他立刻能发现。
+            // ★ v99-r39：当前集【本身也是衍生栏目】时不做这个纠正。
+            //   实测（披荆斩棘2026 hhzy↔jisu）：当前在播「聚乐部第2期」「宿舍日记第2期」
+            //   —— 两者本身就是衍生栏目，上面却把落点「第2期一公挑战赛（上）」判成衍生
+            //   再纠正过去，等于把「衍生 → 正片」当成修复，实际是切错了内容。
+            //   用户本来就在看衍生内容时，保持落到目标的衍生产物才是正确的。
             if (resolved >= 0 && resolved < targetList.size()
-                    && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)) {
+                    && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)
+                    && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
                 int mainIdx = EpisodeNameMatcher.findMainCounterpart(currentSeries.name, tgtNames);
                 if (mainIdx >= 0 && mainIdx < targetList.size()) {
                     resolved = mainIdx;

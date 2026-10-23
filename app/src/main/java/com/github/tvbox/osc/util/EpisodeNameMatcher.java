@@ -43,6 +43,17 @@ public final class EpisodeNameMatcher {
             Pattern.compile("(?<!\\d)(20\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)");
 
     /**
+     * ★ v99-r39：日期被「第…期」包裹的写法（{@code 第20260809期}）。
+     *
+     * <p>部分采集源（实测 zy360）整库都是这种写法，而另一些源（dytt）写裸日期
+     * {@code 20260809}。两侧日期完全相同、同处日期域，但名字字符串差异很大，
+     * {@code findIndex} 的模糊打分认不出来。本 Pattern 用于把这种包裹剥掉，
+     * 让两侧都能归一到「日期 + 内容残差」再做比较。</p>
+     */
+    private static final Pattern WRAPPED_DATE =
+            Pattern.compile("第\\s*(20\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])\\s*期?");
+
+    /**
      * ★ r36：{@code 20260815第1期上} —— 日期与 {@code 第N期} 同时出现。
      *
      * <p><b>这两个不是两个维度，是同一件事的两种写法</b>：日期是首播日，
@@ -3715,6 +3726,16 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         //   旧源 第20260405期（无后缀） vs 新源 20260405下 → score 得 0 → findIndex 返回 -1
         // 但两侧当天都只有一条，语义上就是同一集。
         if (sourceGroup.size() == 1 && targetGroup.size() == 1) {
+            // ★ v99-r39：1v1 也必须校验【正片/衍生属性】。
+            //   {@code sameDayGroup} 会排除衍生条目，于是在"当天正片各只有一条"时，
+            //   一条<b>衍生</b>的当前集会被硬配到目标当天唯一的那条<b>正片</b>上。
+            //   实测（dytt→zy360）：「20260816舞台纯享版」（衍生）被配到「第20260816期下」
+            //   （正片），而正确答案是「第20260816期舞台纯享」。
+            //   属性不符就放弃，交给后面的「同日期 + 内容残差」层精确匹配。
+            String only = targetNames.get(targetGroup.get(0));
+            if (isNonMainEntry(currentName) != isNonMainEntry(only)) {
+                return -1;
+            }
             return targetGroup.get(0);
         }
 
@@ -3723,8 +3744,11 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         // 依据："无后缀 ≡ 上" 这一归一在"该源当天只有一条"时仍然成立：
         // 一天只出一条，说明该源没有把这一天拆开，那一条即当天的首段（上）。
         if (sourceGroup.size() == 1) {
+            // ★ v99-r39：同上，衍生条目不能落到正片的"上"段上
+            boolean curNonMain = isNonMainEntry(currentName);
             for (int i : targetGroup) {
-                if (extractPart(targetNames.get(i)) == PART_UP) {
+                if (extractPart(targetNames.get(i)) == PART_UP
+                        && isNonMainEntry(targetNames.get(i)) == curNonMain) {
                     return i;
                 }
             }
@@ -4085,7 +4109,20 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (byPart >= 0) {
             return byPart;
         }
-        // 2) 名字可可靠区分时，用名字匹配
+        // 2) ★ v99-r39：同日期 + 内容残差匹配。
+        //   解决「裸日期式 ↔ 包裹日期式」——两侧同处日期域、日期完全相同，却因名字形态
+        //   不同（{@code 20260817备战篇} ↔ {@code 第20260817期备战篇}）被下面的 findIndex
+        //   判掉。真实样本（5 源 × 65 档综艺）里这一形态占全部「该切没切」的 80%。
+        //
+        //   排在 findIndex【之前】的原因：它是"同日期 + 分段一致 + 正片/衍生属性一致 +
+        //   残差唯一命中"的确定性证据，比 findIndex 的模糊打分更硬。实测放在 findIndex
+        //   之后会被模糊匹配抢先命中错误项（{@code 20260816舞台纯享版} 被模糊到
+        //   {@code 第20260816期下}，而确定性答案是 {@code 第20260816期舞台纯享}）。
+        int byResidue = alignByDateResidue(currentName, targetNames);
+        if (byResidue >= 0) {
+            return byResidue;
+        }
+        // 3) 名字可可靠区分时，用名字匹配
         //   ★ v99-r35：这里【不】做衍生纠正 —— 实测在 locate 层加纠正会让
         //   集对齐矩阵从 727 掉到 707（误伤 20 项）。纠正统一放在调用方
         //   DetailActivity / PlayFragment 的 findMatchingEpisodeIndex 末尾，
@@ -4094,8 +4131,97 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (exact >= 0) {
             return exact;
         }
-        // 3) 跨域（日期 ↔ 期数）兜底
+        // 4) 跨域（日期 ↔ 期数）兜底
         return alignByOrder(sourceIndex, sourceNames, targetNames);
+    }
+
+    /**
+     * ★ v99-r39：同日期 + 内容残差匹配。
+     *
+     * <p><b>要解决的问题</b>：{@code 20260817备战篇}（裸日期）与
+     * {@code 第20260817期备战篇}（包裹日期）指向同一集，日期都是 20260817、
+     * 内容词都是「备战篇」，但字符串形态差太多，{@link #findIndex} 的模糊打分
+     * 给不出分，{@link #alignByGroupPosition} 又因为「目标同日组全是无后缀」
+     * 被 {@code bareCount >= 2} 的防护挡掉 —— 于是只能退化到按位置硬猜，整体偏移。</p>
+     *
+     * <p><b>做法</b>：两侧各剥掉「日期 / 第…期包裹 / 第N期 / 尾部分段 / 标点空白」，
+     * 剩下<b>内容残差</b>；在同一日期的候选组内比较残差，<b>唯一命中</b>才采纳。</p>
+     *
+     * <p><b>三道安全门</b>（任一条不满足就不切，宁可不切也不猜）：</p>
+     * <ul>
+     *   <li>分段必须一致（{@code 上/中/下}）—— 同日常有多条，分段是唯一硬判据；</li>
+     *   <li>正片/衍生属性必须一致 —— 防止正片切到「观演区 / 预热直播」那类衍生上；</li>
+     *   <li><b>候选必须唯一</b> —— 出现 2 个以上同等候选就放弃（切错用户毫无察觉）。</li>
+     * </ul>
+     *
+     * @param currentName 当前在播集名（旧源）
+     * @param targetNames 新源完整集名列表
+     * @return 新源下标；不具备条件或候选不唯一返回 -1
+     */
+    public static int alignByDateResidue(String currentName, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        int curDate = dateOf(currentName);
+        if (curDate <= 0) {
+            return -1;                              // 当前集没有日期 ⇒ 无从按日期对齐
+        }
+        int curPart = extractPart(currentName);
+        String curRes = dateResidue(currentName);
+        boolean curNonMain = isNonMainEntry(currentName);
+
+        int exact = -1, exactCount = 0;             // 残差完全一致
+        int sub = -1, subCount = 0;                 // 残差互为子串（一方是另一方的标题变体）
+        for (int i = 0; i < targetNames.size(); i++) {
+            String n = targetNames.get(i);
+            if (TextUtils.isEmpty(n)) {
+                continue;
+            }
+            if (dateOf(n) != curDate) {
+                continue;                           // 不在同一天 ⇒ 不是候选
+            }
+            if (extractPart(n) != curPart) {
+                continue;                           // 分段不同 ⇒ 不是同一集
+            }
+            if (isNonMainEntry(n) != curNonMain) {
+                continue;                           // 正片/衍生属性不同 ⇒ 不是同一类内容
+            }
+            String res = dateResidue(n);
+            if (res.equals(curRes)) {
+                exact = i;
+                exactCount++;
+            } else if (res.length() >= 2 && curRes.length() >= 2
+                    && (res.contains(curRes) || curRes.contains(res))) {
+                sub = i;
+                subCount++;
+            }
+        }
+        // 只在唯一命中时采纳
+        if (exactCount == 1) {
+            return exact;
+        }
+        if (subCount == 1) {
+            return sub;
+        }
+        return -1;
+    }
+
+    /**
+     * 剥掉「日期 / 第…期包裹 / 第N期 / 尾部分段 / 标点空白」后剩下的<b>内容残差</b>。
+     *
+     * <p>{@code 第20260817期备战篇} 与 {@code 20260817备战篇} 都归一为 {@code 备战篇}；
+     * {@code 第20260911期上} 与 {@code 20260911上} 都归一为空串（只剩分段）。</p>
+     */
+    private static String dateResidue(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return "";
+        }
+        String s = WRAPPED_DATE.matcher(name).replaceAll(" ");
+        s = DATE_COMPACT.matcher(s).replaceAll(" ");
+        s = ORDINAL_ARABIC.matcher(s).replaceAll(" ");
+        s = s.replaceAll("[上中下]\\s*$", " ");      // 只剥尾部的分段标记
+        s = s.replaceAll("[\\s\\p{Punct}：（）()\\[\\]【】《》·、，。！？!?,.~“”\"'’‘:]+", "");
+        return s;
     }
 
     /**

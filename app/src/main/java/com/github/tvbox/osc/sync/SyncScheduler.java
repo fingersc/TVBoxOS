@@ -176,11 +176,34 @@ public final class SyncScheduler {
      * <p>只在<b>前台</b>重试：后台不打扰（脏标记已落盘，回前台时 onForeground 会按脏优先排队）。</p>
      */
     public static void skipped(String owner, String reason) {
-        LOG.i("[sync] skip owner=" + owner + " reason=" + reason);
+        skipped(owner, reason, NO_CAP);
+    }
+
+    /**
+     * ★ v99-r39：同上，但指定「最早可以再试的时间」{@code retryCapMs}。
+     *
+     * <p><b>要解决的问题</b>：被<b>最小间隔</b>挡掉时，原实现一律按 {@code PRI_DIRTY}
+     * 的固定档（60 秒）重排。实测（logcat 2026-10-24 01:58）距上次同步只过了 7.1 秒、
+     * 最小间隔是 10 秒 —— 实际只需再等 2.9 秒，却被推到 60 秒后：</p>
+     *
+     * <pre>
+     *   01:58:21.649 [Sync] done (auto)
+     *   01:58:28.839 [sync] skip reason=min-gap-bg                  ← 只差 2.9s
+     *   01:58:28.839 [sync] schedule reason=retry-dirty in 60000ms   ← 却排到 60s
+     * </pre>
+     *
+     * <p>退出播放那一刻的进度因此要等 60 秒才上传，与「进度只记退出那一刻」的取舍冲突
+     * （这次是靠用户 4 秒后手动双击退出才传上去的）。</p>
+     *
+     * @param retryCapMs 距下次可再试的真实剩余毫秒；{@link #NO_CAP} 表示按原档位重排
+     */
+    public static void skipped(String owner, String reason, long retryCapMs) {
+        LOG.i("[sync] skip owner=" + owner + " reason=" + reason
+                + (retryCapMs >= 0 ? " retryIn=" + retryCapMs + "ms" : ""));
         if (isForeground() && owner != null && !owner.isEmpty()) {
             try {
                 if (SyncState.load(owner).anyDirty()) {
-                    schedule(owner, "retry-dirty", PRI_DIRTY, NO_CAP, null);
+                    schedule(owner, "retry-dirty", PRI_DIRTY, retryCapMs, null);
                     return;
                 }
             } catch (Throwable t) {
