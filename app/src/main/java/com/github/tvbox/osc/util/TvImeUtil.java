@@ -41,8 +41,16 @@ public final class TvImeUtil {
      */
     private static final Map<EditText, Boolean> MANUAL_SHOWN = new WeakHashMap<>();
 
-    /** 焦点到达后等待多久再兜底收起（给"输入法监听焦点主动弹出"留出弹窗时间）。 */
-    private static final long SUPPRESS_DELAY_MS = 120L;
+    /**
+     * 焦点到达后检查收起的时刻表（毫秒）。
+     *
+     * <p>★ v99-r24：原来只有一个 120ms。用户反馈"太慢、希望 1ms 就收"。
+     * 但<b>单次 1ms 基本无效</b> —— 那一刻输入法还没来得及弹出来，`hideSoftInput` 无处可收，
+     * 之后 IME 才显示，于是照样看到弹窗。所以改成「多次检查」：1ms 抢最快的设备，
+     * 40ms / 120ms 兜底那些慢一点的输入法。每一次都会先看 {@link #MANUAL_SHOWN}，
+     * 用户已按 OK 就全部跳过。</p>
+     */
+    private static final long[] SUPPRESS_DELAYS_MS = {1L, 30L, 60L};
 
     /** 焦点到达不自动弹输入法；按 OK 键 / 回车才唤出。 */
     public static void clickToIme(final EditText... ets) {
@@ -99,14 +107,16 @@ public final class TvImeUtil {
                         return;
                     }
                     MANUAL_SHOWN.put(et, Boolean.FALSE);
-                    et.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (!Boolean.TRUE.equals(MANUAL_SHOWN.get(et))) {
-                                hideIme(et);
+                    for (final long delay : SUPPRESS_DELAYS_MS) {
+                        et.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (!Boolean.TRUE.equals(MANUAL_SHOWN.get(et))) {
+                                    hideIme(et);
+                                }
                             }
-                        }
-                    }, SUPPRESS_DELAY_MS);
+                        }, delay);
+                    }
                 }
             });
         }

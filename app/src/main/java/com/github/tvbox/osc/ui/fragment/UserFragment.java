@@ -110,7 +110,10 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
             tvHotList.setPadding(paddingLeft, paddingTop, paddingRight, paddingBottom);
         }
         if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 2) {
-            List<VodInfo> allVodRecord = RoomDataManger.getAllVodRecord(20);
+            // ★ v99-r26：上限交给「历史记录条数」档位决定（15/30/50），不再写死 20 ——
+            //   否则把档位调到 30/50 时首页永远只显示 20 部，档位等于白设。
+            //   getAllVodRecord 内部会做 min(limit, hisNum)，传 MAX_VALUE 即"按档位"。
+            List<VodInfo> allVodRecord = RoomDataManger.getAllVodRecord(Integer.MAX_VALUE);
             List<Movie.Video> vodList = new ArrayList<>();
             for (VodInfo vodInfo : allVodRecord) {
                 Movie.Video vod = new Movie.Video();

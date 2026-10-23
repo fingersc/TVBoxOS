@@ -20,6 +20,7 @@ import com.google.gson.reflect.TypeToken;
 import com.orhanobut.hawk.Hawk;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -65,7 +66,7 @@ public class RoomDataManger {
 
     public static void insertVodRecord(String sourceKey, VodInfo vodInfo) {
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-        if (Hawk.get(HawkConfig.HISTORY_MERGE, false) && vodInfo != null) {
+        if (Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE) && vodInfo != null) {
             // 合并同名历史开启：本次保存后同名称的旧源记录会被删除。
             // 若本次保存的位置信息缺失（如跨源映射失败导致集数名未取到），先从同名称的其他源记录接续集数记忆，
             // 避免旧源记忆在合并删除时被清空。
@@ -113,16 +114,99 @@ public class RoomDataManger {
                 return;
             }
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            boolean changed = false;
+            // ★ v99-r25：「条数上限」指的是【合并去重之后】的条数。
+            //   合并开启时先把同名记录收敛为「只保留最新源」，再按 keep 裁剪；
+            //   否则"15 条"里可能有多条是同一部片的不同源，实际影片数远少于 15。
+            if (Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE)) {
+                changed = dedupeSameName(dao) > 0;
+            }
             List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
-            if (all == null || all.size() <= keep) {
-                return;
+            if (all != null && all.size() > keep) {
+                for (int i = keep; i < all.size(); i++) {
+                    dao.delete(all.get(i));
+                }
+                // 被裁掉的影片，其播放进度随即成为孤儿，必须一并清理
+                PlayProgressManager.deleteOrphaned();
+                changed = true;
             }
-            for (int i = keep; i < all.size(); i++) {
-                dao.delete(all.get(i));
+            if (changed) {
+                HistorySyncManager.markDirty(SyncScope.HISTORY);
             }
-            HistorySyncManager.markDirty(SyncScope.HISTORY);
         } catch (Throwable ignored) {
         }
+    }
+
+    /**
+     * ★ v99-r25：把库里的同名历史收敛为「只保留最新源」。
+     *
+     * <p>原来只有 {@link #insertVodRecord} 时才会删同名旧源，历史里早已存在的重复
+     * （合并开关从关到开、或多设备同步带进来的）没人清理 —— 于是「上限按去重后条数」
+     * 这件事根本不成立。这里按片名分组，每组保留 {@code updateTime} 最大的一条，
+     * 其余删除前先把播放进度迁到保留的那条（跨源集名匹配，避免丢进度）。</p>
+     *
+     * @return 实际删除的记录数
+     */
+    private static int dedupeSameName(VodRecordDao dao) {
+        List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+        if (all == null || all.size() < 2) {
+            return 0;
+        }
+        Map<String, VodRecord> winner = new LinkedHashMap<>();
+        Map<String, VodInfo> winnerInfo = new LinkedHashMap<>();
+        List<VodRecord> losers = new ArrayList<>();
+        for (VodRecord r : all) {
+            VodInfo info = parseRecordInfo(r);
+            String name = getVodRecordName(info);
+            if (TextUtils.isEmpty(name)) {
+                continue;   // 名字取不到的记录不参与去重（宁可留着也不误删）
+            }
+            VodRecord cur = winner.get(name);
+            if (cur == null) {
+                winner.put(name, r);
+                winnerInfo.put(name, info);
+            } else if (r.updateTime > cur.updateTime) {
+                losers.add(cur);
+                winner.put(name, r);
+                winnerInfo.put(name, info);
+            } else {
+                losers.add(r);
+            }
+        }
+        int n = 0;
+        for (VodRecord r : losers) {
+            try {
+                VodInfo info = parseRecordInfo(r);
+                String name = getVodRecordName(info);
+                VodRecord keep = winner.get(name);
+                if (keep != null && !TextUtils.equals(keep.sourceKey, r.sourceKey)) {
+                    // 删旧源前先把该片全部集的进度搬到新源，否则会丢掉"看到第几集/位置"
+                    PlayProgressManager.migrateByVod(r.sourceKey, r.vodId,
+                            keep.sourceKey, keep.vodId, collectAllEpisodeNames(winnerInfo.get(name)));
+                }
+                dao.delete(r);
+                n++;
+            } catch (Throwable ignored) {
+            }
+        }
+        return n;
+    }
+
+    /** 安全解析历史行的 dataJson；失败返回 null（调用方按"无名"处理）。 */
+    private static VodInfo parseRecordInfo(VodRecord record) {
+        try {
+            if (record != null && !TextUtils.isEmpty(record.dataJson)) {
+                VodInfo info = getVodInfoGson().fromJson(record.dataJson,
+                        new TypeToken<VodInfo>() {
+                        }.getType());
+                if (info != null && info.name != null) {
+                    info.sourceKey = record.sourceKey;
+                    return info;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     public static VodInfo getVodInfo(String sourceKey, String vodId) {
@@ -238,7 +322,7 @@ public class RoomDataManger {
         Integer hisNum = HistoryHelper.getHisNum(index);
         List<VodRecord> recordList = dao.getAll(Integer.MAX_VALUE);
         List<VodInfo> vodInfoList = new ArrayList<>();
-        boolean historyMerge = Hawk.get(HawkConfig.HISTORY_MERGE, false);
+        boolean historyMerge = Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE);
         Set<String> historyNames = historyMerge ? new HashSet<String>() : null;
         if (recordList != null) {
             for (VodRecord record : recordList) {
@@ -263,9 +347,9 @@ public class RoomDataManger {
                 }
             }
         }
+        // 写入路径（insertVodRecord → pruneHistory）已经做过同名去重，库里不应再有重复；
+        // 这里只按条数兜一刀（读路径不做全量 JSON 解析，避免首页刷新时白白耗时）。
         if (dao.getCount() > hisNum) {
-            // reserver 会删掉超出条数的旧历史；被删影片的播放进度随即成为孤儿，
-            // 必须一并清理，否则"历史里已经没有这部片了，进度却一直留着"。
             if (dao.reserver(hisNum) > 0) {
                 PlayProgressManager.deleteOrphaned();
             }

@@ -159,7 +159,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         tvDns.setText(OkGoHelper.dnsHttpsList.get(Hawk.get(HawkConfig.DOH_URL, 0)));
         tvHomeRec.setText(getHomeRecName(Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC)));
         tvHistoryNum.setText(HistoryHelper.getHistoryNumName(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
-        tvHistoryMerge.setText(Hawk.get(HawkConfig.HISTORY_MERGE, false) ? "开启" : "关闭");
+        tvHistoryMerge.setText(Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE) ? "开启" : "关闭");
         tvSearchView.setText(getSearchView(Hawk.get(HawkConfig.SEARCH_VIEW, 0)));
         tvHomeApi.setText(ApiConfig.get().getHomeSourceBean().getName());
         tvScale.setText(PlayerHelper.getScaleName(Hawk.get(HawkConfig.PLAY_SCALE, 0)));
@@ -781,7 +781,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                boolean historyMerge = !Hawk.get(HawkConfig.HISTORY_MERGE, false);
+                boolean historyMerge = !Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE);
                 Hawk.put(HawkConfig.HISTORY_MERGE, historyMerge);
                 tvHistoryMerge.setText(historyMerge ? "开启" : "关闭");
             }

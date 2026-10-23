@@ -88,6 +88,8 @@
 
                 <TextView
                     android:id="@+id/btnScanEntry"
+                    android:nextFocusUp="@id/btnScanEntry"
+                    android:nextFocusLeft="@id/btnScanEntry"
                     android:layout_width="wrap_content"
                     android:layout_height="@dimen/vs_48"
                     android:background="@drawable/button_danmu_setting"
@@ -104,6 +106,8 @@
 
                 <TextView
                     android:id="@+id/btnAddAccount"
+                    android:nextFocusUp="@id/btnAddAccount"
+                    android:nextFocusRight="@id/btnAddAccount"
                     android:layout_width="wrap_content"
                     android:layout_height="@dimen/vs_48"
                     android:layout_marginStart="@dimen/vs_12"
@@ -332,6 +336,7 @@
 
                     <TextView
                         android:id="@+id/btnHistory"
+                        android:nextFocusLeft="@id/btnHistory"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:layout_marginEnd="@dimen/vs_10"
@@ -351,6 +356,7 @@
 
                     <TextView
                         android:id="@+id/btnCollect"
+                        android:nextFocusRight="@id/btnCollect"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:background="@drawable/button_danmu_setting"
@@ -413,6 +419,7 @@
 
                     <EditText
                         android:id="@+id/etDavUrl"
+                        android:nextFocusLeft="@id/etDavUrl"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:layout_marginEnd="@dimen/vs_10"
@@ -469,6 +476,7 @@
 
                     <EditText
                         android:id="@+id/etDavPass"
+                        android:nextFocusRight="@id/etDavPass"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:background="@drawable/input_account_field"
@@ -503,6 +511,7 @@
 
                     <TextView
                         android:id="@+id/btnTestDav"
+                        android:nextFocusLeft="@id/btnTestDav"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:layout_marginEnd="@dimen/vs_10"
@@ -522,6 +531,7 @@
 
                     <TextView
                         android:id="@+id/btnSaveDav"
+                        android:nextFocusRight="@id/btnSaveDav"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:background="@drawable/button_danmu_setting"
@@ -584,6 +594,7 @@
 
                     <TextView
                         android:id="@+id/tvScopeHistory"
+                        android:nextFocusLeft="@id/tvScopeHistory"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_48"
                         android:layout_marginEnd="@dimen/vs_10"
@@ -641,6 +652,7 @@
 
                     <TextView
                         android:id="@+id/tvScopeSettings"
+                        android:nextFocusRight="@id/tvScopeSettings"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_48"
                         android:background="@drawable/button_danmu_setting"
@@ -666,6 +678,8 @@
 
                     <TextView
                         android:id="@+id/btnSyncNow"
+                        android:nextFocusDown="@id/btnSyncNow"
+                        android:nextFocusLeft="@id/btnSyncNow"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:layout_marginEnd="@dimen/vs_10"
@@ -685,6 +699,8 @@
 
                     <TextView
                         android:id="@+id/tvWifiOnly"
+                        android:nextFocusDown="@id/tvWifiOnly"
+                        android:nextFocusRight="@id/tvWifiOnly"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
                         android:background="@drawable/button_danmu_setting"

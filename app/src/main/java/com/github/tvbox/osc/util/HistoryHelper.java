@@ -4,7 +4,9 @@ import com.orhanobut.hawk.Hawk;
 import java.util.ArrayList;
 
 public class HistoryHelper {
-    private static final Integer[] hisNumArray = {20,30,50};
+    // ★ v99-r25：档位 20→15。条数上限对应的是「合并去重之后」的记录数
+    //   （合并开启时同名只保留最新源，所以 15 条 = 15 部影片）。
+    private static final Integer[] hisNumArray = {15,30,50};
     private static final String API_LINE_SPLIT = "\t";
 
     public static String getHistoryNumName(int index){

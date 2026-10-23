@@ -406,6 +406,17 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         }
         // v99-r6：「+ 添加账号」「扫码登录」两个 chip 已移到区块右上角（btnAddAccount / btnScanEntry），
         //          卡片列表这里只保留「游客」与已保存的账号
+        // ★ v99-r25：卡片行内焦点边界。
+        //   r24 做的是「行尾环回行首」，用户要求改成「端点就地不动」：
+        //   第一张按左、最后一张按右，焦点都停在自己身上（不回环、也不跨到 WebDAV 区）。
+        int n = llAccounts.getChildCount();
+        if (n >= 1) {
+            for (int i = 0; i < n; i++) {
+                View v = llAccounts.getChildAt(i);
+                v.setNextFocusLeftId(i == 0 ? v.getId() : llAccounts.getChildAt(i - 1).getId());
+                v.setNextFocusRightId(i == n - 1 ? v.getId() : llAccounts.getChildAt(i + 1).getId());
+            }
+        }
     }
 
     /**
@@ -424,6 +435,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setFocusable(true);
+        // ★ v99-r24：必须有 id，nextFocus 才能指向它（动态创建默认 NO_ID）
+        card.setId(View.generateViewId());
         card.setGravity(android.view.Gravity.CENTER_VERTICAL);
         card.setBackgroundResource(isCurrent ? R.drawable.shape_account_chip_current
                 : ((isAdd || isScan) ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
