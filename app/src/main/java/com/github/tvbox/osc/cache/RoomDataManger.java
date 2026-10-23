@@ -143,10 +143,13 @@ public class RoomDataManger {
     }
 
     /**
-     * ★ v99-r27：删除「永远显示不出来」的历史记录（dataJson 解析失败 / 没有片名）。
+     * ★ v99-r27 / r30 修正：删除「永远显示不出来」的历史记录。
      *
-     * <p>这些记录 {@code getAllVodRecord} 会直接跳过（不显示），但裁剪是按总条数算的
-     * ⇒ 它们白白占着档位名额。用户看到的现象就是"档位 15，实际只能看到 13 部"。</p>
+     * <p>★ 判定条件必须与 {@link #getAllVodRecord(int)} 的显示条件**完全一致**：
+     * 那边只跳过 {@code info == null}（反序列化失败），片名为空的记录仍然会被显示
+     * （{@code TextUtils.isEmpty(name)} 是短路放行）。r27 的初版在这里多加了
+     * 「片名为空也删」，比显示条件更严 ⇒ <b>会把本来能显示的记录误删</b>，
+     * 表现为"看了新片数量也不涨"。现已收窄为只看能否反序列化。</p>
      *
      * @return 删除条数
      */
@@ -157,8 +160,7 @@ public class RoomDataManger {
         }
         int n = 0;
         for (VodRecord r : all) {
-            VodInfo info = parseRecordInfo(r);
-            if (info == null || TextUtils.isEmpty(getVodRecordName(info))) {
+            if (!isParseable(r)) {
                 try {
                     dao.delete(r);
                     n++;
@@ -167,6 +169,35 @@ public class RoomDataManger {
             }
         }
         return n;
+    }
+
+    /**
+     * ★ v99-r30：库内历史记录的实际条数（含暂时无法显示的）。
+     *
+     * <p>用途：设置页把它显示在「历史记录条数」旁边。用户报"档位 15 但只能看到 14"时，
+     * 一眼就能区分是<b>库里真的少</b>还是<b>显示层过滤掉了</b>，不必再靠猜。</p>
+     */
+    public static int countVodRecord() {
+        try {
+            return AppDataManager.get().getVodRecordDao().getCount();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 能否反序列化出 VodInfo（与 getAllVodRecord 的过滤条件一致：只看 info 是否为 null）。 */
+    private static boolean isParseable(VodRecord record) {
+        if (record == null || TextUtils.isEmpty(record.dataJson)) {
+            return false;
+        }
+        try {
+            VodInfo info = getVodInfoGson().fromJson(record.dataJson,
+                    new TypeToken<VodInfo>() {
+                    }.getType());
+            return info != null;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**

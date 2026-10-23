@@ -158,7 +158,10 @@ public class ModelSettingFragment extends BaseLazyFragment {
 
         tvDns.setText(OkGoHelper.dnsHttpsList.get(Hawk.get(HawkConfig.DOH_URL, 0)));
         tvHomeRec.setText(getHomeRecName(Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC)));
-        tvHistoryNum.setText(HistoryHelper.getHistoryNumName(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
+        // ★ v99-r30：把「库内实际条数」一并显示 —— 排障时能立刻区分"库里少"还是"显示少"
+        int dbCount = RoomDataManger.countVodRecord();
+        tvHistoryNum.setText(HistoryHelper.getHistoryNumName(Hawk.get(HawkConfig.HISTORY_NUM, 0))
+                + (dbCount >= 0 ? "（库内 " + dbCount + " 条）" : ""));
         tvHistoryMerge.setText(Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE) ? "开启" : "关闭");
         tvSearchView.setText(getSearchView(Hawk.get(HawkConfig.SEARCH_VIEW, 0)));
         tvHomeApi.setText(ApiConfig.get().getHomeSourceBean().getName());

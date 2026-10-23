@@ -37,7 +37,13 @@ public final class SyncSettings {
             HawkConfig.HOME_REC, HawkConfig.HOME_REC_STYLE, HawkConfig.SHOW_PREVIEW,
             HawkConfig.DEFAULT_LOAD_LIVE, HawkConfig.SEARCH_VIEW, HawkConfig.FAST_SEARCH_MODE,
             // 历史
-            HawkConfig.HISTORY_NUM, HawkConfig.HISTORY_MERGE,
+            // ★ v99-r29：HISTORY_NUM / HISTORY_MERGE 已移出同步列表 —— 它们是【本机显示偏好】，
+            //   不是跨设备数据：
+            //     · 档位：盒子屏幕大可以设 50，手机设 15，本来就该各设备独立；
+            //     · 合并同名：属于本机视图习惯。
+            //   放进同步的后果是"改了又被云端覆盖回旧值"——用户实测"关掉合并后行为没变"，
+            //   正是开关被另一台设备/历史云端值盖回去了。
+            //   （类型表 BOOL_KEYS / INT_KEYS 里保留它们只是为了读写转换，不影响同步范围。）
             // 播放偏好
             HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.PLAY_TIME_STEP,
             HawkConfig.SCREEN_DISPLAY, HawkConfig.IJK_CACHE_PLAY,
