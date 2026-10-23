@@ -5269,10 +5269,32 @@ public class DetailActivity extends BaseActivity {
      * @param targetFlag   目标线路名
      * @param landedIndex  本次切源后本地匹配落地的下标；用于回调时确认用户未再操作
      */
+    /**
+     * 最近一次「在线校正」实际改写的落点，格式 {@code playFlag|playIndex}。
+     *
+     * <p>★ v99-r40：自激循环熔断。链路是
+     * {@code applyOnlineResolvedIndex → setTvPlayUrl → syncPlayingVodInfo → tryOnlineCrossDomainResolve → applyOnlineResolvedIndex}。
+     * 校正落地后播放对象就是目标集，{@code syncPlayingVodInfo} 回传的 {@code landedIndex}
+     * 会等于刚写进去的 {@code playIndex}，于是守卫（flag 相同 && playIndex==landedIndex）
+     * 恒成立，解析结果也恒等于该下标 ⇒ 每轮都"再校正到同一集"并再次重驱播放，
+     * 实测 58 秒内重放了 2608 次（约 45 次/秒），播放永远起不来。</p>
+     *
+     * <p>只有<b>成功改写过</b>才记账，因此不会挡掉正常解析：</p>
+     * <ul>
+     *   <li>解析未命中 → 不 apply → 不记账，下次照常解析；</li>
+     *   <li>用户手动换集/换线路 → {@code landedIndex} 变化 → key 不同 → 照常解析。</li>
+     * </ul>
+     */
+    private String lastOnlineAppliedKey = null;
+
     private void tryOnlineCrossDomainResolve(final String currentName, final String targetFlag,
                                              final List<VodInfo.VodSeries> targetList, final int landedIndex) {
         if (TextUtils.isEmpty(currentName)) return;
         if (targetList == null || targetList.size() < 2) return;
+        // ★ v99-r40：这个落点已经是在线校正的结果了，再查一次只会得到同一个答案。
+        if (lastOnlineAppliedKey != null && lastOnlineAppliedKey.equals(targetFlag + "|" + landedIndex)) {
+            return;
+        }
         if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return;
         final List<String> targetNames = seriesNames(targetList);
         // 严格门控：只有真正跨域（日期↔期数）才联网；同域（含前导零、多字少字）一律本地解决。
@@ -5319,6 +5341,10 @@ public class DetailActivity extends BaseActivity {
         if (vodInfo == null || targetList == null || index < 0 || index >= targetList.size()) return;
         if (!TextUtils.equals(vodInfo.playFlag, targetFlag)) return;
         if (vodInfo.playIndex != landedIndex) return;
+        // ★ v99-r40：解析结果就是当前所在集 ⇒ 无需改写、更无需重驱播放。
+        //   这一条直接切断自激循环（详见 lastOnlineAppliedKey 的注释）：
+        //   循环态的正是 index == landedIndex == playIndex。
+        if (index == vodInfo.playIndex) return;
 
         // ★ 迟到的结果**不再丢弃** —— 只要用户还停在本次落点上（上面两条校验），
         //   就应用并重驱。
@@ -5338,6 +5364,8 @@ public class DetailActivity extends BaseActivity {
         final boolean wasPlaying = isPreviewPlaying();
 
         vodInfo.playIndex = index;
+        // ★ v99-r40：记账，供 tryOnlineCrossDomainResolve 熔断同一落点的重复解析。
+        lastOnlineAppliedKey = targetFlag + "|" + index;
         for (int i = 0; i < targetList.size(); i++) {
             VodInfo.VodSeries s = targetList.get(i);
             if (s != null) s.selected = (i == index);

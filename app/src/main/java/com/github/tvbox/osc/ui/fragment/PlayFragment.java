@@ -2788,11 +2788,22 @@ public class PlayFragment extends BaseLazyFragment {
      * @param targetFlag  目标线路名
      * @param landedIndex 本次切源后本地匹配落地的下标；用于回调时确认用户未再操作
      */
+    /**
+     * 最近一次「在线校正」实际改写的落点，格式 {@code playFlag|playIndex}。
+     *
+     * <p>★ v99-r40：自激循环熔断。与 DetailActivity 侧同源同语义。</p>
+     */
+    private String lastOnlineAppliedKey = null;
+
     private void tryOnlineCrossDomainResolve(final String currentName, final String targetFlag,
                                              final List<VodInfo.VodSeries> targetList, final int landedIndex) {
         if (TextUtils.isEmpty(currentName)) return;
         if (targetList == null || targetList.size() < 2) return;
         if (!EpisodeOnlineResolver.OnlineResolveConfig.isEnabled()) return;
+        // ★ v99-r40：这个落点已经是在线校正的结果，再查只会得到同一个答案。
+        if (lastOnlineAppliedKey != null && lastOnlineAppliedKey.equals(targetFlag + "|" + landedIndex)) {
+            return;
+        }
         final List<String> targetNames = seriesNames(targetList);
         if (!EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) return;
         final String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
@@ -2835,6 +2846,8 @@ public class PlayFragment extends BaseLazyFragment {
                 if (mVodInfo == null || targetList == null || index < 0 || index >= targetList.size()) return;
                 if (!TextUtils.equals(mVodInfo.playFlag, targetFlag)) return;
                 if (mVodInfo.playIndex != landedIndex) return;
+                // ★ v99-r40：解析结果就是当前所在集 ⇒ 无需改写、更无需重驱播放。
+                if (index == mVodInfo.playIndex) return;
                 // 安全网：迟到过久（网络重试等异常）才放弃，避免用户看了很久被突然拽走。
                 // 与 DetailActivity.applyOnlineResolvedIndex 同源（取值见 EpisodeOnlineResolver）。
                 if (scheduledAtMs > 0
@@ -2845,6 +2858,8 @@ public class PlayFragment extends BaseLazyFragment {
                 }
                 final boolean wasStarted = isPlaybackStarted();
                 mVodInfo.playIndex = index;
+                // ★ v99-r40：记账，供 tryOnlineCrossDomainResolve 熔断同一落点的重复解析。
+                lastOnlineAppliedKey = targetFlag + "|" + index;
                 LOG.sw("[FB] onlineBackfill applied -> " + targetFlag + "/" + index
                         + " name=" + targetList.get(index).name + " wasStarted=" + wasStarted);
                 // 已在播时会有一次可见的跳集，配一句提示让它可被理解
