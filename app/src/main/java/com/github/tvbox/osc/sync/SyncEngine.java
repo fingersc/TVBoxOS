@@ -142,7 +142,9 @@ public final class SyncEngine {
                     : dav.getIfNoneMatch(path, st.getEtag(sc), notModified, etagOut);
 
             if (notModified[0]) {
-                st.setEtag(sc, etagOut[0]);
+                if (etagOut[0] != null && etagOut[0].length() > 0) {
+                    st.setEtag(sc, etagOut[0]);
+                }
                 continue;   // 该 scope 零下载 / 零解密 / 零写库
             }
             allNotModified = false;
@@ -205,7 +207,9 @@ public final class SyncEngine {
             boolean same = remoteBytes != null && remoteBytes.length > 0
                     && HistorySyncManager.contentEquals(merged, remote);
             if (same && !forceUpload) {
-                st.setEtag(sc, etagOut[0]);
+                if (etagOut[0] != null && etagOut[0].length() > 0) {
+                    st.setEtag(sc, etagOut[0]);
+                }
                 continue;
             }
 
@@ -239,7 +243,10 @@ public final class SyncEngine {
                 o.requests++;
                 newEtag = dav.put(path, out, etag2[0]);
             }
-            st.setEtag(sc, newEtag);
+            String et = recoverEtag(dav, path, newEtag, o);
+            if (et != null) {
+                st.setEtag(sc, et);   // ★ r21：null 时保留旧值，绝不清空
+            }
             o.bytesUp += out.length;
             anyUploaded = true;
             LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length);
@@ -301,7 +308,10 @@ public final class SyncEngine {
                     HistorySyncManager.GSON.toJson(part).getBytes("UTF-8"));
             o.requests++;
             String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
-            st.setEtag(sc, newEtag);
+            String etM = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
+            if (etM != null) {
+                st.setEtag(sc, etM);
+            }
         }
         st.splitMigrated = true;
         if (all.epoch > st.lastEpoch) {
@@ -312,8 +322,49 @@ public final class SyncEngine {
                 + " epoch=" + all.epoch);
     }
 
-    /** 解密 + 反序列化；空数据返回空包（不是 null，后续合并要能直接用）。 */
-    private static SyncPayload decode(byte[] key, byte[] raw, String owner) throws Exception {
+    /**
+     * ★ v99-r21：PUT / GET 之后确保 ETag 不丢。
+     *
+     * <p><b>为什么要补这一手</b>：坚果云等 WebDAV 服务端的 <b>PUT 响应头不带 ETag</b>
+     * ⇒ {@code newEtag == null} ⇒ 旧代码直接 {@code st.setEtag(sc, null)} 把本地 ETag
+     * 清空 ⇒ 之后的条件请求不再带 {@code If-None-Match} ⇒ 每次都 200 <b>全量下载</b>。</p>
+     *
+     * <p>全量下载本身要流量，更麻烦的是它每次都进入「合并后与云端比对」分支：只要本地
+     * 进度有一丁点漂移（周期落盘刷新了 updateTime/position）就判定 same=false 并上传，
+     * 而上传又把 ETag 清空一次 ⇒ 形成 {@code 每 5 分钟传一次 progress.bin} 的自锁循环
+     * （上传使 active=true ⇒ 自适应档位被重置回 5 分钟档，永远升不上去）。
+     * 实测证据：最近 5 份日志里 {@code skip=304} 全部为 0，只有 {@code skip=same down=NNNN}。</p>
+     *
+     * <p>这里在响应没给 ETag 时补一次 PROPFIND（无 body，1 个请求）把真实 ETag 取回来；
+     * 仍然取不到就返回 null，由调用方<b>保留旧值</b>，绝不用 null 覆盖。</p>
+     */
+    private static String recoverEtag(WebDavClient dav, String path, String etag, Outcome o) {
+        if (etag != null && etag.length() > 0) {
+            return etag;
+        }
+        try {
+            o.requests++;
+            String again = dav.getEtag(path);
+            if (again != null && again.length() > 0) {
+                LOG.i("[Sync] etag recovered via PROPFIND " + shortName(path));
+                return again;
+            }
+        } catch (Throwable t) {
+            LOG.i("[Sync] etag recover failed " + t.getClass().getSimpleName());
+        }
+        LOG.i("[Sync] etag missing " + shortName(path) + " (keep old)");
+        return null;
+    }
+
+    private static String shortName(String path) {
+        if (path == null) {
+            return "null";
+        }
+        int i = path.lastIndexOf('/');
+        return i >= 0 && i + 1 < path.length() ? path.substring(i + 1) : path;
+    }
+
+    /** 解密 + 反序列化；空数据返回空包（不是 null，后续合并要能直接用）。 */    private static SyncPayload decode(byte[] key, byte[] raw, String owner) throws Exception {
         SyncPayload p;
         if (raw == null || raw.length == 0) {
             p = new SyncPayload();
@@ -393,7 +444,10 @@ public final class SyncEngine {
                 byte[] out = Crypto.encrypt(key,
                         HistorySyncManager.GSON.toJson(empty.forScope(sc)).getBytes("UTF-8"));
                 String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
-                st.setEtag(sc, newEtag);
+                String etC = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
+                if (etC != null) {
+                    st.setEtag(sc, etC);
+                }
             }
 
             // 清本机：否则下次同步会把本机数据又合并上传，等于没清

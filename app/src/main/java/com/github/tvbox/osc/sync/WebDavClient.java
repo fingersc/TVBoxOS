@@ -147,6 +147,55 @@ public final class WebDavClient {
         }
     }
 
+    /**
+     * ★ v99-r21：单独取文件的 ETag（PROPFIND Depth 0，只读响应头/XML，不下载内容）。
+     *
+     * <p><b>为什么需要</b>：坚果云等 WebDAV 服务端的 <b>PUT 响应不带 ETag</b>，
+     * 于是 {@code put()} 返回 null ⇒ 本地 ETag 被清空 ⇒ 之后所有条件请求都退化成
+     * 200 全量下载（实测日志里 {@code skip=304} 从此再没出现过，全是
+     * {@code skip=same down=NNNN}）。全量下载本身就要流量，更麻烦的是每次都会进入
+     * 「合并后与云端比对」分支：只要本地进度有一点点漂移就判定 same=false 并上传，
+     * 而上传又清空 ETag ⇒ 形成「每 5 分钟传一次 progress.bin」的自锁循环。</p>
+     *
+     * <p>PUT 后拿不到 ETag 时调用本方法补一次（1 个 PROPFIND 请求，无 body）。</p>
+     *
+     * @return ETag；服务端未提供返回 null
+     */
+    public String getEtag(String path) throws IOException {
+        Request req = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .header("Depth", "0")
+                .method("PROPFIND", RequestBody.create(null, new byte[0]))
+                .build();
+        try (Response resp = exec(req)) {
+            checkAuth(resp);
+            if (!resp.isSuccessful()) {
+                return null;
+            }
+            String h = resp.header("ETag");
+            if (h != null && h.length() > 0) {
+                return h;
+            }
+            // 响应头没有 ⇒ 从 207 多状态体的 XML 里取 <...:getetag>"xxx"</...:getetag>
+            //   命名空间前缀各家不同（D:/d:/lp1: 等），用宽松正则匹配任意前缀
+            String body = resp.body() == null ? "" : resp.body().string();
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("<[^>]*:?getetag>\\s*([^<]+?)\\s*</[^>]*:?getetag>",
+                            java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(body);
+            if (m.find()) {
+                String v = m.group(1).trim();
+                // 去掉 XML 实体与可能的引号包裹
+                v = v.replace("&quot;", "\"").replace("&apos;", "'");
+                return v;
+            }
+            return null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** 读取文件；不存在返回 null。etagOut[0] 会带回 ETag（若有）。 */
     public byte[] get(String path, String[] etagOut) throws IOException {
         Request req = new Request.Builder()

@@ -84,10 +84,23 @@ public class RoomDataManger {
         record.sourceKey = sourceKey;
         record.vodId = vodInfo.id;
         record.updateTime = System.currentTimeMillis();
-        record.dataJson = getVodInfoGson().toJson(vodInfo);
+        String newJson = getVodInfoGson().toJson(vodInfo);
+        // ★ v99-r21：内容实质没变就不标脏。
+        //
+        //   场景（盒子端实测反馈）：从首页第一条历史继续看同一部片的同一集，退出后
+        //   history.bin 也被上传了一次 —— 用户认为"只该传进度"。根因是这里每次都无条件
+        //   markDirty(HISTORY)，哪怕 dataJson 与库里完全一致（只是 updateTime 刷新了）。
+        //
+        //   updateTime 仍照常刷新（首页"最近观看"的排序依据），但内容一致时不上传：
+        //   HISTORY 不脏 ⇒ 同步时走 304 条件请求 ⇒ 云端 etag 未变 ⇒ 完全跳过。
+        //   真发生了变化（换集 / 换线路 / 片名或海报更新）时 dataJson 必然不同 ⇒ 照常标脏上传。
+        boolean contentChanged = !newJson.equals(record.dataJson);
+        record.dataJson = newJson;
         dao.insert(record);
         // v98 P2：只脏「历史」——写一条观看记录不该把收藏/设置也拖下水
-        HistorySyncManager.markDirty(SyncScope.HISTORY);
+        if (contentChanged) {
+            HistorySyncManager.markDirty(SyncScope.HISTORY);
+        }
         // v77：本机只保留当前档位的条数，超出的直接删（不写墓碑，避免传到别的设备误删）
         pruneHistory();
     }
