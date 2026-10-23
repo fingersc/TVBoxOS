@@ -321,9 +321,33 @@ public class ImgUtil {
         }
         putHeader(headers, "Cookie", cookie);
         if (!TextUtils.isEmpty(ua)) putHeader(headers, "User-Agent", ua);
+        // ★ v99-r31：Referer 兜底。
+        //   原来只有 URL 显式带 @Referer= 才加 Referer，而绝大多数采集站的图床都校验防盗链：
+        //   没有 Referer 直接 403 ⇒ Glide 走 error ⇒ 聚合搜索里出现"只有中间一个字"的卡片。
+        //   兜底策略：用图片自身域名作为 Referer（等价于"同站引用"，绝大多数图床放行）。
+        //   显式 @Referer= 仍然优先（源自己声明的更准）。
+        if (TextUtils.isEmpty(referer)) {
+            referer = hostReferer(url);
+        }
         if (!TextUtils.isEmpty(referer)) putHeader(headers, "Referer", referer);
         for (Map.Entry<String, String> entry : headers.entrySet()) builder.setHeader(entry.getKey(), entry.getValue());
         return new GlideUrl(url, builder.build());
+    }
+
+    /** 取 scheme://host/ 作为兜底 Referer；解析不出来返回 null。 */
+    private static String hostReferer(String url) {
+        if (TextUtils.isEmpty(url)) return null;
+        try {
+            android.net.Uri u = android.net.Uri.parse(url);
+            String scheme = u.getScheme();
+            String host = u.getHost();
+            if (!TextUtils.isEmpty(scheme) && !TextUtils.isEmpty(host)
+                    && (scheme.startsWith("http"))) {
+                return scheme + "://" + host + "/";
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     public static Object getImageModel(String url) {

@@ -26,8 +26,26 @@ public class FastSearchAdapter extends BaseQuickAdapter<Movie.Video, BaseViewHol
     protected void convert(BaseViewHolder helper, Movie.Video item) {
         helper.setText(R.id.tvName, item.name);
         helper.setText(R.id.tvSite, ApiConfig.get().getSource(item.sourceKey).getName());
-        helper.setVisible(R.id.tvNote, item.note != null && !item.note.isEmpty());
-        if (item.note != null && !item.note.isEmpty()) helper.setText(R.id.tvNote, item.note);
+        // ★ v99-r32：备注为空时用「类型 · 年份」补位。
+        //   聚合搜索里同一个源可能返回多个同名影片，而卡片上只显示 片名/源名/备注/封面 四项 ——
+        //   同源同名时片名与源名都相同，只剩备注和封面可区分。备注常为空（源没给），
+        //   这时补上类型与年份，用户就能凭它区分，不必只依赖封面。
+        String note = item.note;
+        if (TextUtils.isEmpty(note)) {
+            StringBuilder sb = new StringBuilder();
+            if (!TextUtils.isEmpty(item.type)) {
+                sb.append(item.type.trim());
+            }
+            if (item.year > 0) {
+                if (sb.length() > 0) {
+                    sb.append(" · ");
+                }
+                sb.append(item.year);
+            }
+            note = sb.toString();
+        }
+        helper.setVisible(R.id.tvNote, !TextUtils.isEmpty(note));
+        helper.setText(R.id.tvNote, TextUtils.isEmpty(note) ? "" : note);
         ImageView ivThumb = helper.getView(R.id.ivThumb);
         if (!TextUtils.isEmpty(item.pic)) {
             ImgUtil.load(item.pic, ivThumb, AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 214), AutoSizeUtils.mm2px(mContext, 280), item.name);
