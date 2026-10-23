@@ -2482,9 +2482,15 @@ public class PlayFragment extends BaseLazyFragment {
             //   期号同为 1、模糊分相同 ⇒ 取到衍生）。取不到正片就 -1，保持原集不动。
             // ★ v99-r39：当前集【本身也是衍生栏目】时不做纠正（与 DetailActivity 同一机制，
             //   两个入口必须一致）。否则「聚乐部第2期」这类衍生内容会被硬纠正到正片上。
+            // ★ v99-r42：落点是「同日期确定性命中」时不做纠正（与 DetailActivity 同一机制，
+            //   两个入口必须一致）。"只给日期不写内容"的源（{@code 第20260831期}）落到
+            //   写了内容的源（{@code 第20260831期加更版}）时，落点会被判成衍生且找不到
+            //   同期号正片 ⇒ 直接 -1，上层退回按原下标就近落地 = 切错集。
             if (resolved >= 0 && resolved < targetList.size()
                     && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)
-                    && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+                    && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)
+                    && !EpisodeNameMatcher.isDateCertainLanding(
+                            currentSeries.name, targetList.get(resolved).name, tgtNames)) {
                 int mainIdx = EpisodeNameMatcher.findMainCounterpart(currentSeries.name, tgtNames);
                 if (mainIdx >= 0 && mainIdx < targetList.size()) {
                     resolved = mainIdx;

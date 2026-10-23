@@ -4893,9 +4893,16 @@ public class DetailActivity extends BaseActivity {
             //   —— 两者本身就是衍生栏目，上面却把落点「第2期一公挑战赛（上）」判成衍生
             //   再纠正过去，等于把「衍生 → 正片」当成修复，实际是切错了内容。
             //   用户本来就在看衍生内容时，保持落到目标的衍生产物才是正确的。
+            // ★ v99-r42：落点是「同日期确定性命中」时不做这条纠正。
+            //   真实源里「只给日期不写内容」的列表（{@code 第20260831期}）对上写了内容的
+            //   列表（{@code 第20260831期加更版}）时，落点会被判成衍生、而同期号正片根本
+            //   不存在 ⇒ 按原逻辑直接 -1，上层再退回按原下标就近落地 = 切错集。
+            //   同日期且目标源那天只有这一条，是"那天就只发了这一集"的确定性证据。
             if (resolved >= 0 && resolved < targetList.size()
                     && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)
-                    && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+                    && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)
+                    && !EpisodeNameMatcher.isDateCertainLanding(
+                            currentSeries.name, targetList.get(resolved).name, tgtNames)) {
                 int mainIdx = EpisodeNameMatcher.findMainCounterpart(currentSeries.name, tgtNames);
                 if (mainIdx >= 0 && mainIdx < targetList.size()) {
                     resolved = mainIdx;

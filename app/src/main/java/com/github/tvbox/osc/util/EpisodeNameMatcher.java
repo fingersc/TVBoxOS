@@ -72,6 +72,22 @@ public final class EpisodeNameMatcher {
     private static final Pattern ORD_THEN_DATE =
             Pattern.compile("第\\s*(\\d{1,3})\\s*[期集话]\\D{0,8}(?:19|20)\\d{6}");
 
+    /**
+     * ★ v99-r41：与 {@link #DATE_THEN_ORD} 同形，但额外捕获「日期与期号之间的中段」。
+     *
+     * <p>用途：区分 {@code 20260906第2期上}（中段为空 ⇒ 正片）与
+     * {@code 20260902大放送第1期} / {@code 20260829企划第2期}（中段是中文内容词 ⇒ 衍生栏目）。</p>
+     *
+     * <p>不改动 {@link #DATE_THEN_ORD} 本身：它的 group(1) 被 {@link #parse} 当作期号使用，
+     * 插入捕获组会让所有取 group(1) 的地方错位。</p>
+     */
+    private static final Pattern DATE_THEN_ORD_MID =
+            Pattern.compile("(?:19|20)\\d{6}(\\D{0,8}?)第\\s*(\\d{1,3})\\s*[期集话]");
+
+    /** ★ v99-r41：{@link #ORD_THEN_DATE} 的中段版（期号在前、日期在后）。 */
+    private static final Pattern ORD_THEN_DATE_MID =
+            Pattern.compile("第\\s*(\\d{1,3})\\s*[期集话](\\D{0,8}?)(?:19|20)\\d{6}");
+
     /** 日期：带分隔符 2026-08-09 / 2026.08.09 / 2026_08_09。 */
     private static final Pattern DATE_SEPARATED =
             Pattern.compile("(?<!\\d)(20\\d{2})[-._/](0?[1-9]|1[0-2])[-._/](0?[1-9]|[12]\\d|3[01])(?!\\d)");
@@ -196,6 +212,18 @@ public final class EpisodeNameMatcher {
     /** 是否含中日韩汉字（用于识别"期号前压着内容词"的衍生条目）。 */
     private static final Pattern HAS_CJK = Pattern.compile("[\\u4e00-\\u9fa5]");
 
+    /**
+     * 季号（{@code 第7季} / {@code 第三季} / 剥过"第…期"后剩下的 {@code 7季}）。
+     *
+     * <p>★ v99-r42：真实源里存在「季号 + 包裹日期」的写法（{@code 第7季第20251015期上}），
+     * 季号与"是不是当期正片"毫无关系，却会在 {@link #stripMainResidue} /
+     * {@link #dateResidue} 里剩成 {@code 7季} ⇒ 整条被误判成"衍生条目"，
+     * 于是从同日分组里被排除，正片落点被推到相邻分段上（实测《令人心动的offer第七季》
+     * {@code 20251015上} 落到 {@code 第20251015期中}）。</p>
+     */
+    private static final Pattern SEASON_TAG =
+            Pattern.compile("第?\\s*[0-9一二三四五六七八九十]{1,4}\\s*季");
+
     /** 结构化正片判定用：剥离日期/分段/标点后应无残余字符，否则说明名字里带了内容词（衍生条目）。 */
     private static final Pattern MAIN_RESIDUE_JUNK = Pattern.compile(
             "[第期集话\\s:：、,，.·\\-—_（）()\\[\\]【】“”\"'’]+");
@@ -286,12 +314,19 @@ public final class EpisodeNameMatcher {
         String w = QUALITY_JUNK.matcher(name.toLowerCase(Locale.ROOT)).replaceAll("").trim();
         // ★ 优先取"紧跟第N期"的分段标记，其次才看字符串末尾。
         //   顺序不能反：`第10期上：某副标题` 的末尾是副标题，PART_TAIL 抓不到。
+        //
+        //   ★★ v99-r41 修正：原写法对同一个 Matcher 连调两次 find() ——
+        //   Matcher.find() 是"从上次匹配结束处继续找下一个"，第二次调用几乎必然返回 false，
+        //   于是【所有】命中 PART_AFTER_ORD 的名字（第2期上 / 第20260906期上 / 第10期下：副标题）
+        //   都被判成 PART_NONE。后果：同一天的「上/下」两段完全无法区分，
+        //   切源时静默切到"上"（真机日志：20260906第2期上 → 360zy 应落第20260906期上(15)，
+        //   却因上/下候选不唯一而返回 -1，再由上层兜底落到索引 0 = 8月21日闺女面对面）。
         Matcher m = PART_AFTER_ORD.matcher(w);
         if (!m.find()) {
             m = PART_TAIL.matcher(w);
-        }
-        if (!m.find()) {
-            return PART_NONE;
+            if (!m.find()) {
+                return PART_NONE;
+            }
         }
         return partValueOf(m.group(1));
     }
@@ -1045,6 +1080,7 @@ public final class EpisodeNameMatcher {
         work = ORDINAL_CHINESE.matcher(work).replaceFirst("");
         work = PART_TAIL.matcher(work).replaceAll("");
         work = MAIN_RESIDUE_JUNK.matcher(work).replaceAll("");
+        work = SEASON_TAG.matcher(work).replaceAll("");   // ★ r42：季号不算内容词
         return work.trim();
     }
 
@@ -1087,6 +1123,29 @@ public final class EpisodeNameMatcher {
             return false;
         }
         String work = BRACKET_CONTENT.matcher(name).replaceAll("").trim();
+        // ★ v99-r41：「日期 + 期号」复合名（{@code 20260906第2期上} / {@code 第2期20260906上}）。
+        //   这类名字 parse 已归到 ORDINAL 域（r36 设计：日期与"第N期"同义，取期号以统一域）。
+        //   但下面用 ORDINAL_ARABIC 找期号时，期号紧跟在 8 位日期之后，其左邻是数字
+        //   ⇒ {@code (?<!\d)} 守卫把匹配挡掉 ⇒ start 保持 -1 ⇒ 跌进"纯序号兜底"，
+        //   被 EIGHT_DIGITS 命中而 return false（判成【衍生】）。
+        //   而语义完全相同的「包裹日期」写法（{@code 第20260906期上}）走 DATE 域被判成【正片】——
+        //   同一集的两种写法被分成两类，跨域对齐的"正片/衍生属性一致"门禁会把正确候选过滤掉，
+        //   locate 只能返回 -1（真机日志：20260906第2期上 → 第20260906期上 应落 15，实际落 0）。
+        //   这里把日期视为"编号而非内容词"，剥掉日期后按正常前缀规则判定。
+        Matcher dThenO = DATE_THEN_ORD.matcher(work);
+        if (dThenO.find()) {
+            if (!leadingPrefixOk(work.substring(0, dThenO.start()))) {
+                return false;
+            }
+            return dateOrdMidIsClean(DATE_THEN_ORD_MID.matcher(work), 1);
+        }
+        Matcher oThenD = ORD_THEN_DATE.matcher(work);
+        if (oThenD.find()) {
+            if (!leadingPrefixOk(work.substring(0, oThenD.start()))) {
+                return false;
+            }
+            return dateOrdMidIsClean(ORD_THEN_DATE_MID.matcher(work), 2);
+        }
         int start = -1;
         Matcher arabic = ORDINAL_ARABIC.matcher(work);
         if (arabic.find()) {
@@ -1106,6 +1165,39 @@ public final class EpisodeNameMatcher {
             return !HAS_CJK.matcher(prefix).find();
         }
         String prefix = work.substring(0, start);
+        return leadingPrefixOk(prefix);
+    }
+
+    /**
+     * ★ v99-r41：「日期 ↔ 期号」之间的中段是否干净（干净 = 正片）。
+     *
+     * <p>干净：{@code 20260906第2期上}、{@code 20260830第1期上}（日期与期号紧邻）。<br>
+     * 不干净：{@code 20260902大放送第1期}、{@code 20260829企划第2期}、{@code 20260907加更版第2期}
+     * —— 中段是中文内容词，说明这是衍生栏目而非当期正片。</p>
+     *
+     * <p><b>为什么必须判</b>：若不判，{@code 20260902大放送第1期} 会被判成正片，
+     * 而语义相同的目标写法 {@code 20260902闺女生活盲盒大放送第1期} 因含"盲盒"被判成衍生，
+     * 两侧属性不一致 ⇒ 跨域对齐的"属性一致"门禁把唯一正确候选过滤掉 ⇒ 模糊匹配落到索引 0。</p>
+     *
+     * @param midGroup 中段所在的捕获组下标（两个 Pattern 的组序不同）
+     */
+    private static boolean dateOrdMidIsClean(Matcher mid, int midGroup) {
+        if (!mid.find()) {
+            return true;                        // 理论上不会走到（外层已确认同形匹配）
+        }
+        String s = mid.group(midGroup);
+        return TextUtils.isEmpty(s) || !HAS_CJK.matcher(s).find();
+    }
+
+    /**
+     * ★ v99-r41：期号之前的"前缀"是否允许（允许 = 期号领衔 = 正片）。
+     *
+     * <p>季号（{@code 第三季 第1期}）允许；含中文内容词（{@code 超前营业第2期}）不允许。</p>
+     */
+    private static boolean leadingPrefixOk(String prefix) {
+        if (TextUtils.isEmpty(prefix)) {
+            return true;
+        }
         if (SEASON_PREFIX.matcher(prefix).matches()) {
             return true;
         }
@@ -1126,6 +1218,7 @@ public final class EpisodeNameMatcher {
         work = EIGHT_DIGITS.matcher(work).replaceAll("");
         work = PART_TAIL.matcher(work).replaceAll("");
         work = MAIN_RESIDUE_JUNK.matcher(work).replaceAll("");
+        work = SEASON_TAG.matcher(work).replaceAll("");   // ★ r42：季号不算内容词
         return work.trim();
     }
 
@@ -3713,6 +3806,25 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (sourceGroup.isEmpty()) {
             return -1;
         }
+        // ★ v99-r42：当前集【自己不在】同日组里 ⇒ 同日分段逻辑对它根本不适用。
+        //
+        //   {@link #sameDayGroup} 会排除衍生条目（同一天正片/衍生混排时不能让衍生也参与
+        //   位置对齐），于是「20260823特别企划」这类衍生条目不在组里，下面的
+        //   {@link #resolvePart} 却仍会按"组内其它条目已占用的后缀"给它反推出一个
+        //   它自己并没有的分段（实测被反推成「下」⇒ 落到「20260823下」，切错集）。
+        //
+        //   位置对齐的前提是"当前集就是组里的第 k 条"；不在组里就无从谈位置，
+        //   一律放弃，交给后面的「同日期 + 内容残差」/ 名字匹配层。
+        boolean inGroup = false;
+        for (int i = 0; i < sourceGroup.size(); i++) {
+            if (sourceGroup.get(i).intValue() == sourceIndex) {
+                inGroup = true;
+                break;
+            }
+        }
+        if (!inGroup) {
+            return -1;
+        }
 
         // --- 新源：与当前集同日的分组 ---
         List<Integer> targetGroup = sameDayGroup(targetNames, current.ordinal);
@@ -4203,6 +4315,41 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (subCount == 1) {
             return sub;
         }
+        // ★ v99-r42 兜底：残差判据在「不标内容的源」上必然失效。
+        //
+        //   真实源里有大量「只给日期、不写内容」的列表：{@code 第20260902期}、
+        //   {@code 第20260830期下}；对端却写了 {@code 第20260902期盲盒放送}。
+        //   两侧残差一个空一个非空 ⇒ 上面的 exact/sub 两档都不命中 ⇒ 整条链只能退化到
+        //   按位置硬猜（系统性偏一期）。而「同一天目标源只有一条（或同分段只有一条）」
+        //   是确定性证据：那天它就只发了这一集，不可能是别的。
+        //
+        //   ★ 仍然守「宁可不切、不可切错」：只在这两种唯一性成立时才采纳；
+        //     同日多条且分段也多条 ⇒ 一律返回 -1。
+        int onlyByDate = -1, onlyByDateCount = 0;   // 目标里该日期只有一条（分段相容即可）
+        int onlyByPart = -1, onlyByPartCount = 0;   // 目标里该 (日期,分段) 只有一条
+        for (int i = 0; i < targetNames.size(); i++) {
+            String n = targetNames.get(i);
+            if (TextUtils.isEmpty(n) || dateOf(n) != curDate) {
+                continue;
+            }
+            if (normalizePart(extractPart(n)) == normalizePart(curPart)) {
+                onlyByDate = i;
+                onlyByDateCount++;
+            }
+            if (extractPart(n) == curPart) {
+                onlyByPart = i;
+                onlyByPartCount++;
+            }
+        }
+        if (onlyByDateCount == 1) {
+            return onlyByDate;                      // 那天目标源只有这一条 ⇒ 就是它
+        }
+        // 同日多条但分段唯一：只在「至少一侧没写内容」时才敢采纳 ——
+        // 两侧都写了却不一致（{@code 看片会直播} vs {@code 特别企划}）说明内容真不同。
+        if (onlyByPartCount == 1
+                && (curRes.isEmpty() || dateResidue(targetNames.get(onlyByPart)).isEmpty())) {
+            return onlyByPart;
+        }
         return -1;
     }
 
@@ -4219,8 +4366,16 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         String s = WRAPPED_DATE.matcher(name).replaceAll(" ");
         s = DATE_COMPACT.matcher(s).replaceAll(" ");
         s = ORDINAL_ARABIC.matcher(s).replaceAll(" ");
+        s = SEASON_TAG.matcher(s).replaceAll(" ");  // ★ r42：「第7季…」的季号不算内容词
         s = s.replaceAll("[上中下]\\s*$", " ");      // 只剥尾部的分段标记
         s = s.replaceAll("[\\s\\p{Punct}：（）()\\[\\]【】《》·、，。！？!?,.~“”\"'’‘:]+", "");
+        // ★ v99-r42：残差只剩一个分段字 ⇒ 视为「没写内容」。
+        //   {@code 20260830(第1期上)} 剥掉日期与「第1期」后括号里只剩「上」，
+        //   而 {@code 20260830第1期上} 的「上」已被尾部分段规则剥掉 ⇒ 残差空串。
+        //   两者是同一集，却因为一个「上」一个空串被残差判据挡掉（真实样本 8 条）。
+        if (s.length() == 1 && "上中下一二三".indexOf(s.charAt(0)) >= 0) {
+            return "";
+        }
         return s;
     }
 
@@ -4232,6 +4387,52 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
      */
     public static boolean isNonMainEntryName(String name) {
         return name != null && name.length() > 0 && isNonMainEntry(name);
+    }
+
+    /**
+     * ★ v99-r42：落点是不是「同日期确定性命中」。
+     *
+     * <p><b>为什么需要它</b>：真实源里有大量「只给日期、不写内容」的列表
+     * （{@code 第20260831期}、{@code 第20260902期}），对端却写了内容
+     * （{@code 第20260831期加更版}）。此时落点会被 {@link #isNonMainEntry} 判成
+     * 「衍生」，而上层的"落衍生就纠正到正片"逻辑找不到同期号正片 ⇒ 直接放弃（-1）。
+     * 放弃后上层退回【按原下标就近落地】，那才是真的切错集。</p>
+     *
+     * <p>同日期 + 目标源该日期只有这一条 = 确定性证据：那天它就只发了这一集。
+     * 这种落点不该再被"正片/衍生"的属性判据推翻。</p>
+     *
+     * @param currentName 当前在播集名（旧源）
+     * @param matchedName 落点集名（新源）
+     * @param targetNames 新源完整集名列表
+     * @return true 表示两侧同日期、且该日期（含分段）在新源里唯一
+     */
+    public static boolean isDateCertainLanding(String currentName, String matchedName,
+                                               List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName) || targetNames == null) {
+            return false;
+        }
+        int date = dateOf(currentName);
+        if (date <= 0 || dateOf(matchedName) != date) {
+            return false;
+        }
+        int part = extractPart(currentName);
+        int exact = 0;      // 分段完全一致
+        int compat = 0;     // 分段语义相容（无后缀 ≡ 上）
+        for (String n : targetNames) {
+            if (TextUtils.isEmpty(n) || dateOf(n) != date) {
+                continue;
+            }
+            if (extractPart(n) == part) {
+                exact++;
+            }
+            if (normalizePart(extractPart(n)) == normalizePart(part)) {
+                compat++;
+            }
+            if (exact > 1 && compat > 1) {
+                return false;                   // 同一天多条 ⇒ 日期不足以定案
+            }
+        }
+        return exact == 1 || compat == 1;
     }
 
     /**
