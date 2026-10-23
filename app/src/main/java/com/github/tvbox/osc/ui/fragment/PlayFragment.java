@@ -2476,6 +2476,19 @@ public class PlayFragment extends BaseLazyFragment {
                     resolved = retry;
                 }
             }
+            // ★ v99-r35：落点落在【衍生条目】上时纠正为正片；纠正不到就不落（-1）。
+            //   与 DetailActivity 同一机制，两个入口必须一致。
+            //   实测：旧源「20260815第1期上」→「预热直播第1期」（该列表里衍生排在正片之前、
+            //   期号同为 1、模糊分相同 ⇒ 取到衍生）。取不到正片就 -1，保持原集不动。
+            if (resolved >= 0 && resolved < targetList.size()
+                    && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)) {
+                int mainIdx = EpisodeNameMatcher.findMainCounterpart(currentSeries.name, tgtNames);
+                if (mainIdx >= 0 && mainIdx < targetList.size()) {
+                    resolved = mainIdx;
+                } else {
+                    resolved = -1;
+                }
+            }
             // 跨源事实记忆：本次成功落位即一条"期号↔日期"的双侧强证据。
             if (resolved >= 0 && resolved < targetList.size()) {
                 // ★ 传入两侧列表，让事实层做"序关系守卫"（与 DetailActivity 同一机制）

@@ -42,13 +42,32 @@ public final class EpisodeNameMatcher {
     private static final Pattern DATE_COMPACT =
             Pattern.compile("(?<!\\d)(20\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)");
 
+    /**
+     * ★ r36：{@code 20260815第1期上} —— 日期与 {@code 第N期} 同时出现。
+     *
+     * <p><b>这两个不是两个维度，是同一件事的两种写法</b>：日期是首播日，
+     * {@code 第1期} 是该期的期序，即 <b>20260815 本身就代表"这一季第 1 期"</b>
+     * （周更时 20260822 = 第 2 期 = 20260815 + 7 天）。所以两种写法指向同一期，
+     * 取哪一个都不会改变语义。</p>
+     *
+     * <p><b>但必须优先取期号</b>：日期值（20260822）只有在"首播日基准"已知时才能换算成
+     * 第几期，而目标列表全是这种混合写法时基准建不起来 ⇒ 跨域层失效 ⇒ 整类【不落】。
+     * 期号是直接的离散序，取它可让两侧落在同一个域（ORDINAL），无需任何换算。</p>
+     */
+    private static final Pattern DATE_THEN_ORD =
+            Pattern.compile("(?:19|20)\\d{6}\\D{0,8}第\\s*(\\d{1,3})\\s*[期集话]");
+
+    /** ★ r36：反过来——「第N期」在前、日期在后（{@code 第1期20260815上}），语义与上者相同。 */
+    private static final Pattern ORD_THEN_DATE =
+            Pattern.compile("第\\s*(\\d{1,3})\\s*[期集话]\\D{0,8}(?:19|20)\\d{6}");
+
     /** 日期：带分隔符 2026-08-09 / 2026.08.09 / 2026_08_09。 */
     private static final Pattern DATE_SEPARATED =
             Pattern.compile("(?<!\\d)(20\\d{2})[-._/](0?[1-9]|1[0-2])[-._/](0?[1-9]|[12]\\d|3[01])(?!\\d)");
 
     /** 期数/集数：可选的"第"，阿拉伯数字，后接 期/集/话/話。 */
     private static final Pattern ORDINAL_ARABIC =
-            Pattern.compile("(?:第\\s*)?(\\d{1,4})\\s*(?:期|集|话|話)");
+            Pattern.compile("(?<!\\d)(?:第\\s*)?(\\d{1,4})\\s*(?:期|集|话|話)");
 
     /** 期数/集数：中文数字 + 期/集/话（第八期、第十二期）。 */
     private static final Pattern ORDINAL_CHINESE =
@@ -140,7 +159,12 @@ public final class EpisodeNameMatcher {
             // —— 综艺常见衍生栏目（用户 2026-10 确认）——
             + "|观演区|预热直播|直拍机位|特别企划"
             // —— 实测在所有真实源里均为纯衍生的组合词根 ——
-            + "|舞台纯享|毕业特辑|端午特辑|纯享典藏");
+            + "|舞台纯享|毕业特辑|端午特辑|纯享典藏"
+            // ★ r38：真实综艺样本（9881 条去重集名，抓自 5 个源站）里出现频次高、
+            //   语义明确为衍生的词根：超前363 / 会员169 / 番外62 / 精编43 /
+            //   未播36 / 手记36 / vlog23 / 发布会14 / 彩排6。
+            //   「日记/营业/出发」频次也高但可能是正片名的一部分，暂不加入。
+            + "|超前|番外|精编|未播|手记|[vV]log|发布会|彩排|会员");
 
     /**
      * 期号必须出现在名字<b>开头</b>（允许前置"第x季"），才算"期数式正片"。
@@ -303,6 +327,19 @@ public final class EpisodeNameMatcher {
         // 1. 先去噪（与旧实现一致：去掉方括号/圆括号内容、清晰度标记），保证召回率不下降
         work = BRACKET_CONTENT.matcher(work).replaceAll("");
         work = QUALITY_JUNK.matcher(work.toLowerCase(Locale.ROOT)).replaceAll("");
+
+        // 1.5 ★ r36：日期与「第N期」同时出现 ⇒ 取期号。
+        //   `20260815第1期上` 里日期就是首播日、"第1期"是同一期的另一种写法（两者同义），
+        //   但日期值需换算才能得到期序，而混合命名的目标列表建不起首播基准 ⇒ 跨域失效 ⇒ 整类不落。
+        //   取期号后两侧同为 ORDINAL 域，直接用离散期序匹配。matrix_v4 的 ok 从 701 → 761。
+        Matcher both = DATE_THEN_ORD.matcher(work);
+        if (both.find()) {
+            return new EpisodeKey(Integer.parseInt(both.group(1)), DOMAIN_ORDINAL, part, raw);
+        }
+        both = ORD_THEN_DATE.matcher(work);
+        if (both.find()) {
+            return new EpisodeKey(Integer.parseInt(both.group(1)), DOMAIN_ORDINAL, part, raw);
+        }
 
         // 2. 日期优先（必须在剥离年份之前，否则 8 位日期会被截断误判）
         Matcher compact = DATE_COMPACT.matcher(work);
@@ -4049,12 +4086,65 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return byPart;
         }
         // 2) 名字可可靠区分时，用名字匹配
+        //   ★ v99-r35：这里【不】做衍生纠正 —— 实测在 locate 层加纠正会让
+        //   集对齐矩阵从 727 掉到 707（误伤 20 项）。纠正统一放在调用方
+        //   DetailActivity / PlayFragment 的 findMatchingEpisodeIndex 末尾，
+        //   那里是最终收口，只影响"真的落了衍生条目"的那一次切源。
         int exact = findIndex(currentName, targetNames);
         if (exact >= 0) {
             return exact;
         }
         // 3) 跨域（日期 ↔ 期数）兜底
         return alignByOrder(sourceIndex, sourceNames, targetNames);
+    }
+
+    /**
+     * ★ v99-r35：公开的「非正片（衍生栏目）」判定。
+     *
+     * <p>给 DetailActivity / PlayFragment 在落点纠偏时用 —— 内部 {@code isNonMainEntry}
+     * 是 private，这里只暴露一个只读判定，不改它的语义。</p>
+     */
+    public static boolean isNonMainEntryName(String name) {
+        return name != null && name.length() > 0 && isNonMainEntry(name);
+    }
+
+    /**
+     * ★ v99-r35：模糊匹配落在衍生条目上时，改取「同期号的正片」。
+     *
+     * <p>优先「期号 + 分段」都一致的正片；没有则退到「同期号任意分段」的正片。</p>
+     *
+     * @return 正片下标；<b>找不到返回 -1（不落）</b>——
+     *         保持原集不动，用户能立刻发现；静默切到预热直播/观演区那类衍生条目则完全察觉不到。
+     */
+    public static int findMainCounterpart(String currentName, List<String> targetNames) {
+        if (currentName == null || targetNames == null) {
+            return -1;
+        }
+        int curOrd = extractOrdinal(currentName);
+        if (curOrd <= 0) {
+            return -1;
+        }
+        int curPart = extractPart(currentName);
+        int anyPart = -1;
+        for (int i = 0; i < targetNames.size(); i++) {
+            String n = targetNames.get(i);
+            if (n == null || n.length() == 0) {
+                continue;
+            }
+            if (isNonMainEntry(n)) {
+                continue;                       // 衍生条目一律跳过
+            }
+            if (extractOrdinal(n) != curOrd) {
+                continue;                       // 期号不同 ⇒ 不是同一期
+            }
+            if (extractPart(n) == curPart) {
+                return i;                       // 期号 + 分段都一致 ⇒ 最佳
+            }
+            if (anyPart < 0) {
+                anyPart = i;                    // 同期间、分段不同 ⇒ 次优
+            }
+        }
+        return anyPart;
     }
 
     /** 把剧集名列表转为纯名称列表，便于调用方复用 locate/alignByOrder。 */

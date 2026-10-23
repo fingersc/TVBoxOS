@@ -4880,6 +4880,23 @@ public class DetailActivity extends BaseActivity {
                     resolved = retry;
                 }
             }
+            // ★ v99-r35：落点落在【衍生条目】上时纠正为正片；纠正不到就不落（-1）。
+            //
+            //   实测（披荆斩棘2026，logcat 第 3 跳）：
+            //     旧源「20260815第1期上」→ 金鹰点播「预热直播第1期」 ✗
+            //   该列表里「预热直播第1期」排在「第1期：初舞台（上）」之前，两者期号同为 1，
+            //   模糊打分相同 ⇒ 取了先出现的衍生条目。预热直播是预热栏目，不是正片。
+            //
+            //   取不到正片就返回 -1（保持原集不动）：切错集用户毫无察觉，保持不动他立刻能发现。
+            if (resolved >= 0 && resolved < targetList.size()
+                    && EpisodeNameMatcher.isNonMainEntryName(targetList.get(resolved).name)) {
+                int mainIdx = EpisodeNameMatcher.findMainCounterpart(currentSeries.name, tgtNames);
+                if (mainIdx >= 0 && mainIdx < targetList.size()) {
+                    resolved = mainIdx;
+                } else {
+                    resolved = -1;
+                }
+            }
             // 跨源事实记忆：本次成功落位就是一条"期号↔日期"被两侧证实的强证据。
             // 记下来，后续切到任何源都能直接查表命中，不必再依赖脆弱的周更快照推算。
             if (resolved >= 0 && resolved < targetList.size()) {
