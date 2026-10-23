@@ -446,9 +446,31 @@ public class RoomDataManger {
         return out;
     }
 
+    /**
+     * 取「用于同名判定」的片名。
+     *
+     * <p>★ v99-r28：加归一化。网页抓来的片名常夹全角空格（NBSP）、零宽字符、BOM，
+     * 视觉上和另一条一模一样，但 {@code equals} 不等 ⇒ 同名去重（库级 dedupeSameName）
+     * 与显示去重（getAllVodRecord 的 historyNames）双双失效，首页出现两张"看起来重名"的卡片。</p>
+     *
+     * <p>归一化只做「不可见字符 → 空 / 连续空白 → 单空格 / 首尾 trim」，
+     * 不做大小写或标点重写，避免把真正不同的片（如「第1季」「第 2 季」）误并。</p>
+     */
     private static String getVodRecordName(VodInfo vodInfo) {
-        return vodInfo == null || vodInfo.name == null ? "" : vodInfo.name.trim();
+        if (vodInfo == null || vodInfo.name == null) {
+            return "";
+        }
+        String s = vodInfo.name
+                .replace('\u00A0', ' ')   // 不换行空格
+                .replace("\u200B", "")    // 零宽空格
+                .replace("\u200C", "")    // 零宽非连接符
+                .replace("\u200D", "")    // 零宽连接符
+                .replace("\uFEFF", "");   // BOM
+        return WS.matcher(s).replaceAll(" ").trim();
     }
+
+    private static final java.util.regex.Pattern WS =
+            java.util.regex.Pattern.compile("\\s+");
 
     public static void insertVodCollect(String sourceKey, VodInfo vodInfo) {
         VodCollect record = AppDataManager.get().getVodCollectDao().getVodCollect(sourceKey, vodInfo.id);

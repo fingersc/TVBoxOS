@@ -252,6 +252,18 @@ public final class SyncEngine {
             LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length);
         }
 
+        // ★ v99-r28：同步把云端数据写回本地后，立即按本机策略收敛一次
+        //   （清坏记录 → 同名去重 → 按档位裁剪）。
+        //   原来只有「用户看片写历史」才触发 pruneHistory，云端带回来的同名记录会一直躺着，
+        //   期间首页就会出现两张看起来重名的卡片（用户实测反馈）。
+        if (enabled.history) {
+            try {
+                com.github.tvbox.osc.cache.RoomDataManger.pruneHistory();
+            } catch (Throwable t) {
+                LOG.e("[Sync] prune after apply failed", t);
+            }
+        }
+
         finish(st, now, dirtyBefore);
 
         o.ok = true;
