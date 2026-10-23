@@ -51,6 +51,14 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private static final String SCAN_ENTRY = "__SCAN_ENTRY__";
     /** 正在切换账号：忽略重复点击与并发的登录请求 */
     private boolean switching;
+    /**
+     * ★ v99-r27：当前账号那张卡片的视图引用。
+     *
+     * <p>切账号成功后 {@link #buildAccountCards()} 会 removeAllViews 重建，
+     * 所有卡片都没有焦点 ⇒ 新当前账号卡片不会显示聚焦高亮，用户要退出再进才能看到
+     * （盒子端实测反馈）。这里记住它，切换完成后把焦点还给这张卡。</p>
+     */
+    private View currentAccountCard;
     private TextView btnLogin;
     private TextView btnQrLogin;
     /** 首次激活阶段：等待二次输入密码 */
@@ -138,8 +146,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         super.onDestroy();
     }
 
-    private void refreshAll() {
-        AccountContext.load();
+    private void refreshAll() {        AccountContext.load();
         // v99-r6b：页面标题下那行身份说明已删除（用户要求），登录状态改由账号卡片的
         //          「当前账号」高亮体现，不再单独占一行文字
         etDavUrl.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""));
@@ -400,6 +407,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             return;
         }
         llAccounts.removeAllViews();
+        currentAccountCard = null;
         addAccountCard("游客", "", true);
         for (AccountStore.Item it : AccountStore.list()) {
             addAccountCard(it.name, it.owner, false);
@@ -470,6 +478,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         card.setLayoutParams(lp);
         card.setPadding(padH, padV, padH, padV);
         card.setMinimumWidth((int) getResources().getDimension(R.dimen.vs_180));
+        if (isCurrent) {
+            currentAccountCard = card;   // ★ v99-r27：切账号后把焦点还给这张卡
+        }
         card.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -583,6 +594,19 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 switching = false;
                 setBusy(false, null);
                 refreshAll();
+                // ★ v99-r27：卡片列表刚被重建，焦点已丢失 ⇒ 主动落到新的当前账号卡片上，
+                //   否则要退出再进才能看到它的高亮（盒子端实测反馈）。
+                if (currentAccountCard != null) {
+                    final View card = currentAccountCard;
+                    card.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (card.isShown() && !card.isFocused()) {
+                                card.requestFocus();
+                            }
+                        }
+                    });
+                }
                 tvSyncStatus.setText(message);
                 toast(message);
             }

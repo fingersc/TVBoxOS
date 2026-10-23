@@ -115,11 +115,16 @@ public class RoomDataManger {
             }
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
             boolean changed = false;
+            // ★ v99-r27：先清掉「永远显示不出来」的坏记录。
+            //   现象（用户反馈）：档位 15，首页只显示 13 部，再看一部新的最旧的就不见了。
+            //   根因：dataJson 解析失败 / 没有片名的记录，getAllVodRecord 会跳过它们（不显示），
+            //   但裁剪是按【总条数】算的 ⇒ 坏记录白占名额，用户看到的上限就变成 13。
+            changed = purgeInvalidRecords(dao) > 0;
             // ★ v99-r25：「条数上限」指的是【合并去重之后】的条数。
             //   合并开启时先把同名记录收敛为「只保留最新源」，再按 keep 裁剪；
             //   否则"15 条"里可能有多条是同一部片的不同源，实际影片数远少于 15。
             if (Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE)) {
-                changed = dedupeSameName(dao) > 0;
+                changed = dedupeSameName(dao) > 0 || changed;
             }
             List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
             if (all != null && all.size() > keep) {
@@ -135,6 +140,33 @@ public class RoomDataManger {
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    /**
+     * ★ v99-r27：删除「永远显示不出来」的历史记录（dataJson 解析失败 / 没有片名）。
+     *
+     * <p>这些记录 {@code getAllVodRecord} 会直接跳过（不显示），但裁剪是按总条数算的
+     * ⇒ 它们白白占着档位名额。用户看到的现象就是"档位 15，实际只能看到 13 部"。</p>
+     *
+     * @return 删除条数
+     */
+    private static int purgeInvalidRecords(VodRecordDao dao) {
+        List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
+        if (all == null || all.isEmpty()) {
+            return 0;
+        }
+        int n = 0;
+        for (VodRecord r : all) {
+            VodInfo info = parseRecordInfo(r);
+            if (info == null || TextUtils.isEmpty(getVodRecordName(info))) {
+                try {
+                    dao.delete(r);
+                    n++;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return n;
     }
 
     /**
@@ -331,10 +363,14 @@ public class RoomDataManger {
                     if (record.dataJson != null && !TextUtils.isEmpty(record.dataJson)) {
                         info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {
                         }.getType());
-                        info.sourceKey = record.sourceKey;
+                        // ★ v99-r27：fromJson 可能返回 null（坏 JSON），原代码直接 info.sourceKey
+                        //   会 NPE —— 虽被外层 catch 兜住，但每次刷新都抛一次异常刷屏。
+                        if (info != null) {
+                            info.sourceKey = record.sourceKey;
 //                        SourceBean sourceBean = ApiConfig.get().getSource(info.sourceKey);
-                        if (info.name == null)
-                            info = null;
+                            if (info.name == null)
+                                info = null;
+                        }
                     }
                 } catch (Exception e) {
                     e.printStackTrace();
