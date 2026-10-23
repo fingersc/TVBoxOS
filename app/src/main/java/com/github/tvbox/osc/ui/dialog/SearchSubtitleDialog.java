@@ -20,6 +20,7 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.bean.Subtitle;
 import com.github.tvbox.osc.bean.SubtitleData;
 import com.github.tvbox.osc.ui.adapter.SearchSubtitleAdapter;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.viewmodel.SubtitleViewModel;
 import com.owen.tvrecyclerview.widget.TvRecyclerView;
@@ -64,6 +65,7 @@ public class SearchSubtitleDialog extends BaseDialog {
         loadingBar = findViewById(R.id.loadingBar);
         mGridView = findViewById(R.id.mGridView);
         subtitleSearchEt = findViewById(R.id.input);
+        TvImeUtil.clickToIme(subtitleSearchEt);
         subtitleSearchBtn = findViewById(R.id.inputSubmit);
         searchAdapter = new SearchSubtitleAdapter();
         mGridView.setHasFixedSize(true);

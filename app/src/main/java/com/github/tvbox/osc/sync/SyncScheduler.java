@@ -135,7 +135,19 @@ public final class SyncScheduler {
 
     /** 立即执行（手动 / 切换账号 / 退出 App 前）。cb 可为 null。 */
     public static void requestNow(String owner, String reason, HistorySyncManager.Callback cb) {
-        schedule(owner, reason, PRI_NOW, 0L, cb);
+        requestNow(owner, reason, true, cb);
+    }
+
+    /**
+     * ★ v99-r20：把「立即档」与「强制上传」解耦 —— 立即档（绕过 min-gap / 仅 Wi-Fi 门禁）
+     * 不必连带"无视内容比对强推"。
+     *
+     * <p>历史页 {@code pullNow} 语义是"拉"：用 {@code force=false}，合并后与云端一致就不再
+     * PUT（原来每次打开历史页即使内容一致也全量 PUT 一遍）。切账号 / 立即同步 / 退出 App
+     * 传 {@code true} 保持原行为。</p>
+     */
+    public static void requestNow(String owner, String reason, boolean force, HistorySyncManager.Callback cb) {
+        schedule(owner, reason, PRI_NOW, 0L, force, cb);
     }
 
     /**
@@ -261,6 +273,12 @@ public final class SyncScheduler {
 
     private static void schedule(String owner, String reason, int pri, long capMs,
                                  HistorySyncManager.Callback cb) {
+        schedule(owner, reason, pri, capMs, false, cb);
+    }
+
+    /** ★ v99-r20：{@code force} 见 {@link #requestNow(String, String, boolean, HistorySyncManager.Callback)}。 */
+    private static void schedule(String owner, String reason, int pri, long capMs, boolean force,
+                                 HistorySyncManager.Callback cb) {
         if (owner == null || owner.isEmpty()) {
             return;
         }
@@ -300,7 +318,7 @@ public final class SyncScheduler {
             if (capMs >= 0 && capMs < delay) {
                 delay = capMs;
             }
-            Task t = new Task(owner, reason, pri, cb);
+            Task t = new Task(owner, reason, pri, force, cb);
             t.background = REASON_BG.equals(reason);
             t.runAt = now + delay;
             TASKS.put(owner, t);
@@ -406,6 +424,8 @@ public final class SyncScheduler {
         final String owner;
         final String reason;
         final int pri;
+        /** ★ v99-r20：是否无视内容比对强推（仅 requestNow 显式传入；final —— 不需要跨请求传播）。 */
+        final boolean force;
         final HistorySyncManager.Callback cb;
         long runAt;
 
@@ -422,10 +442,11 @@ public final class SyncScheduler {
          */
         boolean background;
 
-        Task(String owner, String reason, int pri, HistorySyncManager.Callback cb) {
+        Task(String owner, String reason, int pri, boolean force, HistorySyncManager.Callback cb) {
             this.owner = owner;
             this.reason = reason;
             this.pri = pri;
+            this.force = force;
             this.cb = cb;
         }
 
@@ -446,7 +467,7 @@ public final class SyncScheduler {
             //
             // ★ r19：必须读独立字段而不是 reason —— 被 pull-forward 提前的任务
             // reason 仍是 "dirty"，读 reason 会让 10s 档永远不生效。
-            HistorySyncManager.sync(pri == PRI_NOW, background, cb);
+            HistorySyncManager.sync(pri == PRI_NOW, background, force, cb);
         }
     }
 }

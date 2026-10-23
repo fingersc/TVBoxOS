@@ -259,7 +259,7 @@ public final class HistorySyncManager {
             }
             lastPullAt = now;
         }
-        SyncScheduler.requestNow(owner(), "pull", cb);
+        SyncScheduler.requestNow(owner(), "pull", false, cb);
     }
 
     /**
@@ -333,14 +333,14 @@ public final class HistorySyncManager {
         return sb.toString();
     }
 
-    /** 手动同步：立即执行，绕过最小间隔与「仅 Wi-Fi」。 */
+    /** 手动同步：立即执行，绕过最小间隔与「仅 Wi-Fi」，并强制上传（无视内容比对）。 */
     public static void syncNow(Callback cb) {
         if (AccountContext.isGuest() || !hasConfig()) {
             // 调度器对游客 / 未配置是静默忽略的，这里必须直接走一次，让页面拿到提示
-            sync(true, false, cb);
+            sync(true, false, true, cb);
             return;
         }
-        SyncScheduler.requestNow(owner(), "manual", cb);
+        SyncScheduler.requestNow(owner(), "manual", true, cb);
     }
 
     // ---------------------------------------------------------------- 主流程
@@ -351,7 +351,20 @@ public final class HistorySyncManager {
      * <p>v98 P2：所有「这次没跑成」的分支都要回调 {@link SyncScheduler#skipped}，
      * 否则调度器的自适应轮询链条会断掉（旧代码靠一个 30 分钟定时器兜底，现在没有了）。</p>
      */
-    static void sync(final boolean manual, final boolean background, final Callback cb) {
+    /**
+     * 跑一次同步。
+     *
+     * <p>★ v99-r20：{@code manual}（绕过执行层门禁）与 {@code force}（引擎层无视内容比对
+     * 强推 + 熔断强破）解耦。此前两者同源（都来自 {@code pri == PRI_NOW}），导致打开历史页
+     * 的 {@code pullNow} 即使内容与云端一致也全量 PUT 一遍。现在只有「立即同步 / 退出 App /
+     * 切换账号」保持 force=true，{@code pullNow} 传 force=false —— 它的语义是"拉"。</p>
+     *
+     * @param manual     绕过执行层门禁（最小间隔 / 仅 Wi-Fi）
+     * @param background 进后台补传（最小间隔走 10s 档，见 {@link #MIN_GAP_BACKGROUND_MS}）
+     * @param force      强制上传（引擎层无视内容比对；熔断中强行恢复）
+     * @param cb         完成回调
+     */
+    static void sync(final boolean manual, final boolean background, final boolean force, final Callback cb) {
         final String owner = AccountContext.ownerKey();
         if (AccountContext.isGuest()) {
             post(cb, false, "游客模式：登录后才能同步");
@@ -429,7 +442,7 @@ public final class HistorySyncManager {
                     //   （"exception X is never thrown in body of corresponding try statement"）。
                     //   改为：只 catch Throwable 兜底，具体的错误语义由 Outcome.message 承载。
                     {
-                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, manual);
+                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, force);
                         ok = r.ok;
                         msg = r.message == null ? "同步完成" : r.message;
                         engineHandled = true;

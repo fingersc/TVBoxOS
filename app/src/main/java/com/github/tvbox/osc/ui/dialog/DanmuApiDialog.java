@@ -10,6 +10,7 @@ import androidx.annotation.NonNull;
 
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.DanmakuApi;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
 
@@ -24,6 +25,7 @@ public class DanmuApiDialog extends BaseDialog {
         setContentView(R.layout.dialog_danmu_api);
         setCanceledOnTouchOutside(false);
         input = findViewById(R.id.input);
+        TvImeUtil.clickToIme(input);
         input.setText(Hawk.get(HawkConfig.DANMU_API, ""));
         input.setHint(getDefaultApi());
         findViewById(R.id.inputDefault).setOnClickListener(v -> saveDefault());

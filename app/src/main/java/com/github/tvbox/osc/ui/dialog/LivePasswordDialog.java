@@ -11,6 +11,7 @@ import android.widget.EditText;
 import androidx.annotation.NonNull;
 
 import com.github.tvbox.osc.R;
+import com.github.tvbox.osc.util.TvImeUtil;
 
 import org.jetbrains.annotations.NotNull;
 
@@ -30,6 +31,7 @@ public class LivePasswordDialog extends BaseDialog {
         setOwnerActivity((Activity) context);
         setContentView(R.layout.dialog_live_password);
         inputPassword = findViewById(R.id.input);
+        TvImeUtil.clickToIme(inputPassword);
         findViewById(R.id.inputSubmit).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {

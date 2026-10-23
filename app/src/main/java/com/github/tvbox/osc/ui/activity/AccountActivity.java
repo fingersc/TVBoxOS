@@ -29,6 +29,7 @@ import com.github.tvbox.osc.ui.dialog.TipDialog;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.orhanobut.hawk.Hawk;
 
 /**
@@ -88,6 +89,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etDavUrl = findViewById(R.id.etDavUrl);
         etDavUser = findViewById(R.id.etDavUser);
         etDavPass = findViewById(R.id.etDavPass);
+        // ★ v99-r20：TV 端输入法全局统一 —— 焦点到达输入框不自动弹，按 OK 键才唤出
+        // （否则遥控器焦点扫过输入框就弹输入法，打断浏览）
+        TvImeUtil.clickToIme(etUser, etPass, etPassConfirm, etDavUrl, etDavUser, etDavPass);
         tvScopeHistory = findViewById(R.id.tvScopeHistory);
         tvScopeProgress = findViewById(R.id.tvScopeProgress);
         tvScopeCollect = findViewById(R.id.tvScopeCollect);
@@ -468,6 +472,19 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 return true;
             }
         });
+        // ★ v99-r20：遥控器聚焦高亮。当前账号卡片用的 shape_account_chip_current 是静态
+        // shape（无 state_focused），聚焦时不像其它卡片（button_danmu_setting 是 selector）那样
+        // 变蓝 —— 盒子端实测反馈。聚焦时临时换用同一个 selector，失焦换回身份底色；
+        // 「✓ 前缀 + 绿色『当前账号』文字」仍保留身份标识，不新增资源。
+        if (isCurrent) {
+            card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                @Override
+                public void onFocusChange(View v, boolean hasFocus) {
+                    card.setBackgroundResource(hasFocus ? R.drawable.button_danmu_setting
+                            : R.drawable.shape_account_chip_current);
+                }
+            });
+        }
         llAccounts.addView(card);
     }
 

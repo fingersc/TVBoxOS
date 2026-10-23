@@ -77,7 +77,7 @@ public final class AccountSwitcher {
                         final String msg = message;
                         // v98 P2：切换账号是「必须立刻拉一次」的场景，
                         //        走调度器的立即档（不再借用历史页 pullNow 的 20 秒节流）
-                        SyncScheduler.requestNow(owner, "switch", new HistorySyncManager.Callback() {
+                        SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
                             @Override
                             public void onDone(boolean ok, String text) {
                                 post(cb, true, ok ? msg : msg + "；同步未完成，稍后会自动重试");

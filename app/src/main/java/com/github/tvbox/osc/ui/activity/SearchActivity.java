@@ -42,6 +42,7 @@ import com.github.tvbox.osc.ui.adapter.SearchAdapter;
 import com.github.tvbox.osc.ui.dialog.RemoteDialog;
 import com.github.tvbox.osc.ui.dialog.SearchCheckboxDialog;
 import com.github.tvbox.osc.ui.tv.widget.SearchKeyboard;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
@@ -178,6 +179,10 @@ public class SearchActivity extends BaseActivity {
         llLayout = findViewById(R.id.llLayout);
         llHistoryWord = findViewById(R.id.llHistoryWord);
         etSearch = findViewById(R.id.etSearch);
+        // ★ v99-r20：全局输入法原则 —— 焦点到达不自动弹。
+        // 例外：这里【不】接管 OK 键 —— OK 已有语义（用当前内容直接搜索），
+        // 系统输入法由页面上的自绘键盘切换键唤出。
+        TvImeUtil.suppressAutoIme(etSearch);
         tvSearch = findViewById(R.id.tvSearch);
         tvSearchCheckboxBtn = findViewById(R.id.tvSearchCheckboxBtn);
         tvClear = findViewById(R.id.tvClear);

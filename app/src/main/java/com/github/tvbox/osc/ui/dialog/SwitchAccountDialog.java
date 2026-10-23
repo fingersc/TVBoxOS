@@ -16,6 +16,7 @@ import com.github.tvbox.osc.sync.AccountPaths;
 import com.github.tvbox.osc.sync.AccountService;
 import com.github.tvbox.osc.sync.Crypto;
 import com.github.tvbox.osc.sync.WebDavClient;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
@@ -52,6 +53,7 @@ public class SwitchAccountDialog extends BaseDialog {
         ((TextView) findViewById(R.id.btnSwitchQr)).setText("二维码登录");
         tvStatus = findViewById(R.id.tvSwitchStatus);
         etPass = findViewById(R.id.etSwitchPass);
+        TvImeUtil.clickToIme(etPass);
 
         findViewById(R.id.btnSwitchOk).setOnClickListener(new View.OnClickListener() {
             @Override

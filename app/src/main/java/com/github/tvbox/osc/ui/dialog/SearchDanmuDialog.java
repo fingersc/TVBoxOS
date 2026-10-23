@@ -16,6 +16,7 @@ import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.DanmakuApi;
 import com.github.tvbox.osc.bean.DanmuSearchResult;
 import com.github.tvbox.osc.ui.adapter.SearchDanmuAdapter;
+import com.github.tvbox.osc.util.TvImeUtil;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.owen.tvrecyclerview.widget.TvRecyclerView;
 import com.owen.tvrecyclerview.widget.V7LinearLayoutManager;
@@ -46,6 +47,7 @@ public class SearchDanmuDialog extends BaseDialog {
         loadingBar = findViewById(R.id.loadingBar);
         gridView = findViewById(R.id.mGridView);
         searchInput = findViewById(R.id.input);
+        TvImeUtil.clickToIme(searchInput);
         TextView searchButton = findViewById(R.id.inputSubmit);
         searchAdapter = new SearchDanmuAdapter();
         gridView.setHasFixedSize(true);
