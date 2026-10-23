@@ -30,7 +30,6 @@
         android:textSize="@dimen/ts_20" />
 
     <EditText
-        android:showSoftInputOnFocus="false"
         android:id="@+id/etSwitchPass"
         android:layout_width="match_parent"
         android:layout_height="@dimen/vs_56"
