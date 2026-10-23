@@ -151,6 +151,7 @@
                     android:orientation="horizontal">
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etUser"
                         android:layout_width="@dimen/vs_0"
                         android:layout_height="@dimen/vs_56"
@@ -172,6 +173,7 @@
                         android:textSize="@dimen/ts_22" />
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etPass"
                         android:layout_width="@dimen/vs_0"
                         android:layout_height="@dimen/vs_56"
@@ -213,6 +215,7 @@
                     android:visibility="gone">
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etPassConfirm"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
@@ -412,6 +415,7 @@
                     android:layout_weight="2">
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etDavUrl"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
@@ -440,6 +444,7 @@
                     android:layout_weight="1">
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etDavUser"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"
@@ -468,6 +473,7 @@
                     android:layout_weight="1">
 
                     <EditText
+                        android:showSoftInputOnFocus="false"
                         android:id="@+id/etDavPass"
                         android:layout_width="match_parent"
                         android:layout_height="@dimen/vs_56"

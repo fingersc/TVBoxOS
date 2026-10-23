@@ -7,6 +7,9 @@ import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 
+import java.util.Map;
+import java.util.WeakHashMap;
+
 /**
  * ★ v99-r20：TV 端输入法唤出原则 —— 全局统一。
  *
@@ -30,6 +33,17 @@ public final class TvImeUtil {
     private TvImeUtil() {
     }
 
+    /**
+     * 每个输入框「本次聚焦后是否被用户主动唤出过」。
+     *
+     * <p>焦点兜底会在聚焦后延迟收起输入法，但如果用户在这个窗口内已经按了 OK，
+     * 收起动作<b>必须让位</b>，否则会把刚唤出的输入法立刻收掉（用户要的是"点击才唤出"）。</p>
+     */
+    private static final Map<EditText, Boolean> MANUAL_SHOWN = new WeakHashMap<>();
+
+    /** 焦点到达后等待多久再兜底收起（给"输入法监听焦点主动弹出"留出弹窗时间）。 */
+    private static final long SUPPRESS_DELAY_MS = 120L;
+
     /** 焦点到达不自动弹输入法；按 OK 键 / 回车才唤出。 */
     public static void clickToIme(final EditText... ets) {
         suppressAutoIme(ets);
@@ -46,6 +60,8 @@ public final class TvImeUtil {
                     if (event.getAction() == KeyEvent.ACTION_DOWN
                             && (keyCode == KeyEvent.KEYCODE_DPAD_CENTER
                             || keyCode == KeyEvent.KEYCODE_ENTER)) {
+                        // 用户主动唤出：标记后，焦点兜底的延迟收起会自行跳过
+                        MANUAL_SHOWN.put(et, Boolean.TRUE);
                         showIme(et);
                         return true;
                     }
@@ -55,7 +71,7 @@ public final class TvImeUtil {
         }
     }
 
-    /** 只抑制「焦点到达自动弹输入法」，不接管 OK 键。 */
+    /** 只抑制「焦点到达自动弹输入法」，不接管 OK 键（给 OK 键已有专属语义的输入框用）。 */
     public static void suppressAutoIme(final EditText... ets) {
         if (ets == null) {
             return;
@@ -67,6 +83,43 @@ public final class TvImeUtil {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 et.setShowSoftInputOnFocus(false);
             }
+            // ★ v99-r22：兜底 —— 光靠 setShowSoftInputOnFocus(false) 挡不住所有输入法。
+            //   两条路径：
+            //     ① View 层：TextView.onFocusChanged() 按 mShowSoftInputOnFocus 决定是否
+            //        showSoftInput ⇒ 设 false 有效；
+            //     ② 输入法层：部分 TV 输入法（Gboard / 触宝 / 搜狗 TV 版）自己监听
+            //        AccessibilityEvent.TYPE_VIEW_FOCUSED 主动弹出 ⇒ 与 ① 无关，flag 拦不住。
+            //   盒子端实测"焦点到达仍唤出"走的就是 ②。
+            //   对策：聚焦后延迟 SUPPRESS_DELAY_MS 再收一次；若用户已按 OK（MANUAL_SHOWN）
+            //        则跳过，保证"点击才唤出"不被自己收掉。
+            et.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+                @Override
+                public void onFocusChange(View v, boolean hasFocus) {
+                    if (!hasFocus) {
+                        return;
+                    }
+                    MANUAL_SHOWN.put(et, Boolean.FALSE);
+                    et.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!Boolean.TRUE.equals(MANUAL_SHOWN.get(et))) {
+                                hideIme(et);
+                            }
+                        }
+                    }, SUPPRESS_DELAY_MS);
+                }
+            });
+        }
+    }
+
+    private static void hideIme(EditText et) {
+        try {
+            InputMethodManager imm = (InputMethodManager)
+                    et.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null && et.getWindowToken() != null) {
+                imm.hideSoftInputFromWindow(et.getWindowToken(), 0);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

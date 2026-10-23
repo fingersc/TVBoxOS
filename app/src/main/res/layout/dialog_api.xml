@@ -97,6 +97,7 @@
                     tools:ignore="RtlSymmetry,TextViewEdits" />
 
                 <EditText
+                    android:showSoftInputOnFocus="false"
                     android:id="@+id/input"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
@@ -155,6 +156,7 @@
                     tools:ignore="RtlSymmetry,TextViewEdits" />
 
                 <EditText
+                    android:showSoftInputOnFocus="false"
                     android:id="@+id/inputLive"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
