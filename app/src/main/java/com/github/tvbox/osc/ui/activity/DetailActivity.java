@@ -1435,6 +1435,9 @@ public class DetailActivity extends BaseActivity {
             //   漂移（详见 detailFallbackAnchorTitle 注释）。空片名兜底为空串。
             if (!TextUtils.isEmpty(vod_name)) {
                 detailFallbackAnchorTitle = vod_name.trim();
+                // ★ v99-r56 取证：写法的不同写法应落到同一个池键（LOG.sw = TVBox-switch）
+                LOG.sw("[FB] poolKey " + ShowTitleKey.familyKey(vod_name)
+                        + " <- " + detailFallbackAnchorTitle);
             }
             loadDetail(bundle.getString("id", null), bundle.getString("sourceKey", ""));
         }
@@ -1805,7 +1808,7 @@ public class DetailActivity extends BaseActivity {
 
     /** 缓存里是否还有该片名的可用候选（不含是否已轮转的判断）。 */
     private boolean detailFallbackCacheEntryUsable() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         return cachedCandidates != null && !cachedCandidates.isEmpty();
     }
 
@@ -1814,7 +1817,7 @@ public class DetailActivity extends BaseActivity {
      * 取不到时先尝试开新圈（清空 CycleKeys），仍然取不到才返回 ""。
      */
     private String pollNextCycledSource() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return "";
         }
@@ -2091,7 +2094,7 @@ public class DetailActivity extends BaseActivity {
      * 那么第一条被拉黑后，同站的其它正片候选就再也轮不到。故按 id 粒度在站内跳过。</p>
      */
     private String detailFallbackFirstAliveId(String sourceKey) {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null || TextUtils.isEmpty(sourceKey)) {
             return "";
         }
@@ -2195,7 +2198,7 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(sourceKey)) {
             return 0;
         }
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null) {
             return 0;
         }
@@ -2459,7 +2462,7 @@ public class DetailActivity extends BaseActivity {
     }
 
     private Movie.Video detailFallbackCacheVideo(String title, String sourceKey) {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+        List<Movie.Video> cachedCandidates = poolOf(title);
         if (cachedCandidates == null) {
             return null;
         }
@@ -2479,7 +2482,7 @@ public class DetailActivity extends BaseActivity {
      */
     private Movie.Video detailFallbackCacheVideo(String title, String sourceKey, String videoId) {
         if (!TextUtils.isEmpty(videoId)) {
-            List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+            List<Movie.Video> cachedCandidates = poolOf(title);
             if (cachedCandidates != null) {
                 for (Movie.Video video : cachedCandidates) {
                     if (video != null && TextUtils.equals(video.sourceKey, sourceKey)
@@ -3471,7 +3474,7 @@ public class DetailActivity extends BaseActivity {
      * 用于「抢跳门槛」判断：池子太薄时抢跳会导致原地打转。
      */
     private int detailFallbackUsableCandidateCount() {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return 0;
         }
@@ -3572,8 +3575,11 @@ public class DetailActivity extends BaseActivity {
     /** 把候选池落盘到 Hawk，供下次进同一部片直接复用。 */
     private void persistDetailFallbackCache(String title) {
         title = title == null ? "" : title.trim();
-        List<Movie.Video> candidates = detailFallbackCache.get(title);
-        if (TextUtils.isEmpty(title) || candidates == null || candidates.isEmpty()) {
+        // ★ v99-r56：落盘键与内存池键同为 familyKey（原文键会让写法变体各落一份）
+        String poolKey = ShowTitleKey.familyKey(title);
+        List<Movie.Video> candidates = poolOf(title);
+        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(poolKey)
+                || candidates == null || candidates.isEmpty()) {
             return;
         }
         // ★ 候选池没变化就不落盘。切源收尾（含「切源成功」这条高频路径）每次都会走
@@ -3591,9 +3597,9 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         try {
-            Hawk.put(HAWK_FALLBACK_CACHE_PREFIX + title,
+            Hawk.put(HAWK_FALLBACK_CACHE_PREFIX + poolKey,
                     new FallbackCacheBox(slim, System.currentTimeMillis()));
-            trimFallbackCacheIndex(title);
+            trimFallbackCacheIndex(poolKey);
             detailFallbackCacheDirty = false;
         } catch (Throwable th) {
             LOG.e("persistDetailFallbackCache fail: " + th);
@@ -3685,12 +3691,13 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         try {
-            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + hawkTitle);
+            // ★ v99-r56：读键与写键同为 familyKey（旧版按原文落的盘读不到，冷启动一次即可）
+            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + ShowTitleKey.familyKey(hawkTitle));
             if (box == null || box.entries == null || box.entries.isEmpty()) {
                 return;
             }
             if (System.currentTimeMillis() - box.savedAt > FALLBACK_CACHE_TTL_MS) {
-                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + hawkTitle);
+                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + ShowTitleKey.familyKey(hawkTitle));
                 return;
             }
             List<Movie.Video> restored = new ArrayList<>(box.entries.size());
@@ -3713,9 +3720,9 @@ public class DetailActivity extends BaseActivity {
                 return;
             }
             // 并入内存缓存：与已有条目按 key 增量合并，不置 dirty（见方法注释）。
-            List<Movie.Video> cachedCandidates = detailFallbackCache.get(poolKey);
+            List<Movie.Video> cachedCandidates = poolOf(poolKey);
             if (cachedCandidates == null) {
-                detailFallbackCache.put(poolKey, restored);
+                poolPut(poolKey, restored);
             } else {
                 Set<String> existing = new HashSet<>(Math.max(16, cachedCandidates.size() * 2));
                 for (Movie.Video c : cachedCandidates) {
@@ -3982,10 +3989,10 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(title) || candidates == null || candidates.isEmpty()) {
             return;
         }
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(title);
+        List<Movie.Video> cachedCandidates = poolOf(title);
         if (cachedCandidates == null) {
             cachedCandidates = new ArrayList<>();
-            detailFallbackCache.put(title, cachedCandidates);
+            poolPut(title, cachedCandidates);
         }
         // 一次性建立已有候选的 key 索引，避免逐条线性扫描（O(n²) → O(n)）。
         Set<String> existingKeys = new HashSet<>(Math.max(16, cachedCandidates.size() * 2));
@@ -4008,10 +4015,10 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void cacheDetailFallbackCandidate(Movie.Video video) {
-        List<Movie.Video> cachedCandidates = detailFallbackCache.get(detailFallbackAnchorTitle);
+        List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null) {
             cachedCandidates = new ArrayList<>();
-            detailFallbackCache.put(detailFallbackAnchorTitle, cachedCandidates);
+            poolPut(detailFallbackAnchorTitle, cachedCandidates);
         }
         String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
         for (Movie.Video cachedVideo : cachedCandidates) {
@@ -4209,6 +4216,39 @@ public class DetailActivity extends BaseActivity {
                     return size() > FALLBACK_CACHE_MAX_ENTRIES;
                 }
             };
+
+    /**
+     * ★ v99-r56：候选池的「读键」——一律走 {@link ShowTitleKey#familyKey}，不用片名原文。
+     *
+     * <p><b>为什么要换键</b>（真机实例，2026-10-25）：同一部片《药屋少女的呢喃第三季》
+     * 在历史里有两条写法（无空格 / 有空格）。切源时 {@code vod_name} 会被新站的写法覆盖，
+     * 于是第二次点进去时锚变成了另一种写法 ⇒ 缓存与磁盘各是一个桶，实测
+     * <b>第一次池子 5 个站、第二次 13 个站，交集只有 2 个</b>。用户看到的就是
+     * 「同一部片，两次进来能切的站点完全不一样」。</p>
+     *
+     * <p>{@code familyKey} 把「语言 / 序号 / 主干」三段分别编码，空格与中文数字差异
+     * 都被吃掉 ⇒ 两种写法落到同一个键，候选池合并。</p>
+     *
+     * <p><b>搜索词不受影响</b>：{@link #detailFallbackAnchorTitle} 仍是片名原文
+     * （要发给站点搜索，不能带 {@code |季4} 这类结构），只有「存取池子」用本键。</p>
+     */
+    private List<Movie.Video> poolOf(String title) {
+        String key = ShowTitleKey.familyKey(title);
+        if (TextUtils.isEmpty(key)) {
+            return null;
+        }
+        return detailFallbackCache.get(key);
+    }
+
+    /** {@link #poolOf} 的写入侧，键口径必须一致（详见方法注释）。 */
+    private void poolPut(String title, List<Movie.Video> candidates) {
+        String key = ShowTitleKey.familyKey(title);
+        if (TextUtils.isEmpty(key)) {
+            return;
+        }
+        detailFallbackCache.put(key, candidates);
+    }
+
     private final Set<String> detailFallbackPendingSources = new HashSet<>();
     /**
      * 滑动窗口下每个在途源的发出时刻（key = sourceKey）。

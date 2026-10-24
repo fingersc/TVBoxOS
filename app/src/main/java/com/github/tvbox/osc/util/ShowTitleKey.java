@@ -396,6 +396,99 @@ public final class ShowTitleKey {
     }
 
     /**
+     * 剥掉归一化串尾部的「纯修饰」片段（{@code 庆余年完结 → 庆余年}）。
+     *
+     * <p><b>为什么需要</b>：{@link #stripTags} 只在修饰词<b>紧贴词边界</b>时剥
+     * （防「全集人生」被误剥），于是 {@code 庆余年HD} 这种紧贴汉字的写法剥不掉，
+     * {@code 庆余年} 与 {@code 庆余年HD} 会落到两个键（少并）。
+     * 但 {@link #sameFamily} 的「前缀 + 纯修饰」放宽认为它们是同一部片，
+     * 这里补一刀把两者对齐。</p>
+     *
+     * <p><b>安全性</b>：只剥 {@link #isPureModifier} 认可的后缀 —— 这正是
+     * {@code sameFamily} 放宽所用的同一个判据 ⇒ 剥完之后键相等的两个片名，
+     * 其 {@code sameFamily} 仍为 true（只会少并，不会错并）。</p>
+     */
+    private static String stripTrailingModifiers(String n) {
+        if (TextUtils.isEmpty(n)) {
+            return n;
+        }
+        // ★ 只剥一轮，绝不迭代：迭代会突破「形态词」红线。
+        //   实例：一人之下电影版 —— 一轮只剥「版」得「一人之下电影」；
+        //   若再来一轮，「电影」也在修饰词表里，会继续剥成「一人之下」，
+        //   于是动漫与电影被并进同一个键（形态不同，绝不能并）。
+        int cut = matchTrailingModifier(n);
+        // 不剥到空串：主干必须留下
+        if (cut <= 0 || cut >= n.length()) {
+            return n;
+        }
+        return n.substring(0, n.length() - cut);
+    }
+
+    /**
+     * 归一化串尾部「整体由修饰词构成」的最长片段长度（0 = 尾巴不是修饰）。
+     * 从最长后缀往短试，取第一个整体命中 {@link #isPureModifier} 的。
+     */
+    private static int matchTrailingModifier(String s) {
+        for (int start = 0; start < s.length(); start++) {
+            if (isPureModifier(s.substring(start))) {
+                return s.length() - start;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * 「同一部片」的<b>分组键</b>：同一部片的不同写法落到<b>同一个键</b>，
+     * 不同的片落到<b>不同的键</b>。供以片名作 key 的容器（切源候选池、其持久化）
+     * 使用 —— 这类容器的正确性是「读键 = 写键」，用片名原文会让写法变体各成一个桶。
+     *
+     * <p><b>为什么不能直接用 {@link #normalize} 或 {@link #same}</b>：</p>
+     * <ul>
+     *   <li>{@code normalize} 不做「中文数字 → 阿拉伯」⇒ {@code 第四季} 与 {@code 第4季}
+     *       是两个键（实测 false）；</li>
+     *   <li>{@code VodNameNormalizer} 做中文数字转换但<b>不剥运营标签</b>
+     *       ⇒ {@code 第四季} 与 {@code 第四季HD} 是两个键；</li>
+     *   <li>本方法把「语言词 / 序号段」抽出来单独编码，主干走 {@code normalize}
+     *       （它会剥掉尾部运营标签）⇒ 空格、中文数字、HD/完结 三类变体全部归一。</li>
+     * </ul>
+     *
+     * <p><b>键结构</b>：{@code 语言|主干|序号}（无语言记 {@code -}，无序号则不带第三段）。</p>
+     *
+     * <p><b>★ 安全性（比 {@link #sameFamily} 更严格，绝不会误并）</b>：
+     * 键相等 ⇒ 语言红线、序号红线、主干归一化三者都相等 ⇒ {@code sameFamily} 必为 true。
+     * 反之不成立（{@code sameFamily} 还有「前缀 + 纯修饰」放宽，那部分不可传递、
+     * 做不成分组键）⇒ 本键只会<b>少并</b>不会<b>错并</b>，用于分组是安全的。</p>
+     *
+     * @param title 片名原文（可为 null）
+     * @return 分组键；空片名或主干归一化后为空时返回 {@code ""}（调用方据此跳过）
+     */
+    public static String familyKey(String title) {
+        if (TextUtils.isEmpty(title)) {
+            return "";
+        }
+        String t = title.trim();
+        // 语言：与 sameFamily 同口径，先抽出来单独编码（红线字段，不能混进主干）
+        String lang = findLanguageWord(t);
+        String noLang = lang == null ? t : t.replace(lang, "");
+        // 序号：第四季 与 第4季 在这里被解析成同一个 (kind,value)
+        Ordinal ord = findOrdinalSegment(noLang);
+        String core = ord == null ? noLang
+                : noLang.substring(0, ord.start) + noLang.substring(ord.end);
+        // 主干 normalize：删空白/符号，剥尾部运营标签（第四季 HD → 现在就出发）
+        String n = stripTrailingModifiers(normalize(core));
+        if (TextUtils.isEmpty(n)) {
+            return "";
+        }
+        String cl = canonicalLanguage(lang);
+        StringBuilder sb = new StringBuilder(n.length() + 8);
+        sb.append(cl == null ? "-" : cl).append('|').append(n);
+        if (ord != null) {
+            sb.append('|').append(ord.kind).append(ord.value);
+        }
+        return sb.toString();
+    }
+
+    /**
      * 换片判定的修饰词表：{@link #MODIFIER_WORDS} + {@link #FORM_CHANGE_WORDS}。
      *
      * <p><b>为什么换片判定要把形态词加回来</b>：{@link #sameFamily}（切源候选口径）
