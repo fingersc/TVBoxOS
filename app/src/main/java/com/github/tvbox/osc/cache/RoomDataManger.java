@@ -152,13 +152,16 @@ public class RoomDataManger {
         try {
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
             int before = dao.getCount();
-            removed += purgeInvalidRecords(dao);
-            removed += dedupeSameName(dao);
+            int purge = purgeInvalidRecords(dao);
+            int dedupe = dedupeSameName(dao);
+            removed = purge + dedupe;
             if (removed > 0) {
                 PlayProgressManager.deleteOrphaned();
                 HistorySyncManager.markDirty(SyncScope.HISTORY);
                 try {
-                    LOG.i("[Hist] compact db=" + before + " removed=" + removed
+                    // ★ v99-r55：拆开 purge（坏行）与 dedupe（同名重复），
+                    //   否则"一次删了 6 条"分不清是数据坏了还是重复太多，无从下手。
+                    LOG.i("[Hist] compact db=" + before + " purge=" + purge + " dedupe=" + dedupe
                             + " keeep=" + HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
                 } catch (Throwable ignored) {
                 }
@@ -186,8 +189,9 @@ public class RoomDataManger {
      *   <li>调用方保证：只在本跳成功（detail 已加载、episodeCheck 通过）之后调用；</li>
      *   <li>名字护栏：两条记录归一化名必须相同；不同 ⇒ 可能切到了别的同名片 ⇒ 不删；</li>
      *   <li>身份护栏：from/to 必须不同，且 from 行确实存在。</li>
-     * </ol>
-     * 删除**不写墓碑**（这是内部合并，不是用户删除，不能传播到其它设备）。</p>
+   * </ol>
+   * ★ v99-r55：删除**要写墓碑**（原实现不写，理由见下方 dedupeSameName 的同名注释）。
+   * 不写的话云端那份旧行永远还在，每次同步落地又被 upsert 回本机，条数反复抖动。</p>
      *
      * @return 删除的行数（0 表示未命中/被护栏拦下）
      */
@@ -223,6 +227,8 @@ public class RoomDataManger {
             } catch (Throwable ignored) {
             }
             dao.delete(from);
+            // ★ v99-r55：与 dedupeSameName 同理，写墓碑切断"云端回灌"闭环。
+            SyncTombstones.addRecord(fromSourceKey, fromVodId);
             try {
                 LOG.i("[Hist] hopMerged " + fromSourceKey + "/" + fromVodId
                         + " -> " + toSourceKey + "/" + toVodInfo.id);
@@ -341,6 +347,15 @@ public class RoomDataManger {
                             keep.sourceKey, keep.vodId, collectAllEpisodeNames(winnerInfo.get(name)));
                 }
                 dao.delete(r);
+                // ★ v99-r55：同名合并的删除**必须写墓碑**。
+                //
+                //   原实现不写（理由是"内部合并不是用户删除，不该传播"），结果：云端那份
+                //   重复行永远还在，每次同步落地又被 upsert 回本机 —— 真机实测（02:47:29）
+                //   同步后 db 从 10 涨到 15，compact 再删 6 条回到 9，条数反复抖动、档位永远填不满。
+                //
+                //   写墓碑是安全的：删掉 loser 的同时 winner 也在同一个同步包里上传，
+                //   其它设备拉到的结果是「这部片只剩 winner 那一行」，不会整片丢失。
+                SyncTombstones.addRecord(r.sourceKey, r.vodId);
                 n++;
             } catch (Throwable ignored) {
             }
