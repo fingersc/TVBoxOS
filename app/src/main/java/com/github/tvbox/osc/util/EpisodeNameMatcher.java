@@ -1977,6 +1977,11 @@ public final class EpisodeNameMatcher {
             if (srcPeriod <= 0) {
                 srcPeriod = 7;         // 保留原周更快照（实测行为正确）
             }
+            // ★★ 开头孤立锚守卫（v99-r48）：首播基准被"开播前的先导/预告"污染时往后挪。
+            //   实测（开始推理吧 第四季 zuidazy/122868）：首条 `20260324` 距下一条 `20260429`
+            //   有 36 天（节拍 7 的 5 倍多）——那是预告，真正第1期是 `20260527`。
+            //   判据要求"孤立"（与下一条正片距离 ≥ 4×节拍），隔周更新/停播三周都不触发。
+            firstDate = skipLeadingIsolatedAnchor(sourceNames, labels, firstDate, srcPeriod);
             if (firstDate > 0 && curDay > 0) {
                 long diff = curDay - dayNumberOf(firstDate);
                 if (diff >= 0) {
@@ -1988,6 +1993,25 @@ public final class EpisodeNameMatcher {
                         inferred = episode;
                     }
                 }
+            }
+            // ★★★ 期号唯一性守卫（v99-r48）：
+            //   日期外推（首播日 + 节拍×(N-1)）依赖"首播基准"，而源列表开头的先导/预告
+            //   常比真正的第1期早好几周 —— 基准一偏，外推出的期号整体位移，静默落到别的期。
+            //
+            //   实测（真机 2026-10-24 18:27，开始推理吧 第四季）：
+            //     源 zuidazy/122868（72 条裸日期）首条是 `20260324`（开播前的预告），
+            //     真正的第1期是 `20260527`（暴风 `20260527(第1期上)` 为证）。
+            //     0324 + 7×9 = 0527 ⇒ 外推成「第10期」，而目标 Clun 的「第10期」是 0812，
+            //     于是看「第1期上」被切到「第10期上」，整整跳了两个月。
+            //
+            //   救命的证据：源站自己在中段写了「第N期」——
+            //     `20260708第5期上` / `20260729第8期上` / `20260812第10期上`。
+            //   第10期已被 0812 占用 ⇒ 0527 不可能是第10期 ⇒ 外推无效，宁可返回 -1
+            //   （上层保持原下标 + 正片兜底），也不能切到错误的一期。
+            if (byEpisode >= 0 && inferred > 0
+                    && ordinalClaimedByOtherDate(sourceNames, cur.ordinal, inferred,
+                    Math.max(3, srcPeriod), labels)) {
+                byEpisode = -1;
             }
             // ★★★★ 源侧列表截断守卫（本项目实测最隐蔽的一类静默错切）。
             //   **必须放在下一行"规模不一致就返回 byEpisode"之前** —— 那行判据
@@ -2883,6 +2907,93 @@ public final class EpisodeNameMatcher {
      */
     private static int firstMainDate(List<String> names) {
         return firstMainDate(names, null);
+    }
+
+    /**
+     * ★ v99-r48：本源里是否有「另一天」用显式「第N期」标注了同一个期号。
+     *
+     * <p>用途见 {@code alignByMainFeatureRank} 日期分支里的「期号唯一性守卫」——
+     * 日期外推依赖首播基准，基准偏了期号就会整体位移；而源站中段的
+     * {@code 第N期} 标注是"某一期 = 某一天"的直接证据，可以用来反证外推。</p>
+     *
+     * <p>不算冲突的情况：</p>
+     * <ul>
+     *   <li>同一天的多条（一期上/下/纯享都在同一天）；</li>
+     *   <li>距离当前日期不足一个节拍的条目（一期上/下常跨相邻两天）；</li>
+     *   <li>衍生条目自带的「第N期」（如 {@code 20260811解锁中加更第10期}，那是加更序列的期号）；</li>
+     *   <li>包裹式日期期号（{@code 第20260527期上} 的期号就是日期，从数值上不会与小编号相等）。</li>
+     * </ul>
+     */
+    private static boolean ordinalClaimedByOtherDate(List<String> sourceNames, int curDate,
+                                                     int ordinal, long minGap, FeatureLabels labels) {
+        if (sourceNames == null || curDate <= 0 || ordinal <= 0) {
+            return false;
+        }
+        long curDay = dayNumberOf(curDate);
+        for (int i = 0; i < sourceNames.size(); i++) {
+            String n = sourceNames.get(i);
+            if (TextUtils.isEmpty(n)) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d <= 0 || d == curDate) {
+                continue;
+            }
+            if (Math.abs(dayNumberOf(d) - curDay) < minGap) {
+                continue;                       // 同一期的上/下/纯享跨相邻几天，不算另一天
+            }
+            if (isNonMainEntry(n, labels)) {
+                continue;                       // 衍生的「第N期」是它自己那套序号
+            }
+            if (extractOrdinal(n) == ordinal) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * ★ v99-r48：跳过「开播前的先导/预告」这种孤立的首条锚。
+     *
+     * <p>只处理列表开头：若首条正片与第二条正片的日期差 ≥ {@code 4×period}，
+     * 说明首条不属于常规节奏（先导片/预告/序），把它从首播基准里剔掉；
+     * 依次往后看，直到首条与第二条的距离回到正常范围。</p>
+     *
+     * <p>保守性：门槛取 4 倍节拍 —— 正常的隔周更新（2 期一次）、甚至停播三周（3×节拍）
+     * 都不触发；只有"比常规节奏慢了 4 倍以上"的孤立首条才被认为是先导/预告。</p>
+     */
+    private static int skipLeadingIsolatedAnchor(List<String> names, FeatureLabels labels,
+                                                 int firstDate, int period) {
+        if (names == null || firstDate <= 0 || period <= 0) {
+            return firstDate;
+        }
+        List<Integer> days = new ArrayList<>();
+        for (String n : names) {
+            if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels)) {
+                continue;
+            }
+            int d = dateOf(n);
+            if (d <= 0) {
+                continue;
+            }
+            if (days.isEmpty() || days.get(days.size() - 1) != d) {
+                days.add(d);
+            }
+        }
+        int cur = firstDate;
+        int idx = days.indexOf(cur);
+        if (idx < 0) {
+            return firstDate;
+        }
+        while (idx >= 0 && idx + 1 < days.size()) {
+            long gap = Math.abs(dayNumberOf(days.get(idx + 1)) - dayNumberOf(days.get(idx)));
+            if (gap < (long) period * 4) {
+                break;
+            }
+            idx++;
+            cur = days.get(idx);
+        }
+        return cur;
     }
 
     private static int firstMainDate(List<String> names, FeatureLabels labels) {
