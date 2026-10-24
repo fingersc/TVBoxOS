@@ -82,6 +82,20 @@ public class SourceViewModel extends ViewModel {
     private static final String PUSH_AGENT = "push_agent";
     private static final String PUSH_FALLBACK = "push_fallback";
     private static final String PUSH_HEADERS_MARKER = "@Headers=";
+    /**
+     * ★ v99-r43：detail 请求显式要全量集数。
+     *
+     * <p><b>为什么</b>：MacCMS 的 {@code ac=detail} 有默认 {@code limit}（实测 20/30），
+     * 不传就会把 {@code vod_play_url} 按条数截断 —— 真机日志（2026-10-24，我家那闺女2026）
+     * 里 {@code ac=detail&wd=} 只拿到 28 集，而同一影片从另一个源（忽略 limit）拿到 49 集。
+     * 两侧正片序列长度不等 ⇒ {@code alignByMainFeatureRank} 的"正片序列位置映射"
+     * （最强、最通用的一层）直接失效，整条链退化到期号换算/就近兜底，
+     * 实测把「20260906第2期上」切到「20260830上」（少一期）。</p>
+     *
+     * <p>取 1000 而不是 0：0 在个别 CMS 上被当无效值回落默认，1000 覆盖全部真实集数
+     * （单季综艺/电视剧极少超过 200 集），且遵守参数的站点会返回全量、忽略的站点行为不变。</p>
+     */
+    private static final String DETAIL_LIMIT = "1000";
 
     public MutableLiveData<AbsSortXml> sortResult;
     public MutableLiveData<AbsXml> listResult;
@@ -778,6 +792,7 @@ public class SourceViewModel extends ViewModel {
             OkGo.<String>get(sourceBean.getApi())
                     .tag("detail")
                     .params("ac", sourceBean.getType() == 0 ? "videolist" : "detail")
+                    .params("limit", DETAIL_LIMIT)
                     .params("ids", TextUtils.join(",", ids))
                     .execute(new AbsCallback<String>() {
 
@@ -888,6 +903,7 @@ public class SourceViewModel extends ViewModel {
             GetRequest<String> request = OkGo.<String>get(sourceBean.getApi())
                     .tag("detail")
                     .params("ac", type == 0 ? "videolist" : "detail")
+                    .params("limit", DETAIL_LIMIT)
                     .params("ids", id);
             // 当 extend 不为空且非空字符串时添加参数
             if (extend != null && !extend.isEmpty()) {
@@ -1037,6 +1053,7 @@ public class SourceViewModel extends ViewModel {
                     .tag(requestTag)
                     .params("wd", queryWd)
                     .params("ac" ,"detail")
+                    .params("limit", DETAIL_LIMIT)
                     .params("quick" ,"false");
             // 当 extend 不为空且非空字符串时添加参数
             if (extend != null && !extend.isEmpty()) {
@@ -1136,6 +1153,7 @@ public class SourceViewModel extends ViewModel {
                     .tag("search")
                     .params("wd", searchWd)
                     .params("ac" ,"detail")
+                    .params("limit", DETAIL_LIMIT)
                     .params("quick" ,"true");
             // 当 extend 不为空且非空字符串时添加参数
             if (extend != null && !extend.isEmpty()) {

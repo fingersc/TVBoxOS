@@ -5434,32 +5434,51 @@ public class DetailActivity extends BaseActivity {
      * 避免列表前部有"特别篇"等额外条目导致整体后移时，裸下标指向错误的集；
      * 无法提取集数号时才退回钳位后的原始下标。
      */
+    /**
+     * ★ v99-r43：就近落点 —— 重写为「日期锚优先，无锚不猜」。
+     *
+     * <p><b>旧实现的三个 bug</b>（真机日志 2026-10-24 实证）：</p>
+     * <ol>
+     *   <li>{@code extractOrdinal} 对日期式名字返回的就是日期本身（{@code 20260830上} → 20260830），
+     *       拿它和期号（{@code 第2期} → 2）比数值距离纯属噪声 —— 实测把
+     *       {@code 20260906第2期上} 配到 {@code 20260821闺女面对面上}（日期最小的那条）；</li>
+     *   <li>跨域时 {@code score} 恒 0，于是走 {@code sc > bestScore} 的"取第一个同分者"，
+     *       实测 {@code 第2期} 落到列表里第一个日期域条目 {@code 第20260522期}（恰好是第1期）；</li>
+     *   <li>两者都不命中时退化为 {@code clamped(fallbackIndex)}，而 fallbackIndex 是<b>源侧下标</b>，
+     *       跨源列表构成不同时本身就是错的。</li>
+     * </ol>
+     *
+     * <p><b>新口径</b>（用户口径：{@code 20260808} ≡ {@code 第20260808期} ≡ {@code 20260808期}，
+     * 日期即真值）：目标名带日期时，只在<b>候选也带日期</b>的集合里按日期差取唯一最近；
+     * 一天多条（平手）或候选都没有日期（纯期号列表）时<b>不做任何猜测</b>，保持原下标，
+     * 由上层 {@code sanitizeMainFeatureFallback} 矫正正片属性。宁可不切，不可切错。</p>
+     */
     private int nearestEpisodeIndex(VodInfo.VodSeries target, int fallbackIndex, List<VodInfo.VodSeries> list) {
-        if (list == null || list.isEmpty()) return 0;
+        if (list == null || list.isEmpty()) return Math.max(0, fallbackIndex);
         int clamped = Math.max(0, Math.min(fallbackIndex, list.size() - 1));
         if (target == null || TextUtils.isEmpty(target.name)) return clamped;
-        // ★ 跨域安全：目标名与新列表若分属不同命名域（期数 ↔ 日期），
-        //   直接比 ordinal 数值没有意义（|20260411 - 2| 恒为巨值，会挑到任意条目）。
-        //   此时改用 score（含跨域判等）挑最佳，而不是比数值距离。
-        int targetNum = extractEpisodeNumber(target.name);
-        boolean targetIsDate = EpisodeNameMatcher.dateOf(target.name) > 0;
-        boolean targetHasNum = targetNum >= 0;
-        int bestIndex = -1, bestDiff = Integer.MAX_VALUE, bestScore = 0;
+        int targetDate = EpisodeNameMatcher.dateOf(target.name);
+        if (targetDate <= 0) {
+            // 目标名没有日期（纯期号式）：本地没有可用的锚，任何"就近"都是猜 —— 保持原位
+            return clamped;
+        }
+        int bestIndex = -1, bestDiff = Integer.MAX_VALUE, tie = 0;
         for (int i = 0; i < list.size(); i++) {
             VodInfo.VodSeries s = list.get(i);
             if (s == null || TextUtils.isEmpty(s.name)) continue;
-            boolean sameDomain = (EpisodeNameMatcher.dateOf(s.name) > 0) == targetIsDate;
-            if (sameDomain && targetHasNum) {
-                int n = extractEpisodeNumber(s.name);
-                if (n < 0) continue;
-                int diff = Math.abs(n - targetNum);
-                if (diff < bestDiff) { bestDiff = diff; bestIndex = i; }
-            } else {
-                int sc = EpisodeNameMatcher.score(target.name, s.name);
-                if (sc > bestScore) { bestScore = sc; bestIndex = i; }
+            int d = EpisodeNameMatcher.dateOf(s.name);
+            if (d <= 0) continue;                       // 候选没有日期 ⇒ 无法按锚比较
+            int diff = Math.abs(d - targetDate);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIndex = i;
+                tie = 1;
+            } else if (diff == bestDiff) {
+                tie++;
             }
         }
-        return bestIndex >= 0 ? bestIndex : clamped;
+        // 只有"唯一最近"才采纳；同一天多条并列 ⇒ 锚不足以定案，保持原位
+        return (bestIndex >= 0 && tie == 1) ? bestIndex : clamped;
     }
 
     private int getEpisodeMatchScore(String currentName, int currentEpisode, String targetName) {

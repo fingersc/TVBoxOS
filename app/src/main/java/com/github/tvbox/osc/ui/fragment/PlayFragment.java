@@ -1427,6 +1427,26 @@ public class PlayFragment extends BaseLazyFragment {
                             LOG.i("echo-ignore stale play result");
                             return;
                         }
+                        // ★ v99-r44：起播连发节流 —— 同一播放项的播放信息结果只放行第一个。
+                        //
+                        // 实测（真机日志 2026-10-24，两份日志同构）：进详情起播后 0.3 秒内
+                        // `playResult.setValue` 被触发 14~25 次（getPlay 串行完成，seq 检查
+                        // 全部通过），每次都跑完整解析链（initParse → doParse → loadWebView
+                        // → WebView.loadUrl）。窗口内**没有任何 play 网络请求** ⇒ 这些是本地
+                        // spider 路径的重复结果，对用户体验只有坏处：
+                        //   · 主线程被 25 轮完整解析链打满 ⇒ 用户感知「切源卡卡的」；
+                        //   · WebView 被密集导航 ⇒ 推高系统 WebView native 崩溃概率
+                        //     （崩溃日志与无崩溃日志在这一段完全同构，差别只在设备 GPU 偶发）。
+                        //
+                        // 判据用 progressKey（源+id+线路+下标+集名，服务端原样回带）：
+                        // 同一个 key 已经起播过，后续重复结果直接丢弃。
+                        // 失败结果（info == null）不记账 ⇒ 自动重试/换线后的成功仍能放行；
+                        // 用户主动重播（play(true)）会清账，不会被误挡。
+                        if (!TextUtils.isEmpty(progressKey)
+                                && TextUtils.equals(progressKey, lastResolvedProgressKey)) {
+                            LOG.i("echo-ignore duplicate play result key=" + progressKey);
+                            return;
+                        }
                         mHandler.removeMessages(MSG_RESOLVE_PLAY_URL_TIMEOUT);
                         publishQuality(info);
                         webPlayUrl = null;
@@ -1489,8 +1509,11 @@ public class PlayFragment extends BaseLazyFragment {
                         }
                         if (parse || jx) {
                             boolean userJxList = (playUrl.isEmpty() && ApiConfig.get().getVipParseFlags().contains(flag)) || jx;
+                            // 记账放在起播动作之前：这一 key 的解析链从此只跑一次
+                            lastResolvedProgressKey = progressKey;
                             initParse(flag, userJxList, playUrl, url);
                         } else {
+                            lastResolvedProgressKey = progressKey;
                             mController.showParse(false);
                             playUrl(playUrl + url, headers);
                         }
@@ -2008,6 +2031,7 @@ public class PlayFragment extends BaseLazyFragment {
             sourceViewModel.playResult.removeObserver(playResultObserver);
             playResultObserver = null;
         }
+        lastResolvedProgressKey = null;
         super.onDestroyView();
         ApiConfig.get().setCurrentPlaySourceKey("");
         cancelPlayTimeout();
@@ -2942,6 +2966,11 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void play(boolean reset) {
         if(mVodInfo==null)return;
+        // ★ v99-r44：用户主动重播（replay/errReplay 走 reset=true）必须清掉同 key 节流账，
+        //   否则「同一集再播一次」的结果会被当成重复而丢弃。
+        if (reset) {
+            lastResolvedProgressKey = null;
+        }
         boolean reusePlayer = reusePlayerOnSwitch && !releasePlayerOnSwitch;
         reusePlayerOnSwitch = false;
         releasePlayerOnSwitch = false;
@@ -3079,6 +3108,8 @@ public class PlayFragment extends BaseLazyFragment {
     private String playSubtitle;
     private String subtitleCacheKey;
     private String progressKey;
+    /** ★ v99-r44：已放行过解析链的 progressKey（起播连发节流，见 playResultObserver）。 */
+    private String lastResolvedProgressKey;
     // 当前进度元组快照：与 progressKey 同时赋值（P2），供新表按列读写
     private String pkSourceKey;
     private String pkVodId;

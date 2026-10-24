@@ -1737,6 +1737,22 @@ public final class EpisodeNameMatcher {
                 return tgtSeq.get(pos);
             }
         }
+        // ★ v99-r43：源正片序列是目标的【前缀】时同样按位置映射。
+        //
+        //   根因（真机日志 2026-10-24，我家那闺女2026）：MacCMS 的 `ac=detail&ids=`
+        //   不带 limit 参数，站点按默认 limit=20/30 截断 vod_play_url ⇒ 源侧列表
+        //   只有 28 条而目标侧 49 条 ⇒ 上面「数量相等」的前提不成立，
+        //   整条链退化到期号换算/就近兜底，实测把「20260906第2期上」切到「20260830上」
+        //   （少一期）。截断只影响尾部，前 pos 个正片仍一一对应。
+        //
+        //   必须做【锚序列前缀校验】才放行：逐条比对两侧正片的锚（日期，期号式源用期号），
+        //   源侧全部对得上才认为"只是被截断"；对不上说明是另一份错乱列表，仍不放行。
+        if (!srcSeq.isEmpty() && srcSeq.size() < tgtSeq.size()) {
+            int pos = srcSeq.indexOf(sourceIndex);
+            if (pos >= 0 && isAnchorPrefix(srcSeq, sourceNames, tgtSeq, targetNames)) {
+                return tgtSeq.get(pos);
+            }
+        }
 
         EpisodeKey cur = parse(currentName);
         final boolean curHasOrdinal = cur.domain == DOMAIN_ORDINAL && cur.ordinal > 0;
@@ -1784,13 +1800,28 @@ public final class EpisodeNameMatcher {
             final int wantPart = wantPart0;
             // ① 簇法：期号即秩（第N期 = 目标列表第 N-1 个正片簇）
             List<List<Integer>> clusters = buildMainFeatureClusters(targetNames, labels);
+            // ★ v99-r43：期号秩的【起算簇校准】—— 用户口径「日期与期号同义」的落地。
+            //
+            //   旧实现直接拿 `rank = 期号-1` 当目标簇下标，隐含假设「目标列表第 0 簇就是第 1 期」。
+            //   实测（真机 2026-10-24，我家那闺女2026 maoyanzy→api_41）：
+            //     源侧 `20260830第1期上 / 20260906第2期上`（第1期=20260830），
+            //     目标侧正片簇 = [20260823EP00上/下, 20260830上/下, 20260906上/下, …]
+            //     —— 目标把「EP00 试播」当成了第 0 簇 ⇒ `第2期`(rank=1) 落到簇1 = 20260830
+            //     （真实的第1期），**整体少一期**，用户看到的就是切错集。
+            //
+            //   修法：源侧列表若带「第N期 + 日期」的条目（最大资源整库这种写法），
+            //   取期号最小那条的日期作为「第1期」的真值锚，在目标侧定位该锚所在簇，
+            //   期号秩从那一簇起算：effRank = anchorRank + (期号-1)。
+            //   源侧取不到锚（纯期号式源）时保持旧行为，不猜。
+            int anchorRank = leadingOrdinalAnchorRank(sourceNames, targetNames, clusters, labels);
+            int effRank = anchorRank >= 0 ? anchorRank + rank : rank;
             // 只在"目标确实是日期式列表"时才用簇法：期数式列表解析不出日期，
             // 所有正片都会落进同一个簇，簇秩失去意义（那种情况交给按名匹配更安全）。
             int byCluster = -1;
-            if (rank < clusters.size()
-                    && dateOf(targetNames.get(clusters.get(rank).get(0))) > 0) {
-                long expectedDay = expectedDayOf(targetNames, clusters, rank);
-                byCluster = pickMainFeatureEntry(targetNames, clusters.get(rank), wantPart, expectedDay);
+            if (effRank < clusters.size()
+                    && dateOf(targetNames.get(clusters.get(effRank).get(0))) > 0) {
+                long expectedDay = expectedDayOf(targetNames, clusters, effRank);
+                byCluster = pickMainFeatureEntry(targetNames, clusters.get(effRank), wantPart, expectedDay);
                 // expectedDay 只作为簇内"就近挑条"的依据，不作为硬性可信度门槛：
                 // 非严格周更的节目（隔周更新、中间插特辑等）会让"首簇 + 7×rank"整体偏移，
                 // 用硬校验会把<b>正确结果误拒</b>而退回按位置猜。
@@ -1800,16 +1831,19 @@ public final class EpisodeNameMatcher {
             //   直接拿「第N期 → 第N簇」会整体偏一期。校准后 rank 往后挪 drop 个簇。
             //   与日期式分支用同一个判据（双向对称），详见 leadingInsertClusters。
             int dropRev = leadingInsertClusters(sourceNames, targetNames, labels);
-            if (dropRev > 0 && rank + dropRev < clusters.size()
-                    && dateOf(targetNames.get(clusters.get(rank + dropRev).get(0))) > 0) {
-                int effRank = rank + dropRev;
-                long expectedDay2 = expectedDayOf(targetNames, clusters, effRank);
-                byCluster = pickMainFeatureEntry(targetNames, clusters.get(effRank),
+            if (dropRev > 0 && effRank + dropRev < clusters.size()
+                    && dateOf(targetNames.get(clusters.get(effRank + dropRev).get(0))) > 0) {
+                int effRank2 = effRank + dropRev;
+                long expectedDay2 = expectedDayOf(targetNames, clusters, effRank2);
+                byCluster = pickMainFeatureEntry(targetNames, clusters.get(effRank2),
                         wantPart, expectedDay2);
             }
             // ② 绝对日期外推：首播日 + 7×(N-1) = 第 N 期的期望播出日，按日期直接落位。
             //    同样要把插入簇校准传进去，否则它会抢先返回未校准的错误结果。
-            int byDay = findIndexByExpectedDay(targetNames, curOrdinal, wantPart, labels, dropRev);
+            //    ★ v99-r43：锚校准（anchorRank）与插入簇校准同义——都是把首播基准后挪若干簇，
+            //      因此合并传进去，否则 byDay 会盖掉已校准的簇法结果。
+            int byDay = findIndexByExpectedDay(targetNames, curOrdinal, wantPart, labels,
+                    dropRev + (anchorRank > 0 ? anchorRank : 0));
             // ③ 期集合规模判定：两侧规模一致 → 簇秩即正确映射；
             //    不一致说明目标源缺期（列表比源侧少几期），此时簇秩会让后续所有期
             //    整体前移，改用<b>不受列表缺项影响</b>的日期外推（实测：目标源缺第4期时，
@@ -2805,6 +2839,24 @@ public final class EpisodeNameMatcher {
         if (names == null) {
             return -1;
         }
+        // ★ v99-r44：首播基准必须跳过「日更衍生簇」。
+        //
+        //   实测（歌手2026，真机 2026-10-24）：iqiyi / 360zy 把衍生也命名成
+        //   `第20260515期`~`第20260518期`（纯日期期号名、无内容词 ⇒ isNonMainEntry
+        //   判不出衍生），日更连排 4 天。旧实现逐条扫描取到的"首播日"是 20260515，
+        //   于是 `第20260529期`（=第2期）被外推算成第3期，整档节目整体偏移一期。
+        //
+        //   现在先按正片簇（内部已剔除日更簇）取首簇首条日期；没有可用簇时才退回
+        //   逐条扫描（保持旧行为）。
+        List<List<Integer>> clusters = buildMainFeatureClusters(names, labels);
+        if (!clusters.isEmpty()) {
+            for (int idx : clusters.get(0)) {
+                int d = dateOf(names.get(idx));
+                if (d > 0) {
+                    return d;
+                }
+            }
+        }
         for (String n : names) {
             if (TextUtils.isEmpty(n) || isNonMainEntry(n, labels)) {
                 continue;
@@ -3158,7 +3210,58 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
                 lastMainDate = d;
             }
         }
-        return clusters;
+        // ★ v99-r44：剔除「日更衍生簇」——见 dropDailyRefreshClusters。
+        return dropDailyRefreshClusters(clusters, names);
+    }
+
+    /**
+     * ★ v99-r44：剔除「日更衍生簇」。
+     *
+     * <p><b>要解决的问题</b>（真机日志 2026-10-24，歌手2026，两处切错）：</p>
+     * <ul>
+     *   <li>iqiyi 把衍生命名成 {@code 第20260515期}~{@code 第20260518期}（纯日期期号名、
+     *       无内容词 ⇒ {@code isNonMainEntry} 判不出衍生），它们日更连排 4 天，
+     *       被并成一个正片簇 ⇒ 期序整体后移一期：{@code 第2期} 落到簇1 = 0522（第1期）；</li>
+     *   <li>360zy 同样形态 ⇒ {@code 第20260529期}（=第2期）的簇秩算成 3，
+     *       落到目标源「第3期」。</li>
+     * </ul>
+     *
+     * <p><b>判据</b>：正片一期最多拆成 上/中/下 三段、通常同一天或相邻一两天；
+     * 而衍生（超前营业/特别企划/直拍）是<b>日更连排</b>——连续多天、每天一条。
+     * 因此簇内<b>不同日期数 ≥ 3</b> 即认定日更衍生簇（{@code 20260515/16/17/18} 四连、
+     * {@code 20260527/28/29} 三连都是这一形态），从期序里剔除。
+     * 同一天的上/中/下（1 个日期）与相邻两天的上/下（2 个日期）都保留。</p>
+     *
+     * <p><b>保守性</b>：全列表都判成日更簇时（异常输入）原样返回，不把列表剔空。</p>
+     */
+    private static List<List<Integer>> dropDailyRefreshClusters(List<List<Integer>> clusters,
+                                                                List<String> names) {
+        if (clusters == null || clusters.size() < 2 || names == null) {
+            return clusters;
+        }
+        List<List<Integer>> out = new ArrayList<>();
+        for (List<Integer> c : clusters) {
+            if (isDailyRefreshCluster(c, names)) {
+                continue;
+            }
+            out.add(c);
+        }
+        return out.isEmpty() ? clusters : out;
+    }
+
+    /** 簇内不同日期数达到该值即视为日更连排（衍生），不是一期。 */
+    private static final int DAILY_CLUSTER_MIN_DISTINCT_DAYS = 3;
+
+    /** 簇内去重后的不同日期数 ≥ {@link #DAILY_CLUSTER_MIN_DISTINCT_DAYS} ⇒ 日更衍生簇。 */
+    private static boolean isDailyRefreshCluster(List<Integer> cluster, List<String> names) {
+        java.util.Set<Long> days = new java.util.HashSet<>();
+        for (int idx : cluster) {
+            int d = dateOf(names.get(idx));
+            if (d > 0) {
+                days.add(dayNumberOf(d));
+            }
+        }
+        return days.size() >= DAILY_CLUSTER_MIN_DISTINCT_DAYS;
     }
 
     /**
@@ -4084,6 +4187,93 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         return sourceIndex < targetNames.size() ? sourceIndex : -1;
     }
 
+    /**
+     * ★ v99-r43：正片序列的【锚前缀校验】—— 判断 {@code srcSeq} 是否为 {@code tgtSeq} 的前缀。
+     *
+     * <p>锚的取法：能取到日期就用日期（用户口径：{@code 20260808} ≡ {@code 第20260808期} ≡
+     * {@code 20260808期}，日期即真值）；取不到日期（期号式列表）用期号。任一侧取不到锚
+     * （如纯内容词名）时该条无法比对 ⇒ 整体判不成立（宁可保守）。</p>
+     *
+     * <p>用途见 {@link #alignByMainFeatureRank} 第 0 层：源列表被站点 limit 截断时，
+     * 只有确认"前 pos 条正片确实是同一批"才允许按位置映射。</p>
+     */
+    private static boolean isAnchorPrefix(List<Integer> srcSeq, List<String> srcNames,
+                                          List<Integer> tgtSeq, List<String> tgtNames) {
+        for (int k = 0; k < srcSeq.size(); k++) {
+            String a = srcNames.get(srcSeq.get(k));
+            String b = tgtNames.get(tgtSeq.get(k));
+            int aa = anchorOf(a);
+            int bb = anchorOf(b);
+            if (aa <= 0 || bb <= 0 || aa != bb) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 正片序列锚：优先日期，其次期号；都取不到返回 -1。 */
+    private static int anchorOf(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return -1;
+        }
+        int d = dateOf(name);
+        if (d > 0) {
+            return d;
+        }
+        return extractOrdinal(name);
+    }
+
+    /**
+     * ★ v99-r43：期号式源 → 日期式目标时，「第 1 期」在目标正片簇里的下标（起算锚）。
+     *
+     * <p><b>为什么需要</b>：簇法旧假设「目标列表第 0 簇 = 第 1 期」。真实采集源常把
+     * EP00/试播/先导当作正片排在最前（实测我家那闺女2026：目标侧
+     * {@code [20260823EP00上/下, 20260830上/下, 20260906上/下, …]}，
+     * 而源侧写的是 {@code 20260830第1期上} / {@code 20260906第2期上}）⇒
+     * 直接按 {@code 期号-1} 取簇会整体少一期。</p>
+     *
+     * <p><b>口径</b>（用户：{@code 20260808} ≡ {@code 第20260808期} ≡ {@code 20260808期}，
+     * 日期即真值）：源侧列表里「日期 + 期号」复合名中<b>期号最小的那条，
+     * 其日期就是「第 1 期」的真值锚；在目标侧正片簇中定位该日期所在簇即为 rank 0。
+     * 源侧没有带日期的期号条目（纯 {@code 第N期} 式源）或目标侧没有该日期 ⇒ 返回 -1（不校准）。</p>
+     */
+    private static int leadingOrdinalAnchorRank(List<String> sourceNames, List<String> targetNames,
+                                                List<List<Integer>> clusters, FeatureLabels labels) {
+        if (sourceNames == null || targetNames == null || clusters == null || clusters.isEmpty()) {
+            return -1;
+        }
+        int anchorDate = -1;
+        int anchorOrd = Integer.MAX_VALUE;
+        for (String n : sourceNames) {
+            if (TextUtils.isEmpty(n)) {
+                continue;
+            }
+            EpisodeKey k = parse(n);
+            if (k.domain != DOMAIN_ORDINAL || k.ordinal <= 0) {
+                continue;                       // 只认「日期 + 期号」复合名
+            }
+            int d = dateOf(n);
+            if (d <= 0) {
+                continue;                       // 期号不带日期 ⇒ 没有真值锚
+            }
+            if (k.ordinal < anchorOrd) {
+                anchorOrd = k.ordinal;
+                anchorDate = d;
+            }
+        }
+        if (anchorDate <= 0) {
+            return -1;
+        }
+        for (int c = 0; c < clusters.size(); c++) {
+            for (int idx : clusters.get(c)) {
+                if (dateOf(targetNames.get(idx)) == anchorDate) {
+                    return c;
+                }
+            }
+        }
+        return -1;
+    }
+
     /** 统计列表中域名可识别（日期域或序号域）的条目数。 */
     private static int recognizableCount(List<String> names) {
         if (names == null) {
@@ -4284,6 +4474,12 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
 
         int exact = -1, exactCount = 0;             // 残差完全一致
         int sub = -1, subCount = 0;                 // 残差互为子串（一方是另一方的标题变体）
+        // ★ v99-r43：同名多线路列表（MacCMS 的 `liangzi$$$lzm3u8` 会被解析成两个 flag、
+        //   而 detailFallback 探测可能把两份同名列表拼在一起，实测 now=98 = 49×2）
+        //   会让上面四个"唯一性"判据全部翻倍失效 —— 同一集名出现两次即 count=2。
+        //   计数一律按**去重后的集名集合**统计，命中的索引仍取第一次出现的真实下标。
+        java.util.Set<String> seenExact = new java.util.HashSet<>();
+        java.util.Set<String> seenSub = new java.util.HashSet<>();
         for (int i = 0; i < targetNames.size(); i++) {
             String n = targetNames.get(i);
             if (TextUtils.isEmpty(n)) {
@@ -4300,12 +4496,16 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
             String res = dateResidue(n);
             if (res.equals(curRes)) {
-                exact = i;
-                exactCount++;
+                if (seenExact.add(n)) {
+                    exact = i;
+                    exactCount++;
+                }
             } else if (res.length() >= 2 && curRes.length() >= 2
                     && (res.contains(curRes) || curRes.contains(res))) {
-                sub = i;
-                subCount++;
+                if (seenSub.add(n)) {
+                    sub = i;
+                    subCount++;
+                }
             }
         }
         // 只在唯一命中时采纳
@@ -4327,18 +4527,24 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         //     同日多条且分段也多条 ⇒ 一律返回 -1。
         int onlyByDate = -1, onlyByDateCount = 0;   // 目标里该日期只有一条（分段相容即可）
         int onlyByPart = -1, onlyByPartCount = 0;   // 目标里该 (日期,分段) 只有一条
+        java.util.Set<String> seenDay = new java.util.HashSet<>();
+        java.util.Set<String> seenDayPart = new java.util.HashSet<>();
         for (int i = 0; i < targetNames.size(); i++) {
             String n = targetNames.get(i);
             if (TextUtils.isEmpty(n) || dateOf(n) != curDate) {
                 continue;
             }
             if (normalizePart(extractPart(n)) == normalizePart(curPart)) {
-                onlyByDate = i;
-                onlyByDateCount++;
+                if (seenDay.add(n)) {
+                    onlyByDate = i;
+                    onlyByDateCount++;
+                }
             }
             if (extractPart(n) == curPart) {
-                onlyByPart = i;
-                onlyByPartCount++;
+                if (seenDayPart.add(n)) {
+                    onlyByPart = i;
+                    onlyByPartCount++;
+                }
             }
         }
         if (onlyByDateCount == 1) {
