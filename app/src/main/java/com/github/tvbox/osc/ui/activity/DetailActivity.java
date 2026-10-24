@@ -57,6 +57,7 @@ import com.github.tvbox.osc.util.EpisodeOnlineResolver;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.SearchHelper;
@@ -5758,25 +5759,50 @@ public class DetailActivity extends BaseActivity {
         // 切源连跳：一站一条地写历史，会挤占历史上限（把其它影片的记录顶掉），
         // 也让"最近观看"里塞满同一部片。切源本来就是同一部片换站，只保留当前这一条。
         // 旧源的播放进度会在此之前被整体迁到本源，不会因合并而丢失。
+        // ★ v99-r54：切源会话内必须「先删上一跳，再写本跳」——顺序错了就全白做。
+        //
+        //   旧顺序（r50~r53）是 insertVodRecord() 在前、mergeSwitchHop() 在后。而
+        //   insertVodRecord() 内部第一件事就是 removeSameNameVodRecords()——按片名把其它源的
+        //   同名行全删掉，上一跳那一行**在这里就已经没了**。等 mergeSwitchHop() 拿着
+        //   (fromSourceKey, fromVodId) 去查库，永远查不到 ⇒ 真机日志 3/3 全是 ret=0。
+        //   也就是说 hopMerge 从来没真正生效过，切源收敛一直只靠"片名归一化"这一条腿，
+        //   名字一旦对不上（变体写法）就漏，库里留下多源各一行 ⇒ 历史上限被同一部片占掉多格。
+        //
+        //   把删除提前之后：删除者是明确的「上一跳身份」（不依赖名字，不受写法变体影响），
+        //   随后的 insertVodRecord() 只会再删"除上一跳之外的历史遗留同名行"。
+        //   一删一插严格配对 ⇒ 切源不再让历史总数净减少。
+        //
+        // ★ v99-r53：身份判定必须用 (sourceKey, vodId) 这一对，不能只比 vodId。
+        //   实测（真机 02:11）：暴风资源 与 api_23 其实是同一个后端，换源后 vodId 完全相同
+        //   （都是 165275）。旧写法把这种跳当成"同一跳"而跳过合并，于是库里留下
+        //   (暴风,165275) 与 (api_23,165275) 两条同名记录。
+        if (!TextUtils.isEmpty(switchFromVodId) && !TextUtils.isEmpty(switchFromSourceKey)) {
+            boolean sameSwitchHop = TextUtils.equals(switchFromSourceKey, sourceKey)
+                    && TextUtils.equals(switchFromVodId, vodInfo.id);
+            if (!sameSwitchHop) {
+                int dbBeforeHop = RoomDataManger.countVodRecord();
+                int hopMerged = RoomDataManger.mergeSwitchHop(switchFromSourceKey, switchFromVodId,
+                        sourceKey, vodInfo);
+                LOG.sw("[FB] hopMerge ret=" + hopMerged + " " + switchFromSourceKey + "/" + switchFromVodId
+                        + " -> " + sourceKey + "/" + vodInfo.id + " db=" + dbBeforeHop
+                        + "->" + RoomDataManger.countVodRecord());
+            }
+            switchFromSourceKey = "";       // 本跳已消费，防重复
+            switchFromVodId = "";
+        }
         if (detailFallbackActive) {
             int merged = RoomDataManger.mergeSameNameVodRecords(sourceKey, vodInfo);
             if (merged > 0) {
                 LOG.sw("[FB] mergeSameName removed=" + merged + " keep=" + sourceKey + "/" + vodInfo.id);
             }
         }
+        // ★ v99-r54 取证：每次写历史都打印库内条数演变。用户报"档位 15 却只有 14 条"，
+        //   靠这一行就能区分是「本次写入净减少」还是「库里本来就这么少」，不必再靠猜。
+        int dbBeforeWrite = RoomDataManger.countVodRecord();
         RoomDataManger.insertVodRecord(sourceKey, vodInfo);
-        // ★ v99-r50：切源会话内按「上一跳身份」再删一次——不依赖名字变体判定。
-        //   三层护栏：本跳已成功（走到这里说明 detail 加载/episodeCheck/落点都过了）、
-        //   名字归一化相同（在 RoomDataManger 里校验）、身份不同且旧行存在。
-        if (!TextUtils.isEmpty(switchFromVodId) && !TextUtils.isEmpty(switchFromSourceKey)
-                && !TextUtils.equals(switchFromVodId, vodInfo.id)) {
-            int hopMerged = RoomDataManger.mergeSwitchHop(switchFromSourceKey, switchFromVodId,
-                    sourceKey, vodInfo);
-            LOG.sw("[FB] hopMerge ret=" + hopMerged + " " + switchFromSourceKey + "/" + switchFromVodId
-                    + " -> " + sourceKey + "/" + vodInfo.id);
-            switchFromSourceKey = "";       // 本跳已消费，防重复
-            switchFromVodId = "";
-        }
+        LOG.sw("[FB] histWrite " + sourceKey + "/" + vodInfo.id
+                + " db=" + dbBeforeWrite + "->" + RoomDataManger.countVodRecord()
+                + " tier=" + HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
     }
 
