@@ -1757,6 +1757,7 @@ public class DetailActivity extends BaseActivity {
         // 7~8 秒（详情 RTT + 解析 + 起播），以为没生效而反复点击。
         showDetailFallbackIndicators(nextSource, video);
         markDetailFallbackInflight(nextSource, nextId);
+        markSwitchFrom();
         loadDetail(nextId, nextSource, true);
         return true;
     }
@@ -2617,13 +2618,7 @@ public class DetailActivity extends BaseActivity {
         fallbackFromIndex = idx;
         fallbackFromName = list.get(idx).name == null ? "" : list.get(idx).name;
         fallbackFromValid = !TextUtils.isEmpty(fallbackFromName);
-        // ★ v99-r51：只有"正在切源"时的快照才是"上一跳"。
-        //   切源成功后的那次 capture（detailFallbackActive 已被 resetDetailFallbackKeepCache 置 false）
-        //   会拿到"新源身份"，若也写进来，就会把真正的上一跳覆盖掉 ⇒ 合并永远不触发。
-        if (detailFallbackActive) {
-            switchFromSourceKey = fallbackFromSourceKey;
-            switchFromVodId = fallbackFromVodId;
-        }
+
     }
 
     /**
@@ -3237,6 +3232,7 @@ public class DetailActivity extends BaseActivity {
                 markDetailFallbackInflight(nextSource, videoId);
                 LOG.sw("[FB] loadDetail -> " + nextSource + " id=" + videoId
                         + " failover=" + detailFallbackFailoverCount);
+                markSwitchFrom();
                 loadDetail(videoId, nextSource, true);
                 return;
             }
@@ -4276,6 +4272,20 @@ public class DetailActivity extends BaseActivity {
     /** ★ v99-r51：切源会话的"上一跳身份"。只在"开始切源"时写，切源成功路径不会覆写它。 */
     private String switchFromSourceKey = "";
     private String switchFromVodId = "";
+
+    /**
+     * ★ v99-r52：记录"这一跳是从哪来的"。
+     *
+     * <p>必须放在「加载新源详情之前」这一行，而不是 captureLivePlaybackSnapshot 里：
+     * 那个方法在 {@code startDetailFallback} 里被调用时 {@code detailFallbackActive} 还是 false
+     * （它在后面第 1662 行才置 true），而切源成功后又会再调一次（那时 sourceKey 已是新源）。
+     * 放在 loadDetail(fallback=true) 之前，是唯一"一定执行且一定拿到旧身份"的位置。</p>
+     */
+    private void markSwitchFrom() {
+        switchFromSourceKey = sourceKey == null ? "" : sourceKey;
+        switchFromVodId = vodId == null ? "" : vodId;
+        LOG.sw("[FB] markFrom " + switchFromSourceKey + "/" + switchFromVodId);
+    }
     private String fallbackFromFlag = "";
     private int fallbackFromIndex = -1;
     private String fallbackFromName = "";
