@@ -5745,6 +5745,20 @@ public class DetailActivity extends BaseActivity {
             }
         }
         RoomDataManger.insertVodRecord(sourceKey, vodInfo);
+        // ★ v99-r50：切源会话内按「上一跳身份」再删一次——不依赖名字变体判定。
+        //   三层护栏：本跳已成功（走到这里说明 detail 加载/episodeCheck/落点都过了）、
+        //   名字归一化相同（在 RoomDataManger 里校验）、身份不同且旧行存在。
+        if (detailFallbackActive && fallbackFromValid
+                && !TextUtils.isEmpty(fallbackFromVodId)
+                && !TextUtils.equals(fallbackFromVodId, vodInfo.id)) {
+            int hopMerged = RoomDataManger.mergeSwitchHop(fallbackFromSourceKey, fallbackFromVodId,
+                    sourceKey, vodInfo);
+            if (hopMerged > 0) {
+                LOG.sw("[FB] hopMerged " + fallbackFromSourceKey + "/" + fallbackFromVodId
+                        + " -> " + sourceKey + "/" + vodInfo.id);
+            }
+            fallbackFromValid = false;      // 本跳已消费，防重复
+        }
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
     }
 

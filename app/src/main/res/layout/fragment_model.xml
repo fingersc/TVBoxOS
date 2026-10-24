@@ -972,7 +972,6 @@
                             android:textColor="@android:color/white"
                             android:textSize="@dimen/ts_30" />
                     </LinearLayout>
-
                     <LinearLayout
                         android:id="@+id/showPreview"
                         android:layout_width="@dimen/vs_0"
@@ -1158,8 +1157,8 @@
                         android:id="@+id/llSaveSettings"
                         android:layout_width="@dimen/vs_0"
                         android:layout_height="match_parent"
-                        android:layout_marginEnd="@dimen/vs_5"
-                        android:layout_marginRight="@dimen/vs_5"
+                        android:layout_marginStart="@dimen/vs_5"
+                        android:layout_marginLeft="@dimen/vs_5"
                         android:layout_weight="1"
                         android:background="@drawable/shape_setting_model_focus"
                         android:focusable="true"
@@ -1179,7 +1178,6 @@
                             android:layout_width="0dp"
                             android:layout_height="wrap_content"
                             android:layout_weight="1" />
-
 
                         <TextView
                             android:layout_width="wrap_content"
@@ -1309,8 +1307,8 @@
                         android:id="@+id/llHistoryNum"
                         android:layout_width="@dimen/vs_0"
                         android:layout_height="match_parent"
-                        android:layout_marginStart="@dimen/vs_5"
-                        android:layout_marginLeft="@dimen/vs_5"
+                        android:layout_marginEnd="@dimen/vs_5"
+                        android:layout_marginRight="@dimen/vs_5"
                         android:layout_weight="1"
                         android:background="@drawable/shape_setting_model_focus"
                         android:focusable="true"

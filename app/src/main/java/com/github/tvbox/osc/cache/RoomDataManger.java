@@ -12,6 +12,7 @@ import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
+import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.VodNameNormalizer;
 import com.google.gson.FieldAttributes;
 import com.google.gson.Gson;
@@ -116,17 +117,9 @@ public class RoomDataManger {
                 return;
             }
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-            boolean changed = false;
-            // ★ v99-r27：先清掉「永远显示不出来」的坏记录。
-            //   现象（用户反馈）：档位 15，首页只显示 13 部，再看一部新的最旧的就不见了。
-            //   根因：dataJson 解析失败 / 没有片名的记录，getAllVodRecord 会跳过它们（不显示），
-            //   但裁剪是按【总条数】算的 ⇒ 坏记录白占名额，用户看到的上限就变成 13。
-            changed = purgeInvalidRecords(dao) > 0;
-            // ★ v99-r25：「条数上限」指的是【合并去重之后】的条数。
-            //   合并开启时先把同名记录收敛为「只保留最新源」，再按 keep 裁剪；
-            //   否则"15 条"里可能有多条是同一部片的不同源，实际影片数远少于 15。
-            // ★ v99-r49：同名合并恒开启（开关已删除）
-            changed = dedupeSameName(dao) > 0 || changed;
+            // ★ v99-r50：把"清坏行 + 同名收敛"收敛成唯一出口 compactHistory()，
+            //   所有需要收敛的路径（写入/裁剪/同步落地/读时自愈）都调它，避免口径漂移。
+            boolean changed = compactHistory() > 0;
             List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
             if (all != null && all.size() > keep) {
                 for (int i = keep; i < all.size(); i++) {
@@ -140,6 +133,104 @@ public class RoomDataManger {
                 HistorySyncManager.markDirty(SyncScope.HISTORY);
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * ★ v99-r50：历史收敛的统一出口（幂等）。
+     *
+     * <p>做三件事：清掉坏行、把同名记录收敛为一条（保留最新）、清理随之产生的孤儿进度。</p>
+     *
+     * <p><b>为什么还要这个东西</b>：写入入口（insertVodRecord）已经会删同名，但有三条路径绕过它——
+     * 云同步 {@code applyLocal}（整表重写）、备份恢复（整库覆盖）、以及升级前的历史遗留。
+     * 这三条都可能把重复行带进来，所以需要一个与入口解耦的收敛点。</p>
+     *
+     * @return 发生变动的条数（0 = 无重复、无需写库）
+     */
+    public static int compactHistory() {
+        int removed = 0;
+        try {
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            int before = dao.getCount();
+            removed += purgeInvalidRecords(dao);
+            removed += dedupeSameName(dao);
+            if (removed > 0) {
+                PlayProgressManager.deleteOrphaned();
+                HistorySyncManager.markDirty(SyncScope.HISTORY);
+                try {
+                    LOG.i("[Hist] compact db=" + before + " removed=" + removed
+                            + " keeep=" + HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+        return removed;
+    }
+
+    /** 同步落地 / 启动自愈用：等价于 compactHistory()，命名更贴近调用语义。 */
+    public static int selfHealHistory() {
+        return compactHistory();
+    }
+
+    /**
+     * ★ v99-r50：切源「按会话身份」合并上一跳——不看名字也能删（名字只作护栏）。
+     *
+     * <p>切源链路每一跳都会写一条历史（源与 id 都变），能否收敛全看名字，
+     * 而名字变体（标点/全角/季节写法）会让合并漏掉 ⇒ 同一部片占多个档位。
+     * 这里用「切源会话内已知的上一跳身份」直接删旧行，与名字判定互为兜底。</p>
+     *
+     * <p><b>三层护栏</b>（缺一不删）：
+     * <ol>
+     *   <li>调用方保证：只在本跳成功（detail 已加载、episodeCheck 通过）之后调用；</li>
+     *   <li>名字护栏：两条记录归一化名必须相同；不同 ⇒ 可能切到了别的同名片 ⇒ 不删；</li>
+     *   <li>身份护栏：from/to 必须不同，且 from 行确实存在。</li>
+     * </ol>
+     * 删除**不写墓碑**（这是内部合并，不是用户删除，不能传播到其它设备）。</p>
+     *
+     * @return 删除的行数（0 表示未命中/被护栏拦下）
+     */
+    public static int mergeSwitchHop(String fromSourceKey, String fromVodId,
+                                     String toSourceKey, VodInfo toVodInfo) {
+        try {
+            if (TextUtils.isEmpty(fromSourceKey) || TextUtils.isEmpty(fromVodId) || toVodInfo == null) {
+                return 0;
+            }
+            if (TextUtils.equals(fromSourceKey, toSourceKey) && TextUtils.equals(fromVodId, toVodInfo.id)) {
+                return 0;
+            }
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            VodRecord from = dao.getVodRecord(fromSourceKey, fromVodId);
+            if (from == null) {
+                return 0;
+            }
+            VodInfo fromInfo = parseRecordInfo(from);
+            String fromName = getVodRecordName(fromInfo);
+            String toName = getVodRecordName(toVodInfo);
+            if (TextUtils.isEmpty(fromName) || !TextUtils.equals(fromName, toName)) {
+                try {
+                    LOG.i("[Hist] hopSkip nameMismatch 「" + fromName + "」vs「" + toName + "」");
+                } catch (Throwable ignored) {
+                }
+                return 0;
+            }
+            // 先迁进度（按集名对齐），迁移失败也照删——进度是"尽力而为"，不能因为迁移失败留下重复行
+            try {
+                PlayProgressManager.migrateByVod(fromSourceKey, fromVodId,
+                        toSourceKey, toVodInfo.id, collectAllEpisodeNames(toVodInfo));
+            } catch (Throwable ignored) {
+            }
+            dao.delete(from);
+            try {
+                LOG.i("[Hist] hopMerged " + fromSourceKey + "/" + fromVodId
+                        + " -> " + toSourceKey + "/" + toVodInfo.id);
+            } catch (Throwable ignored) {
+            }
+            return 1;
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return 0;
         }
     }
 
@@ -392,8 +483,10 @@ public class RoomDataManger {
         Integer hisNum = HistoryHelper.getHisNum(index);
         List<VodRecord> recordList = dao.getAll(Integer.MAX_VALUE);
         List<VodInfo> vodInfoList = new ArrayList<>();
-        // ★ v99-r49：同名合并恒开启 ⇒ 显示层始终按归一化名去重
+        // ★ v99-r50：读路径**不再隐藏**同名记录 —— 隐藏会让"页面条数 < 库内条数"，
+        //   表现为"档位 15 却只显示 14/12"。改成：发现重复就自愈一次，然后按真实条数显示。
         Set<String> historyNames = new HashSet<String>();
+        boolean dupFound = false;
         if (recordList != null) {
             for (VodRecord record : recordList) {
                 VodInfo info = null;
@@ -415,10 +508,20 @@ public class RoomDataManger {
                 }
                 String name = getVodRecordName(info);
                 if (info != null) {
-                    if (TextUtils.isEmpty(name) || historyNames.add(name)) {
-                        vodInfoList.add(info);
+                    if (!TextUtils.isEmpty(name) && !historyNames.add(name)) {
+                        dupFound = true;          // 同名重复：先照显，随后自愈
                     }
+                    vodInfoList.add(info);
                 }
+            }
+        }
+        if (dupFound) {
+            // 自愈：收敛库内同名（只删重复，不动档位裁剪），成功后重读一次
+            try {
+                if (compactHistory() > 0) {
+                    return getAllVodRecord(limit);
+                }
+            } catch (Throwable ignored) {
             }
         }
         // ★ v99-r47：读路径**不再删库**。

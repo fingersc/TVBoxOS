@@ -211,6 +211,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
     @Override
     protected void init() {
         notifyLegacyMergeOnce();
+        captureBaseline();
         refreshUi();
         findViewById(R.id.llParseWebVew).setOnClickListener(new View.OnClickListener() {
             @Override
@@ -858,7 +859,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 @Override
                 public void onClick(View v) {
                     FastClickCheckUtil.check(v);
-                    showSaveConfirm();
+                    showSaveDialog("本次修改");
                 }
             });
         }
@@ -926,9 +927,58 @@ public class ModelSettingFragment extends BaseLazyFragment {
         tvIjkCachePlay.setText(cur(HawkConfig.IJK_CACHE_PLAY, false) ? "开启" : "关闭");
         tvHomeDefaultShow = findViewById(R.id.tvHomeText);
         tvHomeDefaultShow.setText(cur(HawkConfig.DEFAULT_LOAD_LIVE, false) ? "直播" : "点播");
+        applyGuestBackupState();
+    }
+
+    /** ★ v99-r50：数据备份只服务游客（游客态 markDirty 天然不上传）；登录态置灰。 */
+    private void applyGuestBackupState() {
+        View v = findViewById(R.id.llBackup);
+        if (v == null) {
+            return;
+        }
+        boolean guest = com.github.tvbox.osc.sync.AccountContext.isGuest();
+        v.setEnabled(guest);
+        v.setClickable(guest);
+        v.setAlpha(guest ? 1f : 0.4f);
     }
 
     // ------------------------------------------------------------------ 草稿层
+    /** 进页面时的原值快照：判断"改没改"、生成"旧→新"都要用它（不能拿 Hawk 比，API 类会临时落盘）。 */
+    private final java.util.LinkedHashMap<String, Object> baseline = new java.util.LinkedHashMap<>();
+
+    private void captureBaseline() {
+        baseline.clear();
+        for (String k : SETTING_NAMES.keySet()) {
+            baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : null);
+        }
+        for (String k : API_DEPENDENT_KEYS) {
+            if (!baseline.containsKey(k)) {
+                baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : null);
+            }
+        }
+    }
+
+    private boolean changed(String key) {
+        if (!draft.containsKey(key)) {
+            return false;
+        }
+        Object old = baseline.get(key);
+        Object now = draft.get(key);
+        if (old == null) {
+            return now != null;
+        }
+        return !old.equals(now);
+    }
+
+    private boolean hasChanges() {
+        for (String k : draft.keySet()) {
+            if (changed(k)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** 读草稿，没有则回落到已保存值。 */
     @SuppressWarnings("unchecked")
     private <T> T cur(String key, T defValue) {
@@ -944,7 +994,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         return Hawk.get(key, defValue);
     }
 
-    /** 写草稿。API 类键例外：立即落盘并重新解析，保证「首页站源/线路选择」候选是新 API 的。 */
+    /** 写草稿。API 类键例外：临时落盘 → 立即解析 → 立刻还原"用户设置类"键。 */
     private void draftPut(String key, Object value) {
         if (isApiDependent(key)) {
             snapshotApiKeys();
@@ -965,22 +1015,29 @@ public class ModelSettingFragment extends BaseLazyFragment {
         return false;
     }
 
-    /** API 改动前的现场：用于「不保存」时把 parseJson 写过的键还原。 */
+    /** API 改动前的现场（只记一次）。 */
     private void snapshotApiKeys() {
         if (!apiSnapshot.isEmpty() || !apiAbsent.isEmpty()) {
-            return;                      // 一次页面内只记第一份现场
+            return;
         }
         for (String k : API_DEPENDENT_KEYS) {
             if (Hawk.contains(k)) {
-                apiSnapshot.put(k, Hawk.get(k));
+                apiSnapshot.put(k, Hawk.get(k, (Object) null));
             } else {
                 apiAbsent.add(k);
             }
         }
     }
 
-    private void restoreApiKeys() {
+    /**
+     * 还原"用户设置类"键（API_URL/LIVE_API_URL/DOH/EPG…），
+     * 但**保留 API_LINE_LIST** —— 它是解析产物，"线路选择"的候选列表要靠它。
+     */
+    private void restoreApiSettingsOnly() {
         for (String k : API_DEPENDENT_KEYS) {
+            if (HawkConfig.API_LINE_LIST.equals(k)) {
+                continue;
+            }
             if (apiSnapshot.containsKey(k)) {
                 Hawk.put(k, apiSnapshot.get(k));
             } else if (apiAbsent.contains(k)) {
@@ -991,17 +1048,25 @@ public class ModelSettingFragment extends BaseLazyFragment {
         apiAbsent.clear();
     }
 
-    /** 用当前 API_URL 重新解析（草稿期让候选列表立刻反映新地址）。 */
+    /** 用当前 Hawk[API_URL] 重新解析；成功后还原设置类键并刷新依赖 UI。 */
     private void reloadApiForDraft() {
         try {
             ApiConfig.get().loadConfig(true, new ApiConfig.LoadConfigCallback() {
                 @Override
                 public void success() {
+                    boolean touched = !apiSnapshot.isEmpty() || !apiAbsent.isEmpty();
+                    if (touched) {
+                        restoreApiSettingsOnly();
+                    }
                     refreshApiDependentUi();
                 }
 
                 @Override
                 public void error(String msg) {
+                    boolean touched = !apiSnapshot.isEmpty() || !apiAbsent.isEmpty();
+                    if (touched) {
+                        restoreApiSettingsOnly();
+                    }
                     refreshApiDependentUi();
                     if (mContext != null) {
                         Toast.makeText(mContext, "配置解析失败：" + msg, Toast.LENGTH_SHORT).show();
@@ -1038,74 +1103,79 @@ public class ModelSettingFragment extends BaseLazyFragment {
         });
     }
 
-    /** 丢弃草稿（不保存 / Home 键离开）：API 现场一并还原。 */
+    /** 丢弃草稿（不保存 / Home 键离开）。API 早已还原，这里只需按旧配置重新解析一次。 */
     private void discardDraft() {
-        boolean apiTouched = !apiSnapshot.isEmpty() || !apiAbsent.isEmpty();
+        boolean apiTouched = !draft.isEmpty() && (draft.containsKey(HawkConfig.API_URL)
+                || draft.containsKey(HawkConfig.LIVE_API_URL));
         draft.clear();
         if (apiTouched) {
-            restoreApiKeys();
-            reloadApiForDraft();
+            reloadApiForDraft();      // Hawk 里是旧值 ⇒ 内存态回到旧配置
         }
+        captureBaseline();
         refreshUi();
     }
 
     // ------------------------------------------------------------------ 保存
-    private void showSaveConfirm() {
-        String text = buildChangeSummary();
-        if (text.length() == 0) {
+    /** 三键确认框：save=落盘并上传；discard=丢弃；cancel=留在本页。 */
+    private void showSaveDialog(String title) {
+        String content = buildChangeSummary();
+        if (content.length() == 0) {
             Toast.makeText(mContext, "没有需要保存的改动", Toast.LENGTH_SHORT).show();
             return;
         }
-        final com.github.tvbox.osc.ui.dialog.TipDialog[] holder = new com.github.tvbox.osc.ui.dialog.TipDialog[1];
-        holder[0] = new com.github.tvbox.osc.ui.dialog.TipDialog(mActivity,
-                "本次修改：" + text + "\n保存后将同步到云端", "取消", "保存",
-                new com.github.tvbox.osc.ui.dialog.TipDialog.OnListener() {
+        new com.github.tvbox.osc.ui.dialog.SaveConfirmDialog(mActivity, title, content,
+                new com.github.tvbox.osc.ui.dialog.SaveConfirmDialog.OnListener() {
                     @Override
-                    public void left() {
-                        holder[0].dismiss();
+                    public void save() {
+                        doSave();
                     }
 
                     @Override
-                    public void right() {
-                        holder[0].dismiss();
-                        doSave();
+                    public void discard() {
+                        discardDraft();
+                        if (mActivity != null) {
+                            mActivity.finish();
+                        }
                     }
 
                     @Override
                     public void cancel() {
                     }
-                });
-        holder[0].show();
+                }).show();
     }
 
-    /** 改动清单：只给「名称：变化简述」，不展示长串原值。 */
+    /** 改动清单：「名称：旧 → 新」，长串（地址）只给省略形态。 */
     private String buildChangeSummary() {
         StringBuilder sb = new StringBuilder();
+        int n = 0;
         for (java.util.Map.Entry<String, Object> e : draft.entrySet()) {
             String key = e.getKey();
-            Object now = e.getValue();
-            if (Hawk.contains(key)) {
-                Object old = Hawk.get(key, (Object) null);
-                if (old != null && old.equals(now)) {
-                    continue;
-                }
-            }
-            if (now == null) {
+            if (!changed(key)) {
                 continue;
             }
             String name = SETTING_NAMES.containsKey(key) ? SETTING_NAMES.get(key) : key;
-            sb.append('\n').append("· ").append(name).append("：").append(describeValue(key, now));
+            String from = describeValue(key, baseline.get(key));
+            String to = describeValue(key, e.getValue());
+            sb.append('\n').append("· ").append(name).append("：").append(from).append(" → ").append(to);
+            n++;
+        }
+        if (n == 0) {
+            return "";
         }
         return sb.toString();
     }
 
     private String describeValue(String key, Object v) {
+        if (v == null) {
+            return "无";
+        }
         try {
+            if (HawkConfig.API_URL.equals(key) || HawkConfig.LIVE_API_URL.equals(key)
+                    || HawkConfig.API_LINE_SOURCE.equals(key)) {
+                return shortUrl(String.valueOf(v));
+            }
             if (v instanceof Boolean) {
                 return ((Boolean) v) ? "开启" : "关闭";
-            }
-            if (HawkConfig.API_URL.equals(key) || HawkConfig.LIVE_API_URL.equals(key)) {
-                return "已更换地址";
             }
             if (HawkConfig.HISTORY_NUM.equals(key)) {
                 return HistoryHelper.getHistoryNumName((Integer) v);
@@ -1138,6 +1208,14 @@ public class ModelSettingFragment extends BaseLazyFragment {
         return String.valueOf(v);
     }
 
+    /** 地址只显示首尾，避免长串撑爆弹窗。 */
+    private static String shortUrl(String url) {
+        if (url == null || url.length() <= 24) {
+            return url;
+        }
+        return url.substring(0, 12) + "…" + url.substring(url.length() - 8);
+    }
+
     /** 真正落盘：写 Hawk + 裁剪 + 广播 + 标脏上传（+ 配置类变更触发重载）。 */
     private void doSave() {
         boolean apiChanged = false;
@@ -1145,13 +1223,13 @@ public class ModelSettingFragment extends BaseLazyFragment {
         boolean historyNumChanged = false;
         for (java.util.Map.Entry<String, Object> e : draft.entrySet()) {
             String k = e.getKey();
-            if (isApiDependent(k)) {
-                // API 类在 draftPut 时已写入 Hawk（为了让解析立刻可用），这里只记标记
-                apiChanged |= (HawkConfig.API_URL.equals(k) || HawkConfig.LIVE_API_URL.equals(k));
-                homeApiChanged |= HawkConfig.HOME_API.equals(k);
-                continue;
+            Hawk.put(k, e.getValue());               // API 类也在此正式落盘
+            if (HawkConfig.API_URL.equals(k) || HawkConfig.LIVE_API_URL.equals(k)) {
+                apiChanged = true;
             }
-            Hawk.put(k, e.getValue());
+            if (HawkConfig.HOME_API.equals(k)) {
+                homeApiChanged = true;
+            }
             if (HawkConfig.HISTORY_NUM.equals(k)) {
                 historyNumChanged = true;
             }
@@ -1159,8 +1237,9 @@ public class ModelSettingFragment extends BaseLazyFragment {
         draft.clear();
         apiSnapshot.clear();
         apiAbsent.clear();
+        captureBaseline();
 
-        // 档位下调 ⇒ 此刻才真正裁剪（保存确认弹窗里已列明）
+        // 档位变了 ⇒ 此刻才真正裁剪（清单里已列明）
         if (historyNumChanged) {
             try {
                 RoomDataManger.pruneHistory();
@@ -1172,7 +1251,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         if (homeApiChanged) {
             EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HOME_SOURCE_CHANGE));
         }
-        // 标脏并立即同步（这是设置上传的唯一入口）
+        // 标脏并立即同步 —— 设置上传的唯一入口
         try {
             HistorySyncManager.markDirty(SyncScope.SETTINGS);
             com.github.tvbox.osc.sync.SyncScheduler.requestNow(
@@ -1191,39 +1270,16 @@ public class ModelSettingFragment extends BaseLazyFragment {
     }
 
     // ------------------------------------------------------------------ 离开拦截
-    /** 返回键：有未保存改动则拦下弹窗。返回 true 表示已消费本次返回键。 */
+    /** 返回键：有未保存改动则拦下弹三键框。返回 true 表示已消费本次返回键。 */
     public boolean handleBackPress() {
         if (suppressLeavePrompt) {
             suppressLeavePrompt = false;
             return false;
         }
-        if (draft.isEmpty()) {
+        if (!hasChanges()) {
             return false;
         }
-        final com.github.tvbox.osc.ui.dialog.TipDialog[] holder = new com.github.tvbox.osc.ui.dialog.TipDialog[1];
-        holder[0] = new com.github.tvbox.osc.ui.dialog.TipDialog(mActivity,
-                "有未保存的设置改动：" + buildChangeSummary(), "不保存", "保存",
-                new com.github.tvbox.osc.ui.dialog.TipDialog.OnListener() {
-                    @Override
-                    public void left() {
-                        holder[0].dismiss();
-                        discardDraft();
-                        if (mActivity != null) {
-                            mActivity.finish();
-                        }
-                    }
-
-                    @Override
-                    public void right() {
-                        holder[0].dismiss();
-                        showSaveConfirm();
-                    }
-
-                    @Override
-                    public void cancel() {
-                    }
-                });
-        holder[0].show();
+        showSaveDialog("有未保存的修改，返回首页将丢失");
         return true;
     }
 
