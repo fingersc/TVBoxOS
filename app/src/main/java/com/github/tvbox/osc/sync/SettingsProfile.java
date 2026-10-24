@@ -34,23 +34,42 @@ public final class SettingsProfile {
         return (owner == null || owner.isEmpty()) ? base : base + "." + owner;
     }
 
-    /** 保存当前设置到该账号的本地快照。 */
+    /**
+     * 保存当前设置到该账号的本地快照。
+     *
+     * <p>★ v99-r47：修「时间戳全变 0」的缺陷。
+     * 旧实现直接取 {@code SyncSettings.collect()} 的 {@code t}，而 {@code collect()} 是按
+     * 「当前值」重新构造的，{@code t} 恒为 0 ⇒ 切账号往返（save → load）后，本机所有设置
+     * 都以 {@code t=0} 参与 LWW 合并，<b>必然输给云端任何旧值</b> —— 这正是 r29 把
+     * HISTORY_NUM / HISTORY_MERGE 撤出同步时观察到的"改了又被覆盖回去"。</p>
+     *
+     * <p>现规则：<b>与上次同步快照相同</b>的键沿用快照里的 {@code t}（保持与云端的先后关系）；
+     * <b>本机改过</b>（值不同）或快照里没有的键记当前时间，代表"本机刚改"。</p>
+     */
     public static void save(String owner) {
         try {
             Map<String, SyncPayload.SettingValue> cur = SyncSettings.collect();
+            Map<String, SyncPayload.SettingValue> last = SyncSettings.loadSnapshot();
+            long now = System.currentTimeMillis();
             List<SyncPayload.SettingItem> items = new ArrayList<>();
             for (Map.Entry<String, SyncPayload.SettingValue> e : cur.entrySet()) {
                 SyncPayload.SettingItem it = new SyncPayload.SettingItem();
                 it.key = e.getKey();
                 it.v = e.getValue().v;
                 it.ty = e.getValue().ty;
-                it.t = e.getValue().t;
+                SyncPayload.SettingValue old = last == null ? null : last.get(e.getKey());
+                boolean localChanged = old == null || !sameValue(old.v, e.getValue().v);
+                it.t = localChanged ? now : old.t;
                 items.add(it);
             }
             Hawk.put(key(HawkConfig.SYNC_SETTINGS_PROFILE, owner), GSON.toJson(items));
         } catch (Throwable t) {
             LOG.e("[Account] save settings profile failed", t);
         }
+    }
+
+    private static boolean sameValue(String a, String b) {
+        return a == null ? b == null : a.equals(b);
     }
 
     /** 恢复该账号的本地快照；没有快照返回 false。 */

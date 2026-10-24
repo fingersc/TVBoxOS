@@ -33,6 +33,8 @@ public final class ConfigPlan {
     public static final int HOME = 2;
     /** 只预热直播配置。 */
     public static final int LIVE = 3;
+    /** 只刷新历史列表（档位/同名合并开关变了）。 */
+    public static final int HISTORY = 4;
 
     /** 变了就必须重新解析接口配置的键。 */
     public static final String[] RELOAD_KEYS = {
@@ -54,12 +56,27 @@ public final class ConfigPlan {
             HawkConfig.LIVE_API_URL, HawkConfig.EPG_URL,
     };
 
-    /** 快照长度：RELOAD + HOME + LIVE 三组键按此顺序排列。 */
-    public static final int KEY_COUNT = RELOAD_KEYS.length + HOME_KEYS.length + LIVE_KEYS.length;
+    /**
+     * 只影响「历史列表」的键（v99-r47）。
+     *
+     * <p>历史档位与同名合并开关都是账号级设置、会跨设备同步；值写回 Hawk 之后
+     * 必须让首页/历史页立刻按新口径重排，否则用户看到的是"设置改了但没反应"。</p>
+     *
+     * <p><b>刻意不做裁剪</b>：真实裁剪要等用户确认（设置页的二次确认弹窗）或下一次
+     * 写历史时自然发生 —— 在这里删数据会把"调低后又调回"变成不可逆的误删。</p>
+     */
+    public static final String[] HISTORY_KEYS = {
+            HawkConfig.HISTORY_NUM, HawkConfig.HISTORY_MERGE,
+    };
+
+    /** 快照长度：RELOAD + HOME + LIVE + HISTORY 四组键按此顺序排列。 */
+    public static final int KEY_COUNT = RELOAD_KEYS.length + HOME_KEYS.length
+            + LIVE_KEYS.length + HISTORY_KEYS.length;
 
     public boolean reloadConfig;
     public boolean refreshHome;
     public boolean prewarmLive;
+    public boolean refreshHistory;
 
     /** 按固定顺序展开全部动作键，供 {@link #diff} 的前后两帧快照使用。 */
     public static String[] keys() {
@@ -72,6 +89,9 @@ public final class ConfigPlan {
             out[i++] = k;
         }
         for (String k : LIVE_KEYS) {
+            out[i++] = k;
+        }
+        for (String k : HISTORY_KEYS) {
             out[i++] = k;
         }
         return out;
@@ -97,11 +117,16 @@ public final class ConfigPlan {
                 return LIVE;
             }
         }
+        for (String k : HISTORY_KEYS) {
+            if (k.equals(key)) {
+                return HISTORY;
+            }
+        }
         return NONE;
     }
 
     public boolean isEmpty() {
-        return !reloadConfig && !refreshHome && !prewarmLive;
+        return !reloadConfig && !refreshHome && !prewarmLive && !refreshHistory;
     }
 
     public void merge(ConfigPlan o) {
@@ -111,6 +136,7 @@ public final class ConfigPlan {
         reloadConfig |= o.reloadConfig;
         refreshHome |= o.refreshHome;
         prewarmLive |= o.prewarmLive;
+        refreshHistory |= o.refreshHistory;
     }
 
     public void set(int action) {
@@ -123,6 +149,9 @@ public final class ConfigPlan {
                 break;
             case LIVE:
                 prewarmLive = true;
+                break;
+            case HISTORY:
+                refreshHistory = true;
                 break;
             default:
                 break;
@@ -159,6 +188,11 @@ public final class ConfigPlan {
                 p.prewarmLive = true;
             }
         }
+        for (int c = 0; c < HISTORY_KEYS.length && i < n; c++, i++) {
+            if (!eq(before[i], after[i])) {
+                p.refreshHistory = true;
+            }
+        }
         return p;
     }
 
@@ -177,6 +211,9 @@ public final class ConfigPlan {
         }
         if (prewarmLive) {
             sb.append("live ");
+        }
+        if (refreshHistory) {
+            sb.append("history ");
         }
         if (isEmpty()) {
             sb.append("none");

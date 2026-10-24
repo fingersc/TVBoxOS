@@ -12,6 +12,7 @@ import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
+import com.github.tvbox.osc.util.VodNameNormalizer;
 import com.google.gson.FieldAttributes;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -292,10 +293,13 @@ public class RoomDataManger {
      * ↓换源时跨源找回播放记忆：按视频名称在其他源的历史记录里查找（排除当前 sourceKey+vodId 本身）。
      * 返回的记录带有所在源的 sourceKey/vodId 以及记住的 playFlag/playIndex/playNote。
      * 多个同名记录时优先返回最近更新的一个（getAll 已按 updateTime desc 排序）。
+     *
+     * <p>★ v99-r46：同名判定改用 {@link VodNameNormalizer#normalize(String)}（与历史合并同口径），
+     * 于是「现在就出发第四季」的记录能接上「现在就出发 第4季」源里的播放位置。</p>
      */
     public static VodInfo getVodInfoBySameName(String sourceKey, String vodId, String name) {
         if (TextUtils.isEmpty(name)) return null;
-        String trimName = name.trim();
+        String key = VodNameNormalizer.normalize(name);
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
         List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
         if (all == null) return null;
@@ -307,7 +311,8 @@ public class RoomDataManger {
             try {
                 if (record.dataJson == null || TextUtils.isEmpty(record.dataJson)) continue;
                 VodInfo info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {}.getType());
-                if (info != null && info.name != null && TextUtils.equals(trimName, info.name.trim())) {
+                if (info != null && info.name != null
+                        && TextUtils.equals(key, VodNameNormalizer.normalize(info.name))) {
                     info.sourceKey = record.sourceKey;
                     info.id = record.vodId;
                     return info;
@@ -330,7 +335,7 @@ public class RoomDataManger {
      */
     public static VodInfo getVodInfoBySameNameNewerThan(String sourceKey, String vodId, String name, long newerThan) {
         if (TextUtils.isEmpty(name)) return null;
-        String trimName = name.trim();
+        String key = VodNameNormalizer.normalize(name);
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
         List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
         if (all == null) return null;
@@ -345,7 +350,9 @@ public class RoomDataManger {
             try {
                 if (record.dataJson == null || TextUtils.isEmpty(record.dataJson)) continue;
                 VodInfo info = getVodInfoGson().fromJson(record.dataJson, new TypeToken<VodInfo>() {}.getType());
-                if (info != null && info.name != null && TextUtils.equals(trimName, info.name.trim())) {
+                // ★ v99-r46：与 getVodInfoBySameName 同口径（归一化后比较），变体写法也能接上进度
+                if (info != null && info.name != null
+                        && TextUtils.equals(key, VodNameNormalizer.normalize(info.name))) {
                     info.sourceKey = record.sourceKey;
                     info.id = record.vodId;
                     return info;
@@ -414,13 +421,12 @@ public class RoomDataManger {
                 }
             }
         }
-        // 写入路径（insertVodRecord → pruneHistory）已经做过同名去重，库里不应再有重复；
-        // 这里只按条数兜一刀（读路径不做全量 JSON 解析，避免首页刷新时白白耗时）。
-        if (dao.getCount() > hisNum) {
-            if (dao.reserver(hisNum) > 0) {
-                PlayProgressManager.deleteOrphaned();
-            }
-        }
+        // ★ v99-r47：读路径**不再删库**。
+        //   原实现在这里 `dao.reserver(hisNum)` —— 首页一刷新就把超出档位的记录物理删掉。
+        //   问题是档位调低之后，用户还没来得及在设置页确认"要删多少条"，只要回一次首页，
+        //   记录就已经没了 ⇒ 二次确认形同虚设。而且这是 UI 线程上的删除写操作。
+        //   现在：显示层仍按 min(limit, hisNum) 收敛（上面第 431 行），真正的裁剪只发生在
+        //   ① 设置页确认后手动 pruneHistory() ② 下一次写历史 ③ 同步落地后 SyncEngine 的 pruneHistory()。
         int size = Math.min(vodInfoList.size(), Math.min(limit, hisNum));
         return new ArrayList<>(vodInfoList.subList(0, size));
     }
@@ -478,30 +484,28 @@ public class RoomDataManger {
     }
 
     /**
-     * 取「用于同名判定」的片名。
+     * 取「用于同名判定」的片名（归一化键，界面显示仍用原始片名）。
      *
-     * <p>★ v99-r28：加归一化。网页抓来的片名常夹全角空格（NBSP）、零宽字符、BOM，
+     * <p>★ v99-r28：网页抓来的片名常夹全角空格（NBSP）、零宽字符、BOM，
      * 视觉上和另一条一模一样，但 {@code equals} 不等 ⇒ 同名去重（库级 dedupeSameName）
      * 与显示去重（getAllVodRecord 的 historyNames）双双失效，首页出现两张"看起来重名"的卡片。</p>
      *
-     * <p>归一化只做「不可见字符 → 空 / 连续空白 → 单空格 / 首尾 trim」，
-     * 不做大小写或标点重写，避免把真正不同的片（如「第1季」「第 2 季」）误并。</p>
+     * <p>★ v99-r46：用户口径升级为「<b>意思一样就算同一个片</b>」——同一部片在不同源的写法
+     * 差异不止不可见字符，还有空格与中文数字：</p>
+     * <pre>
+     *   现在就出发第四季 / 现在就出发 第四季 / 现在就出发 第4季 / 现在就出发第4季
+     * </pre>
+     * <p>这些变体各占一个历史名额（档位 15/30/50），把其它影片挤掉，表现为
+     * 「历史里能看到的片变少」+「同一个片好几张卡片」——两端同一个病根。
+     * 现统一走 {@link VodNameNormalizer#normalize(String)}（删空白 / 全角转半角 /
+     * 第N季期部篇 中文数字转阿拉伯），r28 的不可见字符处理也已内含其中。</p>
      */
     private static String getVodRecordName(VodInfo vodInfo) {
         if (vodInfo == null || vodInfo.name == null) {
             return "";
         }
-        String s = vodInfo.name
-                .replace('\u00A0', ' ')   // 不换行空格
-                .replace("\u200B", "")    // 零宽空格
-                .replace("\u200C", "")    // 零宽非连接符
-                .replace("\u200D", "")    // 零宽连接符
-                .replace("\uFEFF", "");   // BOM
-        return WS.matcher(s).replaceAll(" ").trim();
+        return VodNameNormalizer.normalize(vodInfo.name);
     }
-
-    private static final java.util.regex.Pattern WS =
-            java.util.regex.Pattern.compile("\\s+");
 
     public static void insertVodCollect(String sourceKey, VodInfo vodInfo) {
         VodCollect record = AppDataManager.get().getVodCollectDao().getVodCollect(sourceKey, vodInfo.id);

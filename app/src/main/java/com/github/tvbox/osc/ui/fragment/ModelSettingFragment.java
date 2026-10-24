@@ -38,7 +38,10 @@ import com.github.tvbox.osc.ui.dialog.BackupDialog;
 import com.github.tvbox.osc.ui.dialog.DanmuApiDialog;
 import com.github.tvbox.osc.ui.dialog.SearchRemoteTvDialog;
 import com.github.tvbox.osc.ui.dialog.SelectDialog;
+import com.github.tvbox.osc.ui.dialog.TipDialog;
 import com.github.tvbox.osc.ui.dialog.XWalkInitDialog;
+import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.SyncScope;
 import com.github.tvbox.osc.util.DanmuHelper;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.FileUtils;
@@ -693,11 +696,50 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setTip("保留历史记录数量");
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
-                    public void click(Integer value, int pos) {
+                    public void click(final Integer value, int pos) {
+                        final int oldIndex = Hawk.get(HawkConfig.HISTORY_NUM, 0);
+                        // ★ v99-r47：先改变档位（显示层立刻按新档位收敛），再决定要不要提醒裁剪
                         Hawk.put(HawkConfig.HISTORY_NUM, value);
                         tvHistoryNum.setText(HistoryHelper.getHistoryNumName(value));
-                        // v77：改小档位后立即裁剪本机历史
-                        RoomDataManger.pruneHistory();
+                        // 档位是账号级设置 ⇒ 标脏让它 1 分钟内推出去（否则要等别的 dirty 顺风车）
+                        HistorySyncManager.markDirty(SyncScope.SETTINGS);
+                        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
+                        if (value.intValue() == oldIndex) {
+                            return;
+                        }
+                        // ★ v99-r47：真实裁剪必须用户确认后才执行。
+                        //   只有「新档位容不下现存记录」时才需要提醒；调高、或库里本来就没那么多，
+                        //   都不会删东西，不必打扰。
+                        final int keep = HistoryHelper.getHisNum(value);
+                        final int count = RoomDataManger.countVodRecord();
+                        if (count <= keep) {
+                            return;
+                        }
+                        final TipDialog[] holder = new TipDialog[1];
+                        holder[0] = new TipDialog(mActivity,
+                                "保留历史记录数量改为 " + keep + " 条\n"
+                                        + "当前有 " + count + " 条，将删除最早的 " + (count - keep) + " 条\n"
+                                        + "这些影片的播放进度也会一并清除，不可恢复",
+                                "取消", "确定删除", new TipDialog.OnListener() {
+                            @Override
+                            public void left() {
+                                holder[0].dismiss();
+                            }
+
+                            @Override
+                            public void right() {
+                                holder[0].dismiss();
+                                RoomDataManger.pruneHistory();
+                                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
+                                LOG.i("history trim by user confirm: keep=" + keep + " before=" + count);
+                            }
+
+                            @Override
+                            public void cancel() {
+                                // 点外部关闭 = 不裁剪（记录保留，下一次写历史时自然按新档位裁）
+                            }
+                        });
+                        holder[0].show();
                     }
 
                     @Override
@@ -784,6 +826,9 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 boolean historyMerge = !Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE);
                 Hawk.put(HawkConfig.HISTORY_MERGE, historyMerge);
                 tvHistoryMerge.setText(historyMerge ? "开启" : "关闭");
+                // ★ v99-r47：开关属账号级设置 ⇒ 标脏同步 + 列表立即按新口径重排
+                HistorySyncManager.markDirty(SyncScope.SETTINGS);
+                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
             }
         });
 

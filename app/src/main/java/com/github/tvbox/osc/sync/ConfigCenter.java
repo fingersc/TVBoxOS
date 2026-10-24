@@ -188,6 +188,7 @@ public final class ConfigCenter {
             PENDING.reloadConfig = false;
             PENDING.refreshHome = false;
             PENDING.prewarmLive = false;
+            PENDING.refreshHistory = false;
         }
         return p;
     }
@@ -247,6 +248,12 @@ public final class ConfigCenter {
             // 只是首页源变了：接口配置完全不用重新解析，直接换源再刷新布局。
             applyHomeSource();
             EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HOME_SOURCE_CHANGE));
+        }
+        if (p.refreshHistory) {
+            // ★ v99-r47：历史档位 / 同名合并开关变了 —— 只让列表按新口径重排。
+            //   这里**不裁剪**：真实裁剪由设置页的二次确认（或下一次写历史）执行，
+            //   在配置下发路径上删数据会把"调低后又调回"变成不可逆误删。
+            EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
         }
         if (p.prewarmLive) {
             // 与上面的首页动作错开 2 秒：两者一起跑就是又一次「抢首屏」。
