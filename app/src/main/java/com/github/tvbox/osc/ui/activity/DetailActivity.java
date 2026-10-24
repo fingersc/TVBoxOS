@@ -5452,33 +5452,84 @@ public class DetailActivity extends BaseActivity {
      * 日期即真值）：目标名带日期时，只在<b>候选也带日期</b>的集合里按日期差取唯一最近；
      * 一天多条（平手）或候选都没有日期（纯期号列表）时<b>不做任何猜测</b>，保持原下标，
      * 由上层 {@code sanitizeMainFeatureFallback} 矫正正片属性。宁可不切，不可切错。</p>
+     *
+     * <p><b>★ v99-r45：纯期号目标列表的兜底</b>。目标名不带日期（{@code 第2期}）而候选也全是
+     * 期号式时，按「同期号 + 同分段 + 正片」找一条 —— 这正是真机日志里
+     * 「{@code 第2期} 落到 {@code 第2期下}」的缺口：日期锚用不上，旧实现直接退回
+     * {@code clamped(源下标)}，而源下标跨源没有意义。仍找不到就保持原位。</p>
      */
     private int nearestEpisodeIndex(VodInfo.VodSeries target, int fallbackIndex, List<VodInfo.VodSeries> list) {
         if (list == null || list.isEmpty()) return Math.max(0, fallbackIndex);
         int clamped = Math.max(0, Math.min(fallbackIndex, list.size() - 1));
         if (target == null || TextUtils.isEmpty(target.name)) return clamped;
         int targetDate = EpisodeNameMatcher.dateOf(target.name);
-        if (targetDate <= 0) {
-            // 目标名没有日期（纯期号式）：本地没有可用的锚，任何"就近"都是猜 —— 保持原位
-            return clamped;
-        }
-        int bestIndex = -1, bestDiff = Integer.MAX_VALUE, tie = 0;
-        for (int i = 0; i < list.size(); i++) {
-            VodInfo.VodSeries s = list.get(i);
-            if (s == null || TextUtils.isEmpty(s.name)) continue;
-            int d = EpisodeNameMatcher.dateOf(s.name);
-            if (d <= 0) continue;                       // 候选没有日期 ⇒ 无法按锚比较
-            int diff = Math.abs(d - targetDate);
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                bestIndex = i;
-                tie = 1;
-            } else if (diff == bestDiff) {
-                tie++;
+        if (targetDate > 0) {
+            // ★ v99-r45：先按「同日期 + 同分段 + 正片」精确命中。
+            //   实测（真机 2026-10-24）：目标源当天拆成上/下且【下排在前面】时，
+            //   旧实现按日期差挑唯一最近，上/下两天都是差 0 ⇒ 平手不采纳 ⇒
+            //   退回 clamped(源下标)，而源下标恰好指向「下」—— 用户看到的就是切错段。
+            int targetPartN = EpisodeNameMatcher.normalizePart(EpisodeNameMatcher.extractPart(target.name));
+            for (int i = 0; i < list.size(); i++) {
+                VodInfo.VodSeries s = list.get(i);
+                if (s == null || TextUtils.isEmpty(s.name)) continue;
+                if (EpisodeNameMatcher.dateOf(s.name) != targetDate) continue;
+                if (EpisodeNameMatcher.normalizePart(EpisodeNameMatcher.extractPart(s.name)) != targetPartN) continue;
+                if (EpisodeNameMatcher.isNonMainEntryName(s.name)) continue;
+                return i;                                  // 同日期同分段的正片 ⇒ 就是它
             }
+            int bestIndex = -1, bestDiff = Integer.MAX_VALUE, tie = 0;
+            for (int i = 0; i < list.size(); i++) {
+                VodInfo.VodSeries s = list.get(i);
+                if (s == null || TextUtils.isEmpty(s.name)) continue;
+                int d = EpisodeNameMatcher.dateOf(s.name);
+                if (d <= 0) continue;                       // 候选没有日期 ⇒ 无法按锚比较
+                int diff = Math.abs(d - targetDate);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    bestIndex = i;
+                    tie = 1;
+                } else if (diff == bestDiff) {
+                    tie++;
+                }
+            }
+            // 只有"唯一最近"才采纳；同一天多条并列 ⇒ 锚不足以定案，保持原位
+            return (bestIndex >= 0 && tie == 1) ? bestIndex : clamped;
         }
-        // 只有"唯一最近"才采纳；同一天多条并列 ⇒ 锚不足以定案，保持原位
-        return (bestIndex >= 0 && tie == 1) ? bestIndex : clamped;
+        // 目标名没有日期（纯期号式）：按「同期号 + 同分段 + 正片」找一条
+        int targetOrd = EpisodeNameMatcher.extractOrdinal(target.name);
+        int targetPart = EpisodeNameMatcher.extractPart(target.name);
+        if (targetOrd > 0) {
+            int samePart = -1, anyPart = -1;
+            for (int i = 0; i < list.size(); i++) {
+                VodInfo.VodSeries s = list.get(i);
+                if (s == null || TextUtils.isEmpty(s.name)) continue;
+                if (EpisodeNameMatcher.extractOrdinal(s.name) != targetOrd) continue;
+                if (EpisodeNameMatcher.isNonMainEntryName(s.name)) continue;   // 衍生不参与
+                if (anyPart < 0) anyPart = i;
+                if (EpisodeNameMatcher.normalizePart(EpisodeNameMatcher.extractPart(s.name))
+                        == EpisodeNameMatcher.normalizePart(targetPart)) {
+                    samePart = i;
+                    break;                                  // 同期号同分段的正片 ⇒ 就是它
+                }
+            }
+            if (samePart >= 0) return samePart;
+            // 同期号只有一条正片（目标源没拆分段）也认
+            if (anyPart >= 0 && countMainOfOrdinal(list, targetOrd) == 1) return anyPart;
+        }
+        // 没有任何可用锚：保持原位
+        return clamped;
+    }
+
+    /** 统计列表里指定期号的【正片】条目数（nearestEpisodeIndex 的唯一性判据）。 */
+    private int countMainOfOrdinal(List<VodInfo.VodSeries> list, int ordinal) {
+        int n = 0;
+        for (VodInfo.VodSeries s : list) {
+            if (s == null || TextUtils.isEmpty(s.name)) continue;
+            if (EpisodeNameMatcher.extractOrdinal(s.name) != ordinal) continue;
+            if (EpisodeNameMatcher.isNonMainEntryName(s.name)) continue;
+            n++;
+        }
+        return n;
     }
 
     private int getEpisodeMatchScore(String currentName, int currentEpisode, String targetName) {

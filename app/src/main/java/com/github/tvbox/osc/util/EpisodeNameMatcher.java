@@ -181,12 +181,24 @@ public final class EpisodeNameMatcher {
      * 「初舞台」是中性词（可能是正片板块名）故<b>不入表</b>，
      * 但「初舞台观演区」由「观演区」命中。</p>
      */
+    /**
+     * ★ v99-r45：「日期-序号」形态的尾缀（{@code 20260703-01} / {@code 2026-07-03 1}）。
+     * 用于在日期锚判据里排除这种不可靠对应，见 {@link #score}。
+     */
+    private static final Pattern DATE_INDEX_TAIL =
+            Pattern.compile("\\d{8}\\s*[-–]\\s*\\d{1,2}(?![\\d])");
+
     private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
             "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享"
             // —— 综艺常见衍生栏目（用户 2026-10 确认）——
             + "|观演区|预热直播|直拍机位|特别企划"
             // —— 实测在所有真实源里均为纯衍生的组合词根 ——
             + "|舞台纯享|毕业特辑|端午特辑|纯享典藏"
+            // ★ r45：真机 2026-10-24 又抓到一批漏网衍生词根（最大资源整库）：
+            //   「20260829企划第2期」「20260902大放送第1期」「20260823看片会直播」
+            //   「20260915陈瑶慢直播」「歌手后花园」「第20260829期人物篇」——
+            //   它们都带期号，旧词表判不出衍生 ⇒ 与正片同分竞争，findIndex 平手取先到就切错。
+            + "|企划|大放送|看片会|慢直播|后花园|人物篇"
             // ★ r38：真实综艺样本（9881 条去重集名，抓自 5 个源站）里出现频次高、
             //   语义明确为衍生的词根：超前363 / 会员169 / 番外62 / 精编43 /
             //   未播36 / 手记36 / vlog23 / 发布会14 / 彩排6。
@@ -470,6 +482,44 @@ public final class EpisodeNameMatcher {
         }
         if (targetName.equalsIgnoreCase(currentName)) {
             return 100;
+        }
+        // ★ v99-r45：日期锚同义 —— 用户口径「20260808 ≡ 第20260808期 ≡ 20260808期」的直接落地。
+        //
+        //   必须排在下面的同域判定【之前】：日期+期号复合名（{@code 20260906第2期上}）被
+        //   {@link #parse} 判成 ORDINAL 域（ordinal=2），而包裹日期式
+        //   （{@code 第20260906期上}）是 DATE 域（ordinal=20260906）—— 两侧 ordinal
+        //   量纲不同，同域判据永远不成立，旧实现一律返回 0。
+        //   实测（真机 2026-10-24）：iqiyi 的「第20260906期上」切到最大资源时
+        //   findIndex 返回 -1 ⇒ 上层退回落点兜底 ⇒ 切到「20260906第2期下」/「0905超前营业」。
+        //
+        //   两侧都取得到日期时日期就是真值：日期不同 ⇒ 不同集；日期相同再比分段，
+        //   分段语义不同（上/中/下）仍是不同集；衍生条目降权。
+        int curDate = dateOf(currentName);
+        int tgtDate = dateOf(targetName);
+        // ★ 「日期-序号」形态（实测 dytt 整库：{@code 20260703-01}/{@code 20260710-02}）的
+        //   尾部序号表示"该日期下的第 N 条"，与目标侧的期号/分段没有可靠对应 ——
+        //   语料2 有 12 条正是这么错的（{@code 20260703-01} 被配到
+        //   {@code 第20260703期第1期(一)}，而真值是同期另一条衍生）。
+        //   两侧任一是该形态时不采纳日期锚，落回下面的同域/模糊逻辑（即 r44 行为）。
+        boolean curIndexTail = DATE_INDEX_TAIL.matcher(currentName).find();
+        boolean tgtIndexTail = DATE_INDEX_TAIL.matcher(targetName).find();
+        if (curDate > 0 && tgtDate > 0 && !curIndexTail && !tgtIndexTail) {
+            if (curDate != tgtDate) {
+                return 0;
+            }
+            if (normalizePart(extractPart(currentName)) != normalizePart(extractPart(targetName))) {
+                return 0;
+            }
+            // ★ 正片/衍生属性必须一致：衍生（纯享/加更/特辑…）只与同期衍生对应，
+            //   与正片同分会把「20260703纯享」配到「第20260703期第1期(一)」（正片）。
+            //   实测语料2 有 18 条正是这么错的（喜剧之王单口季第三季 dytt→zy360）。
+            if (isNonMainFeature(currentName) != isNonMainFeature(targetName)) {
+                return 0;
+            }
+            if (isNonMainFeature(currentName) || isNonMainFeature(targetName)) {
+                return NON_MAIN_PENALTY;
+            }
+            return 80;
         }
         EpisodeKey cur = parse(currentName);
         EpisodeKey tgt = parse(targetName);
@@ -3627,11 +3677,23 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         // 第一轮：同域精确匹配
         int matched = -1;
         int bestScore = 0;
+        boolean matchedIsMain = false;
         for (int i = 0; i < targetNames.size(); i++) {
             int s = score(currentName, targetNames.get(i));
-            if (s > bestScore) {
+            if (s <= 0) {
+                continue;
+            }
+            // ★ v99-r45：同分平手时优先【正片】条目，而不是"先到先得"。
+            //
+            // 实测（真机 2026-10-24，我家那闺女2026 → 最大资源）：源侧「第2期」在目标列表里
+            // 同时命中衍生条目「20260829企划第2期」（80 分，排在索引 8）与正片
+            // 「20260906第2期上」（80 分，索引 16）—— 旧规则取先到的那条，
+            // 用户看到的就是切到衍生/错误集。衍生条目本就不该与正片同分竞争。
+            boolean isMain = isMainFeatureEntry(targetNames.get(i));
+            if (s > bestScore || (s == bestScore && isMain && !matchedIsMain)) {
                 bestScore = s;
                 matched = i;
+                matchedIsMain = isMain;
             }
         }
         return matched;
