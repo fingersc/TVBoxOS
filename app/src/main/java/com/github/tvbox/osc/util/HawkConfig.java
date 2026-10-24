@@ -31,8 +31,14 @@ public class HawkConfig {
     public static final int DEFAULT_HOME_REC = 1;
     public static final String HOME_REC = "home_rec"; // 0 豆瓣热播 1 数据源推荐 2 历史
     public static final String HISTORY_NUM = "history_num";
-    public static final String HISTORY_MERGE = "history_merge";
+    /**
+     * ★ v99-r49：同名合并已固定开启，开关常量删除。
+     * 这个字面量只用于「升级后一次性提示」——检测到旧键为 false 时告知用户历史已被合并。
+     */
+    public static final String LEGACY_HISTORY_MERGE = "history_merge";
     /** ★ v99-r25：历史合并默认开启 —— 同名影片只保留「最新源」的那条记录。 */
+    /** @deprecated v99-r49 起同名合并恒开启，默认值不再需要；保留仅为源码兼容查询。 */
+    @Deprecated
     public static final boolean DEFAULT_HISTORY_MERGE = true;
     public static final String SEARCH_VIEW = "search_view"; // 0 列表 1 缩略图
     public static final String LIVE_CHANNEL = "last_live_channel_name";

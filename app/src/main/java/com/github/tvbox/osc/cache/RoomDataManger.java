@@ -67,7 +67,8 @@ public class RoomDataManger {
 
     public static void insertVodRecord(String sourceKey, VodInfo vodInfo) {
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-        if (Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE) && vodInfo != null) {
+        // ★ v99-r49：同名合并恒开启（开关已删除），写入前一律收敛其它源的同名记录
+        if (vodInfo != null) {
             // 合并同名历史开启：本次保存后同名称的旧源记录会被删除。
             // 若本次保存的位置信息缺失（如跨源映射失败导致集数名未取到），先从同名称的其他源记录接续集数记忆，
             // 避免旧源记忆在合并删除时被清空。
@@ -124,9 +125,8 @@ public class RoomDataManger {
             // ★ v99-r25：「条数上限」指的是【合并去重之后】的条数。
             //   合并开启时先把同名记录收敛为「只保留最新源」，再按 keep 裁剪；
             //   否则"15 条"里可能有多条是同一部片的不同源，实际影片数远少于 15。
-            if (Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE)) {
-                changed = dedupeSameName(dao) > 0 || changed;
-            }
+            // ★ v99-r49：同名合并恒开启（开关已删除）
+            changed = dedupeSameName(dao) > 0 || changed;
             List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
             if (all != null && all.size() > keep) {
                 for (int i = keep; i < all.size(); i++) {
@@ -392,8 +392,8 @@ public class RoomDataManger {
         Integer hisNum = HistoryHelper.getHisNum(index);
         List<VodRecord> recordList = dao.getAll(Integer.MAX_VALUE);
         List<VodInfo> vodInfoList = new ArrayList<>();
-        boolean historyMerge = Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE);
-        Set<String> historyNames = historyMerge ? new HashSet<String>() : null;
+        // ★ v99-r49：同名合并恒开启 ⇒ 显示层始终按归一化名去重
+        Set<String> historyNames = new HashSet<String>();
         if (recordList != null) {
             for (VodRecord record : recordList) {
                 VodInfo info = null;
@@ -415,7 +415,7 @@ public class RoomDataManger {
                 }
                 String name = getVodRecordName(info);
                 if (info != null) {
-                    if (!historyMerge || TextUtils.isEmpty(name) || historyNames.add(name)) {
+                    if (TextUtils.isEmpty(name) || historyNames.add(name)) {
                         vodInfoList.add(info);
                     }
                 }
@@ -565,8 +565,8 @@ public class RoomDataManger {
      *
      * <p>切源连跳会一站一条地写入历史（每跳一个站成功加载详情就写一次），
      * 既挤占历史上限把其它影片顶掉，也让"最近观看"里塞满同一部片。
-     * 切源本来就是同一部片换站，理应只保留一条——故此处不受
-     * {@code HawkConfig.HISTORY_MERGE} 开关限制。</p>
+     * 切源本来就是同一部片换站，理应只保留一条——v99-r49 起同名合并恒开启，本方法
+     * 与 {@link #insertVodRecord} 走同一条收敛逻辑。</p>
      *
      * @return 被合并掉的旧源条数
      */

@@ -44,8 +44,9 @@ public final class SyncSettings {
             //       本地设置永远以 t=0 参与 LWW，必输给云端旧值；
             //     · ConfigPlan 没有「历史」这一组动作 ⇒ 值写回 Hawk 了，但首页/历史列表不刷新、
             //       裁剪不按新档位跑，看起来就像"开关没生效"。
-            //   两处都已修（r47），故重新纳入：档位与合并开关属于【账号偏好】，两端应一致。
-            HawkConfig.HISTORY_NUM, HawkConfig.HISTORY_MERGE,
+            //   两处都已修（r47），故重新纳入：档位属于【账号偏好】，两端应一致。
+            //   ★ v99-r49：同名合并固定开启、开关删除 ⇒ 只有档位参与同步。
+            HawkConfig.HISTORY_NUM,
             // 播放偏好
             HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.PLAY_TIME_STEP,
             HawkConfig.SCREEN_DISPLAY, HawkConfig.IJK_CACHE_PLAY,
@@ -66,7 +67,7 @@ public final class SyncSettings {
     };
 
     private static final String[] BOOL_KEYS = {
-            HawkConfig.HOME_REC_STYLE, HawkConfig.FAST_SEARCH_MODE, HawkConfig.HISTORY_MERGE,
+            HawkConfig.HOME_REC_STYLE, HawkConfig.FAST_SEARCH_MODE,
             HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.IJK_CACHE_PLAY,
             HawkConfig.DANMU_OPEN, HawkConfig.DANMU_RANDOM_COLOR, HawkConfig.LIVE_SHOW_NET_SPEED,
             HawkConfig.LIVE_SHOW_TIME, HawkConfig.LIVE_CHANNEL_REVERSE, HawkConfig.LIVE_CROSS_GROUP,

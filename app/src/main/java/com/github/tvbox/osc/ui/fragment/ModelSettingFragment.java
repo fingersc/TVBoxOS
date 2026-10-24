@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.text.TextUtils;
 import android.provider.OpenableColumns;
 import android.os.Handler;
 import android.view.View;
@@ -94,7 +95,6 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private TextView tvDns;
     private TextView tvHomeRec;
     private TextView tvHistoryNum;
-    private TextView tvHistoryMerge;
     private TextView tvSearchView;
     private TextView tvShowPreviewText;
     private TextView tvFastSearchText;
@@ -107,6 +107,54 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private boolean selectLocalLive;
     private TextView tvDanmuOpenText;
     private TextView tvDanmuApiText;
+
+    // ================== v99-r49：设置页草稿制 ==================
+    // 用户在本页的所有改动先落在 draft 里，保存确认后才写回 Hawk。
+    // 未保存 ⇒ 不生效、不上传（Hawk 始终是"已保存值"，同步层看不到差异）。
+    private final java.util.LinkedHashMap<String, Object> draft = new java.util.LinkedHashMap<>();
+    /** API 类改动是唯一"立即生效"的例外（要让候选列表立刻是新 API 的），这些键要能回滚。 */
+    private final java.util.LinkedHashMap<String, Object> apiSnapshot = new java.util.LinkedHashMap<>();
+    private final java.util.HashSet<String> apiAbsent = new java.util.HashSet<>();
+    /** 保存后自动返回首页时置位，避免"未保存提醒"重复弹。 */
+    private boolean suppressLeavePrompt = false;
+    /** 跳转其它页面（导入本地配置）期间不丢弃草稿。 */
+    private boolean leavingForResult = false;
+    /** 供 SettingActivity 的返回键转发使用（Fragment 生命周期内有效）。 */
+    public static ModelSettingFragment leaveGuard;
+
+    /** parseJson 会改写的键：API 改动要能整体回滚。 */
+    private static final String[] API_DEPENDENT_KEYS = {
+            HawkConfig.API_URL, HawkConfig.LIVE_API_URL, HawkConfig.API_LINE_SOURCE,
+            HawkConfig.API_LINE_LIST, HawkConfig.HOME_API, HawkConfig.DOH_URL,
+            HawkConfig.DOH_JSON, HawkConfig.EPG_URL, HawkConfig.LIVE_WEB_HEADER,
+            HawkConfig.LIVE_CONNECT_TIMEOUT,
+    };
+
+    /** 键 → 中文名（保存/离开弹窗的改动清单用）。 */
+    private static final java.util.LinkedHashMap<String, String> SETTING_NAMES = new java.util.LinkedHashMap<>();
+    static {
+        SETTING_NAMES.put(HawkConfig.API_URL, "配置地址");
+        SETTING_NAMES.put(HawkConfig.LIVE_API_URL, "直播接口");
+        SETTING_NAMES.put(HawkConfig.HOME_API, "首页站源");
+        SETTING_NAMES.put(HawkConfig.HOME_REC, "首页推荐");
+        SETTING_NAMES.put(HawkConfig.HOME_REC_STYLE, "首页多行");
+        SETTING_NAMES.put(HawkConfig.SEARCH_VIEW, "搜索展示");
+        SETTING_NAMES.put(HawkConfig.FAST_SEARCH_MODE, "聚合搜索");
+        SETTING_NAMES.put(HawkConfig.DEFAULT_LOAD_LIVE, "下次进入");
+        SETTING_NAMES.put(HawkConfig.PLAY_TYPE, "播放器");
+        SETTING_NAMES.put(HawkConfig.IJK_CODEC, "IJK解码方式");
+        SETTING_NAMES.put(HawkConfig.PLAY_RENDER, "渲染方式");
+        SETTING_NAMES.put(HawkConfig.PLAY_SCALE, "画面缩放");
+        SETTING_NAMES.put(HawkConfig.SHOW_PREVIEW, "窗口预览");
+        SETTING_NAMES.put(HawkConfig.M3U8_PURIFY, "去广告");
+        SETTING_NAMES.put(HawkConfig.AUTO_SWITCH_LINE, "自动换线");
+        SETTING_NAMES.put(HawkConfig.DOH_URL, "安全DNS");
+        SETTING_NAMES.put(HawkConfig.PARSE_WEBVIEW, "嗅探Webview");
+        SETTING_NAMES.put(HawkConfig.DANMU_OPEN, "弹幕");
+        SETTING_NAMES.put(HawkConfig.DANMU_API, "弹幕地址");
+        SETTING_NAMES.put(HawkConfig.IJK_CACHE_PLAY, "IJK缓存");
+        SETTING_NAMES.put(HawkConfig.HISTORY_NUM, "历史记录");
+    }
 
     public static ModelSettingFragment newInstance() {
         return new ModelSettingFragment().setArguments();
@@ -122,62 +170,55 @@ public class ModelSettingFragment extends BaseLazyFragment {
     }
 
     @Override
-    protected void init() {
-        tvFastSearchText = findViewById(R.id.showFastSearchText);
-        tvFastSearchText.setText(Hawk.get(HawkConfig.FAST_SEARCH_MODE, true) ? "开启" : "关闭");
-        tvm3u8AdText = findViewById(R.id.m3u8AdText);
-        tvm3u8AdText.setText(Hawk.get(HawkConfig.M3U8_PURIFY, false) ? "开启" : "关闭");
-        tvDanmuOpenText = findViewById(R.id.danmuOpenText);
-        tvDanmuOpenText.setText(DanmuHelper.isOpen() ? "开启" : "关闭");
-        tvDanmuApiText = findViewById(R.id.danmuApiText);
-        refreshDanmuApiText();
-        tvAutoSwitchLineText = findViewById(R.id.autoSwitchLineText);
-        tvAutoSwitchLineText.setText(Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true) ? "开启" : "关闭");
-        tvRecStyleText = findViewById(R.id.showRecStyleText);
-        tvRecStyleText.setText(Hawk.get(HawkConfig.HOME_REC_STYLE, false) ? "是" : "否");
-        tvShowPreviewText = findViewById(R.id.showPreviewText);
-        tvShowPreviewText.setText(Hawk.get(HawkConfig.SHOW_PREVIEW, true) ? "开启" : "关闭");
-        tvParseWebView = findViewById(R.id.tvParseWebView);
-        tvMediaCodec = findViewById(R.id.tvMediaCodec);
-        tvPlay = findViewById(R.id.tvPlay);
-        tvRender = findViewById(R.id.tvRenderType);
-        tvScale = findViewById(R.id.tvScaleType);
-        llApi = findViewById(R.id.llApi);
-        llApiHistory = findViewById(R.id.llApiHistory);
-        llApiLine = findViewById(R.id.llApiLine);
-        tvApi = findViewById(R.id.tvApi);
-        tvApiLine = findViewById(R.id.tvApiLine);
-        tvHomeApi = findViewById(R.id.tvHomeApi);
-        tvDns = findViewById(R.id.tvDns);
-        tvHomeRec = findViewById(R.id.tvHomeRec);
-        tvHistoryNum = findViewById(R.id.tvHistoryNum);
-        tvHistoryMerge = findViewById(R.id.tvHistoryMerge);
-        tvSearchView = findViewById(R.id.tvSearchView);
-        tvIjkCachePlay = findViewById(R.id.tvIjkCachePlay);
-        tvMediaCodec.setText(Hawk.get(HawkConfig.IJK_CODEC, "硬解码"));
-        tvParseWebView.setText(Hawk.get(HawkConfig.PARSE_WEBVIEW, true) ? "系统自带" : "XWalkView");
-        tvApi.setText(Hawk.get(HawkConfig.API_URL, ""));
-        refreshApiLineText();
+    public void onResume() {
+        super.onResume();
+        leaveGuard = this;
+        leavingForResult = false;
+    }
 
-        tvDns.setText(OkGoHelper.dnsHttpsList.get(Hawk.get(HawkConfig.DOH_URL, 0)));
-        tvHomeRec.setText(getHomeRecName(Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC)));
-        tvHistoryNum.setText(HistoryHelper.getHistoryNumName(Hawk.get(HawkConfig.HISTORY_NUM, 0)));
-        tvHistoryMerge.setText(Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE) ? "开启" : "关闭");
-        tvSearchView.setText(getSearchView(Hawk.get(HawkConfig.SEARCH_VIEW, 0)));
-        tvHomeApi.setText(ApiConfig.get().getHomeSourceBean().getName());
-        tvScale.setText(PlayerHelper.getScaleName(Hawk.get(HawkConfig.PLAY_SCALE, 0)));
-        tvPlay.setText(PlayerHelper.getPlayerName(Hawk.get(HawkConfig.PLAY_TYPE, 2)));
-        tvRender.setText(PlayerHelper.getRenderName(Hawk.get(HawkConfig.PLAY_RENDER, 0)));
-        tvIjkCachePlay.setText(Hawk.get(HawkConfig.IJK_CACHE_PLAY, false) ? "开启" : "关闭");
-        tvHomeDefaultShow = findViewById(R.id.tvHomeText);
-        tvHomeDefaultShow.setText(Hawk.get(HawkConfig.DEFAULT_LOAD_LIVE, false) ? "直播" : "点播");
+    /**
+     * ★ v99-r49：按 Home 键 / 被系统回收 = 未保存的草稿直接丢弃（用户口径）。
+     * 跳转其它页面（导入本地配置）期间不清，用 leavingForResult 挡住。
+     */
+    @Override
+    public void onStop() {
+        super.onStop();
+        if (leaveGuard == this) {
+            leaveGuard = null;
+        }
+        if (!leavingForResult && !suppressLeavePrompt && !draft.isEmpty()) {
+            discardDraft();
+        }
+    }
+
+    /** 升级后一次性提示：同名合并已固定开启（旧键为关闭态的用户会看到历史被合并）。 */
+    private void notifyLegacyMergeOnce() {
+        try {
+            boolean hasLegacy = Hawk.contains(HawkConfig.LEGACY_HISTORY_MERGE);
+            boolean legacy = hasLegacy && Hawk.get(HawkConfig.LEGACY_HISTORY_MERGE, true);
+            if (hasLegacy && !legacy) {
+                Toast.makeText(mContext,
+                        "同名合并已固定开启：历史里重复的同一部影片已合并为一条（播放进度已迁移）",
+                        Toast.LENGTH_LONG).show();
+            }
+            if (hasLegacy) {
+                Hawk.delete(HawkConfig.LEGACY_HISTORY_MERGE);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    protected void init() {
+        notifyLegacyMergeOnce();
+        refreshUi();
         findViewById(R.id.llParseWebVew).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                boolean useSystem = !Hawk.get(HawkConfig.PARSE_WEBVIEW, true);
-                Hawk.put(HawkConfig.PARSE_WEBVIEW, useSystem);
-                tvParseWebView.setText(Hawk.get(HawkConfig.PARSE_WEBVIEW, true) ? "系统自带" : "XWalkView");
+                boolean useSystem = !cur(HawkConfig.PARSE_WEBVIEW, true);
+                draftPut(HawkConfig.PARSE_WEBVIEW, useSystem);
+                tvParseWebView.setText(cur(HawkConfig.PARSE_WEBVIEW, true) ? "系统自带" : "XWalkView");
                 if (!useSystem) {
                     Toast.makeText(mContext, "注意: XWalkView只适用于部分低Android版本，Android5.0以上推荐使用系统自带", Toast.LENGTH_LONG).show();
                     XWalkInitDialog dialog = new XWalkInitDialog(mContext);
@@ -281,7 +322,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int dohUrl = Hawk.get(HawkConfig.DOH_URL, 0);
+                int dohUrl = cur(HawkConfig.DOH_URL, 0);
 
                 SelectDialog<String> dialog = new SelectDialog<>(mActivity);
                 dialog.setTip("请选择安全DNS");
@@ -289,7 +330,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                     @Override
                     public void click(String value, int pos) {
                         tvDns.setText(OkGoHelper.dnsHttpsList.get(pos));
-                        Hawk.put(HawkConfig.DOH_URL, pos);
+                        draftPut(HawkConfig.DOH_URL, pos);
 //                        String url = OkGoHelper.getDohUrl(pos);
 //                        OkGoHelper.dnsOverHttps.setUrl(url.isEmpty() ? null : HttpUrl.get(url));
                         OkGoHelper.reloadDns();
@@ -324,16 +365,12 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setOnListener(new ApiDialog.OnListener() {
                     @Override
                     public void onchange(String api) {
-                        String oldApi = Hawk.get(HawkConfig.API_URL, "");
-                        Hawk.put(HawkConfig.API_URL, api);
+                        draftPut(HawkConfig.API_URL, api);
                         if (!HistoryHelper.isApiLineHistory(api)) {
                             HistoryHelper.clearApiLineList();
                         }
                         tvApi.setText(api);
                         refreshApiLineText();
-                        if (!oldApi.equals(api)) {
-                            restartAppAfterConfigChanged();
-                        }
                     }
 
                     @Override
@@ -356,10 +393,10 @@ public class ModelSettingFragment extends BaseLazyFragment {
         findViewById(R.id.llApiHistory).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                ArrayList<String> history = Hawk.get(HawkConfig.API_HISTORY, new ArrayList<String>());
+                ArrayList<String> history = cur(HawkConfig.API_HISTORY, new ArrayList<String>());
                 if (history.isEmpty())
                     return;
-                String current = Hawk.get(HawkConfig.API_URL, "");
+                String current = cur(HawkConfig.API_URL, "");
                 int idx = 0;
                 if (history.contains(current))
                     idx = history.indexOf(current);
@@ -368,19 +405,15 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new ApiHistoryDialogAdapter.SelectDialogInterface() {
                     @Override
                     public void click(String value) {
-                        String oldApi = Hawk.get(HawkConfig.API_URL, "");
+                        draftPut(HawkConfig.API_URL, value);
+                        draftPut(HawkConfig.LIVE_API_URL, value);
                         if (!HistoryHelper.isApiLineHistory(value)) {
                             HistoryHelper.clearApiLineList();
                         }
-                        Hawk.put(HawkConfig.API_URL, value);
-                        Hawk.put(HawkConfig.LIVE_API_URL, value);
                         HistoryHelper.setLiveApiHistory(value);
                         tvApi.setText(value);
                         refreshApiLineText();
                         dialog.dismiss();
-                        if (!oldApi.equals(value)) {
-                            restartAppAfterConfigChanged();
-                        }
                     }
 
                     @Override
@@ -395,12 +428,12 @@ public class ModelSettingFragment extends BaseLazyFragment {
         findViewById(R.id.llApiLine).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                ArrayList<String> apiLines = Hawk.get(HawkConfig.API_LINE_LIST, new ArrayList<String>());
+                ArrayList<String> apiLines = cur(HawkConfig.API_LINE_LIST, new ArrayList<String>());
                 if (apiLines.isEmpty()) {
                     Toast.makeText(mContext, "线路列表为空", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                String current = Hawk.get(HawkConfig.API_URL, "");
+                String current = cur(HawkConfig.API_URL, "");
                 int idx = 0;
                 for (int i = 0; i < apiLines.size(); i++) {
                     if (current.equals(HistoryHelper.getApiLineUrl(apiLines.get(i)))) {
@@ -414,19 +447,18 @@ public class ModelSettingFragment extends BaseLazyFragment {
                     @Override
                     public void click(String value, int pos) {
                         String newApi = HistoryHelper.getApiLineUrl(value);
-                        String oldApi = Hawk.get(HawkConfig.API_URL, "");
                         if (newApi.isEmpty()) {
                             return;
                         }
-                        Hawk.put(HawkConfig.API_URL, newApi);
-                        Hawk.put(HawkConfig.LIVE_API_URL, newApi);
+                        if (!HistoryHelper.isApiLineHistory(newApi)) {
+                            // 快照由 draftPut 内部在首次 API 改动时记录，这里不再前置副作用
+                        }
+                        draftPut(HawkConfig.API_URL, newApi);
+                        draftPut(HawkConfig.LIVE_API_URL, newApi);
                         HistoryHelper.setLiveApiHistory(newApi);
                         tvApi.setText(newApi);
                         refreshApiLineText();
                         dialog.dismiss();
-                        if (!oldApi.equals(newApi)) {
-                            restartAppAfterConfigChanged();
-                        }
                     }
 
                     @Override
@@ -448,7 +480,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 FastClickCheckUtil.check(v);
 
                 int defaultPos = 0;
-                String ijkSel = Hawk.get(HawkConfig.IJK_CODEC, "硬解码");
+                String ijkSel = cur(HawkConfig.IJK_CODEC, "硬解码");
                 for (int j = 0; j < ijkCodes.size(); j++) {
                     if (ijkSel.equals(ijkCodes.get(j).getName())) {
                         defaultPos = j;
@@ -487,7 +519,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int defaultPos = Hawk.get(HawkConfig.PLAY_SCALE, 0);
+                int defaultPos = cur(HawkConfig.PLAY_SCALE, 0);
                 ArrayList<Integer> players = new ArrayList<>();
                 players.add(0);
                 players.add(1);
@@ -500,7 +532,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
                     public void click(Integer value, int pos) {
-                        Hawk.put(HawkConfig.PLAY_SCALE, value);
+                        draftPut(HawkConfig.PLAY_SCALE, value);
                         tvScale.setText(PlayerHelper.getScaleName(value));
                     }
 
@@ -526,7 +558,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int playerType = Hawk.get(HawkConfig.PLAY_TYPE, 2);
+                int playerType = cur(HawkConfig.PLAY_TYPE, 2);
                 int defaultPos = 0;
                 ArrayList<Integer> players = PlayerHelper.getExistPlayerTypes();
                 ArrayList<Integer> renders = new ArrayList<>();
@@ -542,7 +574,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                     @Override
                     public void click(Integer value, int pos) {
                         Integer thisPlayerType = players.get(pos);
-                        Hawk.put(HawkConfig.PLAY_TYPE, thisPlayerType);
+                        draftPut(HawkConfig.PLAY_TYPE, thisPlayerType);
                         tvPlay.setText(PlayerHelper.getPlayerName(thisPlayerType));
                         PlayerHelper.init();
                     }
@@ -570,7 +602,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int defaultPos = Hawk.get(HawkConfig.PLAY_RENDER, 0);
+                int defaultPos = cur(HawkConfig.PLAY_RENDER, 0);
                 ArrayList<Integer> renders = new ArrayList<>();
                 renders.add(0);
                 renders.add(1);
@@ -579,7 +611,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
                     public void click(Integer value, int pos) {
-                        Hawk.put(HawkConfig.PLAY_RENDER, value);
+                        draftPut(HawkConfig.PLAY_RENDER, value);
                         tvRender.setText(PlayerHelper.getRenderName(value));
                         PlayerHelper.init();
                     }
@@ -606,7 +638,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int defaultPos = Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC);
+                int defaultPos = cur(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC);
                 ArrayList<Integer> types = new ArrayList<>();
                 types.add(0);
                 types.add(1);
@@ -616,7 +648,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
                     public void click(Integer value, int pos) {
-                        Hawk.put(HawkConfig.HOME_REC, value);
+                        draftPut(HawkConfig.HOME_REC, value);
                         tvHomeRec.setText(getHomeRecName(value));
                     }
 
@@ -642,7 +674,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int defaultPos = Hawk.get(HawkConfig.SEARCH_VIEW, 0);
+                int defaultPos = cur(HawkConfig.SEARCH_VIEW, 0);
                 ArrayList<Integer> types = new ArrayList<>();
                 types.add(0);
                 types.add(1);
@@ -651,7 +683,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
                     public void click(Integer value, int pos) {
-                        Hawk.put(HawkConfig.SEARCH_VIEW, value);
+                        draftPut(HawkConfig.SEARCH_VIEW, value);
                         tvSearchView.setText(getSearchView(value));
                     }
 
@@ -679,15 +711,15 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                Hawk.put(HawkConfig.SHOW_PREVIEW, !Hawk.get(HawkConfig.SHOW_PREVIEW, true));
-                tvShowPreviewText.setText(Hawk.get(HawkConfig.SHOW_PREVIEW, true) ? "开启" : "关闭");
+                draftPut(HawkConfig.SHOW_PREVIEW, !cur(HawkConfig.SHOW_PREVIEW, true));
+                tvShowPreviewText.setText(cur(HawkConfig.SHOW_PREVIEW, true) ? "开启" : "关闭");
             }
         });
         findViewById(R.id.llHistoryNum).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                int defaultPos = Hawk.get(HawkConfig.HISTORY_NUM, 0);
+                int defaultPos = cur(HawkConfig.HISTORY_NUM, 0);
                 ArrayList<Integer> types = new ArrayList<>();
                 types.add(0);
                 types.add(1);
@@ -697,9 +729,9 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 dialog.setAdapter(new SelectDialogAdapter.SelectDialogInterface<Integer>() {
                     @Override
                     public void click(final Integer value, int pos) {
-                        final int oldIndex = Hawk.get(HawkConfig.HISTORY_NUM, 0);
+                        final int oldIndex = cur(HawkConfig.HISTORY_NUM, 0);
                         // ★ v99-r47：先改变档位（显示层立刻按新档位收敛），再决定要不要提醒裁剪
-                        Hawk.put(HawkConfig.HISTORY_NUM, value);
+                        draftPut(HawkConfig.HISTORY_NUM, value);
                         tvHistoryNum.setText(HistoryHelper.getHistoryNumName(value));
                         // 档位是账号级设置 ⇒ 标脏让它 1 分钟内推出去（否则要等别的 dirty 顺风车）
                         HistorySyncManager.markDirty(SyncScope.SETTINGS);
@@ -764,16 +796,16 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                Hawk.put(HawkConfig.FAST_SEARCH_MODE, !Hawk.get(HawkConfig.FAST_SEARCH_MODE, true));
-                tvFastSearchText.setText(Hawk.get(HawkConfig.FAST_SEARCH_MODE, true) ? "开启" : "关闭");
+                draftPut(HawkConfig.FAST_SEARCH_MODE, !cur(HawkConfig.FAST_SEARCH_MODE, true));
+                tvFastSearchText.setText(cur(HawkConfig.FAST_SEARCH_MODE, true) ? "开启" : "关闭");
             }
         });
         findViewById(R.id.m3u8Ad).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                boolean is_purify=Hawk.get(HawkConfig.M3U8_PURIFY, false);
-                Hawk.put(HawkConfig.M3U8_PURIFY, !is_purify);
+                boolean is_purify=cur(HawkConfig.M3U8_PURIFY, false);
+                draftPut(HawkConfig.M3U8_PURIFY, !is_purify);
                 tvm3u8AdText.setText(!is_purify ? "开启" : "关闭");
             }
         });
@@ -781,10 +813,10 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                boolean open = !DanmuHelper.isOpen();
-                DanmuHelper.setOpen(open);
+                // v99-r49：草稿化——只改显示，保存时才写 Hawk 并广播给播放页
+                boolean open = !cur(HawkConfig.DANMU_OPEN, DanmuHelper.isOpen());
+                draftPut(HawkConfig.DANMU_OPEN, open);
                 tvDanmuOpenText.setText(open ? "开启" : "关闭");
-                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_SET_DANMU_SETTINGS, open));
             }
         });
         findViewById(R.id.danmuApi).setOnClickListener(new View.OnClickListener() {
@@ -805,8 +837,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                boolean enable = !Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true);
-                Hawk.put(HawkConfig.AUTO_SWITCH_LINE, enable);
+                boolean enable = !cur(HawkConfig.AUTO_SWITCH_LINE, true);
+                draftPut(HawkConfig.AUTO_SWITCH_LINE, enable);
                 tvAutoSwitchLineText.setText(enable ? "开启" : "关闭");
             }
         });
@@ -814,36 +846,385 @@ public class ModelSettingFragment extends BaseLazyFragment {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                Hawk.put(HawkConfig.HOME_REC_STYLE, !Hawk.get(HawkConfig.HOME_REC_STYLE, false));
-                tvRecStyleText.setText(Hawk.get(HawkConfig.HOME_REC_STYLE, false) ? "是" : "否");
+                draftPut(HawkConfig.HOME_REC_STYLE, !cur(HawkConfig.HOME_REC_STYLE, false));
+                tvRecStyleText.setText(cur(HawkConfig.HOME_REC_STYLE, false) ? "是" : "否");
             }
         });
 
-        findViewById(R.id.llHistoryMerge).setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                FastClickCheckUtil.check(v);
-                boolean historyMerge = !Hawk.get(HawkConfig.HISTORY_MERGE, HawkConfig.DEFAULT_HISTORY_MERGE);
-                Hawk.put(HawkConfig.HISTORY_MERGE, historyMerge);
-                tvHistoryMerge.setText(historyMerge ? "开启" : "关闭");
-                // ★ v99-r47：开关属账号级设置 ⇒ 标脏同步 + 列表立即按新口径重排
-                HistorySyncManager.markDirty(SyncScope.SETTINGS);
-                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
-            }
-        });
+        // v99-r49：「历史合并」开关已删除（合并恒开启），该格改为「保存设置」
+        View saveView = findViewById(R.id.llSaveSettings);
+        if (saveView != null) {
+            saveView.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    FastClickCheckUtil.check(v);
+                    showSaveConfirm();
+                }
+            });
+        }
 
         //下次进入
         findViewById(R.id.tvHomeLive).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
-                Hawk.put(HawkConfig.DEFAULT_LOAD_LIVE, !Hawk.get(HawkConfig.DEFAULT_LOAD_LIVE, false));
-                tvHomeDefaultShow.setText(Hawk.get(HawkConfig.DEFAULT_LOAD_LIVE, false) ? "直播" : "点播");
+                draftPut(HawkConfig.DEFAULT_LOAD_LIVE, !cur(HawkConfig.DEFAULT_LOAD_LIVE, false));
+                tvHomeDefaultShow.setText(cur(HawkConfig.DEFAULT_LOAD_LIVE, false) ? "直播" : "点播");
             }
         });
 
         findViewById(R.id.llIjkCachePlay).setOnClickListener((view -> onClickIjkCachePlay(view)));
         findViewById(R.id.llClearCache).setOnClickListener((view -> onClickClearCache(view)));
+    }
+
+
+    /** v99-r49：统一按「草稿优先」渲染设置页所有值。保存/丢弃后调用一次即可。 */
+    private void refreshUi() {
+        tvFastSearchText = findViewById(R.id.showFastSearchText);
+        tvFastSearchText.setText(cur(HawkConfig.FAST_SEARCH_MODE, true) ? "开启" : "关闭");
+        tvm3u8AdText = findViewById(R.id.m3u8AdText);
+        tvm3u8AdText.setText(cur(HawkConfig.M3U8_PURIFY, false) ? "开启" : "关闭");
+        tvDanmuOpenText = findViewById(R.id.danmuOpenText);
+        tvDanmuOpenText.setText(cur(HawkConfig.DANMU_OPEN, DanmuHelper.isOpen()) ? "开启" : "关闭");
+        tvDanmuApiText = findViewById(R.id.danmuApiText);
+        refreshDanmuApiText();
+        tvAutoSwitchLineText = findViewById(R.id.autoSwitchLineText);
+        tvAutoSwitchLineText.setText(cur(HawkConfig.AUTO_SWITCH_LINE, true) ? "开启" : "关闭");
+        tvRecStyleText = findViewById(R.id.showRecStyleText);
+        tvRecStyleText.setText(cur(HawkConfig.HOME_REC_STYLE, false) ? "是" : "否");
+        tvShowPreviewText = findViewById(R.id.showPreviewText);
+        tvShowPreviewText.setText(cur(HawkConfig.SHOW_PREVIEW, true) ? "开启" : "关闭");
+        tvParseWebView = findViewById(R.id.tvParseWebView);
+        tvMediaCodec = findViewById(R.id.tvMediaCodec);
+        tvPlay = findViewById(R.id.tvPlay);
+        tvRender = findViewById(R.id.tvRenderType);
+        tvScale = findViewById(R.id.tvScaleType);
+        llApi = findViewById(R.id.llApi);
+        llApiHistory = findViewById(R.id.llApiHistory);
+        llApiLine = findViewById(R.id.llApiLine);
+        tvApi = findViewById(R.id.tvApi);
+        tvApiLine = findViewById(R.id.tvApiLine);
+        tvHomeApi = findViewById(R.id.tvHomeApi);
+        tvDns = findViewById(R.id.tvDns);
+        tvHomeRec = findViewById(R.id.tvHomeRec);
+        tvHistoryNum = findViewById(R.id.tvHistoryNum);
+        tvSearchView = findViewById(R.id.tvSearchView);
+        tvIjkCachePlay = findViewById(R.id.tvIjkCachePlay);
+        tvMediaCodec.setText(cur(HawkConfig.IJK_CODEC, "硬解码"));
+        tvParseWebView.setText(cur(HawkConfig.PARSE_WEBVIEW, true) ? "系统自带" : "XWalkView");
+        tvApi.setText(cur(HawkConfig.API_URL, ""));
+        refreshApiLineText();
+
+        tvDns.setText(OkGoHelper.dnsHttpsList.get(cur(HawkConfig.DOH_URL, 0)));
+        tvHomeRec.setText(getHomeRecName(cur(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC)));
+        tvHistoryNum.setText(HistoryHelper.getHistoryNumName(cur(HawkConfig.HISTORY_NUM, 0)));
+        tvSearchView.setText(getSearchView(cur(HawkConfig.SEARCH_VIEW, 0)));
+        tvHomeApi.setText(ApiConfig.get().getHomeSourceBean().getName());
+        tvScale.setText(PlayerHelper.getScaleName(cur(HawkConfig.PLAY_SCALE, 0)));
+        tvPlay.setText(PlayerHelper.getPlayerName(cur(HawkConfig.PLAY_TYPE, 2)));
+        tvRender.setText(PlayerHelper.getRenderName(cur(HawkConfig.PLAY_RENDER, 0)));
+        tvIjkCachePlay.setText(cur(HawkConfig.IJK_CACHE_PLAY, false) ? "开启" : "关闭");
+        tvHomeDefaultShow = findViewById(R.id.tvHomeText);
+        tvHomeDefaultShow.setText(cur(HawkConfig.DEFAULT_LOAD_LIVE, false) ? "直播" : "点播");
+    }
+
+    // ------------------------------------------------------------------ 草稿层
+    /** 读草稿，没有则回落到已保存值。 */
+    @SuppressWarnings("unchecked")
+    private <T> T cur(String key, T defValue) {
+        if (draft.containsKey(key)) {
+            Object v = draft.get(key);
+            if (v != null) {
+                try {
+                    return (T) v;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return Hawk.get(key, defValue);
+    }
+
+    /** 写草稿。API 类键例外：立即落盘并重新解析，保证「首页站源/线路选择」候选是新 API 的。 */
+    private void draftPut(String key, Object value) {
+        if (isApiDependent(key)) {
+            snapshotApiKeys();
+            Hawk.put(key, value);
+            draft.put(key, value);
+            reloadApiForDraft();
+            return;
+        }
+        draft.put(key, value);
+    }
+
+    private static boolean isApiDependent(String key) {
+        for (String k : API_DEPENDENT_KEYS) {
+            if (k.equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** API 改动前的现场：用于「不保存」时把 parseJson 写过的键还原。 */
+    private void snapshotApiKeys() {
+        if (!apiSnapshot.isEmpty() || !apiAbsent.isEmpty()) {
+            return;                      // 一次页面内只记第一份现场
+        }
+        for (String k : API_DEPENDENT_KEYS) {
+            if (Hawk.contains(k)) {
+                apiSnapshot.put(k, Hawk.get(k));
+            } else {
+                apiAbsent.add(k);
+            }
+        }
+    }
+
+    private void restoreApiKeys() {
+        for (String k : API_DEPENDENT_KEYS) {
+            if (apiSnapshot.containsKey(k)) {
+                Hawk.put(k, apiSnapshot.get(k));
+            } else if (apiAbsent.contains(k)) {
+                Hawk.delete(k);
+            }
+        }
+        apiSnapshot.clear();
+        apiAbsent.clear();
+    }
+
+    /** 用当前 API_URL 重新解析（草稿期让候选列表立刻反映新地址）。 */
+    private void reloadApiForDraft() {
+        try {
+            ApiConfig.get().loadConfig(true, new ApiConfig.LoadConfigCallback() {
+                @Override
+                public void success() {
+                    refreshApiDependentUi();
+                }
+
+                @Override
+                public void error(String msg) {
+                    refreshApiDependentUi();
+                    if (mContext != null) {
+                        Toast.makeText(mContext, "配置解析失败：" + msg, Toast.LENGTH_SHORT).show();
+                    }
+                }
+
+                @Override
+                public void notice(String msg) {
+                }
+            }, mActivity);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
+    private void refreshApiDependentUi() {
+        if (mActivity == null) {
+            return;
+        }
+        mActivity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (tvApi != null) {
+                    tvApi.setText(cur(HawkConfig.API_URL, ""));
+                }
+                refreshApiLineText();
+                if (tvHomeApi != null) {
+                    try {
+                        tvHomeApi.setText(ApiConfig.get().getHomeSourceBean().getName());
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        });
+    }
+
+    /** 丢弃草稿（不保存 / Home 键离开）：API 现场一并还原。 */
+    private void discardDraft() {
+        boolean apiTouched = !apiSnapshot.isEmpty() || !apiAbsent.isEmpty();
+        draft.clear();
+        if (apiTouched) {
+            restoreApiKeys();
+            reloadApiForDraft();
+        }
+        refreshUi();
+    }
+
+    // ------------------------------------------------------------------ 保存
+    private void showSaveConfirm() {
+        String text = buildChangeSummary();
+        if (text.length() == 0) {
+            Toast.makeText(mContext, "没有需要保存的改动", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final com.github.tvbox.osc.ui.dialog.TipDialog[] holder = new com.github.tvbox.osc.ui.dialog.TipDialog[1];
+        holder[0] = new com.github.tvbox.osc.ui.dialog.TipDialog(mActivity,
+                "本次修改：" + text + "\n保存后将同步到云端", "取消", "保存",
+                new com.github.tvbox.osc.ui.dialog.TipDialog.OnListener() {
+                    @Override
+                    public void left() {
+                        holder[0].dismiss();
+                    }
+
+                    @Override
+                    public void right() {
+                        holder[0].dismiss();
+                        doSave();
+                    }
+
+                    @Override
+                    public void cancel() {
+                    }
+                });
+        holder[0].show();
+    }
+
+    /** 改动清单：只给「名称：变化简述」，不展示长串原值。 */
+    private String buildChangeSummary() {
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String, Object> e : draft.entrySet()) {
+            String key = e.getKey();
+            Object now = e.getValue();
+            if (Hawk.contains(key)) {
+                Object old = Hawk.get(key, (Object) null);
+                if (old != null && old.equals(now)) {
+                    continue;
+                }
+            }
+            if (now == null) {
+                continue;
+            }
+            String name = SETTING_NAMES.containsKey(key) ? SETTING_NAMES.get(key) : key;
+            sb.append('\n').append("· ").append(name).append("：").append(describeValue(key, now));
+        }
+        return sb.toString();
+    }
+
+    private String describeValue(String key, Object v) {
+        try {
+            if (v instanceof Boolean) {
+                return ((Boolean) v) ? "开启" : "关闭";
+            }
+            if (HawkConfig.API_URL.equals(key) || HawkConfig.LIVE_API_URL.equals(key)) {
+                return "已更换地址";
+            }
+            if (HawkConfig.HISTORY_NUM.equals(key)) {
+                return HistoryHelper.getHistoryNumName((Integer) v);
+            }
+            if (HawkConfig.HOME_REC.equals(key)) {
+                return getHomeRecName((Integer) v);
+            }
+            if (HawkConfig.SEARCH_VIEW.equals(key)) {
+                return getSearchView((Integer) v);
+            }
+            if (HawkConfig.PLAY_SCALE.equals(key)) {
+                return PlayerHelper.getScaleName((Integer) v);
+            }
+            if (HawkConfig.PLAY_TYPE.equals(key)) {
+                return PlayerHelper.getPlayerName((Integer) v);
+            }
+            if (HawkConfig.PLAY_RENDER.equals(key)) {
+                return PlayerHelper.getRenderName((Integer) v);
+            }
+            if (HawkConfig.DOH_URL.equals(key)) {
+                Integer i = (Integer) v;
+                return i >= 0 && i < OkGoHelper.dnsHttpsList.size() ? OkGoHelper.dnsHttpsList.get(i) : "默认";
+            }
+            if (HawkConfig.DANMU_API.equals(key)) {
+                String s = String.valueOf(v);
+                return TextUtils.isEmpty(s) ? "默认" : "已自定义";
+            }
+        } catch (Throwable ignored) {
+        }
+        return String.valueOf(v);
+    }
+
+    /** 真正落盘：写 Hawk + 裁剪 + 广播 + 标脏上传（+ 配置类变更触发重载）。 */
+    private void doSave() {
+        boolean apiChanged = false;
+        boolean homeApiChanged = false;
+        boolean historyNumChanged = false;
+        for (java.util.Map.Entry<String, Object> e : draft.entrySet()) {
+            String k = e.getKey();
+            if (isApiDependent(k)) {
+                // API 类在 draftPut 时已写入 Hawk（为了让解析立刻可用），这里只记标记
+                apiChanged |= (HawkConfig.API_URL.equals(k) || HawkConfig.LIVE_API_URL.equals(k));
+                homeApiChanged |= HawkConfig.HOME_API.equals(k);
+                continue;
+            }
+            Hawk.put(k, e.getValue());
+            if (HawkConfig.HISTORY_NUM.equals(k)) {
+                historyNumChanged = true;
+            }
+        }
+        draft.clear();
+        apiSnapshot.clear();
+        apiAbsent.clear();
+
+        // 档位下调 ⇒ 此刻才真正裁剪（保存确认弹窗里已列明）
+        if (historyNumChanged) {
+            try {
+                RoomDataManger.pruneHistory();
+            } catch (Throwable ignored) {
+            }
+        }
+        // 弹幕开关：保存后才广播给播放页
+        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_SET_DANMU_SETTINGS, DanmuHelper.isOpen()));
+        if (homeApiChanged) {
+            EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HOME_SOURCE_CHANGE));
+        }
+        // 标脏并立即同步（这是设置上传的唯一入口）
+        try {
+            HistorySyncManager.markDirty(SyncScope.SETTINGS);
+            com.github.tvbox.osc.sync.SyncScheduler.requestNow(
+                    com.github.tvbox.osc.sync.AccountContext.ownerKey(), "settings-save", true, null);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+        refreshUi();
+        if (apiChanged) {
+            suppressLeavePrompt = true;
+            Toast.makeText(mContext, "设置已保存，配置已切换，即将重新加载!", Toast.LENGTH_SHORT).show();
+            restartAppAfterConfigChanged();
+        } else {
+            Toast.makeText(mContext, "设置已保存", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ------------------------------------------------------------------ 离开拦截
+    /** 返回键：有未保存改动则拦下弹窗。返回 true 表示已消费本次返回键。 */
+    public boolean handleBackPress() {
+        if (suppressLeavePrompt) {
+            suppressLeavePrompt = false;
+            return false;
+        }
+        if (draft.isEmpty()) {
+            return false;
+        }
+        final com.github.tvbox.osc.ui.dialog.TipDialog[] holder = new com.github.tvbox.osc.ui.dialog.TipDialog[1];
+        holder[0] = new com.github.tvbox.osc.ui.dialog.TipDialog(mActivity,
+                "有未保存的设置改动：" + buildChangeSummary(), "不保存", "保存",
+                new com.github.tvbox.osc.ui.dialog.TipDialog.OnListener() {
+                    @Override
+                    public void left() {
+                        holder[0].dismiss();
+                        discardDraft();
+                        if (mActivity != null) {
+                            mActivity.finish();
+                        }
+                    }
+
+                    @Override
+                    public void right() {
+                        holder[0].dismiss();
+                        showSaveConfirm();
+                    }
+
+                    @Override
+                    public void cancel() {
+                    }
+                });
+        holder[0].show();
+        return true;
     }
 
     private void restartAppAfterConfigChanged() {
@@ -881,8 +1262,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
 
     private void refreshApiLineText() {
         if (tvApiLine == null) return;
-        ArrayList<String> apiLines = Hawk.get(HawkConfig.API_LINE_LIST, new ArrayList<String>());
-        String current = Hawk.get(HawkConfig.API_URL, "");
+        ArrayList<String> apiLines = cur(HawkConfig.API_LINE_LIST, new ArrayList<String>());
+        String current = cur(HawkConfig.API_URL, "");
         boolean showLine = HistoryHelper.isApiLineUrl(current);
         if (llApiLine != null) {
             llApiLine.setVisibility(showLine ? View.VISIBLE : View.GONE);
@@ -906,7 +1287,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
             tvDanmuApiText.setText("默认");
             return;
         }
-        String custom = Hawk.get(HawkConfig.DANMU_API, "");
+        String custom = cur(HawkConfig.DANMU_API, "");
         if (!custom.isEmpty()) {
             tvDanmuApiText.setText("自定义");
             return;
@@ -941,12 +1322,13 @@ public class ModelSettingFragment extends BaseLazyFragment {
 
     private void onClickIjkCachePlay(View v) {
         FastClickCheckUtil.check(v);
-        Hawk.put(HawkConfig.IJK_CACHE_PLAY, !Hawk.get(HawkConfig.IJK_CACHE_PLAY, false));
-        tvIjkCachePlay.setText(Hawk.get(HawkConfig.IJK_CACHE_PLAY, false) ? "开启" : "关闭");
+        draftPut(HawkConfig.IJK_CACHE_PLAY, !cur(HawkConfig.IJK_CACHE_PLAY, false));
+        tvIjkCachePlay.setText(cur(HawkConfig.IJK_CACHE_PLAY, false) ? "开启" : "关闭");
     }
 
     private void openLocalConfig(boolean live) {
         selectLocalLive = live;
+        leavingForResult = true;
         if (!XXPermissions.isGranted(mContext, Permission.Group.STORAGE)) {
             Toast.makeText(getContext(), "请选择文件前需要先授予存储权限", Toast.LENGTH_SHORT).show();
             XXPermissions.with(mActivity)
@@ -984,6 +1366,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
     @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        leavingForResult = false;
         if (requestCode != REQUEST_LOCAL_CONFIG || resultCode != android.app.Activity.RESULT_OK || data == null || data.getData() == null) {
             return;
         }

@@ -182,6 +182,11 @@ public class SettingActivity extends BaseActivity {
 
     @Override
     public void onBackPressed() {
+        // ★ v99-r49：设置页有未保存的草稿时，先弹「保存/不保存」确认
+        ModelSettingFragment guard = ModelSettingFragment.leaveGuard;
+        if (guard != null && guard.handleBackPress()) {
+            return;
+        }
         if (currentApi.equals(Hawk.get(HawkConfig.API_URL, ""))) {
             if (homeRec != Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC)) {
                 jumpActivity(HomeActivity.class, createBundle());

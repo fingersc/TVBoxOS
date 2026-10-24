@@ -66,7 +66,7 @@ public final class ConfigPlan {
      * 写历史时自然发生 —— 在这里删数据会把"调低后又调回"变成不可逆的误删。</p>
      */
     public static final String[] HISTORY_KEYS = {
-            HawkConfig.HISTORY_NUM, HawkConfig.HISTORY_MERGE,
+            HawkConfig.HISTORY_NUM,
     };
 
     /** 快照长度：RELOAD + HOME + LIVE + HISTORY 四组键按此顺序排列。 */
