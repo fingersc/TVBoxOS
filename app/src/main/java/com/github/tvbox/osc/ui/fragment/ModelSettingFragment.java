@@ -859,7 +859,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 @Override
                 public void onClick(View v) {
                     FastClickCheckUtil.check(v);
-                    showSaveDialog("本次修改");
+                    showSaveDialog("本次涉及的修改内容");
                 }
             });
         }
@@ -1279,7 +1279,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         if (!hasChanges()) {
             return false;
         }
-        showSaveDialog("有未保存的修改，返回首页将丢失");
+        showSaveDialog("有未保存的修改，是否保存？\n不保存将丢失当前修改！");
         return true;
     }
 

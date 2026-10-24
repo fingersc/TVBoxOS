@@ -208,12 +208,13 @@ public class RoomDataManger {
             VodInfo fromInfo = parseRecordInfo(from);
             String fromName = getVodRecordName(fromInfo);
             String toName = getVodRecordName(toVodInfo);
-            if (TextUtils.isEmpty(fromName) || !TextUtils.equals(fromName, toName)) {
+            // ★ v99-r51：名字不同不再阻止删除 —— 切源会话内相邻两跳本来就是同一部片，
+            //   名字变体（标点/季度写法/全角）正是重复的来源。差异只记日志以便审计。
+            if (!TextUtils.equals(fromName, toName)) {
                 try {
-                    LOG.i("[Hist] hopSkip nameMismatch 「" + fromName + "」vs「" + toName + "」");
+                    LOG.i("[Hist] hopDiffName 「" + fromName + "」->「" + toName + "」");
                 } catch (Throwable ignored) {
                 }
-                return 0;
             }
             // 先迁进度（按集名对齐），迁移失败也照删——进度是"尽力而为"，不能因为迁移失败留下重复行
             try {

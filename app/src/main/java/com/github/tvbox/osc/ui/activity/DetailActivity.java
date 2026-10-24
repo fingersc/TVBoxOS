@@ -2617,6 +2617,13 @@ public class DetailActivity extends BaseActivity {
         fallbackFromIndex = idx;
         fallbackFromName = list.get(idx).name == null ? "" : list.get(idx).name;
         fallbackFromValid = !TextUtils.isEmpty(fallbackFromName);
+        // ★ v99-r51：只有"正在切源"时的快照才是"上一跳"。
+        //   切源成功后的那次 capture（detailFallbackActive 已被 resetDetailFallbackKeepCache 置 false）
+        //   会拿到"新源身份"，若也写进来，就会把真正的上一跳覆盖掉 ⇒ 合并永远不触发。
+        if (detailFallbackActive) {
+            switchFromSourceKey = fallbackFromSourceKey;
+            switchFromVodId = fallbackFromVodId;
+        }
     }
 
     /**
@@ -4266,6 +4273,9 @@ public class DetailActivity extends BaseActivity {
     // 切源前快照：记录"实际正在播"的源/线路/集，供进度迁移兜底（详见 readOldTimeFromSnapshot）
     private String fallbackFromSourceKey = "";
     private String fallbackFromVodId = "";
+    /** ★ v99-r51：切源会话的"上一跳身份"。只在"开始切源"时写，切源成功路径不会覆写它。 */
+    private String switchFromSourceKey = "";
+    private String switchFromVodId = "";
     private String fallbackFromFlag = "";
     private int fallbackFromIndex = -1;
     private String fallbackFromName = "";
@@ -5748,16 +5758,14 @@ public class DetailActivity extends BaseActivity {
         // ★ v99-r50：切源会话内按「上一跳身份」再删一次——不依赖名字变体判定。
         //   三层护栏：本跳已成功（走到这里说明 detail 加载/episodeCheck/落点都过了）、
         //   名字归一化相同（在 RoomDataManger 里校验）、身份不同且旧行存在。
-        if (detailFallbackActive && fallbackFromValid
-                && !TextUtils.isEmpty(fallbackFromVodId)
-                && !TextUtils.equals(fallbackFromVodId, vodInfo.id)) {
-            int hopMerged = RoomDataManger.mergeSwitchHop(fallbackFromSourceKey, fallbackFromVodId,
+        if (!TextUtils.isEmpty(switchFromVodId) && !TextUtils.isEmpty(switchFromSourceKey)
+                && !TextUtils.equals(switchFromVodId, vodInfo.id)) {
+            int hopMerged = RoomDataManger.mergeSwitchHop(switchFromSourceKey, switchFromVodId,
                     sourceKey, vodInfo);
-            if (hopMerged > 0) {
-                LOG.sw("[FB] hopMerged " + fallbackFromSourceKey + "/" + fallbackFromVodId
-                        + " -> " + sourceKey + "/" + vodInfo.id);
-            }
-            fallbackFromValid = false;      // 本跳已消费，防重复
+            LOG.sw("[FB] hopMerge ret=" + hopMerged + " " + switchFromSourceKey + "/" + switchFromVodId
+                    + " -> " + sourceKey + "/" + vodInfo.id);
+            switchFromSourceKey = "";       // 本跳已消费，防重复
+            switchFromVodId = "";
         }
         EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
     }
