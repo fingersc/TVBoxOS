@@ -33,6 +33,7 @@ import com.github.tvbox.osc.ui.adapter.HomeHotVodAdapter;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.ImgUtil;
+import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.UA;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.google.gson.Gson;
@@ -71,6 +72,18 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
     public static HomeHotVodAdapter homeHotVodAdapter;
     private List<Movie.Video> homeSourceRec;
     public static TvRecyclerView tvHotList;
+    /**
+     * ★ v99-r64：记住「本实例创建的这一份」。
+     *
+     * <p>两个静态引用会在 {@link #onDestroy()} 里置 null 释放（adapter 持 mContext、
+     * tvHotList 持整棵 View 树）。但 ViewPager 换页时**新旧两个实例会并存**，
+     * 旧实例的 onDestroy 可能晚于新实例的 init 执行 ⇒ 把新实例正在用的引用清掉，
+     * 新实例下一次 onFragmentResume 就踩空 NPE（真机 21:18:08 崩在 HomeActivity 切页）。</p>
+     *
+     * <p>所以释放时必须先确认「静态引用的还是我这一份」，不是我的就不许动。</p>
+     */
+    private HomeHotVodAdapter myHomeHotVodAdapter;
+    private TvRecyclerView myHotList;
     private SourceViewModel sourceViewModel;
 
     public static UserFragment newInstance() {
@@ -89,6 +102,20 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
     @Override
     protected void onFragmentResume() {
         super.onFragmentResume();
+        // ★ v99-r64：视图引用可能为 null，两个来源：
+        //   ① 另一个已销毁的实例把静态清了（见 onDestroy 的归属判定）；
+        //   ② 本实例的视图刚被重建、init() 还没轮到（init 只跑第一次可见）。
+        //   这里就地自愈：能从当前 rootView 取回就取回，取不回说明视图还没好，直接返回。
+        if (tvHotList == null) {
+            tvHotList = findViewById(R.id.tvHotList);
+            if (tvHotList != null) {
+                myHotList = tvHotList;
+            }
+        }
+        if (tvHotList == null) {
+            LOG.sw("[home] resume skip reason=noHotList");
+            return;
+        }
         if (Hawk.get(HawkConfig.HOME_REC_STYLE, false)) {
             tvHotList.setVisibility(View.VISIBLE);
             tvHotList.setHasFixedSize(true);
@@ -125,7 +152,12 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
                     vod.note = "上次看到" + vodInfo.playNote;
                 vodList.add(vod);
             }
-            homeHotVodAdapter.setNewData(vodList);
+            // ★ v99-r64：adapter 同样是静态、同样会被兄弟实例释放 ⇒ 用前必须判空。
+            if (homeHotVodAdapter != null) {
+                homeHotVodAdapter.setNewData(vodList);
+            } else {
+                LOG.sw("[home] resume skip reason=noAdapter");
+            }
         }
     }
 
@@ -179,6 +211,7 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
         tvPush.setOnFocusChangeListener(focusChangeListener);
         tvCollect.setOnFocusChangeListener(focusChangeListener);
         tvHotList = findViewById(R.id.tvHotList);
+        myHotList = tvHotList;      // ★ v99-r64：记下「这份是我的」，onDestroy 据此判定归属
         if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1 && homeSourceRec!=null) {
             style=ImgUtil.initStyle();
         }
@@ -189,6 +222,7 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
           tvRate= homeSourceRec!=null?"站点推荐":"豆瓣热播";
         }
         homeHotVodAdapter = new HomeHotVodAdapter(style,tvRate);
+        myHomeHotVodAdapter = homeHotVodAdapter;   // ★ v99-r64：同上，归属标记
         homeHotVodAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
             @Override
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
@@ -403,7 +437,19 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
         //   （连同它上面正在显示的十几张海报 Drawable）。二者都是静态字段，原来从不置 null
         //   ⇒ 首页 Fragment 一重建，旧的就永久滞留。置 null 释放；外部引用（HomeActivity）
         //   已全部加判空。
-        homeHotVodAdapter = null;
-        tvHotList = null;
+        //
+        // ★★ v99-r64：但**不能无条件清**。ViewPager 换页时新旧两个实例并存，
+        //   旧实例的 onDestroy 可能晚于新实例的 init ⇒ 会把新实例正在用的引用清掉，
+        //   新实例下一次 onFragmentResume 就 NPE（真机 21:18:08 崩在 HomeActivity 切页：
+        //   setUserVisibleHint → dispatchUserVisibleHint → tvHotList.setVisibility(null)）。
+        //   所以只在「静态引用的确实是我这一份」时才释放；不是我的，说明已被新实例接管，不许动。
+        if (myHotList != null && tvHotList == myHotList) {
+            tvHotList = null;
+        }
+        if (myHomeHotVodAdapter != null && homeHotVodAdapter == myHomeHotVodAdapter) {
+            homeHotVodAdapter = null;
+        }
+        myHotList = null;
+        myHomeHotVodAdapter = null;
     }
 }
