@@ -4216,6 +4216,40 @@ public class DetailActivity extends BaseActivity {
             kept.add(best);
             droppedCandidates += list.size() - 1;   // 同站多余的候选被收窄掉
         }
+        // ★★ v99-r68：先判「整池是不是属于另一部同名片」。
+        //
+        //   真机实证：用户从搜索页点了**另一部同名影片（韩国版 2013）**并点切源，
+        //   而池是按 familyKey(片名) 存的、里面积的是**国产版 2020** 的候选
+        //   ⇒ 27/29 个站被判年份硬矛盾 ⇒ r67 把它们全剔了，池子从 40 掉到 2，
+        //   而活下来的 2 条只是 year 缺失（不触发硬矛盾），也不是用户要的那部。
+        //
+        //   这种「大量站被剔」不是个别错源，而是**整个池属于另一部片**。
+        //   正确处置是「作废旧池 + 重搜重建」，而不是剔到只剩几条
+        //   （日志里系统后来正是走了"池不可用 → 重新搜索"这条路，只是绕了一大圈）。
+        //
+        //   判据：`>= 3 个站` 且 `过半`。实测正常情况 dropStations=0~2，
+        //   换片那次是 27/29（93%），两侧分得很开。
+        if (droppedStations >= 3 && droppedStations * 2 > bySource.size()) {
+            LOG.sw("[FB] poolFilmReplaced stations=" + droppedStations + "/" + bySource.size()
+                    + " refYear=" + (detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year)
+                    + " => 整池属于另一部同名片，作废并重攒");
+            // 先清内存状态，再停任务（stopPoolFilling 内部会落盘，那时池与已问集合已空 ⇒ 不会写出脏数据）
+            FallbackCacheStore.clearFor(title);
+            poolPut(title, new ArrayList<Movie.Video>());
+            detailFallbackPoolAskedKeys.clear();
+            detailFallbackAskedDirty = true;
+            detailFallbackCacheDirty = true;
+            detailFallbackPoolTried = false;
+            detailFallbackPoolVerifiedYear = 0;
+            detailFallbackCycleKeys.clear();
+            detailFallbackSoftTriedKeys.clear();
+            detailFallbackDeadKeys.clear();
+            if (detailFallbackPoolFilling) {
+                stopPoolFilling("filmReplaced");
+            }
+            scheduleDetailFallbackPoolFill();
+            return false;
+        }
         // ★ 守卫：剔完若池为空，放弃剔除 —— 否则 askedKeys 已记「问过」而池空，
         //   下次进片既不重搜也没有任何可切候选（用户看到的就是"点切源没反应"）。
         if (kept.isEmpty()) {
