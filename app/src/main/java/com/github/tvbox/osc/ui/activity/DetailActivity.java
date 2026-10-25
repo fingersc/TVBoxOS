@@ -3028,9 +3028,13 @@ public class DetailActivity extends BaseActivity {
         if (SearchSession.getShared().isStartupGuardActive()) {
             // ★ v99-r61：被挡下也要留痕（v42 起这条路径全程静默，r60-A 因此无法验证）。
             //   300ms 重查天然把频率压在 ~3 条/秒，不会刷屏。
-            LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
-                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
-                    + " cap=" + detailFallbackPoolConcurrency);
+            // ★ v99-r62：源已全部派完（next 已到 size、pending 还在飞）时，挡不挡毫无区别，
+            //   这种打点纯噪音（真机 16 条里 7 条是 next=101/101）⇒ 只在确实还有源可派时才记。
+            if (detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
+                LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
+                        + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                        + " cap=" + detailFallbackPoolConcurrency);
+            }
             scheduleBusyRefill();
             return;
         }
@@ -4075,6 +4079,12 @@ public class DetailActivity extends BaseActivity {
                 LOG.sw("[FB] poolAskedRestore key=" + poolKey
                         + " asked=" + (detailFallbackPoolAskedKeys.size() - before));
             }
+            // ★ v99-r62：恢复后立刻在<b>内存</b>里剪掉死键（换配置地址后已不存在的源 key）。
+            //   r61 只把裁剪挂在 persistDetailFallbackCache 的「有脏才落盘」之后，
+            //   而纯跳过的片（池已问满、一个源都不发）从不落盘 ⇒ 死键永远剪不到，
+            //   真机实测 `asked=101/100` 一直难看。裁剪只是集合运算，零额外写盘。
+            //   这里剪若确实剪掉了东西会置脏 ⇒ 退出时顺带把磁盘记录也改写干净（一次写）。
+            pruneDeadAskedKeys();
             if (box.entries == null || box.entries.isEmpty()) {
                 return;
             }
@@ -4379,6 +4389,12 @@ public class DetailActivity extends BaseActivity {
                 }
             }
         }
+        // ★ v99-r62：<b>这个复数入口也必须裁</b>。
+        //   r58~r61 只在单数入口 {@link #cacheDetailFallbackCandidate} 里调 trim，
+        //   而「会话候选合并」（refreshFallbackCandidatesFromSession）与「进页恢复候选」
+        //   走的都是这个复数入口 ⇒ 上限形同虚设，真机实测池子顶到 41（>40）。
+        //   上限只挂在部分写入口上，它就只是「大多数时候成立」，不是上限。
+        trimDetailFallbackPool(title);
     }
 
     private void cacheDetailFallbackCandidate(Movie.Video video) {
