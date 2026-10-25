@@ -83,12 +83,22 @@ public final class FallbackCacheStore {
          */
         public int refYear;
 
+        /**
+         * ★ v99-r67：校验这批候选时所用基准资源的<b>演员表</b>（截前 60 字，可为空）。
+         *
+         * <p>换片判定的辅助信号：`refYear` 相同或缺失时，若两边演员交叉不上
+         * （{@code metaRelated}），说明用户换看的是「另一部同名片」，这条记录应当作废重来。
+         * 各站演员表完整度差异极大，所以用「交叉」判定而不是全同。</p>
+         */
+        public String refActor;
+
         public FallbackCacheBox(List<String[]> entries, List<String> askedKeys, long savedAt,
-                                int refYear) {
+                                int refYear, String refActor) {
             this.entries = entries;
             this.askedKeys = askedKeys;
             this.savedAt = savedAt;
             this.refYear = refYear;
+            this.refActor = refActor;
         }
     }
 
@@ -104,11 +114,11 @@ public final class FallbackCacheStore {
      * 「全部问完却零候选」的片（源站确实没资源）也必须落一条记录，
      * 否则下次进页读不回已问集合，又会从头跑一遍 101 个源。</p>
      *
-     * <p>★ v99-r66：{@code refYear} 是「择优折叠」所依据的基准年份（0 = 未折叠）。
-     * 调用方传 0 就表示这批 entries 不保证已折叠。</p>
+     * <p>★ v99-r66/r67：{@code refYear} 是「这批候选在哪一年的基准下校验过」（0 = 未校验）；
+     * {@code refActor} 是同一次校验所用的基准演员表（换片判定的辅助信号）。</p>
      */
     public static void put(String title, List<String[]> slim, List<String> askedKeys,
-                           int refYear) {
+                           int refYear, String refActor) {
         String poolKey = poolKeyOf(title);
         if (TextUtils.isEmpty(poolKey)) {
             return;
@@ -127,7 +137,8 @@ public final class FallbackCacheStore {
                     hasEntries ? slim : new ArrayList<String[]>(),
                     hasAsked ? askedKeys : new ArrayList<String>(),
                     System.currentTimeMillis(),
-                    refYear));
+                    refYear,
+                    refActor == null ? "" : refActor));
             if (!written) {
                 LOG.e("FallbackCacheStore.put reject: " + poolKey
                         + " entries=" + (hasEntries ? slim.size() : 0)

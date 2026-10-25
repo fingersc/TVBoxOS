@@ -1200,17 +1200,22 @@ public class DetailActivity extends BaseActivity {
                         //   两条同名剧封面/演员/年份/类型全同或全空时择优全 0 只能取第一条，
                         //   而第一条可能正是另一部（虎牙《人世间》153010 实测：20 集 vs 58 集）。
                         //   详情已回来、集数悬殊 ⇒ 把该候选记死并自动续切下一站，不渲染错剧集。
-                        //   保守三重门：切源会话内 + 该站有多个候选（有得选）+ 新源集数不足基准一半。
+                        //   ★ v99-r67：原「三重门」（会话内 + 该站多候选 + 不足基准一半）已改：
+                        //   门去掉（单候选站也要判）、阈值收到 1/4、失败只记软不记死。
                         if (fallbackResult && detailFallbackRefEpisodes > 0) {
                             int nowEpisodes = countSeriesEpisodes(vodInfo);
                             int sameStation = countSameStationCandidates(sourceKey);
-                            if (shouldRejectByEpisodes(nowEpisodes, sameStation)) {
+                            if (shouldRejectByEpisodes(nowEpisodes)) {
                                 LOG.sw("[FB] episodeMismatch source=" + sourceKey + " id=" + vodId
                                         + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
                                         + " candidates=" + sameStation
                                         + " " + describeSeriesShape(vodInfo)
-                                        + " => dead + next");
-                                detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
+                                        + " => soft + next");
+                                // ★★ v99-r67：只记软失败（本圈跳过），**不记死**。
+                                //   集数不符只是「内容可能不完整」（未更新完 / 删减版），
+                                //   与「年份矛盾」这种身份级证据不同；记死会让一个
+                                //   连载中的正确源在该片里永久消失（会话内 + 落盘 24h 都受影响）。
+                                detailFallbackSoftTriedKeys.add(sourceKey);
                                 detailFallbackLoadingCandidate = false;
                                 llLayout.removeCallbacks(detailFallbackDetailTimeout);
                                 // ★ v99-r66：这条连跳此前<b>不占预算</b>（直接 loadNext 就返回），
@@ -1930,6 +1935,9 @@ public class DetailActivity extends BaseActivity {
      * 取不到时先尝试开新圈（清空 CycleKeys），仍然取不到才返回 ""。
      */
     private String pollNextCycledSource() {
+        // ★ v99-r67：选源前全量校验一次（幂等、纯 CPU）。这是保险丝 ——
+        //   万一某个候选从「入池时」那条路径漏过校验，也不会被选中。
+        verifyPool(detailFallbackAnchorTitle);
         List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null || cachedCandidates.isEmpty()) {
             return "";
@@ -2294,9 +2302,15 @@ public class DetailActivity extends BaseActivity {
      * 删减版通常只少几集（58→50 不会触发），而另一部同名剧往往量级不同
      * （58→20 必触发）。</p>
      */
-    private boolean shouldRejectByEpisodes(int nowEpisodes, int sameStation) {
-        return sameStation > 1 && nowEpisodes > 0
-                && detailFallbackRefEpisodes > 0 && nowEpisodes * 2 < detailFallbackRefEpisodes;
+    private boolean shouldRejectByEpisodes(int nowEpisodes) {
+        // ★★ v99-r67：两处改动（用户定稿「所有源都必须过校验」）。
+        //   ① 去掉 `sameStation > 1` 门 —— 单候选站的错片此前完全漏网
+        //      （真机 iqiyi：只有 1 集「正片」vs 基准 51 集，`candidates=1` ⇒ 直接放行）。
+        //   ② 阈值从 1/2 收紧到 1/4 —— 1/2 会把「连载中的正确源」误杀：
+        //      ref 58 集、某站只更新到 20 集 ⇒ 20*2=40 < 58 判错片。真机比值：
+        //      错片 1/51=0.02 命中；连载 20/58=0.34、删减 30/58=0.52 都不命中。
+        return nowEpisodes > 0 && detailFallbackRefEpisodes > 0
+                && nowEpisodes * 4 < detailFallbackRefEpisodes;
     }
 
     /** ★ v67：统计一部片的总集数（seriesMap 各线路的剧集数之和）。 */
@@ -2440,7 +2454,27 @@ public class DetailActivity extends BaseActivity {
         if (sa.isEmpty() || sb.isEmpty()) {
             return false;
         }
-        return sa.containsAll(sb) || sb.containsAll(sa);
+        if (sa.containsAll(sb) || sb.containsAll(sa)) {
+            return true;
+        }
+        // ★★ v99-r67：子集匹配之外，**交叉（部分重叠）也要算匹配**。
+        //
+        //   原先只认「一方包含另一方」，而各站演员表完整度差异极大（真机实测同一部片：
+        //   一侧列 66 人、另一侧只列 5 人、交集 3 人）⇒ 子集关系不成立 ⇒ 白丢 20 分。
+        //   用真机抓的 27 条正片做 351 对两两比较：子集口径只命中 79%，交叉口径 100%。
+        //
+        //   但不能退化成「有一个重名就算」：那会让「同班人马的两部片」互相匹配。
+        //   故要求「交集 ≥ 2 且 ≥ 较小一侧的一半」—— 实测正片 351 对全过，
+        //   而「不同片只共演 1 人」仍判不匹配。
+        Set<String> small = sa.size() <= sb.size() ? sa : sb;
+        Set<String> big = sa.size() <= sb.size() ? sb : sa;
+        int common = 0;
+        for (String tag : small) {
+            if (big.contains(tag)) {
+                common++;
+            }
+        }
+        return common >= 2 && common * 2 >= small.size();
     }
 
     /** 按常见分隔符拆元数据字段为标签集合（统一 trim，滤空）。 */
@@ -4084,25 +4118,56 @@ public class DetailActivity extends BaseActivity {
         return new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name};
     }
 
+    /** ★ v99-r67：落盘时保留的基准演员表长度（够做交叉匹配，又不至于把 SP 撑大）。 */
+    private static final int REF_ACTOR_DIGEST_MAX = 60;
+
     /**
-     * ★★ v99-r66：落盘前对「同站同名多片」做<b>择优折叠</b>。
+     * ★ v99-r67：落盘时记录「校验所用的基准演员表」（截前 60 字）。
      *
-     * <p><b>为什么在落盘做、而不是在内存池做</b>：内存池保留全部候选时，切源阶段的择优
-     * （{@link #detailFallbackFirstAliveId}）与集数校验的三重门（{@code sameStation > 1}）
-     * 都还正常工作。只有「跨实例恢复」这条路会丢掉元数据（磁盘只存三元组），
-     * 所以只需要把<b>落盘版本</b>折叠成「每个站一条」，恢复后就不存在「同站两条打平、
-     * 只能按列表顺序取第一条」的问题。</p>
-     *
-     * <p><b>这时元数据是完整的</b>（候选刚从实时搜索结果合并进来），所以择优是准的 ——
-     * 真机实测 11 组同站同名多片，折叠后 11/11 保留了正片，同时池子条目还少了 30%。</p>
-     *
-     * <p>两道不折的守卫：{@code ref} 为空（无从判断，等于瞎折）、最高分打平（判不出来）。
-     * 不折就原样保留多条，交给恢复后的集数校验兜底 —— 与 v67 互补，不冲突。</p>
-     *
-     * @return 是否至少折叠了一个站（决定要不要写 refYear）
+     * <p>用途是<b>换片判定的辅助信号</b>：若下次进片时 ref 的年份相同、但演员交叉不上，
+     * 说明用户换看的是「另一部同名片」，旧池应当作废重来。
+     * 用交叉（{@link #metaRelated}）而不是全同 —— 各站演员表完整度差异很大，全同几乎不可能。</p>
      */
-    private boolean foldSlimForPersist(List<Movie.Video> candidates, List<String[]> out) {
-        // 按站分组、保持入池顺序（LinkedHashMap：日志与切源顺序都依赖这个稳定性）
+    private String refActorDigest(String title) {
+        if (detailFallbackRefVideo == null || TextUtils.isEmpty(detailFallbackRefVideo.actor)) {
+            return "";
+        }
+        String actor = detailFallbackRefVideo.actor.trim();
+        return actor.length() > REF_ACTOR_DIGEST_MAX
+                ? actor.substring(0, REF_ACTOR_DIGEST_MAX) : actor;
+    }
+
+
+
+    /**
+     * ★★ v99-r67：对内存池做「同片校验 + 收窄」。
+     *
+     * <p><b>为什么需要</b>：搜索结果把「同名的另一部片」也收进了池子（真机《人世间》：
+     * 11 个站各有 1 条 2024 版错片），而不带元数据的落盘池恢复后每条只剩「片名 +20」，
+     * 同站两条必然打平、按列表顺序取第一条 —— 于是切到错片。
+     * 现在改为「<b>入池后就判、判错就剔</b>」：错片根本不留在池里，切源自然选不到。</p>
+     *
+     * <p><b>判据只有 -1（年份硬矛盾）</b>：这是唯一零误判的信号。不设分数阈值 ——
+     * 真机实测「只有片名 20 分」的候选是<b>正确</b>候选（详情 51/51 集通过），
+     * 任何阈值都会误杀它。</p>
+     *
+     * <p><b>遍历每一个站</b>（用户定稿）：单条候选也要判分。此前折叠只在「同站多条」时打分，
+     * 单条站直接 `list.get(0)` ⇒ iqiyi 那种「单条 + 年份矛盾」的错片永远漏网。</p>
+     *
+     * <p><b>做法要点</b>：先算后换（{@link #poolPut} 整体替换），<b>绝不原地 remove</b> ——
+     * 全仓有 12 处 {@code poolOf()} 调用点，原地改会踩 ConcurrentModificationException。</p>
+     *
+     * @return 是否真的改动了池子
+     */
+    private boolean verifyPool(String title) {
+        if (detailFallbackRefVideo == null) {
+            return false;                    // 没有基准，判不了（且不能瞎判）
+        }
+        List<Movie.Video> candidates = poolOf(title);
+        if (candidates == null || candidates.isEmpty()) {
+            return false;
+        }
+        // 按站分组，保持入池顺序（切源顺序与日志都依赖这个稳定性）
         java.util.LinkedHashMap<String, List<Movie.Video>> bySource =
                 new java.util.LinkedHashMap<String, List<Movie.Video>>();
         for (Movie.Video v : candidates) {
@@ -4116,63 +4181,59 @@ public class DetailActivity extends BaseActivity {
             }
             list.add(v);
         }
-        boolean folded = false;
+        if (bySource.isEmpty()) {
+            return false;
+        }
+        List<Movie.Video> kept = new ArrayList<>();
+        int droppedCandidates = 0;
+        int droppedStations = 0;
+        StringBuilder dropLog = new StringBuilder();
         for (java.util.Map.Entry<String, List<Movie.Video>> entry : bySource.entrySet()) {
             List<Movie.Video> list = entry.getValue();
-            Movie.Video keep = list.size() > 1 ? pickFoldKeeper(list) : list.get(0);
-            if (keep == null) {
-                // 判不出来（ref 空 / 打平）：原样保留多条
-                for (Movie.Video v : list) {
-                    out.add(slimOf(v));
+            Movie.Video best = null;
+            int bestScore = Integer.MIN_VALUE;
+            for (Movie.Video v : list) {
+                int score = referenceMatchScore(detailFallbackRefVideo, v);
+                if (score > bestScore) {           // 同分保留先出现的那条（与择优一致）
+                    bestScore = score;
+                    best = v;
                 }
+            }
+            if (best == null) {
                 continue;
             }
-            out.add(slimOf(keep));
-            if (list.size() > 1) {
-                folded = true;
-                StringBuilder dropped = new StringBuilder();
-                for (Movie.Video v : list) {
-                    if (v != keep) {
-                        if (dropped.length() > 0) {
-                            dropped.append(',');
-                        }
-                        dropped.append(v.id);
-                    }
+            if (bestScore < 0) {
+                // 该站全部候选都与基准年份硬矛盾 ⇒ 整站剔除
+                droppedStations++;
+                droppedCandidates += list.size();
+                if (dropLog.length() > 0) {
+                    dropLog.append(' ');
                 }
-                LOG.sw("[FB] poolFold station=" + entry.getKey() + " keep=" + keep.id
-                        + " drop=[" + dropped + "] refYear="
-                        + (detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year));
+                dropLog.append(entry.getKey()).append(':').append(best.id)
+                        .append("(x").append(list.size()).append(')');
+                continue;
             }
+            kept.add(best);
+            droppedCandidates += list.size() - 1;   // 同站多余的候选被收窄掉
         }
-        return folded;
-    }
-
-    /**
-     * 折叠时「留哪一条」：复用切源择优的同一套打分（口径必须一致，否则两处判定会分叉）。
-     *
-     * @return 唯一最高分的那条；ref 为空或最高分打平则返回 null（表示不折）
-     */
-    private Movie.Video pickFoldKeeper(List<Movie.Video> list) {
-        if (detailFallbackRefVideo == null) {
-            return null;                 // 守卫 1：没有基准就无从判断
+        // ★ 守卫：剔完若池为空，放弃剔除 —— 否则 askedKeys 已记「问过」而池空，
+        //   下次进片既不重搜也没有任何可切候选（用户看到的就是"点切源没反应"）。
+        if (kept.isEmpty()) {
+            LOG.sw("[FB] poolDrop aborted reason=wouldBeEmpty total=" + candidates.size()
+                    + " ref=" + (detailFallbackRefVideo.id == null ? "?" : detailFallbackRefVideo.id));
+            return false;
         }
-        Movie.Video best = null;
-        int bestScore = Integer.MIN_VALUE;
-        int tie = 0;
-        for (Movie.Video v : list) {
-            int score = referenceMatchScore(detailFallbackRefVideo, v);
-            if (score > bestScore) {
-                bestScore = score;
-                best = v;
-                tie = 1;
-            } else if (score == bestScore) {
-                tie++;
-            }
+        // 走到这里说明「池非空且基准有效」⇒ 记下校验依据的年份（哪怕一条都没剔）。
+        // 落盘时写进 refYear，恢复时据此判断池子是否属于「另一部同名片」。
+        detailFallbackPoolVerifiedYear = detailFallbackRefVideo.year;
+        if (kept.size() == candidates.size() && droppedStations == 0) {
+            return false;                       // 一个都没变，省一次替换
         }
-        if (best == null || tie > 1) {
-            return null;                 // 守卫 2：打平不折（折了等于「取第一条」换个地方发生）
-        }
-        return best;
+        poolPut(title, kept);
+        LOG.sw("[FB] poolVerify kept=" + kept.size() + "/" + candidates.size()
+                + " dropped=" + droppedCandidates + " dropStations=" + droppedStations
+                + (dropLog.length() > 0 ? " drop=[" + dropLog + "]" : ""));
+        return true;
     }
 
     private void persistDetailFallbackCache(String title) {
@@ -4203,11 +4264,17 @@ public class DetailActivity extends BaseActivity {
         String askedOwner = TextUtils.isEmpty(detailFallbackAskedTitle)
                 ? title : detailFallbackAskedTitle;
         boolean askedBelongsHere = TextUtils.equals(askedOwner, title);
+        // ★★ v99-r67：落盘前再校验一次池子（幂等、纯 CPU）。这样即使某个候选从
+        //   「入池时」那条路径漏过了校验，也不会被写进磁盘。
+        verifyPool(title);
         List<String[]> slim = new ArrayList<>();
         List<Movie.Video> candidates = poolOf(title);
-        boolean folded = false;
         if (candidates != null) {
-            folded = foldSlimForPersist(candidates, slim);
+            for (Movie.Video v : candidates) {
+                if (v != null && !TextUtils.isEmpty(v.id) && !TextUtils.isEmpty(v.sourceKey)) {
+                    slim.add(slimOf(v));
+                }
+            }
         }
         List<String> askedToWrite = (askedBelongsHere && !detailFallbackPoolAskedKeys.isEmpty())
                 ? new ArrayList<String>(detailFallbackPoolAskedKeys) : null;
@@ -4215,10 +4282,10 @@ public class DetailActivity extends BaseActivity {
         if (slim.isEmpty() && askedToWrite == null) {
             return;
         }
-        // ★ v99-r66：只有<b>真的折叠过</b>才写 refYear（0 = 未折叠 = 不做有效性校验）。
-        //   没折叠的池不该因为「换了进片的源、ref 年份不同」被丢弃。
-        int refYear = (folded && detailFallbackRefVideo != null) ? detailFallbackRefVideo.year : 0;
-        FallbackCacheStore.put(title, slim, askedToWrite, refYear);
+        // ★ v99-r66/r67：refYear 表示「这批候选是在哪一年的基准下校验过的」，
+        //   0 = 从未校验过（老记录），恢复时不做有效性校验。
+        int refYear = detailFallbackPoolVerifiedYear;
+        FallbackCacheStore.put(title, slim, askedToWrite, refYear, refActorDigest(title));
         detailFallbackCacheDirty = false;
         if (askedBelongsHere) {
             detailFallbackAskedDirty = false;
@@ -4297,6 +4364,23 @@ public class DetailActivity extends BaseActivity {
                 FallbackCacheStore.clearFor(hawkTitle);
                 return;
             }
+            // ★★ v99-r67：年份相同（或一方缺失）时，用<b>演员交叉</b>做换片辅助判定。
+            //   场景：用户先看 A 片，发现想看的是「同名的另一部 B」，重新搜索点进 B。
+            //   两者同年 ⇒ 上面的 refYear 比不出来，只能靠演员表。用 metaRelated（交叉）
+            //   而不是全同 —— 各站演员表完整度差异极大，全同几乎不可能。
+            //   两边任一为空则<b>不判</b>（信息不足时宁可沿用，避免误判换片导致重搜 101 源）。
+            String savedActor = box.refActor;
+            String nowActor = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.actor;
+            if (!TextUtils.isEmpty(savedActor) && !TextUtils.isEmpty(nowActor)
+                    && !metaRelated(savedActor, nowActor)) {
+                LOG.sw("[FB] poolFilmChanged key=" + poolKey + " reason=actorMismatch"
+                        + " savedRefYear=" + savedRefYear + " nowRefYear=" + nowRefYear
+                        + " => 判定换了另一部同名片，丢弃重攒");
+                FallbackCacheStore.clearFor(hawkTitle);
+                return;
+            }
+            // 池子仍然属于当前这部片 ⇒ 记住「它是在哪一年校验的」，落盘时原样写回。
+            detailFallbackPoolVerifiedYear = box.refYear;
             // ★ v99-r59：已问集合与候选解耦恢复。并入（不是覆盖）——
             //   锚 key 和 v66 兼容 key 两条记录可能各带一部分，取并集才不丢。
             if (box.askedKeys != null && !box.askedKeys.isEmpty()) {
@@ -4624,6 +4708,9 @@ public class DetailActivity extends BaseActivity {
         //   走的都是这个复数入口 ⇒ 上限形同虚设，真机实测池子顶到 41（>40）。
         //   上限只挂在部分写入口上，它就只是「大多数时候成立」，不是上限。
         trimDetailFallbackPool(title);
+        // ★ v99-r67：新候选一入池就校验（用户定稿：新入池的每个源都要过一遍）。
+        //   幂等、纯 CPU（≤40 条 × 每条 6 次字符串比较），可以无脑调。
+        verifyPool(title);
     }
 
     private void cacheDetailFallbackCandidate(Movie.Video video) {
@@ -4702,6 +4789,10 @@ public class DetailActivity extends BaseActivity {
      */
     private void resetDetailFallback(boolean keepCache) {
         detailFallbackFailoverCount = 0;
+        if (!keepCache) {
+            // ★ v99-r67：彻底复位 = 池子不再可用 ⇒ 校验年份也作废（避免把旧年份写进新池）。
+            detailFallbackPoolVerifiedYear = 0;
+        }
         detailFallbackActive = false;
         // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
         dismissSwitchingSourceToast();
@@ -5057,6 +5148,14 @@ public class DetailActivity extends BaseActivity {
      * 而这条路径<b>一行日志都没有</b>，出问题只能靠反推（真机奶酪源那次就是）。</p>
      */
     private String detailFallbackDenyMsg = "";
+    /**
+     * ★ v99-r67：本片候选池「是在哪一年的基准资源下校验过的」（0 = 从未校验）。
+     *
+     * <p>落盘时写进 {@code FallbackCacheBox.refYear}，恢复时与当前 ref 的年份比对：
+     * 不一致说明池子是「另一部同名片」留下的（最坏：上次从错片源进来，整池被收敛到错片），
+     * 必须整条作废重攒。与 verifyPool 的剔除结果配套 —— 只有真的校验过才写非 0。</p>
+     */
+    private int detailFallbackPoolVerifiedYear = 0;
     private boolean detailFallbackLoadingCandidate;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
