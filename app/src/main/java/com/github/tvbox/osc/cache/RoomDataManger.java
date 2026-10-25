@@ -10,6 +10,7 @@ import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.sync.SyncScope;
 import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
+import com.github.tvbox.osc.util.FallbackCacheStore;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
@@ -486,11 +487,45 @@ public class RoomDataManger {
         VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodId);
         if (record != null) {
             AppDataManager.get().getVodRecordDao().delete(record);
+            // ★ v99-r58 A 案：历史删了，这部片的切源候选池要跟着删。
+            //   片名不在表里，只在 dataJson（VodInfo 序列化）里，故解析一次；
+            //   解析失败不影响删历史本身（由冷启动的孤儿回收兜底）。
+            clearFallbackPoolQuiet(record);
         }
         // v73：同步墓碑（用户主动删除，需传播到其它设备）
         SyncTombstones.addRecord(sourceKey, vodId);
         // v98 P2：删历史会连带清掉该片的进度（上面 deleteByVod），故两个 scope 都要脏
         HistorySyncManager.markDirty(SyncScope.HISTORY, SyncScope.PROGRESS);
+    }
+
+    /**
+     * ★ v99-r58：删历史 ⇒ 连带删掉该片的切源候选池。
+     *
+     * <p>r58 起候选池会攒到接近"全部可搜源"，体积明显变大；
+     * 历史记录都删了还留着这部片的池子，等于白占 Hawk 的空间。</p>
+     */
+    private static void clearFallbackPoolQuiet(VodRecord record) {
+        try {
+            String name = vodNameOf(record);
+            if (!TextUtils.isEmpty(name)) {
+                FallbackCacheStore.clearFor(name);
+            }
+        } catch (Throwable th) {
+            LOG.e("clearFallbackPoolQuiet fail: " + th);
+        }
+    }
+
+    /** 从历史行里取片名（VodRecord 只有 dataJson 里有完整 VodInfo）。 */
+    private static String vodNameOf(VodRecord record) {
+        if (record == null || TextUtils.isEmpty(record.dataJson)) {
+            return "";
+        }
+        try {
+            VodInfo info = new Gson().fromJson(record.dataJson, VodInfo.class);
+            return info == null ? "" : info.name;
+        } catch (Throwable th) {
+            return "";
+        }
     }
 
     public static List<VodInfo> getAllVodRecord(int limit) {
@@ -546,8 +581,36 @@ public class RoomDataManger {
         //   记录就已经没了 ⇒ 二次确认形同虚设。而且这是 UI 线程上的删除写操作。
         //   现在：显示层仍按 min(limit, hisNum) 收敛（上面第 431 行），真正的裁剪只发生在
         //   ① 设置页确认后手动 pruneHistory() ② 下一次写历史 ③ 同步落地后 SyncEngine 的 pruneHistory()。
+        // ★ v99-r58 B 案：孤儿候选池回收（每天一次）。
+        //   删历史的路径远不止用户手动删 —— 档位自动裁剪、同步落地时的 compact / dedupe /
+        //   合并删除，都会在用户无感知的情况下删行，它们不可能逐个通知候选池。
+        //   只有按「历史幸存名单」事后回收，才收得干净。
+        gcOrphanFallbackPool(vodInfoList);
         int size = Math.min(vodInfoList.size(), Math.min(limit, hisNum));
         return new ArrayList<>(vodInfoList.subList(0, size));
+    }
+
+    /**
+     * 回收「历史里已经没有这部片」的切源候选池。
+     *
+     * <p>放在读历史这条必经路径上：它同时覆盖首页刷新与历史页，且此时全表已在内存，
+     * 不需要额外查库。进程内每天只跑一次（{@link FallbackCacheStore#todayGcDone}）。</p>
+     */
+    private static void gcOrphanFallbackPool(List<VodInfo> allHistory) {
+        try {
+            if (allHistory == null || FallbackCacheStore.todayGcDone()) {
+                return;
+            }
+            List<String> names = new ArrayList<>();
+            for (VodInfo info : allHistory) {
+                if (info != null && !TextUtils.isEmpty(info.name)) {
+                    names.add(info.name);
+                }
+            }
+            FallbackCacheStore.gcOrphan(FallbackCacheStore.aliveKeysFrom(names));
+        } catch (Throwable th) {
+            LOG.e("gcOrphanFallbackPool fail: " + th);
+        }
     }
 
     private static void removeSameNameVodRecords(VodRecordDao dao, String sourceKey, VodInfo vodInfo) {
@@ -724,10 +787,14 @@ public class RoomDataManger {
     public static void deleteVodRecordAll() {
         PlayProgressManager.deleteAll();
         AppDataManager.get().getVodRecordDao().deleteAll();
+        // ★ v99-r58：历史全没了，候选池自然也该全清
+        FallbackCacheStore.clearAll();
     }
 
     /** 清空历史并为每条写墓碑（用户在历史页主动清空 ⇒ 应传播到其它设备）。 */
     public static void deleteVodRecordAllWithTombstones() {
+        // ★ v99-r58：历史全没了，候选池自然也该全清
+        FallbackCacheStore.clearAll();
         try {
             List<VodRecord> all = AppDataManager.get().getVodRecordDao().getAll(Integer.MAX_VALUE);
             if (all != null) {

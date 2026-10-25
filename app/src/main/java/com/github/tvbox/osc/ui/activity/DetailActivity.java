@@ -55,6 +55,7 @@ import com.github.tvbox.osc.util.EpisodeDict;
 import com.github.tvbox.osc.util.EpisodeNameMatcher;
 import com.github.tvbox.osc.util.EpisodeOnlineResolver;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
+import com.github.tvbox.osc.util.FallbackCacheStore;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
@@ -115,7 +116,6 @@ public class DetailActivity extends BaseActivity {
      * <p>必须与 {@link #DETAIL_FALLBACK_SEARCH_TAG} 分开：主搜索收尾会
      * {@code cancelTag(DETAIL_FALLBACK_SEARCH_TAG)}，同 tag 的后台请求会被一起取消。</p>
      */
-    private static final String DETAIL_FALLBACK_PREHEAT_TAG = "detail_fallback_preheat";
     // ★ P2-4：EXTRA_DETAIL_FALLBACK_CANDIDATES 已删除。旧的「候选快照」Intent 通道
     //   （限 20 条、严格 Equals 匹配、序列化后可能超 Binder 1MB）已被下方标题路径取代，
     //   是后者的真子集，故读写两侧一并移除，彻底消除 TransactionTooLargeException 风险面。
@@ -179,39 +179,44 @@ public class DetailActivity extends BaseActivity {
      */
     private static final long DETAIL_FALLBACK_BUSY_REFILL_DELAY_MS = 300L;
     /**
-     * ★ v66：静默预热的并发上限。
+     * ★ v99-r58：攒池引擎的<b>后台并发档</b>（取代原 {@code DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}）。
      *
-     * <p>远小于切源的 {@link #DETAIL_FALLBACK_MAX_SEARCH}(20)：预热与前台播放
-     * <b>并行</b>，必须让视频流占据绝对多数的带宽。预热请求是一次性小报文
-     * （站点搜索接口），并发的实测占用远小于视频流；20 并发则可能与起播抢带宽。</p>
-     *
-     * <p>★ v99-r57：3 → <b>5</b>。原值 3 在 {@link #DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS}
-     * 内只能覆盖约 30 个源（{@code 3 × 8s ÷ 0.8s}），101 个源一轮都走不完；
-     * 取 5 后约覆盖 50~125 个，作为「主搜索被截断/停摆时漏掉那一半」的补充足够，
-     * 再高就开始与视频流抢 WiFi 了。</p>
+     * <p>r58 把「切源主搜索」与「静默预热」合并成一条常驻队列，唯一的变量就是并发档位。
+     * 后台档 5 是与<b>前台播放</b>并存的那档：请求都是一次性小报文，但并发太高仍会与视频流
+     * 抢 WiFi（设备：小米盒子3增强版，纯 802.11ac 2×2，无有线口），故维持原预热的值 5。</p>
      */
-    private static final int DETAIL_FALLBACK_PREHEAT_MAX_SEARCH = 5;
+    private static final int DETAIL_FALLBACK_POOL_CONC_BACKGROUND = 5;
     /**
-     * ★ v66：预热启动延迟（详情加载成功后）。
+     * ★ v66：攒池启动延迟（详情加载成功后）。
      *
      * <p>错开「起播高峰」：详情返回 → 解析 → 拉流起播的前 1.5 秒是带宽最紧的
-     * 窗口，预热若此刻扎进去会拖慢首帧。等首帧出来、播放进入稳态再慢慢补，
-     * 用户点切源时池子通常已经预热了一部分。</p>
+     * 窗口，此刻扎进去会拖慢首帧。等首帧出来、播放进入稳态再慢慢补，
+     * 用户点切源时池子通常已经攒了一部分。</p>
      */
     private static final long DETAIL_FALLBACK_PREHEAT_DELAY_MS = 1500L;
     /**
-     * ★ v66：预热的整体超时（从派发起）。
+     * ★ v99-r58：攒池任务的<b>兜底硬闸</b>（取代原 {@code DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS}）。
      *
-     * <p>预热是尽力而为的后台优化，不能无限期挂着：到点还没发完就停止派发，
-     * 已收回来的候选照常入池。</p>
+     * <p>攒池是尽力而为的后台优化，不能无限期挂着：到点还没问完就停止派发、掐断在途，
+     * 已收回来的候选照常入池。退出详情页（彻底复位）仍会立刻掐断，不会在后台空跑。</p>
      *
-     * <p>★ v99-r57：8s → <b>20s</b>。原值 8s 是按「与切源搜索同档」拍的，但两者的定位不同：
-     * 切源搜索要<b>尽快出结果</b>（用户在等画面），预热则是<b>后台慢速攒池</b>（与播放并存，
-     * 用户无感知）。按 101 个源、并发 5、单源中位 0.8s 计算，走完一轮约需
-     * {@code 101 ÷ 5 × 0.8 ≈ 16s}，8s 会在中途截断；取 20s 刚好能覆盖一整轮。
-     * 退出详情页（彻底复位）仍会立刻掐断，不会在后台空跑。</p>
+     * <p><b>取值 120s（用户拍板）</b>。真机实测（2026-10-25 05:23，101 个源，并发 5）：
+     * 20s 只问到 28/101，反推平均单源占用 {@code 5 × 20s ÷ 28 ≈ 3.6s}，
+     * 走完 101 个源需要 {@code 101 ÷ 5 × 3.6 ≈ 73s}。取 120s 是为了覆盖更差的网络，
+     * 正常情况下由队列跑空自然收尾，硬闸只是异常慢网的保险。</p>
      */
-    private static final long DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS = 20000L;
+    private static final long DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS = 120000L;
+    /**
+     * ★ v99-r58：单部影片候选池的<b>条数软上限</b>（用户拍板 40）。
+     *
+     * <p><b>为什么必须加上限</b>：r58 让池子趋向"问满全部源"，热门片可能攒到五六十条。
+     * 落盘是精简三元组（约 40 字节/条）尚可控，但
+     * {@link #detailFallbackCache} 里存的是完整 {@code Movie.Video}，且
+     * {@link #FALLBACK_CACHE_MAX_ENTRIES}(40) 是<b>部数</b>上限 —— 两者相乘才决定真实占用。
+     * 取 40：一圈切源根本用不到这么多站（超过 40 说明该片到处都有，多存无益），
+     * 超出部分按 {@link #detailFallbackSourceScore} 从低到高剔除。</p>
+     */
+    private static final int DETAIL_FALLBACK_POOL_MAX_CANDIDATES = 40;
     /**
      * 「提前消费」等待窗口：第一个候选进缓存后等这么久就立刻放起来。
      *
@@ -249,10 +254,13 @@ public class DetailActivity extends BaseActivity {
      */
     private static final int DETAIL_FALLBACK_MAX_FAILOVER = 3;
     // ===== 方案D：缓存持久化 =====
-    private static final String HAWK_FALLBACK_CACHE_PREFIX = "fb_cache_";
-    private static final long FALLBACK_CACHE_TTL_MS = 24 * 60 * 60 * 1000L;
-    /** 候选池写入顺序索引（LRU 用）。 */
-    private static final String HAWK_FALLBACK_CACHE_INDEX = "fb_cache_index";
+    // ★ v99-r58：存储实现已迁到 util.FallbackCacheStore
+    //   HAWK_FALLBACK_CACHE_PREFIX -> FallbackCacheStore.PREFIX
+    //   HAWK_FALLBACK_CACHE_INDEX  -> FallbackCacheStore.INDEX
+    //   FALLBACK_CACHE_TTL_MS      -> FallbackCacheStore.TTL_MS
+    //   FALLBACK_CACHE_MAX_ENTRIES -> FallbackCacheStore.MAX_ENTRIES
+    // 抽出去是为了让 RoomDataManger（删除历史连带清池）能直接依赖仓储层，
+    // 而不是反向依赖 UI 层的 Activity。
     /**
      * 候选池最多保留多少部片。
      *
@@ -260,7 +268,7 @@ public class DetailActivity extends BaseActivity {
      * Hawk（SharedPreferences）里堆出成百上千条 key，读写都变慢。这里按写入
      * 顺序保留最近这么多部，超出即删最旧的。</p>
      */
-    private static final int FALLBACK_CACHE_MAX_ENTRIES = 40;
+    private static final int FALLBACK_CACHE_MAX_ENTRIES = FallbackCacheStore.MAX_ENTRIES;
     // ===== 方案E：站点命中率统计 =====
     // 已统一到 SourceQualityStore（key 前缀 fb_stat_，6 字段格式），与搜索页/播放页共用。
     // 不再在本类里维护自有前缀，避免两套格式互相覆盖。
@@ -1149,7 +1157,7 @@ public class DetailActivity extends BaseActivity {
                     // ★ v66：约一次静默预热（延迟错开起播高峰；切源内的详情返回不约）。
                     //   预热把候选池提前攒厚，用户点切源时就是厚池。
                     if (!fallbackResult) {
-                        scheduleDetailFallbackPreheat();
+                        scheduleDetailFallbackPoolFill();
                     }
                     vodInfo = new VodInfo();
                     routeSwitchSeries = null;
@@ -1693,7 +1701,7 @@ public class DetailActivity extends BaseActivity {
             //   全部以新锚为准，直到下一次换片）。
             detailFallbackAnchorTitle = TextUtils.isEmpty(vod_name) ? "" : vod_name.trim();
             // ★ v66：换片 ⇒ 预热重新判据（新片值得再预热一轮）。
-            detailFallbackPreheatTried = false;
+            detailFallbackPoolTried = false;
             // ★ v66：换片 ⇒ 基准资源置空，等新片首轮详情返回后重新记录。
             detailFallbackRefVideo = null;
             // ★ v67：换片 ⇒ 基准集数置零（新片的集数与上一部片无关）。
@@ -2555,40 +2563,34 @@ public class DetailActivity extends BaseActivity {
         // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
         restoreDetailFallbackCache();
 
-        detailFallbackSourceOrder.clear();
-        for (SourceBean bean : ApiConfig.get().getSourceBeanList()) {
-            // 与搜索页（FastSearchActivity/SearchActivity）保持一致的筛选条件：
-            // 只要求 isSearchable。此前多加了 isChangeable，导致「可搜但不可换」的源
-            // 被排除，切源池比搜索结果的源少。
-            // 一圈 = 包括当前源在内全部轮转：不排除当前源，也不按「已用」过滤。
-            if (bean.isSearchable()) {
-                detailFallbackSourceOrder.add(bean.getKey());
+        // ★ v99-r58：队列已在跑（后台档攒池中）时<b>绝不重建</b>。
+        //   重建会清空并重排 sourceOrder，而 nextIndex 是老队列的下标 —— 两者一旦错位，
+        //   要么漏掉一批源、要么把同一批源再问一遍。
+        String probeKey = "";
+        if (!detailFallbackPoolFilling) {
+            SourceQualityStore.Snapshot fbSnapshot = prepareDetailFallbackSourceOrder();
+            if (detailFallbackSourceOrder.isEmpty()) {
+                if (!detailFallbackKeepCurrentDetail) {
+                    showDetailEmpty();
+                } else {
+                    Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
+                }
+                return;
             }
-        }
-        if (detailFallbackSourceOrder.isEmpty()) {
-            if (!detailFallbackKeepCurrentDetail) {
-                showDetailEmpty();
-            } else {
-                Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
+            // ★ 探路要单独朝「最稳的站」打一枪，就必须把它从队列里摘掉：
+            //   否则同一个站点会被搜两次（探路一次 + 队列一次），白扔一个请求不说，
+            //   还让最稳的那个站重复占用一个并发名额。探路没命中时再补回队尾（见
+            //   requeueProbeSource），不会因此漏掉该站。
+            probeKey = pickBestProbeSource(fbSnapshot);
+            if (!TextUtils.isEmpty(probeKey)) {
+                detailFallbackSourceOrder.remove(probeKey);
             }
-            return;
-        }
-        // ★ 按站点质量排序：让「响应快、起播稳」的站点排在前面，切源与搜索用同一套分数
-        // （数据来自 SourceQualityStore，与搜索页/播放页共用）。
-        //
-        // 排序必须稳定：同分（含全部无历史的中性分 0.5）保持 ApiConfig 原序不变，
-        // 否则每次排序结果都可能不同，「一圈」的轮转顺序就失去可预测性。
-        // ★ v63 P1：接住排序时建的快照，探路直接复用（省掉 n 次重复读取）
-        SourceQualityStore.Snapshot fbSnapshot = sortDetailFallbackSourceOrderByQuality();
-        // ★ 探路要单独朝「最稳的站」打一枪，就必须把它从批次队列里摘掉：
-        //   否则同一个站点会被搜两次（探路一次 + 批处理一次），白扔一个请求不说，
-        //   还让最稳的那个站重复占用一个并发名额。探路没命中时再补回队尾（见
-        //   requeueProbeSource），不会因此漏掉该站。
-        String probeKey = pickBestProbeSource(fbSnapshot);
-        if (!TextUtils.isEmpty(probeKey)) {
-            detailFallbackSourceOrder.remove(probeKey);
         }
 
+        // ★ v99-r58：攒池队列可能正从后台档延续下来。此时<b>不能</b>重建队列/重置令牌，
+        //   否则在途请求回来时令牌已变，会被守卫当成陌生请求丢掉 ——
+        //   这正是 r57 真机「池子锁死 30」的直接成因。
+        final boolean reuseFilling = detailFallbackPoolFilling;
         detailFallbackActive = true;
         detailFallbackSearching = true;
         detailFallbackSearchCollecting = true;
@@ -2601,26 +2603,32 @@ public class DetailActivity extends BaseActivity {
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackEarlyConsume);
         }
-        detailFallbackBatchIndex = 0;
-        detailFallbackNextSourceIndex = 0;
-        detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
-        // 批令牌仍要每轮轮转：滑动窗口下不再分"批"，但它仍是「这条结果/这次超时
-        // 属于本轮还是上轮」的唯一凭据（见 onDetailFallbackSearchResult 的守卫）。
-        // 必须在首次派发之前定好 —— 线程池在 keepCache 复位后会存活到下一轮，
-        // 令牌若跟着池一起复用就会漏更新，上一轮的迟到结果会被当成本轮结果收下。
-        detailFallbackBatchToken = detailFallbackToken + "_batch_" + (++detailFallbackBatchIndex);
+        if (!reuseFilling) {
+            detailFallbackBatchIndex = 1;
+            detailFallbackToken = "detail_fallback_" + (++detailFallbackRequestIndex);
+            // 批令牌是「这条结果属于本任务还是上个任务」的唯一凭据
+            // （见 onDetailFallbackSearchResult 的守卫），必须在首次派发前定好。
+            detailFallbackBatchToken = detailFallbackToken + "_batch_" + detailFallbackBatchIndex;
+            detailFallbackNextSourceIndex = 0;
+        }
         detailFallbackBatchStartMs = System.currentTimeMillis();
-        LOG.i("[FB] startSearch title=" + detailFallbackTitle + " sources=" + detailFallbackSourceOrder.size() + " token=" + detailFallbackToken);
-        // 新的一轮搜索前先把上一轮残留的派发线程收掉：
-        //  1) 上一轮的结果会因 token 轮转被 onDetailFallbackSearchResult 的守卫全部丢弃，
-        //     留着跑没有意义；
-        //  2) 线程池现在是长生命周期复用的（原来每批都新建池），若不收掉，上一轮那些
-        //     阻塞在 type==3 爬虫 searchContent 上的任务会占住线程名额，让本轮新派发排队。
-        stopDetailFallbackSearchExecutor();
-        scheduleDetailFallbackSearch();
-        // 方案A：批处理已铺开，再朝历史命中率最高的站点单独打一枪。
-        // 必须放在 detailFallbackActive/Token 就绪之后，否则会被守卫直接拦掉。
-        startDetailFallbackProbe(probeKey);
+        // 重开 8s 前台窗口（记账 / 提前消费 / 并发档位都看它）
+        detailFallbackPoolFrontWindowClosed = false;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackTimeout);
+            llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
+            detailFallbackSearchTimeoutScheduled = true;
+        }
+        LOG.sw("[FB] startSearch title=" + detailFallbackTitle
+                + " sources=" + detailFallbackSourceOrder.size()
+                + " reuse=" + (reuseFilling ? 1 : 0));
+        // 提速到前台档（已在跑则只提档不重建队列）；ensurePoolFilling 内部会处理派发与硬闸
+        ensurePoolFilling(DETAIL_FALLBACK_MAX_SEARCH, "switch");
+        // 方案A：探路。队列已复用时不探 —— 队列本身正在覆盖全部源，
+        // 再朝同一个站单独打一枪等于把它搜两次。
+        if (!reuseFilling) {
+            startDetailFallbackProbe(probeKey);
+        }
         // ★ 切源不盖全屏 Loading。
         // showLoading() 会用 LoadSir 的全屏遮罩盖住整个页面（含正在播放的播放器），
         // 在候选频繁失败时表现为「一直卡在 Loading」——这正是「点了像卡死」的根源。
@@ -2932,14 +2940,10 @@ public class DetailActivity extends BaseActivity {
             handleDetailFallbackProbeResult(data);
             return;
         }
-        // ===== ★ v66：预热结果单独处理（只入池，不切源）=====
-        // 放在切源守卫之前：预热与切源并行，结果必须都能进来
-        if (detailFallbackPreheating && !TextUtils.isEmpty(detailFallbackPreheatToken)
-                && detailFallbackPreheatToken.equals(data.searchToken)) {
-            handleDetailFallbackPreheatResult(data);
-            return;
-        }
-        if (!detailFallbackActive || !detailFallbackSearchCollecting || !detailFallbackBatchToken.equals(data.searchToken)) {
+        // ★ v99-r58：守卫从「本轮切源状态」（active/collecting）换成「攒池任务状态」。
+        //   旧守卫在切源成功后必然失效 —— active 被 reset 置 false、batchToken 被清空，
+        //   于是批1 之后所有回包都被当成陌生请求丢掉（真机：101 源只 dispatch 一次，池子锁死 30）。
+        if (!detailFallbackPoolFilling || !detailFallbackBatchToken.equals(data.searchToken)) {
             return;
         }
         // 方案E：每个源返回，记录命中/失败统计（耗时按该源自己的发出时刻算，
@@ -2948,9 +2952,15 @@ public class DetailActivity extends BaseActivity {
         long searchCostMs = dispatchedAt == null
                 ? (detailFallbackBatchStartMs > 0 ? System.currentTimeMillis() - detailFallbackBatchStartMs : 0L)
                 : System.currentTimeMillis() - dispatchedAt;
-        recordFallbackStat(data.sourceKey,
-                data.movie != null && data.movie.videoList != null && !data.movie.videoList.isEmpty(),
-                searchCostMs);
+        // ★ v99-r58：<b>只有前台窗口内的回包才记账</b>。
+        //   后台档是与播放并存的低优先级请求，它的耗时/成败混进 SourceQualityStore 会
+        //   拉低那些「只是当时后台在跑」的站点分数，进而打乱
+        //   sortDetailFallbackSourceOrderByQuality 的顺序 —— 这是合并两条腿时最容易漏的回归。
+        if (!detailFallbackPoolFrontWindowClosed) {
+            recordFallbackStat(data.sourceKey,
+                    data.movie != null && data.movie.videoList != null && !data.movie.videoList.isEmpty(),
+                    searchCostMs);
+        }
         detailFallbackPendingSources.remove(data.sourceKey);
         boolean cachedAny = false;
         if (data.movie != null && data.movie.videoList != null) {
@@ -2967,20 +2977,18 @@ public class DetailActivity extends BaseActivity {
         }
         // ★ 提前消费：一旦本批结果里出现了可用候选，就安排一次「不再死等搜索收尾」的放片。
         // 见 DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS 的说明 —— 这是空白期的主因。
-        if (cachedAny && detailFallbackSearchCollecting && !detailFallbackEarlyConsumeScheduled) {
+        // ★ v99-r58：只在<b>前台窗口内</b>安排 —— 后台档是纯攒池，没人在等画面，
+        //   抢先放片只会把用户正在看的画面顶掉。
+        if (cachedAny && detailFallbackSearchCollecting && detailFallbackSearching
+                && !detailFallbackPoolFrontWindowClosed && !detailFallbackEarlyConsumeScheduled) {
             detailFallbackEarlyConsumeScheduled = true;
             llLayout.postDelayed(detailFallbackEarlyConsume, DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS);
         }
-        if (!detailFallbackLoadingCandidate) {
-            if (detailFallbackSearching) {
-                scheduleDetailFallbackSearch();
-            } else if (detailFallbackPendingSources.isEmpty()) {
-                finishDetailFallbackSearchCollection();
-            }
-        } else if (detailFallbackSearching) {
-            // ★ v99-r57：加载中不再「静默放弃补位」（旧行为 = 永久停摆），改为延迟重试。
-            //   真机 04:10 冷启动那轮，就是在这里被吞掉后面 76 个源的补位机会。
-            scheduleBusyRefill();
+        // ★ v99-r58：只要攒池任务活着就继续补位，不再区分「是否还在本轮切源会话内」。
+        if (detailFallbackSearching || detailFallbackPoolFilling) {
+            scheduleDetailFallbackSearch();
+        } else if (detailFallbackPendingSources.isEmpty()) {
+            finishDetailFallbackSearchCollection();
         }
     }
 
@@ -2997,23 +3005,27 @@ public class DetailActivity extends BaseActivity {
      * 否则会把还没试的源跳过。</p>
      */
     private void scheduleDetailFallbackSearch() {
-        if (!detailFallbackActive || !detailFallbackSearching) {
+        // ★ v99-r58：守卫换成任务级标志。旧写法要求 active && searching，
+        //   而这两个正是「一次切源轮次」的状态，切源一成功就为 false ⇒ 补位永久停摆。
+        if (!detailFallbackPoolFilling) {
             return;
         }
-        // ★ v99-r57：加载详情期间<b>不再一律 return</b>，改为「降级补位」——并发降到
-        //   {@link #DETAIL_FALLBACK_MAX_SEARCH_BUSY}(8)。旧写法让补位永久停摆：
-        //   真机实测 101 个源只发出 25 个，候选池被锁死在 2，用户只能在 2 个站之间打转。
-        //   收尾/消费路径由 {@code loadNextDetailFallbackSource()} 自带的
-        //   {@code !detailFallbackLoadingCandidate} 守卫保护，忙时调它不会重复 loadDetail。
-        final boolean busy = detailFallbackLoadingCandidate;
-        final int cap = busy ? DETAIL_FALLBACK_MAX_SEARCH_BUSY : DETAIL_FALLBACK_MAX_SEARCH;
-        // 全部源都已发出 + 无在途 → 搜索阶段结束
+        // 并发 = 当前档位；加载详情期间再降到忙时档（8），保护详情页请求。
+        int cap = detailFallbackPoolConcurrency;
+        if (detailFallbackLoadingCandidate && cap > DETAIL_FALLBACK_MAX_SEARCH_BUSY) {
+            cap = DETAIL_FALLBACK_MAX_SEARCH_BUSY;
+        }
+        // 全部源都已发出 + 无在途 → 攒池任务结束
         if (detailFallbackNextSourceIndex >= detailFallbackSourceOrder.size()
                 && detailFallbackPendingSources.isEmpty()) {
-            detailFallbackSearching = false;
-            llLayout.removeCallbacks(detailFallbackTimeout);
-            stopDetailFallbackSearchExecutor();
-            loadNextDetailFallbackSource();
+            // stopPoolFilling 会把 searching 置 false，故先记下本轮是否需要驱动取源
+            final boolean driveSwitch = detailFallbackSearching;
+            detailFallbackPoolCompleted = true;
+            detailFallbackPoolSourceFingerprint = currentSourceSetFingerprint();
+            stopPoolFilling("allAsked");
+            if (driveSwitch) {
+                loadNextDetailFallbackSource();
+            }
             return;
         }
         ensureDetailFallbackSearchExecutor();
@@ -3038,12 +3050,17 @@ public class DetailActivity extends BaseActivity {
             dispatched.add(searchKey);
         }
         if (!dispatched.isEmpty()) {
-            LOG.i("[FB] dispatch token=" + detailFallbackBatchToken + " n=" + dispatched.size()
-                    + " inflight=" + detailFallbackPendingSources.size() + " busy=" + (busy ? 1 : 0)
-                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
-                    + " keys=" + dispatched);
-        } else if (busy) {
-            // 忙时名额占满、一个都没发出 ⇒ 稍后重试补位，避免"这一轮就这么算了"
+            // ★ v99-r58：日志改走 LOG.sw（LOG.i 的 tag 会被真机 logcat 过滤掉），
+            //   并把 r57 的 busy=0/1 换成更有信息量的 cap / front —— 合并成单队列后，
+            //   「并发档位 + 是否在前台窗口」才是判断行为的关键。
+            LOG.sw("[FB] dispatch task=t" + detailFallbackPoolTaskId
+                    + " n=" + dispatched.size()
+                    + " inflight=" + detailFallbackPendingSources.size()
+                    + " cap=" + cap
+                    + " front=" + (detailFallbackPoolFrontWindowClosed ? 0 : 1)
+                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size());
+        } else if (detailFallbackLoadingCandidate) {
+            // 名额被占满、一个都没发出 ⇒ 稍后重试补位，避免"这一轮就这么算了"
             scheduleBusyRefill();
         }
         if (!detailFallbackSearchTimeoutScheduled) {
@@ -3069,185 +3086,6 @@ public class DetailActivity extends BaseActivity {
         llLayout.postDelayed(detailFallbackBusyRefill, DETAIL_FALLBACK_BUSY_REFILL_DELAY_MS);
     }
 
-    // ==================== ★ v66：静默预热（只攒池，不切源） ====================
-
-    /**
-     * 安排一次预热（详情加载成功后调用，延迟 {@link #DETAIL_FALLBACK_PREHEAT_DELAY_MS}
-     * 错开起播高峰）。一次进页只约一次，由 {@link #detailFallbackPreheatTried} 节流。
-     */
-    private void scheduleDetailFallbackPreheat() {
-        if (detailFallbackPreheatTried || detailFallbackPreheating) {
-            return;
-        }
-        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
-            // ★ v67：诊断日志 —— 锚为空（入口没传片名且详情未回）时预热不启动，
-            //   这是「进了详情却没有 preheatStart 日志」的可疑原因之一。
-            LOG.sw("[FB] preheatSkip reason=emptyAnchor");
-            return;
-        }
-        detailFallbackPreheatTried = true;
-        if (llLayout != null) {
-            llLayout.removeCallbacks(detailFallbackPreheatStart);
-            llLayout.postDelayed(detailFallbackPreheatStart, DETAIL_FALLBACK_PREHEAT_DELAY_MS);
-            LOG.sw("[FB] preheatScheduled delay=" + DETAIL_FALLBACK_PREHEAT_DELAY_MS
-                    + " title=" + detailFallbackAnchorTitle);
-        }
-    }
-
-    /**
-     * 启动静默预热：对全部可搜源派发一轮搜索，结果只入候选池。
-     *
-     * <p><b>与切源主状态机完全并行</b>：独立 token（{@link #detailFallbackPreheatToken}）、
-     * 独立在途集合（{@link #detailFallbackPreheatPending}）、独立源队列下标。
-     * 不设 {@link #detailFallbackActive}、不弹「正在切换片源」提示、不触发
-     * early consume —— 用户无感知，只是池子提前变厚。</p>
-     *
-     * <p><b>播放保护</b>：并发上限 {@link #DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}(3)
-     * 远小于切源的 20，且由 {@link #scheduleDetailFallbackPreheat()} 延迟启动
-     * 错开起播带宽高峰；请求本身是一次性小报文，不与视频流抢通道。</p>
-     */
-    private void startDetailFallbackPreheat() {
-        if (isFinishing() || isDestroyed()) {
-            // ★ v99-r57 取证：预热「约上了却没跑」的三个候选原因之一
-            LOG.sw("[FB] preheatSkip reason=activityGone");
-            return;
-        }
-        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
-            LOG.sw("[FB] preheatSkip reason=emptyAnchor");
-            return;
-        }
-        detailFallbackPreheatOrder = new ArrayList<>();
-        try {
-            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
-            if (sourceBeanList != null) {
-                for (SourceBean bean : sourceBeanList) {
-                    // 与切源全网搜索同一范围：只要 isSearchable（可搜但不可换的源
-                    // 也可能有候选，预热不挑）
-                    if (bean != null && bean.isSearchable()) {
-                        detailFallbackPreheatOrder.add(bean.getKey());
-                    }
-                }
-            }
-        } catch (Throwable th) {
-            LOG.e("[FB] preheat build order fail: " + th);
-            return;
-        }
-        if (detailFallbackPreheatOrder.isEmpty()) {
-            LOG.sw("[FB] preheatSkip reason=noSearchableSource");
-            return;
-        }
-        detailFallbackPreheatNextIndex = 0;
-        detailFallbackPreheatPending.clear();
-        startPreheatDispatch();
-    }
-
-    /**
-     * ★ v99-r57：预热的<b>统一派发入口</b>——起一轮后台搜索。
-     *
-     * <p>队列由调用方备好：{@link #startDetailFallbackPreheat()} 备「全部可搜源」，
-     * {@link #handoffRemainingSourcesToBackground(int)} 备「主搜索还没问过的源」。</p>
-     */
-    private void startPreheatDispatch() {
-        // 复用 requestIndex 自增，保证与切源 token 不撞
-        detailFallbackPreheatToken = "detail_preheat_" + (++detailFallbackRequestIndex);
-        detailFallbackPreheating = true;
-        detailFallbackPreheatTimeoutScheduled = false;
-        // ★ 走 LOG.sw（tag TVBox-switch）：LOG.i 的 tag 会被真机 logcat 过滤丢掉，
-        //   这正是「日志里只能看到 preheatScheduled、看不到 preheatStart」的取证障碍之一。
-        LOG.sw("[FB] preheatStart title=" + detailFallbackAnchorTitle
-                + " sources=" + (detailFallbackPreheatOrder == null ? 0 : detailFallbackPreheatOrder.size())
-                + " token=" + detailFallbackPreheatToken);
-        scheduleDetailFallbackPreheatSearch();
-    }
-
-    /**
-     * 预热的滑动窗口派发（并发上限 {@link #DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}）。
-     *
-     * <p>与 {@link #scheduleDetailFallbackSearch} 同构但更克制：不设
-     * {@code detailFallbackLoadingCandidate} 检查（预热与切源互不阻塞），
-     * 不记账（切源路径照常记，预热只是提前攒数据）。</p>
-     */
-    private void scheduleDetailFallbackPreheatSearch() {
-        if (!detailFallbackPreheating) {
-            return;
-        }
-        if (detailFallbackPreheatNextIndex >= detailFallbackPreheatOrder.size()
-                && detailFallbackPreheatPending.isEmpty()) {
-            finishDetailFallbackPreheat();
-            return;
-        }
-        // ★ v99-r57：后台用<b>独立线程池</b>。原实现复用主搜索的池，而主搜索收尾会
-        //   shutdownNow() 并把引用置 null —— 后台在途请求会被一起掐断。
-        ensureDetailFallbackPreheatExecutor();
-        List<String> dispatched = new ArrayList<>();
-        while (detailFallbackPreheatPending.size() < DETAIL_FALLBACK_PREHEAT_MAX_SEARCH
-                && detailFallbackPreheatNextIndex < detailFallbackPreheatOrder.size()) {
-            final String searchKey = detailFallbackPreheatOrder.get(detailFallbackPreheatNextIndex++);
-            final String searchTitle = detailFallbackAnchorTitle;
-            final String searchToken = detailFallbackPreheatToken;
-            detailFallbackPreheatPending.add(searchKey);
-            detailFallbackPreheatExecutor.execute(new Runnable() {
-                @Override
-                public void run() {
-                    sourceViewModel.getDetailFallbackPreheatSearch(searchKey, searchTitle, searchToken);
-                }
-            });
-            dispatched.add(searchKey);
-        }
-        if (!dispatched.isEmpty()) {
-            LOG.sw("[FB] preheatDispatch n=" + dispatched.size()
-                    + " inflight=" + detailFallbackPreheatPending.size()
-                    + " next=" + detailFallbackPreheatNextIndex + "/" + detailFallbackPreheatOrder.size());
-        }
-        if (!detailFallbackPreheatTimeoutScheduled) {
-            detailFallbackPreheatTimeoutScheduled = true;
-            llLayout.postDelayed(detailFallbackPreheatTimeout, DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS);
-        }
-    }
-
-    /**
-     * 预热结果处理：只入池 + 补位 + 收尾。
-     *
-     * <p>由 {@link #onDetailFallbackSearchResult} 按预热 token 分流进来。
-     * 过滤口径与切源完全一致（{@link #isSameFallbackTitle} 对<b>锚</b>判定），
-     * 保证两条路径攒进池子的是同一批候选。</p>
-     */
-    private void handleDetailFallbackPreheatResult(AbsXml data) {
-        if (data == null) {
-            return;
-        }
-        detailFallbackPreheatPending.remove(data.sourceKey);
-        boolean cachedAny = false;
-        if (data.movie != null && data.movie.videoList != null) {
-            for (Movie.Video video : data.movie.videoList) {
-                if (video == null || TextUtils.isEmpty(video.id)
-                        || !isSameFallbackTitle(detailFallbackAnchorTitle, video.name)) {
-                    continue;
-                }
-                cacheDetailFallbackCandidate(video);
-                cachedAny = true;
-            }
-        }
-        if (cachedAny) {
-            detailFallbackCacheDirty = true;
-        }
-        if (detailFallbackPreheatNextIndex >= detailFallbackPreheatOrder.size()
-                && detailFallbackPreheatPending.isEmpty()) {
-            finishDetailFallbackPreheat();
-        } else {
-            scheduleDetailFallbackPreheatSearch();
-        }
-    }
-
-    /** 预热收尾：清标志 + 落盘（幂等，dirty 才写）。 */
-    private void finishDetailFallbackPreheat() {
-        detailFallbackPreheating = false;
-        if (llLayout != null) {
-            llLayout.removeCallbacks(detailFallbackPreheatTimeout);
-        }
-        persistDetailFallbackCache(detailFallbackAnchorTitle);
-        LOG.i("[FB] preheatDone poolSize=" + detailFallbackUsableCandidateCount());
-    }
 
     /**
      * 懒建搜索线程池：整轮搜索只建一次，滑动窗口全程复用。
@@ -3264,86 +3102,239 @@ public class DetailActivity extends BaseActivity {
         }
     }
 
-    /** ★ v99-r57：后台专用线程池（与主搜索池互不干扰）。 */
-    private void ensureDetailFallbackPreheatExecutor() {
-        if (detailFallbackPreheatExecutor == null || detailFallbackPreheatExecutor.isShutdown()) {
-            detailFallbackPreheatExecutor = Executors.newFixedThreadPool(2);
-        }
-    }
 
-    /** ★ v99-r57：停止后台线程池并取消后台在途请求（仅「彻底复位」时调用）。 */
-    private void stopDetailFallbackPreheatExecutor() {
-        if (detailFallbackPreheatExecutor != null) {
-            detailFallbackPreheatExecutor.shutdownNow();
-            detailFallbackPreheatExecutor = null;
-        }
-        try {
-            OkGo.getInstance().cancelTag(DETAIL_FALLBACK_PREHEAT_TAG);
-        } catch (Throwable ignored) {
-        }
-    }
-
+    /**
+     * 8s {@link #DETAIL_FALLBACK_SEARCH_TIMEOUT_MS} 到点：<b>只是前台窗口结束</b>。
+     *
+     * <p>★ v99-r58：这里<b>不再结束攒池</b>。历史的两种写法都有问题：</p>
+     * <ol>
+     *   <li>把游标推到底 → 等于宣布"剩下的源都问过了"，那几十个源再也不会被问；</li>
+     *   <li>r57 移交给后台队列 → 已出发的在途请求会因 token 失效被丢掉，要重新问一遍。</li>
+     * </ol>
+     * 现在攒池本身就是跨轮常驻的一条队列：到点只解除与「本轮切源」的耦合，
+     * 降为后台并发继续把剩下的源问完，直到 {@link #DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS}。</p>
+     */
     private void finishDetailFallbackSearchOnTimeout() {
-        if (!detailFallbackActive || !detailFallbackSearching) {
+        if (!detailFallbackPoolFilling || !detailFallbackSearching) {
             return;
         }
         detailFallbackSearchTimeoutScheduled = false;
-        // 超时后不再等剩下的批次；但已收集到的结果已经进了 detailFallbackCache，下一圈仍可用。
-        detailFallbackSearching = false;
         detailFallbackSearchTimedOut = true;
-        // ★ v99-r57：旧写法是 {@code detailFallbackNextSourceIndex = detailFallbackSourceOrder.size()}
-        //   —— 把游标直接推到底，等于宣布"剩下的源都问过了"。于是 101 个源里没问过的那几十个
-        //   <b>再也不会被问</b>，冷启动的池子被永久锁死在超时那一刻的规模（实测锁死在 2）。
-        //   现在改为：把「还没问过的源」移交给后台队列继续问（低并发、与播放并存、用户无感知）。
-        handoffRemainingSourcesToBackground(detailFallbackNextSourceIndex);
+        // 前台窗口关闭：不再驱动切源、不再记账、并发降为后台档。
+        detailFallbackSearching = false;
+        detailFallbackSearchCollecting = false;
+        detailFallbackPoolFrontWindowClosed = true;
+        detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
+        LOG.sw("[FB] poolFrontWindowEnd task=t" + detailFallbackPoolTaskId
+                + " conc=" + detailFallbackPoolConcurrency
+                + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                + " pending=" + detailFallbackPendingSources.size()
+                + " poolSize=" + detailFallbackUsableCandidateCount());
         if (!detailFallbackLoadingCandidate) {
             loadNextDetailFallbackSource();
         }
+        // 继续把剩下的源问完（cap 已降为后台档）
+        scheduleDetailFallbackSearch();
     }
 
     /**
-     * ★ v99-r57：把主搜索「还没问过的源」移交给后台队列继续问。
+     * ★ v99-r58：攒池任务的<b>唯一收尾口</b>（全部问完 / 120s 硬闸 / 彻底复位）。
      *
-     * <p>后台队列即预热队列（独立 token、独立在途集合，不受切源 token 轮转影响），
-     * 因此这些迟到结果仍能正常入池。若预热正在跑就追加到队尾，否则以剩余源直接起一轮。</p>
+     * <p>负责「停派发 + 掐在途 + 落盘 + 打点」，<b>不碰 UI</b> —— 是否要驱动取源由调用方
+     * 按「是否还在本轮切源会话内」决定。</p>
      */
-    private void handoffRemainingSourcesToBackground(int fromIndex) {
-        if (llLayout == null || isFinishing() || isDestroyed()) {
+    private void stopPoolFilling(String reason) {
+        if (!detailFallbackPoolFilling) {
             return;
         }
-        if (TextUtils.isEmpty(detailFallbackAnchorTitle)
-                || detailFallbackSourceOrder == null
-                || fromIndex >= detailFallbackSourceOrder.size()) {
+        detailFallbackPoolFilling = false;
+        detailFallbackSearching = false;
+        detailFallbackSearchCollecting = false;
+        detailFallbackPoolFrontWindowClosed = true;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackTimeout);
+            llLayout.removeCallbacks(detailFallbackPoolFillTimeout);
+            llLayout.removeCallbacks(detailFallbackBusyRefill);
+        }
+        detailFallbackBusyRefillScheduled = false;
+        stopDetailFallbackSearchExecutor();
+        try {
+            OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+        } catch (Throwable ignored) {
+        }
+        LOG.sw("[FB] poolFillStop reason=" + reason
+                + " task=t" + detailFallbackPoolTaskId
+                + " asked=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                + " pending=" + detailFallbackPendingSources.size()
+                + " poolSize=" + detailFallbackUsableCandidateCount());
+        detailFallbackPendingSources.clear();
+        detailFallbackSourceStartMs.clear();
+        persistDetailFallbackCache(detailFallbackAnchorTitle);
+    }
+
+    // ==================== ★ v99-r58：攒池引擎（单队列常驻） ====================
+
+    /**
+     * 攒池引擎的<b>唯一入口</b>：保证这条队列正以「至少 {@code concurrency} 档」在跑。
+     *
+     * <p><b>原来的两条腿去哪了</b>：原先「切源主搜索」和「静默预热」各跑一份全量
+     * （100 / 101 个源，集合几乎完全重叠），既多发一倍请求，出问题也分不清是哪条腿。
+     * 现在只有一份 {@code order / nextIndex / pending / token}，唯一变量是并发档位。</p>
+     *
+     * <p><b>已在跑时只调档、绝不重建队列</b>：重建会把在途请求变成"没身份证明的陌生人"
+     * —— 它们回来时令牌已变，被 {@link #onDetailFallbackSearchResult} 的守卫丢弃，
+     * 这正是 r57 真机「池子锁死 30」的直接成因。</p>
+     *
+     * @param concurrency 目标并发档（20 前台 / 8 忙时 / 5 后台）
+     * @param reason      仅用于日志：preheat = 详情进页后台攒池；switch = 用户点切源提速
+     */
+    private void ensurePoolFilling(int concurrency, String reason) {
+        if (llLayout == null) {
             return;
         }
-        List<String> rest = new ArrayList<>();
-        for (int i = fromIndex; i < detailFallbackSourceOrder.size(); i++) {
-            String k = detailFallbackSourceOrder.get(i);
-            if (!TextUtils.isEmpty(k) && !rest.contains(k)) {
-                rest.add(k);
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            LOG.sw("[FB] poolFillSkip reason=" + reason + " emptyAnchor=1");
+            return;
+        }
+        if (detailFallbackPoolFilling) {
+            if (concurrency > detailFallbackPoolConcurrency) {
+                LOG.sw("[FB] poolFillSpeed reason=" + reason
+                        + " conc=" + detailFallbackPoolConcurrency + "->" + concurrency
+                        + " task=t" + detailFallbackPoolTaskId
+                        + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size());
+                detailFallbackPoolConcurrency = concurrency;
             }
-        }
-        if (rest.isEmpty()) {
+            llLayout.removeCallbacks(detailFallbackPoolFillTimeout);
+            llLayout.postDelayed(detailFallbackPoolFillTimeout, DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS);
+            scheduleDetailFallbackSearch();
             return;
         }
-        ensureDetailFallbackPreheatExecutor();
-        if (detailFallbackPreheating && detailFallbackPreheatOrder != null) {
-            for (String k : rest) {
-                if (!detailFallbackPreheatOrder.contains(k)) {
-                    detailFallbackPreheatOrder.add(k);
+        // 已经问过一遍全部源、且源集合没变 ⇒ 再跑一遍不会带来任何新信息
+        if (detailFallbackPoolCompleted && !poolSourceSetChanged()) {
+            LOG.sw("[FB] poolFillSkip reason=" + reason
+                    + " completed=1 sameSourceSet=1"
+                    + " poolSize=" + detailFallbackUsableCandidateCount());
+            return;
+        }
+        if (detailFallbackSourceOrder.isEmpty()) {
+            LOG.sw("[FB] poolFillSkip reason=" + reason + " emptyOrder=1");
+            return;
+        }
+        detailFallbackPoolFilling = true;
+        detailFallbackPoolConcurrency = concurrency;
+        detailFallbackPoolFrontWindowClosed = false;
+        detailFallbackPoolCompleted = false;
+        detailFallbackPoolSourceFingerprint = currentSourceSetFingerprint();
+        detailFallbackPoolTaskId = ++detailFallbackRequestIndex;
+        detailFallbackNextSourceIndex = 0;
+        detailFallbackPendingSources.clear();
+        detailFallbackSourceStartMs.clear();
+        detailFallbackToken = "detail_fallback_" + detailFallbackPoolTaskId;
+        detailFallbackBatchToken = detailFallbackToken + "_batch_1";
+        detailFallbackBatchStartMs = System.currentTimeMillis();
+        llLayout.removeCallbacks(detailFallbackPoolFillTimeout);
+        llLayout.postDelayed(detailFallbackPoolFillTimeout, DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS);
+        LOG.sw("[FB] poolFillStart reason=" + reason
+                + " conc=" + concurrency
+                + " task=t" + detailFallbackPoolTaskId
+                + " order=" + detailFallbackSourceOrder.size()
+                + " poolSize=" + detailFallbackUsableCandidateCount());
+        scheduleDetailFallbackSearch();
+    }
+
+    /**
+     * 详情加载成功后预约一次后台攒池（延迟 {@link #DETAIL_FALLBACK_PREHEAT_DELAY_MS}）。
+     * 一次进页只约一次，由 {@link #detailFallbackPoolTried} 节流。
+     */
+    private void scheduleDetailFallbackPoolFill() {
+        if (detailFallbackPoolTried || detailFallbackPoolFilling) {
+            return;
+        }
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            LOG.sw("[FB] poolFillSkip reason=emptyAnchor");
+            return;
+        }
+        detailFallbackPoolTried = true;
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackPoolStart);
+            llLayout.postDelayed(detailFallbackPoolStart, DETAIL_FALLBACK_PREHEAT_DELAY_MS);
+            LOG.sw("[FB] poolFillScheduled delay=" + DETAIL_FALLBACK_PREHEAT_DELAY_MS
+                    + " title=" + detailFallbackAnchorTitle);
+        }
+    }
+
+    /** 后台档启动：建队列 → 以 {@link #DETAIL_FALLBACK_POOL_CONC_BACKGROUND} 起跑。 */
+    private void startPoolFillingBackground() {
+        if (isFinishing() || isDestroyed()) {
+            LOG.sw("[FB] poolFillSkip reason=activityGone");
+            return;
+        }
+        if (detailFallbackPoolFilling) {
+            LOG.sw("[FB] poolFillSkip reason=alreadyFilling");
+            return;
+        }
+        if (prepareDetailFallbackSourceOrder() == null || detailFallbackSourceOrder.isEmpty()) {
+            LOG.sw("[FB] poolFillSkip reason=noSearchableSource");
+            return;
+        }
+        ensurePoolFilling(DETAIL_FALLBACK_POOL_CONC_BACKGROUND, "preheat");
+    }
+
+    /**
+     * 构建攒池队列：取全部可搜源，按站点质量从高到低排序。
+     *
+     * <p><b>为什么要抽出来</b>：这段原先写在 {@link #startDetailFallback()} 里（只有切源才建队列），
+     * 而 r57 的预热用的是 <b>ApiConfig 原序</b>。两条腿两套顺序 ⇒ 同一部片的站位不一致，
+     * 且 {@code nextIndex} 无法跨路复用。合并后统一走<b>质量序</b>：先问好站，
+     * 正是切源最需要的。</p>
+     *
+     * @return 本次排序用的快照（供探路复用，省 n 次重复读分）；源数不足 / 异常时为 {@code null}
+     */
+    private SourceQualityStore.Snapshot prepareDetailFallbackSourceOrder() {
+        detailFallbackSourceOrder.clear();
+        try {
+            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
+            if (sourceBeanList != null) {
+                for (SourceBean bean : sourceBeanList) {
+                    // 与搜索页（FastSearchActivity/SearchActivity）保持一致的筛选条件：
+                    // 只要求 isSearchable。此前多加了 isChangeable，导致「可搜但不可换」的源
+                    // 被排除，切源池比搜索结果的源少。
+                    // 一圈 = 包括当前源在内全部轮转：不排除当前源，也不按「已用」过滤。
+                    if (bean != null && bean.isSearchable()) {
+                        detailFallbackSourceOrder.add(bean.getKey());
+                    }
                 }
             }
-            scheduleDetailFallbackPreheatSearch();
-        } else {
-            detailFallbackPreheatOrder = rest;
-            detailFallbackPreheatNextIndex = 0;
-            detailFallbackPreheatPending.clear();
-            detailFallbackPreheatTried = true;   // 防止 scheduleDetailFallbackPreheat 再排一次
-            startPreheatDispatch();
+        } catch (Throwable th) {
+            LOG.e("[FB] buildPoolOrder fail: " + th);
         }
-        LOG.sw("[FB] searchHandoff rest=" + rest.size()
-                + " asked=" + fromIndex + "/" + detailFallbackSourceOrder.size()
-                + " poolSize=" + detailFallbackUsableCandidateCount());
+        if (detailFallbackSourceOrder.isEmpty()) {
+            return null;
+        }
+        return sortDetailFallbackSourceOrderByQuality();
+    }
+
+    /** 源集合指纹（可搜源数量 + key 哈希）：变了才值得把已完成的池推翻重跑。 */
+    private int currentSourceSetFingerprint() {
+        try {
+            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
+            if (sourceBeanList == null) {
+                return 0;
+            }
+            int fp = sourceBeanList.size();
+            for (SourceBean bean : sourceBeanList) {
+                if (bean != null && bean.isSearchable() && bean.getKey() != null) {
+                    fp = fp * 31 + bean.getKey().hashCode();
+                }
+            }
+            return fp;
+        } catch (Throwable th) {
+            return 0;
+        }
+    }
+
+    private boolean poolSourceSetChanged() {
+        return currentSourceSetFingerprint() != detailFallbackPoolSourceFingerprint;
     }
 
     /**
@@ -3713,7 +3704,9 @@ public class DetailActivity extends BaseActivity {
         llLayout.postDelayed(new Runnable() {
             @Override
             public void run() {
-                if (!detailFallbackActive || !detailFallbackSearching) {
+                // ★ v99-r58：守卫换成任务级标志 —— 切源轮次结束不再掐断慢源看护，
+                //   否则慢源会永远占着 pending 名额（没有别的路径再把它摘掉）。
+                if (!detailFallbackPoolFilling) {
                     return;
                 }
                 if (!searchToken.equals(detailFallbackBatchToken)) {
@@ -3758,64 +3751,18 @@ public class DetailActivity extends BaseActivity {
         if (slim.isEmpty()) {
             return;
         }
-        try {
-            Hawk.put(HAWK_FALLBACK_CACHE_PREFIX + poolKey,
-                    new FallbackCacheBox(slim, System.currentTimeMillis()));
-            trimFallbackCacheIndex(poolKey);
-            detailFallbackCacheDirty = false;
-        } catch (Throwable th) {
-            LOG.e("persistDetailFallbackCache fail: " + th);
-        }
+        FallbackCacheStore.put(title, slim);
+        detailFallbackCacheDirty = false;
     }
 
     /**
-     * 候选池缓存的条数上限管理（LRU）。
+     * 清空持久化的切源候选池（设置页「清空缓存」调用）。
      *
-     * <p>每部片一个 Hawk key，且只有这部片再次被打开且已过期时才会删自己那条，
-     * 于是 key 只增不减。看过的片子多了，Hawk 里会堆出成百上千条，读写都变慢。
-     * 这里维护一张「写入顺序」索引，超出 {@link #FALLBACK_CACHE_MAX_ENTRIES} 就删最旧的。</p>
-     */
-    /**
-     * ★ v69：清空持久化的切源候选池（设置页「清空缓存」调用）。
-     *
-     * <p>候选池按「片名」一条条存在 Hawk（{@link #HAWK_FALLBACK_CACHE_PREFIX} + 片名），
-     * 另有 {@link #HAWK_FALLBACK_CACHE_INDEX} 记写入顺序做 LRU 淘汰。
-     * 它是<b>纯缓存</b>：清掉后下次进详情页会重新搜一遍，不丢任何用户数据。</p>
-     *
-     * <p><b>必须连索引一起清</b>：只删数据键不删索引，{@link #trimFallbackCacheIndex}
-     * 下次写入时会拿着一份「记载着已删除片名」的索引做淘汰，淘汰到的片名对应的键
-     * 早就不存在了 —— 白删一次不说，索引还会长期停留在满容量。</p>
+     * <p>★ v99-r58：实现已迁到 {@link FallbackCacheStore#clearAll()}，这里保留转发，
+     * 免得设置页直接依赖仓储层。</p>
      */
     public static void clearPersistedFallbackCache() {
-        try {
-            List<String> raw = Hawk.get(HAWK_FALLBACK_CACHE_INDEX);
-            if (raw != null) {
-                for (String title : raw) {
-                    if (title != null && !title.isEmpty()) {
-                        Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + title);
-                    }
-                }
-            }
-            Hawk.delete(HAWK_FALLBACK_CACHE_INDEX);
-        } catch (Throwable th) {
-            LOG.e("clearPersistedFallbackCache fail: " + th);
-        }
-    }
-
-    private void trimFallbackCacheIndex(String title) {
-        try {
-            List<String> raw = Hawk.get(HAWK_FALLBACK_CACHE_INDEX);
-            List<String> index = raw == null ? new ArrayList<String>() : new ArrayList<String>(raw);
-            index.remove(title);
-            index.add(title);
-            while (index.size() > FALLBACK_CACHE_MAX_ENTRIES) {
-                String oldest = index.remove(0);
-                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + oldest);
-            }
-            Hawk.put(HAWK_FALLBACK_CACHE_INDEX, index);
-        } catch (Throwable th) {
-            LOG.e("trimFallbackCacheIndex fail: " + th);
-        }
+        FallbackCacheStore.clearAll();
     }
 
     /**
@@ -3854,12 +3801,12 @@ public class DetailActivity extends BaseActivity {
         }
         try {
             // ★ v99-r56：读键与写键同为 familyKey（旧版按原文落的盘读不到，冷启动一次即可）
-            FallbackCacheBox box = Hawk.get(HAWK_FALLBACK_CACHE_PREFIX + ShowTitleKey.familyKey(hawkTitle));
+            FallbackCacheStore.FallbackCacheBox box = FallbackCacheStore.get(hawkTitle);
             if (box == null || box.entries == null || box.entries.isEmpty()) {
                 return;
             }
-            if (System.currentTimeMillis() - box.savedAt > FALLBACK_CACHE_TTL_MS) {
-                Hawk.delete(HAWK_FALLBACK_CACHE_PREFIX + ShowTitleKey.familyKey(hawkTitle));
+            if (System.currentTimeMillis() - box.savedAt > FallbackCacheStore.TTL_MS) {
+                FallbackCacheStore.clearFor(hawkTitle);
                 return;
             }
             List<Movie.Video> restored = new ArrayList<>(box.entries.size());
@@ -3898,17 +3845,6 @@ public class DetailActivity extends BaseActivity {
             }
         } catch (Throwable th) {
             LOG.e("restoreDetailFallbackCache fail: " + th);
-        }
-    }
-
-    /** Hawk 里存的精简缓存（只留 sourceKey/id/name，避免序列化整个 Movie.Video）。 */
-    private static class FallbackCacheBox {
-        final List<String[]> entries;
-        final long savedAt;
-
-        FallbackCacheBox(List<String[]> entries, long savedAt) {
-            this.entries = entries;
-            this.savedAt = savedAt;
         }
     }
 
@@ -4190,6 +4126,41 @@ public class DetailActivity extends BaseActivity {
         }
         cachedCandidates.add(video);
         detailFallbackCacheDirty = true;
+        trimDetailFallbackPool(detailFallbackAnchorTitle);
+    }
+
+    /**
+     * ★ v99-r58：候选池条数软上限（{@link #DETAIL_FALLBACK_POOL_MAX_CANDIDATES}）。
+     *
+     * <p><b>为什么必须有</b>：r58 会把池子问满，热门片可能攒到五六十条。
+     * 落盘侧已经是精简三元组尚可接受，但内存里存的是完整 {@code Movie.Video}，
+     * 而 {@link #FALLBACK_CACHE_MAX_ENTRIES} 管的是<b>部数</b> ——
+     * 真实占用 = 部数 × 每部条数，必须两个维度都设闸。</p>
+     *
+     * <p>按 {@link #detailFallbackSourceScore} 降序保留：被挤掉的一定是历史表现最差的站点，
+     * 而一圈切源根本轮不到第 40 个之后。</p>
+     */
+    private void trimDetailFallbackPool(String title) {
+        List<Movie.Video> candidates = poolOf(title);
+        if (candidates == null || candidates.size() <= DETAIL_FALLBACK_POOL_MAX_CANDIDATES) {
+            return;
+        }
+        try {
+            java.util.Collections.sort(candidates, new Comparator<Movie.Video>() {
+                @Override
+                public int compare(Movie.Video a, Movie.Video b) {
+                    // 降序：质量高的排前面（保留段在头部）
+                    return Double.compare(detailFallbackSourceScore(b.sourceKey), detailFallbackSourceScore(a.sourceKey));
+                }
+            });
+            int overflow = candidates.size() - DETAIL_FALLBACK_POOL_MAX_CANDIDATES;
+            for (int i = 0; i < overflow; i++) {
+                candidates.remove(candidates.size() - 1);
+            }
+            detailFallbackCacheDirty = true;
+        } catch (Throwable th) {
+            LOG.e("[FB] trimPool fail: " + th);
+        }
     }
 
     private void showDetailEmpty() {
@@ -4220,22 +4191,39 @@ public class DetailActivity extends BaseActivity {
         detailFallbackActive = false;
         // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
         dismissSwitchingSourceToast();
+        // 本轮切源结束：不再由本轮驱动取源。
         detailFallbackSearching = false;
         detailFallbackSearchCollecting = false;
+        // ★ v99-r58：攒池是<b>跨轮任务</b>。旧实现无条件清 batchToken / sourceOrder /
+        //   pendingSources / nextIndex 并摘定时器 —— 注释写着"保留仍在跑的批处理"，
+        //   实际全清。后果：首批之后结果回调被令牌守卫拦、单源超时被 !searching 拦、
+        //   8s 定时器被摘 ⇒ 补位永久停摆（真机：101 源只 dispatch 一次，池子锁死 30）。
+        //   现在切源收尾只把攒池降回后台档，队列本身毫发无损。
+        final boolean keepFilling = keepCache && detailFallbackPoolFilling;
+        if (keepFilling) {
+            detailFallbackPoolFrontWindowClosed = true;
+            detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
+            LOG.sw("[FB] resetKeepCache task=t" + detailFallbackPoolTaskId
+                    + " conc=" + detailFallbackPoolConcurrency
+                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                    + " pending=" + detailFallbackPendingSources.size()
+                    + " poolSize=" + detailFallbackUsableCandidateCount());
+        } else {
+            detailFallbackBatchIndex = 0;
+            detailFallbackNextSourceIndex = 0;
+            detailFallbackToken = "";
+            detailFallbackBatchToken = "";
+            detailFallbackSourceOrder.clear();
+            detailFallbackPendingSources.clear();
+            detailFallbackSourceStartMs.clear();
+        }
         detailFallbackSearchTimedOut = false;
         detailFallbackDetailTimedOut = false;
         detailFallbackSearchTimeoutScheduled = false;
         detailFallbackKeepCurrentDetail = false;
         detailFallbackLoadingCandidate = false;
-        detailFallbackBatchIndex = 0;
-        detailFallbackNextSourceIndex = 0;
-        detailFallbackToken = "";
-        detailFallbackBatchToken = "";
         // 方案D：复位前把候选池落盘，供下次进同一部片直接复用
         persistDetailFallbackCache(detailFallbackAnchorTitle);
-        detailFallbackSourceOrder.clear();
-        detailFallbackPendingSources.clear();
-        detailFallbackSourceStartMs.clear();
         // 方案A：清理探路状态
         detailFallbackProbePending = false;
         detailFallbackProbeSourceKey = "";
@@ -4252,30 +4240,19 @@ public class DetailActivity extends BaseActivity {
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
             llLayout.removeCallbacks(detailFallbackEarlyConsume);
             llLayout.removeCallbacks(detailFallbackBusyRefill);
-            // ★ v99-r57：预热的两个定时器<b>只在「彻底复位」时摘</b>（防退出后还启动/落盘）。
-            //   旧写法是「无论哪种复位都摘掉」，而切源收尾走的正是 keepCache=true；
-            //   预热又是 postDelayed(1500ms)，于是几乎必然在起跑前被摘掉 ——
-            //   真机实测 preheatScheduled 2 次 / preheatStart 0 次，这条腿形同虚设。
+            // 后台攒池的启动定时器<b>只在「彻底复位」时摘</b>（防退出页面后还在起跑 / 落盘）。
+            // 切源收尾走的是 keepCache=true，攒池必须让它继续。
             if (!keepCache) {
-                llLayout.removeCallbacks(detailFallbackPreheatStart);
-                llLayout.removeCallbacks(detailFallbackPreheatTimeout);
+                llLayout.removeCallbacks(detailFallbackPoolStart);
             }
         }
         detailFallbackEarlyConsumeScheduled = false;
         detailFallbackBusyRefillScheduled = false;
         if (!keepCache) {
-            detailFallbackPreheatTimeoutScheduled = false;
-            // 只有「彻底复位」才掐断批处理；切源成功后的收尾必须让它继续跑完，
-            // 否则候选池永远只有第一个源 —— 这正是「一直切回同一站点」的根因。
-            stopDetailFallbackSearchExecutor();
-            OkGo.getInstance().cancelTag(DETAIL_FALLBACK_SEARCH_TAG);
+            detailFallbackPoolTried = false;
+            // ★ v99-r58：彻底复位 = 攒池一并停（停派发 + 掐在途 + 落盘 + 打点）
+            stopPoolFilling("reset");
             cancelDetailFallbackProbe();
-            // ★ v66：彻底复位时预热也停（已攒的候选保留在池里）。
-            // ★ v99-r57：后台有自己的线程池与请求 tag，必须显式停，
-            //   原注释以为"已被主搜索池的 shutdownNow 掐掉"是不成立的。
-            stopDetailFallbackPreheatExecutor();
-            detailFallbackPreheating = false;
-            detailFallbackPreheatPending.clear();
         }
     }
 
@@ -4359,14 +4336,6 @@ public class DetailActivity extends BaseActivity {
     private final List<String> quickSearchWord = new ArrayList<>();
     private ExecutorService searchExecutorService = null;
     private ExecutorService detailFallbackSearchExecutor;
-    /**
-     * ★ v99-r57：后台（预热 / 超时移交）专用线程池。
-     *
-     * <p>与主搜索池分开，避免主搜索收尾的 {@code shutdownNow()} 把后台请求一起掐断。
-     * 线程数取 2：这里的 Runnable 只负责<b>发起</b>异步请求（OkGo 自带线程池），
-     * 不阻塞等待响应，2 个线程足以喂满并发 5 的滑动窗口。</p>
-     */
-    private ExecutorService detailFallbackPreheatExecutor;
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     /**
      * 候选池（内存层），按归一化片名索引。
@@ -4595,28 +4564,36 @@ public class DetailActivity extends BaseActivity {
     private String detailFallbackTimedOutKey;
     /** 当前在途详情请求的站点 key（与 {@link #detailFallbackTimedOutKey} 配套，供软失败按站粒度记录）。 */
     private String detailFallbackTimedOutSource;
-    // ===== ★ v66：进详情静默预热 =====
+    // ===== ★ v99-r58：攒池引擎（单队列常驻） =====
     /**
-     * 是否正在静默预热（进详情页后后台派发一轮搜索，只往候选池攒数据，
-     * 不切源、不弹提示、不触发 early consume）。
+     * 攒池引擎是否正在跑 —— <b>任务级</b>标志，不随切源轮次复位。
      *
-     * <p>与切源主状态机（{@link #detailFallbackActive}）<b>完全并行</b>：
-     * 预热用自己的 token 与在途集合，用户随时点切源不受影响；
-     * 预热结果照常按锚做 sameFamily 过滤后入池。</p>
+     * <p><b>为什么必须独立</b>：每条攒池相关的守卫原先都挂在
+     * {@link #detailFallbackActive} / {@link #detailFallbackSearching} 上，而这两个是
+     * 「一次切源轮次」的状态。切源成功后必走 {@code resetDetailFallbackKeepCache()}，
+     * 它无条件把 {@code active=false / searching=false / batchToken=""} 并
+     * {@code pendingSources.clear()} ⇒ 首批 20 个源之后：结果回调被 token 守卫拦、
+     * 单源超时被 {@code !searching} 拦、8s 定时器被摘。真机实测 101 个源
+     * <b>只派发一次</b>，池子锁死在 30，32 次切源全在这 30 个源里转。</p>
      */
-    private boolean detailFallbackPreheating = false;
-    /** 预热的批次令牌（与切源的 {@link #detailFallbackBatchToken} 独立，防结果串扰）。 */
-    private String detailFallbackPreheatToken = "";
-    /** 预热源队列的下一个待派发下标。 */
-    private int detailFallbackPreheatNextIndex = 0;
-    /** 预热在途的源 key 集合。 */
-    private final Set<String> detailFallbackPreheatPending = new HashSet<>();
-    /** 预热的源队列（全部可搜源，与切源全网搜索同范围）。 */
-    private List<String> detailFallbackPreheatOrder = new ArrayList<>();
-    /** 预热整体超时是否已预约（只约一次）。 */
-    private boolean detailFallbackPreheatTimeoutScheduled = false;
-    /** 预热是否已尝试过（一次进页只预热一轮，换片重置）。 */
-    private boolean detailFallbackPreheatTried = false;
+    private boolean detailFallbackPoolFilling = false;
+    /** 当前并发档位：20（前台）/ 8（加载详情中）/ {@link #DETAIL_FALLBACK_POOL_CONC_BACKGROUND}（后台）。 */
+    private int detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
+    /**
+     * 8s {@link #DETAIL_FALLBACK_SEARCH_TIMEOUT_MS} 前台窗口是否已关闭。
+     *
+     * <p>关闭后：<b>不再记账</b>（后台慢速回包混进 SourceQualityStore 会污染站点排序）、
+     * <b>不安排提前消费</b>（没人等着看画面）、并发降到后台档，但攒池继续。</p>
+     */
+    private boolean detailFallbackPoolFrontWindowClosed = true;
+    /** 本轮全量是否已问完（配合源指纹，避免无意义地再跑一遍）。 */
+    private boolean detailFallbackPoolCompleted = false;
+    /** 问完那一刻的源集合指纹；{@link #poolSourceSetChanged} 为真才允许重跑。 */
+    private int detailFallbackPoolSourceFingerprint = 0;
+    /** 攒池任务编号，日志用它串起同一任务的一生（启动/提速/降速/停止）。 */
+    private int detailFallbackPoolTaskId = 0;
+    /** 是否已预约过后台攒池（一次进页只约一次，换片重置）。 */
+    private boolean detailFallbackPoolTried = false;
     /**
      * ★ v66：切源择优的「基准资源」—— 首轮进详情时用户看的那条视频快照。
      *
@@ -4693,31 +4670,25 @@ public class DetailActivity extends BaseActivity {
         @Override
         public void run() {
             detailFallbackBusyRefillScheduled = false;
-            if (detailFallbackActive && detailFallbackSearching) {
+            if (detailFallbackPoolFilling) {
                 scheduleDetailFallbackSearch();
             }
         }
     };
 
-    // ===== ★ v66：静默预热的两个定时器 =====
-    /** 预热启动（详情成功回调里 postDelayed，错开起播高峰）。 */
-    private final Runnable detailFallbackPreheatStart = new Runnable() {
+    // ===== ★ v99-r58：攒池引擎的两个定时器 =====
+    /** 后台档启动（详情成功回调里 postDelayed，错开起播高峰）。 */
+    private final Runnable detailFallbackPoolStart = new Runnable() {
         @Override
         public void run() {
-            startDetailFallbackPreheat();
+            startPoolFillingBackground();
         }
     };
-    /** 预热整体超时：停止派发（在途结果照常入池），已攒的落盘。 */
-    private final Runnable detailFallbackPreheatTimeout = new Runnable() {
+    /** 120s 硬闸：停止派发 + 掐断在途 + 落盘。已在 {@link #stopPoolFilling} 内统一收尾。 */
+    private final Runnable detailFallbackPoolFillTimeout = new Runnable() {
         @Override
         public void run() {
-            if (detailFallbackPreheating) {
-                detailFallbackPreheating = false;
-                LOG.sw("[FB] preheat timeout, stop dispatch (pending="
-                        + detailFallbackPreheatPending.size() + ")");
-            }
-            // 无论是否正在预热，把已攒的候选落盘（幂等，dirty 才写）
-            persistDetailFallbackCache(detailFallbackAnchorTitle);
+            stopPoolFilling("hardTimeout");
         }
     };
 

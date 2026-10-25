@@ -979,20 +979,16 @@ public class SourceViewModel extends ViewModel {
         getSearch(sourceKey, wd, searchToken, searchResult, "search");
     }
 
+    /**
+     * 攒池搜索：前台切源与后台攒池共用这一条通道。
+     *
+     * <p>★ v99-r58：原先后台（静默预热）走另一个 requestTag
+     * {@code detail_fallback_preheat}，是因为主搜索收尾的 {@code cancelTag} 会连带掐掉后台请求。
+     * 两条腿合并成一条常驻队列后不再需要区分 —— 只有
+     * 「彻底复位（退出 / 换片）」才会 {@code cancelTag}，届时前后台本就该一起停。</p>
+     */
     public void getDetailFallbackSearch(String sourceKey, String wd, String searchToken) {
         getSearch(sourceKey, wd, searchToken, detailFallbackSearchResult, "detail_fallback_search");
-    }
-
-    /**
-     * ★ v99-r57：后台（静默预热 / 主搜索超时移交）专用搜索。
-     *
-     * <p>与主搜索走<b>不同的 requestTag</b>。原因：主搜索收尾时会
-     * {@code OkGo.getInstance().cancelTag("detail_fallback_search")} 清掉在途请求，
-     * 而预热原本复用同一个 tag —— 于是主搜索一收尾，后台那些还没回来的请求就被一起取消了。
-     * 这是「预热一次都没真正跑完」的第三个原因（另两个是定时器被 reset 摘掉、并发太低）。</p>
-     */
-    public void getDetailFallbackPreheatSearch(String sourceKey, String wd, String searchToken) {
-        getSearch(sourceKey, wd, searchToken, detailFallbackSearchResult, "detail_fallback_preheat");
     }
 
     private void getSearch(String sourceKey, String wd, String searchToken, MutableLiveData<AbsXml> result, String requestTag) {
