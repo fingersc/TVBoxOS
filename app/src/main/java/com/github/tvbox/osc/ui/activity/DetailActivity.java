@@ -3018,22 +3018,25 @@ public class DetailActivity extends BaseActivity {
         // 全部源都已发出 + 无在途 → 攒池任务结束
         if (detailFallbackNextSourceIndex >= detailFallbackSourceOrder.size()
                 && detailFallbackPendingSources.isEmpty()) {
-            // stopPoolFilling 会把 searching 置 false，故先记下本轮是否需要驱动取源
-            final boolean driveSwitch = detailFallbackSearching;
-            detailFallbackPoolCompleted = true;
-            detailFallbackPoolSourceFingerprint = currentSourceSetFingerprint();
-            stopPoolFilling("allAsked");
-            if (driveSwitch) {
-                loadNextDetailFallbackSource();
-            }
+            finishPoolFillingAllAsked();
             return;
         }
         ensureDetailFallbackSearchExecutor();
 
         List<String> dispatched = new ArrayList<>();
+        boolean skippedAny = false;
         while (detailFallbackPendingSources.size() < cap
                 && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
             final String searchKey = detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++);
+            // ★ v99-r59：上次（或上一进程）已经问过的源直接跳过 —— 不发请求、不占并发名额。
+            //   这正是「续跑」而不是「重跑」：上次问到 next=60 时退出，
+            //   这次只发剩下的 41 个，前 60 个一个请求都不重发。
+            if (detailFallbackPoolAskedKeys.contains(searchKey)) {
+                skippedAny = true;
+                continue;
+            }
+            detailFallbackPoolAskedKeys.add(searchKey);
+            detailFallbackAskedDirty = true;
             final String searchTitle = detailFallbackAnchorTitle;
             final String searchToken = detailFallbackBatchToken;
             detailFallbackPendingSources.add(searchKey);
@@ -3058,7 +3061,20 @@ public class DetailActivity extends BaseActivity {
                     + " inflight=" + detailFallbackPendingSources.size()
                     + " cap=" + cap
                     + " front=" + (detailFallbackPoolFrontWindowClosed ? 0 : 1)
-                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size());
+                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                    + " skip=" + (skippedAny ? 1 : 0));
+        } else if (skippedAny) {
+            // ★ v99-r59：剩下的源<b>全都问过了</b>，一个请求都没发就扫完了队列表。
+            //   必须当场收尾：此时既没有在途请求、也没有结果回调会再调进来，
+            //   任务会一直挂在 detailFallbackPoolFilling=true 上，下次进片还会走到这里。
+            //   （不能改走 scheduleBusyRefill —— 那要多等 300ms，且同样没人触发它。）
+            if (detailFallbackNextSourceIndex >= detailFallbackSourceOrder.size()
+                    && detailFallbackPendingSources.isEmpty()) {
+                finishPoolFillingAllAsked();
+                // 任务已结束，直接返回：否则会继续走到下面的 8s 定时器补挂，
+                // 留下一个只会空转的定时器（stopPoolFilling 已经摘过它了）。
+                return;
+            }
         } else if (detailFallbackLoadingCandidate) {
             // 名额被占满、一个都没发出 ⇒ 稍后重试补位，避免"这一轮就这么算了"
             scheduleBusyRefill();
@@ -3067,6 +3083,50 @@ public class DetailActivity extends BaseActivity {
             detailFallbackSearchTimeoutScheduled = true;
             llLayout.postDelayed(detailFallbackTimeout, DETAIL_FALLBACK_SEARCH_TIMEOUT_MS);
         }
+    }
+
+    /**
+     * 全部源都已扫过且无在途 ⇒ 攒池任务收尾。
+     *
+     * <p>★ v99-r59 从 {@link #scheduleDetailFallbackSearch} 里抽出来，因为现在有<b>两个</b>入口：</p>
+     * <ol>
+     *   <li>方法顶部的常规收尾（有在途请求回来触发）；</li>
+     *   <li>dispatch 循环「跳过已问源」后一次请求都没发就扫完了表 ——
+     *       这种时候没有在途请求、也没有回调会再进来，只能当场收尾，
+     *       否则任务永远挂在 {@code detailFallbackPoolFilling=true} 上。</li>
+     * </ol>
+     */
+    private void finishPoolFillingAllAsked() {
+        // stopPoolFilling 会把 searching 置 false，故先记下本轮是否需要驱动取源
+        final boolean driveSwitch = detailFallbackSearching;
+        stopPoolFilling("allAsked");
+        if (driveSwitch) {
+            loadNextDetailFallbackSource();
+        }
+    }
+
+    /**
+     * 已问源集合是否已覆盖当前全部可搜源。
+     *
+     * <p>★ v99-r59：这是「跑完不重跑」的唯一判据。三个设计要点：</p>
+     * <ul>
+     *   <li><b>不需要额外的源集合指纹</b>：源扩容时新源的 key 不在集合里 ⇒ 覆盖度判假 ⇒
+     *       允许重跑；源缩小时判真直接跳过也正确（没有新源可问）。</li>
+     *   <li><b>不能用候选数代替</b>：池子小恰恰说明源站确实没资源，那种片每次都重跑
+     *       101 个源是纯浪费；池子满 40 是上限截断、不等于问完了。</li>
+     *   <li><b>集合在彻底复位（换片/退出）时清空</b>，所以不会串片。</li>
+     * </ul>
+     */
+    private boolean isAllSearchableAsked() {
+        if (detailFallbackPoolAskedKeys.isEmpty() || detailFallbackSourceOrder.isEmpty()) {
+            return false;
+        }
+        for (String key : detailFallbackSourceOrder) {
+            if (!detailFallbackPoolAskedKeys.contains(key)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -3164,12 +3224,23 @@ public class DetailActivity extends BaseActivity {
         }
         LOG.sw("[FB] poolFillStop reason=" + reason
                 + " task=t" + detailFallbackPoolTaskId
-                + " asked=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                // ★ v99-r59：asked 报「已问源集合的大小」而不是游标下标。
+                //   游标只数本实例扫过的位置，而集合是跨实例恢复 + 本实例累积的真实口径；
+                //   续跑（上次问到 60 退出、这次只发剩下 41 个）时游标会是 101/101，
+                //   但集合也是 101/101 —— 两者在「全部问完」时一致，在别处集合更有意义。
+                + " asked=" + detailFallbackPoolAskedKeys.size()
+                + "/" + detailFallbackSourceOrder.size()
+                + " next=" + detailFallbackNextSourceIndex
+                + "/" + detailFallbackSourceOrder.size()
                 + " pending=" + detailFallbackPendingSources.size()
                 + " poolSize=" + detailFallbackUsableCandidateCount());
         detailFallbackPendingSources.clear();
         detailFallbackSourceStartMs.clear();
-        persistDetailFallbackCache(detailFallbackAnchorTitle);
+        // ★ v99-r59：已问集合的账要落到它<b>自己那部片</b>的 key 上。
+        //   不能用 detailFallbackAnchorTitle —— 换片时锚标题已经翻到新片了（见字段注释）。
+        String askedTitle = TextUtils.isEmpty(detailFallbackAskedTitle)
+                ? detailFallbackAnchorTitle : detailFallbackAskedTitle;
+        persistDetailFallbackCache(askedTitle);
     }
 
     // ==================== ★ v99-r58：攒池引擎（单队列常驻） ====================
@@ -3209,22 +3280,33 @@ public class DetailActivity extends BaseActivity {
             scheduleDetailFallbackSearch();
             return;
         }
-        // 已经问过一遍全部源、且源集合没变 ⇒ 再跑一遍不会带来任何新信息
-        if (detailFallbackPoolCompleted && !poolSourceSetChanged()) {
-            LOG.sw("[FB] poolFillSkip reason=" + reason
-                    + " completed=1 sameSourceSet=1"
-                    + " poolSize=" + detailFallbackUsableCandidateCount());
-            return;
-        }
         if (detailFallbackSourceOrder.isEmpty()) {
             LOG.sw("[FB] poolFillSkip reason=" + reason + " emptyOrder=1");
+            return;
+        }
+        // ★ v99-r59：判据从「实例标志 detailFallbackPoolCompleted」换成
+        //   「持久化的已问源集合是否覆盖全部可搜源」。
+        //   旧判据挂在实例字段上，而每次进详情页都是新的 Activity 实例
+        //   （真机日志 4 部片 4 次 create/destroy）⇒ 该标志恒为 false ⇒
+        //   「跑完不重跑」从上线起一次都没生效过（poolFillSkip reason=done 零次）。
+        //   ★ 也不能用「候选数是否达到上限 40」代替：池子小恰恰说明源站确实没资源，
+        //     那种片每次都重跑 101 个源是纯浪费；而池子满 40 是上限截断、不等于问完了。
+        //   ★ 不需要额外的「源集合指纹」：源扩容时新源的 key 不在已问集合里，
+        //     覆盖度自然判假允许重跑；源缩小时判真直接跳过也正确（没有新源可问）。
+        if (isAllSearchableAsked()) {
+            LOG.sw("[FB] poolFillSkip reason=" + reason
+                    + " allAskedPersist=1"
+                    + " asked=" + detailFallbackPoolAskedKeys.size()
+                    + "/" + detailFallbackSourceOrder.size()
+                    + " poolSize=" + detailFallbackUsableCandidateCount());
             return;
         }
         detailFallbackPoolFilling = true;
         detailFallbackPoolConcurrency = concurrency;
         detailFallbackPoolFrontWindowClosed = false;
-        detailFallbackPoolCompleted = false;
-        detailFallbackPoolSourceFingerprint = currentSourceSetFingerprint();
+        // ★ v99-r59：这本账从这一刻起归当前这部片（换片落盘时靠它找 key）
+        detailFallbackAskedTitle = detailFallbackAnchorTitle == null
+                ? "" : detailFallbackAnchorTitle.trim();
         detailFallbackPoolTaskId = ++detailFallbackRequestIndex;
         detailFallbackNextSourceIndex = 0;
         detailFallbackPendingSources.clear();
@@ -3273,6 +3355,12 @@ public class DetailActivity extends BaseActivity {
             LOG.sw("[FB] poolFillSkip reason=alreadyFilling");
             return;
         }
+        // ★ v99-r59：后台攒池这条路径原先<b>不恢复 Hawk</b> —— 只有切源入口
+        //   （startDetailFallback）会调 restoreDetailFallbackCache。结果是：
+        //   用户进片后没切源、1.5s 后后台攒池直接起跑时，磁盘上的候选池和
+        //   「已问源集合」都读不回来 ⇒ r59 的跳过判据失去依据，照样从头问 101 个源。
+        //   放在 alreadyFilling 之后，避免与切源入口的恢复重复做一遍。
+        restoreDetailFallbackCache();
         if (prepareDetailFallbackSourceOrder() == null || detailFallbackSourceOrder.isEmpty()) {
             LOG.sw("[FB] poolFillSkip reason=noSearchableSource");
             return;
@@ -3312,29 +3400,6 @@ public class DetailActivity extends BaseActivity {
             return null;
         }
         return sortDetailFallbackSourceOrderByQuality();
-    }
-
-    /** 源集合指纹（可搜源数量 + key 哈希）：变了才值得把已完成的池推翻重跑。 */
-    private int currentSourceSetFingerprint() {
-        try {
-            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
-            if (sourceBeanList == null) {
-                return 0;
-            }
-            int fp = sourceBeanList.size();
-            for (SourceBean bean : sourceBeanList) {
-                if (bean != null && bean.isSearchable() && bean.getKey() != null) {
-                    fp = fp * 31 + bean.getKey().hashCode();
-                }
-            }
-            return fp;
-        } catch (Throwable th) {
-            return 0;
-        }
-    }
-
-    private boolean poolSourceSetChanged() {
-        return currentSourceSetFingerprint() != detailFallbackPoolSourceFingerprint;
     }
 
     /**
@@ -3732,27 +3797,44 @@ public class DetailActivity extends BaseActivity {
         title = title == null ? "" : title.trim();
         // ★ v99-r56：落盘键与内存池键同为 familyKey（原文键会让写法变体各落一份）
         String poolKey = ShowTitleKey.familyKey(title);
-        List<Movie.Video> candidates = poolOf(title);
-        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(poolKey)
-                || candidates == null || candidates.isEmpty()) {
+        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(poolKey)) {
             return;
         }
-        // ★ 候选池没变化就不落盘。切源收尾（含「切源成功」这条高频路径）每次都会走
-        //   复位，无条件写等于每切一次源就做一次 Hawk 序列化写。
-        if (!detailFallbackCacheDirty) {
+        // ★ v99-r59：已问源集合<b>单独判脏</b>。
+        //   它变化时候选池可能一个都没变（全部问失败），只按 detailFallbackCacheDirty
+        //   判定会漏写 ⇒「问完但零候选」的片永远记不住问过了，下次进页照样重跑 101 个源。
+        if (!detailFallbackCacheDirty && !detailFallbackAskedDirty) {
             return;
         }
+        // ★ v99-r59：已问集合只在与它<b>所属的那部片</b>一致时才一起写。
+        //   换片时 initData 会先把 detailFallbackAnchorTitle 翻到新片、再走
+        //   loadDetail → resetDetailFallback，此时锚标题已是新片而集合还是上部片的账；
+        //   若跟着落盘目标写进去，新片进来 isAllSearchableAsked() 直接判真，
+        //   整部片一个源都不搜。stopPoolFilling 传的就是 detailFallbackAskedTitle，
+        //   所以正常路径一定一致；这里只是一道防线。
+        String askedOwner = TextUtils.isEmpty(detailFallbackAskedTitle)
+                ? title : detailFallbackAskedTitle;
+        boolean askedBelongsHere = TextUtils.equals(askedOwner, title);
         List<String[]> slim = new ArrayList<>();
-        for (Movie.Video v : candidates) {
-            if (v != null && !TextUtils.isEmpty(v.id) && !TextUtils.isEmpty(v.sourceKey)) {
-                slim.add(new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name});
+        List<Movie.Video> candidates = poolOf(title);
+        if (candidates != null) {
+            for (Movie.Video v : candidates) {
+                if (v != null && !TextUtils.isEmpty(v.id) && !TextUtils.isEmpty(v.sourceKey)) {
+                    slim.add(new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name});
+                }
             }
         }
-        if (slim.isEmpty()) {
+        List<String> askedToWrite = (askedBelongsHere && !detailFallbackPoolAskedKeys.isEmpty())
+                ? new ArrayList<String>(detailFallbackPoolAskedKeys) : null;
+        // ★ v99-r59：允许「零候选 + 有已问集合」落盘（r58 时 slim 为空直接 return）。
+        if (slim.isEmpty() && askedToWrite == null) {
             return;
         }
-        FallbackCacheStore.put(title, slim);
+        FallbackCacheStore.put(title, slim, askedToWrite);
         detailFallbackCacheDirty = false;
+        if (askedBelongsHere) {
+            detailFallbackAskedDirty = false;
+        }
     }
 
     /**
@@ -3802,11 +3884,29 @@ public class DetailActivity extends BaseActivity {
         try {
             // ★ v99-r56：读键与写键同为 familyKey（旧版按原文落的盘读不到，冷启动一次即可）
             FallbackCacheStore.FallbackCacheBox box = FallbackCacheStore.get(hawkTitle);
-            if (box == null || box.entries == null || box.entries.isEmpty()) {
+            if (box == null) {
                 return;
             }
+            // ★ v99-r59：TTL 判定必须挪到「entries 为空就返回」<b>之前</b>。
+            //   r59 起一条记录可能只有已问集合、没有候选（全部问失败的片），
+            //   若还按老顺序在 entries 检查处返回，这条记录永远读不回来，
+            //   也就永远判不出「问过了」—— 而那正是最需要跳过的场景。
             if (System.currentTimeMillis() - box.savedAt > FallbackCacheStore.TTL_MS) {
                 FallbackCacheStore.clearFor(hawkTitle);
+                return;
+            }
+            // ★ v99-r59：已问集合与候选解耦恢复。并入（不是覆盖）——
+            //   锚 key 和 v66 兼容 key 两条记录可能各带一部分，取并集才不丢。
+            if (box.askedKeys != null && !box.askedKeys.isEmpty()) {
+                int before = detailFallbackPoolAskedKeys.size();
+                detailFallbackPoolAskedKeys.addAll(box.askedKeys);
+                // 记下这本账属于哪部片（换片时锚标题已翻走，落盘要靠它找到正确的 key）
+                detailFallbackAskedTitle = detailFallbackAnchorTitle == null
+                        ? "" : detailFallbackAnchorTitle.trim();
+                LOG.sw("[FB] poolAskedRestore key=" + poolKey
+                        + " asked=" + (detailFallbackPoolAskedKeys.size() - before));
+            }
+            if (box.entries == null || box.entries.isEmpty()) {
                 return;
             }
             List<Movie.Video> restored = new ArrayList<>(box.entries.size());
@@ -4199,6 +4299,17 @@ public class DetailActivity extends BaseActivity {
         //   实际全清。后果：首批之后结果回调被令牌守卫拦、单源超时被 !searching 拦、
         //   8s 定时器被摘 ⇒ 补位永久停摆（真机：101 源只 dispatch 一次，池子锁死 30）。
         //   现在切源收尾只把攒池降回后台档，队列本身毫发无损。
+        // ★ v99-r59（P3）：彻底复位时<b>先把攒池收尾、再清游标</b>。
+        //   旧顺序是「先 nextIndex=0 / sourceOrder.clear() / pendingSources.clear()，
+        //   再 stopPoolFilling("reset")」，于是 poolFillStop 打出来的 asked / pending
+        //   全是清零之后的假值 —— 真机日志里连续三条 asked=0/0 pending=0，
+        //   而那一刻实际是 next=60/101 pending=5。「退出时攒到哪了」彻底不可观测，
+        //   而这正是判断「已问集合要不要持久化」的唯一依据。
+        //   stopPoolFilling 自身不依赖这些待清字段（它只读 anchorTitle 和已问集合），
+        //   提前调用是安全的；它内部的落盘也会在下面这次 persist 之前先把数据写下去。
+        if (!keepCache) {
+            stopPoolFilling("reset");
+        }
         final boolean keepFilling = keepCache && detailFallbackPoolFilling;
         if (keepFilling) {
             detailFallbackPoolFrontWindowClosed = true;
@@ -4250,8 +4361,14 @@ public class DetailActivity extends BaseActivity {
         detailFallbackBusyRefillScheduled = false;
         if (!keepCache) {
             detailFallbackPoolTried = false;
-            // ★ v99-r58：彻底复位 = 攒池一并停（停派发 + 掐在途 + 落盘 + 打点）
-            stopPoolFilling("reset");
+            // ★ v99-r59（P3）：stopPoolFilling("reset") 已提前到清游标之前调用（见上），
+            //   这里不再重复 —— 重复调用会因为 detailFallbackPoolFilling 已被置 false 而空转。
+            // ★ 已问集合必须跟着换片一起清：它是「本部片」的账。不清的话下一部片
+            //   restore 回来时会叠在旧片的已问集合上，isAllSearchableAsked() 直接判真，
+            //   新片的攒池会被整个跳过 —— 一部片都搜不到。
+            detailFallbackPoolAskedKeys.clear();
+            detailFallbackAskedTitle = "";
+            detailFallbackAskedDirty = false;
             cancelDetailFallbackProbe();
         }
     }
@@ -4586,10 +4703,34 @@ public class DetailActivity extends BaseActivity {
      * <b>不安排提前消费</b>（没人等着看画面）、并发降到后台档，但攒池继续。</p>
      */
     private boolean detailFallbackPoolFrontWindowClosed = true;
-    /** 本轮全量是否已问完（配合源指纹，避免无意义地再跑一遍）。 */
-    private boolean detailFallbackPoolCompleted = false;
-    /** 问完那一刻的源集合指纹；{@link #poolSourceSetChanged} 为真才允许重跑。 */
-    private int detailFallbackPoolSourceFingerprint = 0;
+    /**
+     * ★ v99-r59：本部片已经问过哪些源（{@code sourceKey} 集合，含问失败的）。
+     *
+     * <p><b>它是跨实例的</b>：进页时从 Hawk 恢复（{@link #restoreDetailFallbackCache}），
+     * 派发时逐个加入，任务收尾 / 彻底复位时落盘（{@link #persistDetailFallbackCache}）。
+     * r58 用实例字段 {@code detailFallbackPoolCompleted} 记「问完了」，
+     * 而每次进详情页都是新的 Activity 实例 ⇒ 那个标志恒为 false，判据从未生效。</p>
+     *
+     * <p>换片（{@code resetDetailFallback(false)}）时清空 —— 它是「本部片」的账，
+     * 不清就会串片：下一部片 restore 回来叠在旧片集合上，{@link #isAllSearchableAsked}
+     * 直接判真，新片的攒池会被整个跳过。</p>
+     */
+    private final Set<String> detailFallbackPoolAskedKeys = new HashSet<>();
+    /**
+     * ★ v99-r59：当前已问集合<b>属于哪部片</b>（与 {@link #detailFallbackAnchorTitle} 同口径）。
+     *
+     * <p><b>为什么必须单独记</b>：换片时 {@code initData()} 是<b>先把</b>
+     * {@code detailFallbackAnchorTitle} 翻到新片、<b>再</b>走
+     * {@code loadDetail → resetDetailFallback(false)}。也就是说进到复位方法里时，
+     * 锚标题已经是新片，而内存里的已问集合还是<b>上部片</b>的账。
+     * 若落盘时跟着锚标题写，就会把上部片的已问集合写到新片的 key 上 ——
+     * 新片进来 {@link #isAllSearchableAsked()} 直接判真，<b>整部片一个源都不搜</b>。</p>
+     *
+     * <p>赋值点：恢复已问集合时、起跑一次攒池时。彻底复位时连同集合一起清空。</p>
+     */
+    private String detailFallbackAskedTitle = "";
+    /** 已问集合自上次落盘后是否有变化（单独判脏，见 {@link #persistDetailFallbackCache}）。 */
+    private boolean detailFallbackAskedDirty = false;
     /** 攒池任务编号，日志用它串起同一任务的一生（启动/提速/降速/停止）。 */
     private int detailFallbackPoolTaskId = 0;
     /** 是否已预约过后台攒池（一次进页只约一次，换片重置）。 */

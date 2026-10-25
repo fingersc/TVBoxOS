@@ -23,6 +23,11 @@ import java.util.Set;
  *
  * <p>每条 key 存一个 {@link FallbackCacheBox}（只留 sourceKey/id/name 三元组，
  * 不序列化整个 {@code Movie.Video}，一条约 40 字节）。</p>
+ *
+ * <p>★ v99-r59：盒子里除了候选，还存一份<b>已问源集合</b>（{@link FallbackCacheBox#askedKeys}）——
+ * 它是「这部片的全部可搜源都已经问过一遍」的唯一凭据。放在同一个 Hawk 记录里而不是另开 key，
+ * 是为了让 TTL / LRU 淘汰 / {@link #clearFor} / {@link #gcOrphan} 全都自动继承，
+ * 不会出现「候选池删了、问过的标记还在」这种各过各的寿命。</p>
  */
 public final class FallbackCacheStore {
 
@@ -38,13 +43,38 @@ public final class FallbackCacheStore {
     /** 候选池有效期：超过就算过期，下 restore 时删除。 */
     public static final long TTL_MS = 24 * 60 * 60 * 1000L;
 
-    /** Hawk 里存的精简缓存（只留 sourceKey/id/name，避免序列化整个 Movie.Video）。 */
+    /**
+     * Hawk 里存的精简缓存（只留 sourceKey/id/name，避免序列化整个 Movie.Video）。
+     *
+     * <p>★ v99-r59：字段改成<b>非 final</b>。原来三个字段全是 {@code final} 且没有无参构造器，
+     * Gson 只能靠 Unsafe 分配实例再反射写字段 —— 这条路在 ART 上对 final 实例字段并不保证成立，
+     * 一旦不成立就是「读回来永远是 null」而且没有任何报错。改非 final 后与仓库里其它
+     * Hawk 持久化类的写法一致，消掉这类静默失败。</p>
+     */
     public static class FallbackCacheBox {
-        public final List<String[]> entries;
-        public final long savedAt;
+        public List<String[]> entries;
 
-        public FallbackCacheBox(List<String[]> entries, long savedAt) {
+        /**
+         * ★ v99-r59：本部片已经问过哪些源（{@code sourceKey} 集合，含问失败的）。
+         *
+         * <p><b>为什么必须持久化</b>：r58 的「跑完不重跑」判据挂在实例字段上，
+         * 而每次进详情页都是<b>新的 Activity 实例</b>（真机日志：4 部片 4 次 create/destroy），
+         * 实例标志恒为 false ⇒ 那条判据从上线起一次都没生效过。</p>
+         *
+         * <p><b>为什么不能改用「候选数是否达到上限 40」判</b>：池子小恰恰说明源站确实没资源，
+         * 那种片每次都重跑 101 个源是纯浪费；而池子满 40 是<b>上限截断</b>、不等于问完了。
+         * 两个方向上都会判错，所以只能记「问过谁」。</p>
+         *
+         * <p><b>为什么存集合不存游标下标</b>：{@code sourceOrder} 按站点质量动态排序，
+         * 两次进来顺序会漂，存下标会漏掉「上次排在后面、这次排在前面」的源。</p>
+         */
+        public List<String> askedKeys;
+
+        public long savedAt;
+
+        public FallbackCacheBox(List<String[]> entries, List<String> askedKeys, long savedAt) {
             this.entries = entries;
+            this.askedKeys = askedKeys;
             this.savedAt = savedAt;
         }
     }
@@ -54,15 +84,28 @@ public final class FallbackCacheStore {
     }
 
     /**
-     * 写入一部片子的候选池，并把它的 key 顶到索引末尾（超出 {@link #MAX_ENTRIES} 淘汰最旧的）。
+     * 写入一部片子的候选池 + 已问源集合，并把它的 key 顶到索引末尾
+     * （超出 {@link #MAX_ENTRIES} 淘汰最旧的）。
+     *
+     * <p>★ v99-r59：{@code slim} 可以为空、{@code askedKeys} 不可以同时为空。
+     * 「全部问完却零候选」的片（源站确实没资源）也必须落一条记录，
+     * 否则下次进页读不回已问集合，又会从头跑一遍 101 个源。</p>
      */
-    public static void put(String title, List<String[]> slim) {
+    public static void put(String title, List<String[]> slim, List<String> askedKeys) {
         String poolKey = poolKeyOf(title);
-        if (TextUtils.isEmpty(poolKey) || slim == null || slim.isEmpty()) {
+        if (TextUtils.isEmpty(poolKey)) {
+            return;
+        }
+        boolean hasEntries = slim != null && !slim.isEmpty();
+        boolean hasAsked = askedKeys != null && !askedKeys.isEmpty();
+        if (!hasEntries && !hasAsked) {
             return;
         }
         try {
-            Hawk.put(PREFIX + poolKey, new FallbackCacheBox(slim, System.currentTimeMillis()));
+            Hawk.put(PREFIX + poolKey, new FallbackCacheBox(
+                    hasEntries ? slim : new ArrayList<String[]>(),
+                    hasAsked ? askedKeys : new ArrayList<String>(),
+                    System.currentTimeMillis()));
             touchIndex(poolKey);
         } catch (Throwable th) {
             LOG.e("FallbackCacheStore.put fail: " + th);
