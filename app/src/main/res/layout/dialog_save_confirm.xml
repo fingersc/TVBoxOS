@@ -38,51 +38,52 @@
                 android:textSize="@dimen/ts_22" />
         </ScrollView>
 
+        <!-- ★ v99-r63：三键等分（原写法是 wrap_content + gravity="end"，
+             只有中间那个按钮带 marginStart，导致三条硬伤：
+             ① 宽度随字数变（保存 135 / 不保存 165 / 取消 135px）
+             ② 缝不等（1→2 是 27px，2→3 只有 5px，五倍差）
+             ③ 整组被推到最右，左侧空 85px、右侧只空 55px
+             本页其余各行都是「按 weight 严格等分分槽」，弹窗也照此办理。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="@dimen/vs_10"
-            android:gravity="end"
             android:orientation="horizontal">
 
             <TextView
                 android:id="@+id/btnSaveOk"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="@dimen/vs_56"
+                android:layout_weight="1"
                 android:background="@drawable/button_danmu_setting"
                 android:focusable="true"
-                android:paddingLeft="@dimen/vs_28"
-                android:paddingTop="@dimen/vs_10"
-                android:paddingRight="@dimen/vs_28"
-                android:paddingBottom="@dimen/vs_10"
+                android:gravity="center"
                 android:text="保存"
                 android:textColor="@color/dialog_text_primary"
                 android:textSize="@dimen/ts_22" />
             <TextView
                 android:id="@+id/btnSaveDiscard"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="@dimen/vs_56"
                 android:layout_marginStart="@dimen/vs_16"
                 android:layout_marginLeft="@dimen/vs_16"
+                android:layout_weight="1"
                 android:background="@drawable/button_danmu_setting"
                 android:focusable="true"
-                android:paddingLeft="@dimen/vs_28"
-                android:paddingTop="@dimen/vs_10"
-                android:paddingRight="@dimen/vs_28"
-                android:paddingBottom="@dimen/vs_10"
+                android:gravity="center"
                 android:text="不保存"
                 android:textColor="@color/dialog_text_primary"
                 android:textSize="@dimen/ts_22" />
             <TextView
                 android:id="@+id/btnSaveCancel"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_width="@dimen/vs_0"
+                android:layout_height="@dimen/vs_56"
+                android:layout_marginStart="@dimen/vs_16"
+                android:layout_marginLeft="@dimen/vs_16"
+                android:layout_weight="1"
                 android:background="@drawable/button_danmu_setting"
                 android:focusable="true"
-                android:paddingLeft="@dimen/vs_28"
-                android:paddingTop="@dimen/vs_10"
-                android:paddingRight="@dimen/vs_28"
-                android:paddingBottom="@dimen/vs_10"
+                android:gravity="center"
                 android:text="取消"
                 android:textColor="@color/dialog_text_primary"
                 android:textSize="@dimen/ts_22" />
