@@ -5037,7 +5037,7 @@ public class DetailActivity extends BaseActivity {
         if (TextUtils.isEmpty(director)) {
             return "";
         }
-        for (String part : director.split("[/,，、|;；\s]+")) {
+        for (String part : director.split("[/,，、|;；\\s]+")) {
             String t = part.trim();
             if (!t.isEmpty()) {
                 return t.length() > 8 ? t.substring(0, 8) : t;
