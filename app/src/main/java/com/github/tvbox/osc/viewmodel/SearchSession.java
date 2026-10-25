@@ -9,6 +9,7 @@ import com.github.catvod.crawler.JsLoader;
 import com.github.tvbox.osc.bean.AbsXml;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
+import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.ShowTitleKey;
 
 import java.util.ArrayList;
@@ -516,6 +517,10 @@ public class SearchSession {
             }
             startupGuardActive = true;
         }
+        // ★ v99-r61：这个窗口从 v42 起就是静默的，导致真机日志里分不清
+        //   「没触发」和「触发了但没留痕」（r60-A 因此无法验证）。
+        //   开/关各一条，配合 DetailActivity 的 guardBlocked 才能看出它到底在工作没有。
+        LOG.sw("[FB] guardBegin reason=" + (reason == null ? "?" : reason));
         guardHandler.removeCallbacks(startupGuardExpire);
         guardHandler.postDelayed(startupGuardExpire, STARTUP_GUARD_MAX_MS);
         pauseDispatch();
@@ -546,6 +551,9 @@ public class SearchSession {
                 return;
             }
         }
+        // ★ v99-r61：见 beginStartupGuard 的说明 —— 关窗也要留痕，
+        //   否则「窗口开了多久」仍然只能靠猜。
+        LOG.sw("[FB] guardEnd reason=" + (reason == null ? "?" : reason));
         guardHandler.removeCallbacks(startupGuardExpire);
         resumeDispatch();
     }

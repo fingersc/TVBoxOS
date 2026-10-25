@@ -3026,6 +3026,11 @@ public class DetailActivity extends BaseActivity {
         //   300ms 的短重试（复用忙时补位的那套，自带「同时只挂一个」节流，
         //   且 run() 里会把标志复位 ⇒ 窗口没关就自动续挂，不会挂死）。</p>
         if (SearchSession.getShared().isStartupGuardActive()) {
+            // ★ v99-r61：被挡下也要留痕（v42 起这条路径全程静默，r60-A 因此无法验证）。
+            //   300ms 重查天然把频率压在 ~3 条/秒，不会刷屏。
+            LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
+                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                    + " cap=" + detailFallbackPoolConcurrency);
             scheduleBusyRefill();
             return;
         }
@@ -3040,7 +3045,22 @@ public class DetailActivity extends BaseActivity {
         //   <p><b>为什么必须把已搜源折进 askedKeys</b>：压制期间我们自己不发请求，
         //   askedKeys 就不会长。而 r59 的跨实例跳过判据正是 askedKeys 的覆盖度 ——
         //   不折的话重进同一部片会判定「没问过」而从头问 101 个，r59 白做。</p>
-        if (!detailFallbackSearching && sessionCoversThisTitle()) {
+        // ★ v99-r61（丙-单腿，第二层）：切源轮次也压制，但带一道安全阀 ——
+        //   只有「池子里已经有可用的候选」时才压。
+        //
+        //   <p><b>为什么不再区分切源档</b>：r60 真机显示切源档那一发 20 并发的 burst
+        //   有 15/20 跟会话腿重复（asked=80 = 会话75 ∪ 我们20），而且<b>任何一次切源</b>
+        //   都会触发它（切源轮次 searching=true 不压制）。幸福伽菜子那一发恰好没东西可派
+        //   只是因为用户切得晚，属于侥幸、不是保证。</p>
+        //
+        //   <p><b>为什么必须留安全阀</b>：{@link #loadNextDetailFallbackSource} 在
+        //   {@code searching=true} 且池空时，只会调一次 {@code scheduleDetailFallbackSearch()}
+        //   然后 return —— 压制住它就<b>没有任何回调会再把它拉起来</b>（300ms 重查只调
+        //   派发、不调取源），切源要干等 8s 前台窗口超时。池非空时取源能直接走 pick，
+        //   不存在这个死等，所以那种情况下压掉是纯赚。</p>
+        final boolean suppressible = sessionCoversThisTitle()
+                && (!detailFallbackSearching || detailFallbackCacheEntryUsable());
+        if (suppressible) {
             Set<String> sessionSearched =
                     SearchSession.getShared().searchedKeysFor(detailFallbackAnchorTitle);
             if (!sessionSearched.isEmpty()) {
@@ -3118,6 +3138,18 @@ public class DetailActivity extends BaseActivity {
                 }
             });
             dispatched.add(searchKey);
+        }
+        // ★ v99-r61：切源档因会话跳过的键也要折进已问集合。
+        //   压制分支本来就折，但派发循环这条路径以前不折 ⇒ 用户切源后立刻退出
+        //   （来不及再触发一次压制）时，这批键不会落盘，下次进片又会重问一遍。
+        //   必须折在 while <b>之后</b>：提前折会让 askedKeys 先命中、skipS 日志
+        //   再也区分不出「因会话跳过」，两种跳过原因就混在一起了。
+        if (skippedSession) {
+            int before = detailFallbackPoolAskedKeys.size();
+            detailFallbackPoolAskedKeys.addAll(sessionSearched);
+            if (detailFallbackPoolAskedKeys.size() != before) {
+                detailFallbackAskedDirty = true;
+            }
         }
         if (!dispatched.isEmpty()) {
             // ★ v99-r58：日志改走 LOG.sw（LOG.i 的 tag 会被真机 logcat 过滤掉），
@@ -3876,6 +3908,53 @@ public class DetailActivity extends BaseActivity {
 
     // ==================== 方案D：缓存持久化 ====================
 
+    /**
+     * 当前可搜源的 key 集合；取不到（null / 空 / 抛异常）时返回 {@code null}，
+     * 调用方必须按「不剪」处理 —— 见 {@link #pruneDeadAskedKeys}。
+     */
+    private Set<String> currentSearchableSourceKeys() {
+        try {
+            List<SourceBean> sourceBeanList = ApiConfig.get().getSourceBeanList();
+            if (sourceBeanList == null || sourceBeanList.isEmpty()) {
+                return null;
+            }
+            Set<String> keys = new HashSet<String>();
+            for (SourceBean bean : sourceBeanList) {
+                if (bean != null && bean.isSearchable() && bean.getKey() != null) {
+                    keys.add(bean.getKey());
+                }
+            }
+            return keys.isEmpty() ? null : keys;
+        } catch (Throwable th) {
+            return null;
+        }
+    }
+
+    /**
+     * ★ v99-r61：把已问集合里「当前源集合中已不存在」的死键剪掉。
+     *
+     * <p>换配置地址后旧源的 key 会一直留在集合里（真机 {@code asked=132/100}
+     * 就是 32 个死键 + 100 个活键）。死键不参与 {@link #isAllSearchableAsked}
+     * 判定（它只看当前 order），剪掉安全；源回来了算新源重问，也正确。</p>
+     *
+     * <p>★ 取不到源列表时<b>绝不剪</b>：那会把整本账清空，表现为
+     * 「这部片突然又要从头问 101 个源」—— 比数字难看严重得多。</p>
+     */
+    private void pruneDeadAskedKeys() {
+        if (detailFallbackPoolAskedKeys.isEmpty()) {
+            return;
+        }
+        Set<String> live = currentSearchableSourceKeys();
+        if (live == null) {
+            return;
+        }
+        int before = detailFallbackPoolAskedKeys.size();
+        detailFallbackPoolAskedKeys.retainAll(live);
+        if (detailFallbackPoolAskedKeys.size() != before) {
+            detailFallbackAskedDirty = true;
+        }
+    }
+
     /** 把候选池落盘到 Hawk，供下次进同一部片直接复用。 */
     private void persistDetailFallbackCache(String title) {
         title = title == null ? "" : title.trim();
@@ -3890,6 +3969,12 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackCacheDirty && !detailFallbackAskedDirty) {
             return;
         }
+        // ★ v99-r61：落盘前按当前可搜源集合剪掉死键。
+        //   换配置地址后，旧源的 key 会永远留在集合里（真机实测 asked=132/100
+        //   = 32 个死键 + 100 个活键），数字难读而且只涨不跌。
+        //   死键从来不参与 isAllSearchableAsked 判定（它只看当前 order），剪掉是安全的；
+        //   源哪天回来了算新源重问，同样正确。
+        pruneDeadAskedKeys();
         // ★ v99-r59：已问集合只在与它<b>所属的那部片</b>一致时才一起写。
         //   换片时 initData 会先把 detailFallbackAnchorTitle 翻到新片、再走
         //   loadDetail → resetDetailFallback，此时锚标题已是新片而集合还是上部片的账；

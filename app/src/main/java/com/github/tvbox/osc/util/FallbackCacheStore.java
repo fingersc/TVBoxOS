@@ -102,10 +102,20 @@ public final class FallbackCacheStore {
             return;
         }
         try {
-            Hawk.put(PREFIX + poolKey, new FallbackCacheBox(
+            // ★ v99-r61：Hawk.put 返回 false 表示没写进去（SharedPreferences commit 失败 /
+            //   磁盘满等），而 r59 的「跑完不重跑」完全建立在「问过的标记真的落盘了」之上。
+            //   不检查返回值的话，写失败的表现是「下次进片照样重跑 101 个源」——
+            //   一个没有任何报错的静默故障，只能靠猜。这里把它变成可见。
+            boolean written = Hawk.put(PREFIX + poolKey, new FallbackCacheBox(
                     hasEntries ? slim : new ArrayList<String[]>(),
                     hasAsked ? askedKeys : new ArrayList<String>(),
                     System.currentTimeMillis()));
+            if (!written) {
+                LOG.e("FallbackCacheStore.put reject: " + poolKey
+                        + " entries=" + (hasEntries ? slim.size() : 0)
+                        + " asked=" + (hasAsked ? askedKeys.size() : 0));
+                return;
+            }
             touchIndex(poolKey);
         } catch (Throwable th) {
             LOG.e("FallbackCacheStore.put fail: " + th);
