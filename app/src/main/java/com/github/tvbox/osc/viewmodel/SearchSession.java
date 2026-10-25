@@ -14,6 +14,7 @@ import com.github.tvbox.osc.util.ShowTitleKey;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -342,6 +343,9 @@ public class SearchSession {
             clearStartupGuardLocked();
             searchTitle = title == null ? "" : title;
             currentSearchToken = String.valueOf(searchTokenSeq.incrementAndGet());
+            // ★ v99-r60：本轮开始 ⇒ 上报「有一轮覆盖该 title 的搜索正在跑」。
+            //   FastSearchActivity 那条路不走本方法，由它自己调 setLiveSearchTitle。
+            setLiveSearchTitle(searchTitle, true);
         }
 
         ArrayList<SearchTask> tasks = new ArrayList<>();
@@ -492,6 +496,9 @@ public class SearchSession {
             dispatchingPaused = false;
             clearStartupGuardLocked();
             currentSearchToken = "";
+            // ★ v99-r60：轮次作废 ⇒ 摘掉存活标志。否则详情页会一直以为
+            //   「搜索页还在帮我搜」而把填充腿压着，最终一个源都不问。
+            setLiveSearchTitle(searchTitle, false);
         }
     }
 
@@ -906,8 +913,99 @@ public class SearchSession {
 
     private void releaseSlotAndAdvance(String sourceKey, String searchToken) {
         if (releaseSlot(sourceKey, searchToken)) {
+            // ★ v99-r60：SearchSession 自己这套派发器（FAST_SEARCH_MODE=false 的
+            //   SearchActivity 路径）也往注册表里记一笔。FastSearchActivity 那条路
+            //   由它自己在 releaseSearchSlot 里调 noteSearched 上报。
+            noteSearched(searchTitle, sourceKey);
             startNextTask(searchToken);
         }
+    }
+
+    // ==================== ★ v99-r60：已搜源注册表 ====================
+
+    /**
+     * 「这部片的哪些源已经被搜索页搜过了」—— 按 title 记。
+     *
+     * <p><b>为什么需要它</b>：r58 把详情页内部的两条腿合并成了一条，但<b>搜索页那条腿
+     * 没合并</b>。默认配置（{@code FAST_SEARCH_MODE=true}）下搜索页是
+     * {@code FastSearchActivity}，它自持一整套派发器、与 SearchSession 原本毫无关系，
+     * 只是每收一批结果就调 {@link #mergeVideos} 把候选写进本类的候选池。
+     * 于是从搜索页点进详情页时，两条腿搜的是同一批源 —— 真机实测 210 次请求，
+     * 而 101 次就够（2.08 倍）。</p>
+     *
+     * <p><b>为什么挂在候选池旁边</b>：{@link #mergeVideos} 已经是两条搜索路径
+     * 共享的写入通道（注释里写明「池外写入，可安全在任意线程调用」）。
+     * 「搜到了什么」和「搜过谁」本来就是同一件事的两面，放同一个类里
+     * 就不会出现两套寿命/两套口径。候选池有 40 部上限，这里同样限量。</p>
+     *
+     * <p><b>只记 title 不记 token</b>：token 是「这一轮」的编号，而我们要跨轮次复用
+     * —— 用户搜「数到三」→ 进详情 → 返回 → 再搜「数到三」，第二轮的已搜集合
+     * 照样能省掉重复请求。</p>
+     */
+    private final Map<String, Set<String>> searchedKeysByTitle = new LinkedHashMap<String, Set<String>>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Set<String>> eldest) {
+            return size() > SEARCHED_TITLES_MAX;
+        }
+    };
+
+    /** 已搜源注册表最多记几部片（与候选池的 {@link #CANDIDATE_POOL_MAX_TITLES} 同量级）。 */
+    public static final int SEARCHED_TITLES_MAX = 8;
+
+    /**
+     * 当前是否「有一轮覆盖本部片的搜索正在跑」。
+     *
+     * <p>由搜索页在轮次开始/结束时上报。详情页据此决定要不要把填充腿压掉
+     * （让搜索页当唯一填充腿）。</p>
+     */
+    private volatile String liveSearchTitle = "";
+
+    /** 记一笔「某个源已经被搜过了」。任意线程可调；title 为空则忽略。 */
+    public void noteSearched(String title, String sourceKey) {
+        if (TextUtils.isEmpty(title) || TextUtils.isEmpty(sourceKey)) {
+            return;
+        }
+        synchronized (lock) {
+            Set<String> set = searchedKeysByTitle.get(title);
+            if (set == null) {
+                set = new HashSet<String>();
+                searchedKeysByTitle.put(title, set);
+            }
+            set.add(sourceKey);
+        }
+    }
+
+    /**
+     * 取某部片「搜索页已经搜过」的源集合（只读副本，调用方不得修改）。
+     *
+     * <p>返回空集表示「搜索页没为这部片搜过任何源」—— 调用方必须把空集当作
+     * 「没有依据」，不能当作「全都搜过了」。</p>
+     */
+    public Set<String> searchedKeysFor(String title) {
+        if (TextUtils.isEmpty(title)) {
+            return new HashSet<String>();
+        }
+        synchronized (lock) {
+            Set<String> set = searchedKeysByTitle.get(title);
+            return set == null ? new HashSet<String>() : new HashSet<String>(set);
+        }
+    }
+
+    /** 上报「有一轮覆盖该 title 的搜索正在跑 / 已经结束」。 */
+    public void setLiveSearchTitle(String title, boolean alive) {
+        if (!alive) {
+            // 只在自己还挂着的时候才摘，避免后结束的那轮把前一轮的标志误摘
+            if (TextUtils.equals(liveSearchTitle, title)) {
+                liveSearchTitle = "";
+            }
+            return;
+        }
+        liveSearchTitle = title == null ? "" : title;
+    }
+
+    /** 是否有一轮覆盖该 title 的搜索正在跑。 */
+    public boolean hasLiveSearch(String title) {
+        return !TextUtils.isEmpty(liveSearchTitle) && TextUtils.equals(liveSearchTitle, title);
     }
 
     // ==================== 内部：状态判定 ====================

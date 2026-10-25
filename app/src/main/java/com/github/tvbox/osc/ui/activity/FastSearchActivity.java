@@ -562,6 +562,14 @@ public class FastSearchActivity extends BaseActivity {
 
     private void search(String title) {
         cancel();
+        // ★ v99-r60：发起新搜索 ⇒ 上一轮到此为止，先摘掉存活标志。
+        //
+        //   <p>此时 {@code searchTitle} 还是<b>上一轮</b>的标题（新的在下面几行才赋值），
+        //   正好是要摘的那个。不摘的后果：上一轮的标题一直挂在注册表上，
+        //   详情页据此把填充腿压着，而那一轮其实已经被上面的 cancel() 掐死了
+        //   ⇒ 那部片一个源都不问。searchResult() 只在「确有任务」时才置新标志，
+        //   覆盖不到「新一轮一个源都没有」这种退场路径。</p>
+        sharedSession().setLiveSearchTitle(searchTitle, false);
         showLoading();
         this.searchTitle = title;
         fenci();
@@ -708,6 +716,11 @@ public class FastSearchActivity extends BaseActivity {
             setSearchStatusText("\u65e0\u641c\u7d22\u6e90", "\u7ed3\u679c 0");
             return;
         }
+        // ★ v99-r60：上报「有一轮覆盖这个 title 的搜索正在跑」。
+        //   详情页据此把攒池那条腿压掉，让本页当唯一填充腿 —— 否则从搜索页点进
+        //   详情页时两条腿搜同一批源（真机实测 210 次请求，101 次就够）。
+        //   放在「确认有任务」之后：空轮次不该让详情页以为有人在帮它搜。
+        sharedSession().setLiveSearchTitle(searchTitle, true);
         for (SearchTask task : searchTasks) {
             pendingSearchKeys.add(task.sourceKey);
         }
@@ -1164,7 +1177,12 @@ public class FastSearchActivity extends BaseActivity {
 
     private boolean releaseSearchSlot(String sourceKey, String searchToken) {
         if (!isCurrentSearchToken(searchToken) || TextUtils.isEmpty(sourceKey)) return false;
-        return releasedSearchKeys.add(sourceKey);
+        if (!releasedSearchKeys.add(sourceKey)) return false;
+        // ★ v99-r60：这个源搜完了（成功/超时都算）⇒ 上报给详情页的攒池腿。
+        //   放在 add 成功之后：releaseSearchSlot 会被重复调（超时 + 回包），
+        //   只在第一次放行时记，集合本身也会去重，但少走一次同步更便宜。
+        sharedSession().noteSearched(searchTitle, sourceKey);
+        return true;
     }
 
     private void releaseSearchSlotAndStartNext(String sourceKey, String searchToken) {
@@ -1203,6 +1221,11 @@ public class FastSearchActivity extends BaseActivity {
         if (searchAdapter.getData().size() == 0 && resultVods.isEmpty()) {
             showEmpty();
         }
+        // ★ v99-r60：这一轮全部源都搜完了 ⇒ 摘掉存活标志。
+        //   这是「轮次自然结束」的唯一收尾点，四处置换它都盖住。
+        //   不摘的后果：详情页会一直以为搜索页还在帮它搜，把填充腿压着不动，
+        //   而已搜集合又没有新的进来 ⇒ 这部片的池子永远补不完。
+        sharedSession().setLiveSearchTitle(searchTitle, false);
         cancel();
         if (searchTimeoutExecutor != null) {
             searchTimeoutExecutor.shutdownNow();
@@ -1320,6 +1343,10 @@ public class FastSearchActivity extends BaseActivity {
         //   finishRound），就保留线程池，让在途请求把候选池补完。
         //   isFinishing() 为真 = 用户主动离开（返回/跳走），此时才释放资源。
         if (isFinishing()) {
+            // ★ v99-r60：用户主动离开搜索页 ⇒ 这一轮不会再前进了，摘掉存活标志。
+            //   不摘的后果：详情页一直以为「搜索页还在帮我搜」而把填充腿压着，
+            //   最终这部片一个源都不问。
+            sharedSession().setLiveSearchTitle(searchTitle, false);
             try {
                 if (searchExecutorService != null) {
                     searchExecutorService.shutdownNow();

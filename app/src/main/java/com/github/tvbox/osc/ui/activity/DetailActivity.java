@@ -3010,6 +3010,57 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackPoolFilling) {
             return;
         }
+        // ★ v99-r60：起播保护窗内不派发新搜索。
+        //
+        //   <p>v42 起 FastSearchActivity.startNextSearchBatch() 开头就查
+        //   isStartupGuardActive() 并 return —— 起播前 5s（或首帧到达前）让路，
+        //   免得搜索把起播挤到队尾。但 r57/r58 新加的攒池这条腿<b>从来没查过</b>：
+        //   起播前那几秒搜索页在让路、我们的填充在全速派发，v42 的保护被绕过去了。</p>
+        //
+        //   <p>窗口结束时由 PlayFragment 的 onFirstFrame 回调补一次派发（见
+        //   ensurePlayFragment），所以这里直接返回是安全的 —— 不会把任务挂住。</p>
+        //
+        //   <p>但 onFirstFrame 只在「首帧真的到达」时来；若首帧迟迟不来，
+        //   保护窗也会在 {@code STARTUP_GUARD_MAX_MS}（5s）后自动过期。
+        //   后台档没有切源轮次，8s / 120s 那两个定时器都太慢，所以这里额外挂一个
+        //   300ms 的短重试（复用忙时补位的那套，自带「同时只挂一个」节流，
+        //   且 run() 里会把标志复位 ⇒ 窗口没关就自动续挂，不会挂死）。</p>
+        if (SearchSession.getShared().isStartupGuardActive()) {
+            scheduleBusyRefill();
+            return;
+        }
+        // ★ v99-r60（丙-单腿）：后台档下，若搜索页有一轮覆盖本部片的搜索正在跑 ⇒ 不派发，
+        //   让搜索页当唯一填充腿。
+        //
+        //   <p><b>为什么只压后台档、不压切源轮次</b>：切源时用户在等，
+        //   {@code DETAIL_FALLBACK_MAX_SEARCH}=20 的那一发 burst 就是切源 0.5~0.9s
+        //   回来的原因（真机实测）；压掉它切源会变慢。而后台档本来就是 5 并发、
+        //   比搜索页的 6 并发还低，压掉不掉速。</p>
+        //
+        //   <p><b>为什么必须把已搜源折进 askedKeys</b>：压制期间我们自己不发请求，
+        //   askedKeys 就不会长。而 r59 的跨实例跳过判据正是 askedKeys 的覆盖度 ——
+        //   不折的话重进同一部片会判定「没问过」而从头问 101 个，r59 白做。</p>
+        if (!detailFallbackSearching && sessionCoversThisTitle()) {
+            Set<String> sessionSearched =
+                    SearchSession.getShared().searchedKeysFor(detailFallbackAnchorTitle);
+            if (!sessionSearched.isEmpty()) {
+                int before = detailFallbackPoolAskedKeys.size();
+                detailFallbackPoolAskedKeys.addAll(sessionSearched);
+                if (detailFallbackPoolAskedKeys.size() != before) {
+                    detailFallbackAskedDirty = true;
+                }
+            }
+            LOG.sw("[FB] poolSuppress reason=liveSearch"
+                    + " task=t" + detailFallbackPoolTaskId
+                    + " asked=" + detailFallbackPoolAskedKeys.size()
+                    + "/" + detailFallbackSourceOrder.size()
+                    + " sessionSearched=" + sessionSearched.size()
+                    + " poolSize=" + detailFallbackUsableCandidateCount());
+            // 轮次随时可能结束（全部搜完 / 用户离开搜索页），挂个短重查。
+            // 不挂的话没人会再调进来，这条腿就永远不动了。
+            scheduleBusyRefill();
+            return;
+        }
         // 并发 = 当前档位；加载详情期间再降到忙时档（8），保护详情页请求。
         int cap = detailFallbackPoolConcurrency;
         if (detailFallbackLoadingCandidate && cap > DETAIL_FALLBACK_MAX_SEARCH_BUSY) {
@@ -3023,8 +3074,15 @@ public class DetailActivity extends BaseActivity {
         }
         ensureDetailFallbackSearchExecutor();
 
+        // ★ v99-r60：搜索页已经搜过的源（快照，一次调用取一次）。
+        //   切源轮次不压制整条腿，但不能再把搜索页搜过的源重发一遍。
+        final Set<String> sessionSearched =
+                SearchSession.getShared().searchedKeysFor(detailFallbackAnchorTitle);
+        final boolean useSessionSkip = !sessionSearched.isEmpty();
+
         List<String> dispatched = new ArrayList<>();
         boolean skippedAny = false;
+        boolean skippedSession = false;
         while (detailFallbackPendingSources.size() < cap
                 && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
             final String searchKey = detailFallbackSourceOrder.get(detailFallbackNextSourceIndex++);
@@ -3033,6 +3091,15 @@ public class DetailActivity extends BaseActivity {
             //   这次只发剩下的 41 个，前 60 个一个请求都不重发。
             if (detailFallbackPoolAskedKeys.contains(searchKey)) {
                 skippedAny = true;
+                continue;
+            }
+            // ★ v99-r60：搜索页已经搜完的这个源也跳过 —— 两条腿搜同一批源
+            //   是本轮要消灭的东西（真机 210 次请求 vs 101 次就够）。
+            //   只认「已跑完」不认「在途」：在途那几个源随时可能被搜索页丢弃
+            //   （轮次取消 / Activity 销毁），我们自己问就不会漏。
+            if (useSessionSkip && sessionSearched.contains(searchKey)) {
+                skippedAny = true;
+                skippedSession = true;
                 continue;
             }
             detailFallbackPoolAskedKeys.add(searchKey);
@@ -3062,7 +3129,11 @@ public class DetailActivity extends BaseActivity {
                     + " cap=" + cap
                     + " front=" + (detailFallbackPoolFrontWindowClosed ? 0 : 1)
                     + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
-                    + " skip=" + (skippedAny ? 1 : 0));
+                    // ★ v99-r60：skip 保留 r59 的总口径（有没有跳过），另加 skipS
+                    //   专指「因搜索页已搜过而跳过」—— 两种跳过原因必须能分开，
+                    //   否则算不出丙到底省了多少请求。
+                    + " skip=" + (skippedAny ? 1 : 0)
+                    + " skipS=" + (skippedSession ? 1 : 0));
         } else if (skippedAny) {
             // ★ v99-r59：剩下的源<b>全都问过了</b>，一个请求都没发就扫完了队列表。
             //   必须当场收尾：此时既没有在途请求、也没有结果回调会再调进来，
@@ -3103,6 +3174,19 @@ public class DetailActivity extends BaseActivity {
         if (driveSwitch) {
             loadNextDetailFallbackSource();
         }
+    }
+
+    /**
+     * ★ v99-r60：搜索页是否有一轮覆盖<b>本部片</b>的搜索正在跑。
+     *
+     * <p>title 必须严格相等：注册表是跨轮次、跨影片累积的，若不比对片名，
+     * 上一部片的存活标志会让这一部片的填充腿被白压一整轮。</p>
+     */
+    private boolean sessionCoversThisTitle() {
+        if (TextUtils.isEmpty(detailFallbackAnchorTitle)) {
+            return false;
+        }
+        return SearchSession.getShared().hasLiveSearch(detailFallbackAnchorTitle);
     }
 
     /**
@@ -6520,6 +6604,11 @@ public class DetailActivity extends BaseActivity {
             @Override
             public void onFirstFrame() {
                 SearchSession.getShared().endStartupGuardOnFirstFrame();
+                // ★ v99-r60：起播保护窗一关就把攒池的派发补上。
+                //   scheduleDetailFallbackSearch() 在窗口期内是直接返回的，
+                //   若没有人在这里补一次，任务会一直停在「该派发却没派发」的状态，
+                //   直到下一次切源或结果回调才动。
+                scheduleDetailFallbackSearch();
             }
         });
     }
