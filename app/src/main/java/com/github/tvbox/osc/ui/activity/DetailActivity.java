@@ -1582,8 +1582,24 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void startDetailFallbackFromMenu() {
-        if (!startDetailFallback(true)) {
-            Toast.makeText(this, "暂无可切换的片源", Toast.LENGTH_SHORT).show();
+        detailFallbackDenyMsg = "";
+        // ★ v99-r65：手动标志必须在调用期间为真、调用结束立刻复位。
+        //   深层（无参 startDetailFallback）读它决定「要不要自己弹提示」；
+        //   若不复位，之后自动续切进入深层方法时会误以为还是手动，从而漏掉 showDetailEmpty()。
+        boolean started;
+        detailFallbackManualSwap = true;
+        try {
+            started = startDetailFallback(true);
+        } finally {
+            detailFallbackManualSwap = false;
+        }
+        if (!started && !isFinishing() && !isDestroyed()) {
+            // ★ v99-r65：文案由失败原因决定（原来三种原因共用一句「暂无可切换的片源」）。
+            //   只有这里弹 Toast —— 深层分支把手动路径弹窗交给菜单统一处理，避免叠两个。
+            String msg = TextUtils.isEmpty(detailFallbackDenyMsg)
+                    ? "没有可切换的片源" : detailFallbackDenyMsg;
+            LOG.sw("[FB] swapDeny msg=" + msg);
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -1636,9 +1652,33 @@ public class DetailActivity extends BaseActivity {
      * @return true 表示本次点击已被受理（正在切 / 已切），false 表示完全没得切
      */
     private boolean startDetailFallback(boolean manual) {
-        SourceBean currentSource = ApiConfig.get().getSource(sourceKey);
-        if (isFinishing() || currentSource == null || !currentSource.isChangeable()) {
+        detailFallbackManualSwap = manual;
+        detailFallbackDenyMsg = "";
+        if (isFinishing()) {
             return false;
+        }
+        SourceBean currentSource = ApiConfig.get().getSource(sourceKey);
+        if (currentSource == null) {
+            // 原来这个分支和「片名缺失」「没有可搜源」共用一句「暂无可切换的片源」，
+            // 且一个日志都不打 —— 真机上只能靠反推。
+            detailFallbackDenyMsg = "当前源已不在配置里，请刷新源列表";
+            LOG.sw("[FB] swapDeny reason=sourceGone key=" + sourceKey
+                    + " manual=" + (manual ? 1 : 0));
+            return false;
+        }
+        // ★★ v99-r65（用户选乙）：不再用 changeable=0 禁止「从该源切走」。
+        //
+        //   背景（真机 22:00 日志）：当前源「奶酪」在配置里是 changeable=0，点换源连点三次
+        //   全部被这里拦下、一个日志都没有，而当时池子里明明有 6 个可用候选、32 个源全问过；
+        //   换成「剧圈」当当前源后立刻就能切。用户看到的就是「明明有源却说没有」。
+        //
+        //   这个标志在房内**只有这一处使用**，从不参与「选目标」的过滤，却被拿来当起点闸门
+        //   ⇒ 等于把用户困在一个播放不顺的源上。改为只记录、不阻断：
+        //   作为「当前源」允许切走；是否要跳过一个 changeable=0 的站作为**目标**，
+        //   是另一个话题（现在也没做过滤），不在本次范围。
+        if (!currentSource.isChangeable()) {
+            LOG.sw("[FB] swapAllow reason=changeable0 key=" + sourceKey
+                    + "（v99-r65 起不再阻断，仅记录）");
         }
         if (detailFallbackActive) {
             showSwitchingSourceToast();
@@ -1656,10 +1696,14 @@ public class DetailActivity extends BaseActivity {
             vod_name = mVideo.name;
         }
         if (TextUtils.isEmpty(vod_name)) {
+            detailFallbackDenyMsg = "片名缺失，无法匹配其它片源";
+            LOG.sw("[FB] swapDeny reason=noVodName manual=" + (manual ? 1 : 0));
             return false;
         }
         detailFallbackTitle = vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
+            detailFallbackDenyMsg = "片名缺失，无法匹配其它片源";
+            LOG.sw("[FB] swapDeny reason=blankTitle manual=" + (manual ? 1 : 0));
             return false;
         }
 
@@ -2557,7 +2601,13 @@ public class DetailActivity extends BaseActivity {
         // 片名必须先解析出来——探路/恢复缓存都依赖它
         detailFallbackTitle = vod_name == null ? "" : vod_name.trim();
         if (TextUtils.isEmpty(detailFallbackTitle)) {
-            showDetailEmpty();
+            // ★ v99-r65：这条也是「静默 return」，手动路径要把原因交给菜单去弹。
+            detailFallbackDenyMsg = "片名缺失，无法匹配其它片源";
+            LOG.sw("[FB] swapDeny reason=blankTitleInner manual="
+                    + (detailFallbackManualSwap ? 1 : 0));
+            if (!detailFallbackManualSwap) {
+                showDetailEmpty();
+            }
             return;
         }
         // 方案D：二次进同一部片，先从 Hawk 恢复上次的候选池（可能一次网络都不发）
@@ -2570,10 +2620,17 @@ public class DetailActivity extends BaseActivity {
         if (!detailFallbackPoolFilling) {
             SourceQualityStore.Snapshot fbSnapshot = prepareDetailFallbackSourceOrder();
             if (detailFallbackSourceOrder.isEmpty()) {
-                if (!detailFallbackKeepCurrentDetail) {
-                    showDetailEmpty();
-                } else {
-                    Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
+                // ★ v99-r65：同样把原因交出去。手动路径由菜单统一弹一次，这里不弹，
+                //   否则「没有可切换的片源」会叠成两个 Toast。
+                detailFallbackDenyMsg = "没有可切换的片源";
+                LOG.sw("[FB] swapDeny reason=noSearchableSource manual="
+                        + (detailFallbackManualSwap ? 1 : 0));
+                if (!detailFallbackManualSwap) {
+                    if (!detailFallbackKeepCurrentDetail) {
+                        showDetailEmpty();
+                    } else {
+                        Toast.makeText(this, "没有更多可切换的片源", Toast.LENGTH_SHORT).show();
+                    }
                 }
                 return;
             }
@@ -4812,6 +4869,22 @@ public class DetailActivity extends BaseActivity {
     /** ★ v99-r57：忙时补位重试是否已挂起（一次只挂一个）。 */
     private boolean detailFallbackBusyRefillScheduled;
     private boolean detailFallbackKeepCurrentDetail;
+    /**
+     * ★ v99-r65：本次切源是否由用户手动点「换源」触发。
+     *
+     * <p>决定两件事：① 失败时要不要弹提示（自动续切不能弹）；
+     * ② 深层方法（无参 {@code startDetailFallback()}）里的「没有可搜源」分支
+     * 要不要自己弹 —— 手动路径由菜单统一弹一次，避免双 Toast 叠在一起。</p>
+     */
+    private boolean detailFallbackManualSwap = false;
+    /**
+     * ★ v99-r65：本次切源失败的具体原因（给菜单用）。空串 = 用兜底文案。
+     *
+     * <p>此前三种完全不同的失败原因（当前源查不到 / 片名缺失 / 没有可搜源）共用一句
+     * 「暂无可切换的片源」，用户无法判断是"真的没有"还是"被拦住了"；
+     * 而这条路径<b>一行日志都没有</b>，出问题只能靠反推（真机奶酪源那次就是）。</p>
+     */
+    private String detailFallbackDenyMsg = "";
     private boolean detailFallbackLoadingCandidate;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
