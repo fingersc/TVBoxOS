@@ -72,10 +72,23 @@ public final class FallbackCacheStore {
 
         public long savedAt;
 
-        public FallbackCacheBox(List<String[]> entries, List<String> askedKeys, long savedAt) {
+        /**
+         * ★ v99-r66：落盘时「择优折叠」所依据的基准资源年份（0 = 未折叠 / 基准无年份）。
+         *
+         * <p>折叠的前提是「用当时那份 ref 判对了哪条是同片」。若下次进片时 ref 换了
+         * （最坏情况：上次是从<b>错片源</b>进来的，整池被收敛到了错片），这份折叠结果就是错的，
+         * 而候选已经只留了一条、无法回退 ⇒ 只能把整条记录判为失效、重新攒池。
+         * 记一个 year 就是为了让这个判断成立：同一部片的 year 稳定，错片往往年份不同
+         * （真机《人世间》：正片 2022 / 错片 2024），比 pic 可靠得多（各站海报 URL 常不同）。</p>
+         */
+        public int refYear;
+
+        public FallbackCacheBox(List<String[]> entries, List<String> askedKeys, long savedAt,
+                                int refYear) {
             this.entries = entries;
             this.askedKeys = askedKeys;
             this.savedAt = savedAt;
+            this.refYear = refYear;
         }
     }
 
@@ -90,8 +103,12 @@ public final class FallbackCacheStore {
      * <p>★ v99-r59：{@code slim} 可以为空、{@code askedKeys} 不可以同时为空。
      * 「全部问完却零候选」的片（源站确实没资源）也必须落一条记录，
      * 否则下次进页读不回已问集合，又会从头跑一遍 101 个源。</p>
+     *
+     * <p>★ v99-r66：{@code refYear} 是「择优折叠」所依据的基准年份（0 = 未折叠）。
+     * 调用方传 0 就表示这批 entries 不保证已折叠。</p>
      */
-    public static void put(String title, List<String[]> slim, List<String> askedKeys) {
+    public static void put(String title, List<String[]> slim, List<String> askedKeys,
+                           int refYear) {
         String poolKey = poolKeyOf(title);
         if (TextUtils.isEmpty(poolKey)) {
             return;
@@ -109,7 +126,8 @@ public final class FallbackCacheStore {
             boolean written = Hawk.put(PREFIX + poolKey, new FallbackCacheBox(
                     hasEntries ? slim : new ArrayList<String[]>(),
                     hasAsked ? askedKeys : new ArrayList<String>(),
-                    System.currentTimeMillis()));
+                    System.currentTimeMillis(),
+                    refYear));
             if (!written) {
                 LOG.e("FallbackCacheStore.put reject: " + poolKey
                         + " entries=" + (hasEntries ? slim.size() : 0)

@@ -1207,16 +1207,29 @@ public class DetailActivity extends BaseActivity {
                             if (shouldRejectByEpisodes(nowEpisodes, sameStation)) {
                                 LOG.sw("[FB] episodeMismatch source=" + sourceKey + " id=" + vodId
                                         + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
-                                        + " candidates=" + sameStation + " => dead + next");
+                                        + " candidates=" + sameStation
+                                        + " " + describeSeriesShape(vodInfo)
+                                        + " => dead + next");
                                 detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
                                 detailFallbackLoadingCandidate = false;
                                 llLayout.removeCallbacks(detailFallbackDetailTimeout);
+                                // ★ v99-r66：这条连跳此前<b>不占预算</b>（直接 loadNext 就返回），
+                                //   真机实测 1.7 秒内连跳 3 个站、一次点击总共触发 7 次切源。
+                                //   现在与 detailTimeout 走同一个预算：超限即提示并收尾。
+                                if (!consumeFailoverBudget("episodeMismatch")) {
+                                    return;
+                                }
                                 loadNextDetailFallbackSource();
                                 return;
                             }
+                            // ★ v99-r66：集数不等于基准却放行的（loose=1），此前混在 pass 里看不出来 ——
+                            //   而那正是「切到了集数不符的片」的唯一记录。
                             LOG.sw("[FB] episodeCheck source=" + sourceKey + " id=" + vodId
                                     + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
-                                    + " candidates=" + sameStation + " => pass");
+                                    + " candidates=" + sameStation
+                                    + (nowEpisodes == detailFallbackRefEpisodes ? "" : " loose=1")
+                                    + " " + describeSeriesShape(vodInfo)
+                                    + " => pass");
                         }
                         mGridViewFlag.setVisibility(View.VISIBLE);
                         mGridView.setVisibility(View.VISIBLE);
@@ -1732,6 +1745,9 @@ public class DetailActivity extends BaseActivity {
         if (!TextUtils.equals(detailFallbackCycleTitle, normalizedTitle)) {
             detailFallbackCycleTitle = normalizedTitle;
             if (reallySwitchFilm) {
+            // ★ v99-r66：这条分支会清空圈/死站/软失败/基准 —— 是「切源行为突然从第 0 名重来」的
+            //   唯一解释，但此前一个日志都没有（r65 日志里 idx 突然回 0 查不出原因）。
+            LOG.sw("[FB] filmSwitch title=" + detailFallbackCycleTitle + "（清空 cycle/dead/soft/ref）");
             detailFallbackCycleKeys.clear();
             detailFallbackNewCycle = true;
             // ★ 换片必须清 DeadKeys / SoftTriedKeys：
@@ -1953,7 +1969,9 @@ public class DetailActivity extends BaseActivity {
         //   这就是「循环一圈之后，下一圈应该从得分最高的站开始」的落点。
         detailFallbackCycleFrozenOrder.clear();
         detailFallbackCycleCount++;
-        LOG.i("[FB] newCycle #" + detailFallbackCycleCount
+        // ★ v99-r66：这条原本是 LOG.i（tag 不是 TVBox-switch）⇒ 被真机 logcat 过滤掉，
+        //   于是「有没有开新圈」永远查不到（r65 日志里 newCycle 计数为 0，无从判断）。
+        LOG.sw("[FB] newCycle #" + detailFallbackCycleCount
                 + " pool=" + orderedSources.size());
         List<String> newOrder = currentCycleOrder(cachedCandidates);
         picked = scanOrderedSources(newOrder, false);
@@ -1993,10 +2011,15 @@ public class DetailActivity extends BaseActivity {
         //   现在把原因收集起来，随 pollPick 一起打出来（全部跳过时也打）。
         //
         //   四类原因（与下面四个 continue 一一对应）：
-        //     soft  = 本圈已试过的站点（软失败）
-        //     cur   = 当前正在播放的源（allowCurrent=false 时跳过）
-        //     novid = 该站取不到可用的候选 videoId（全是 MV/预告/被拉黑）
+        //     cycled = 本圈已轮转过（cycleKeys）
+        //     soft   = 本圈已试过但被判软失败（softTriedKeys）
+        //     cur    = 当前正在播放的源（allowCurrent=false 时跳过）
+        //     novid  = 该站取不到可用的候选 videoId（全是 MV/预告/被拉黑）
+        //
+        // ★ v99-r66：补上 cycled —— r15 漏了这条，而它恰恰是「跳过源」最常见的原因
+        //   （入口源在开圈时就进了 cycleKeys），导致 pollPick 行里看不到任何 skip 字段。
         final int SKIP_LOG_MAX = 6;
+        List<String> skipCycled = new ArrayList<>();
         List<String> skipSoft = new ArrayList<>();
         List<String> skipCur = new ArrayList<>();
         List<String> skipNovid = new ArrayList<>();
@@ -2005,6 +2028,9 @@ public class DetailActivity extends BaseActivity {
             String cycleKey = orderedSources.get(index);
             // 圈内已轮转过 → 跳过（本圈不重复站点）
             if (detailFallbackCycleKeys.contains(cycleKey)) {
+                if (skipCycled.size() < SKIP_LOG_MAX) {
+                    skipCycled.add(cycleKey);
+                }
                 continue;
             }
             // 软失败：本圈已试过的站点（开新圈时该集合会被清空）。
@@ -2057,7 +2083,8 @@ public class DetailActivity extends BaseActivity {
                     // ★ v99-r15（P2-2）：本轮跳过了谁、为什么
                     + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
                     + buildSkipReasonLog(skipCur, "cur", skipCur.size())
-                    + buildSkipReasonLog(skipNovid, "novid", skipNovid.size()));
+                    + buildSkipReasonLog(skipNovid, "novid", skipNovid.size())
+                    + buildSkipReasonLog(skipCycled, "cycled", skipCycled.size()));
             return cycleKey;
         }
         // ★ v99-r15（P2-2）：一个都没选上时也必须打日志 —— 这正是最需要排查的场景
@@ -2067,7 +2094,8 @@ public class DetailActivity extends BaseActivity {
                 + " cycleKeys=" + detailFallbackCycleKeys.size()
                 + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
                 + buildSkipReasonLog(skipCur, "cur", skipCur.size())
-                + buildSkipReasonLog(skipNovid, "novid", skipNovid.size()));
+                + buildSkipReasonLog(skipNovid, "novid", skipNovid.size())
+                + buildSkipReasonLog(skipCycled, "cycled", skipCycled.size()));
         return "";
     }
 
@@ -2272,17 +2300,51 @@ public class DetailActivity extends BaseActivity {
     }
 
     /** ★ v67：统计一部片的总集数（seriesMap 各线路的剧集数之和）。 */
+    /**
+     * ★★ v99-r66：该「源 × 片」的集数。
+     *
+     * <p><b>旧实现是错的</b>：把所有线路的 {@code list.size()} <b>相加</b>，而
+     * {@code seriesMap} 的 key 就是播放线路 ⇒ 多线路源的集数被乘了线路数。真机实测
+     * （《人世间》58 集）：2 线路算出 116、10 线路算出 580。后果是集数校验里的
+     * 「新源集数不足基准一半」永远不成立，校验形同虚设。</p>
+     *
+     * <p>现改为<b>取各线路条目数的最大值</b>（一集一条时它就等于集数）。
+     * 按用户拍板：<b>不解析条目名里的集号</b> —— 电视剧的集数与条目数一致，
+     * 需要解析的长剧合集包很少见，不为此引入不靠谱的启发式。</p>
+     */
     private static int countSeriesEpisodes(VodInfo vodInfo) {
         if (vodInfo == null || vodInfo.seriesMap == null) {
             return 0;
         }
-        int total = 0;
+        int best = 0;
         for (List<VodInfo.VodSeries> list : vodInfo.seriesMap.values()) {
-            if (list != null) {
-                total += list.size();
+            if (list != null && list.size() > best) {
+                best = list.size();
             }
         }
-        return total;
+        return best;
+    }
+
+    /**
+     * ★ v99-r66：集数校验日志用的「源形态」，形如 {@code L2[58,58] maxEp=58}。
+     *
+     * <p>必须把线路数与各线路条目数一起打出来 —— 否则再出现「now 与 ref 不符」时，
+     * 还是分不清是「多线路被乘错」「合集条目被压扁」还是「真的是错片」。</p>
+     */
+    private static String describeSeriesShape(VodInfo vodInfo) {
+        if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.isEmpty()) {
+            return "L0[]";
+        }
+        StringBuilder sb = new StringBuilder("L").append(vodInfo.seriesMap.size()).append('[');
+        boolean first = true;
+        for (List<VodInfo.VodSeries> list : vodInfo.seriesMap.values()) {
+            if (!first) {
+                sb.append(',');
+            }
+            sb.append(list == null ? 0 : list.size());
+            first = false;
+        }
+        return sb.append("] maxEp=").append(countSeriesEpisodes(vodInfo)).toString();
     }
 
     /**
@@ -4017,6 +4079,102 @@ public class DetailActivity extends BaseActivity {
     }
 
     /** 把候选池落盘到 Hawk，供下次进同一部片直接复用。 */
+    /** 候选 → 落盘三元组（slim）。 */
+    private static String[] slimOf(Movie.Video v) {
+        return new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name};
+    }
+
+    /**
+     * ★★ v99-r66：落盘前对「同站同名多片」做<b>择优折叠</b>。
+     *
+     * <p><b>为什么在落盘做、而不是在内存池做</b>：内存池保留全部候选时，切源阶段的择优
+     * （{@link #detailFallbackFirstAliveId}）与集数校验的三重门（{@code sameStation > 1}）
+     * 都还正常工作。只有「跨实例恢复」这条路会丢掉元数据（磁盘只存三元组），
+     * 所以只需要把<b>落盘版本</b>折叠成「每个站一条」，恢复后就不存在「同站两条打平、
+     * 只能按列表顺序取第一条」的问题。</p>
+     *
+     * <p><b>这时元数据是完整的</b>（候选刚从实时搜索结果合并进来），所以择优是准的 ——
+     * 真机实测 11 组同站同名多片，折叠后 11/11 保留了正片，同时池子条目还少了 30%。</p>
+     *
+     * <p>两道不折的守卫：{@code ref} 为空（无从判断，等于瞎折）、最高分打平（判不出来）。
+     * 不折就原样保留多条，交给恢复后的集数校验兜底 —— 与 v67 互补，不冲突。</p>
+     *
+     * @return 是否至少折叠了一个站（决定要不要写 refYear）
+     */
+    private boolean foldSlimForPersist(List<Movie.Video> candidates, List<String[]> out) {
+        // 按站分组、保持入池顺序（LinkedHashMap：日志与切源顺序都依赖这个稳定性）
+        java.util.LinkedHashMap<String, List<Movie.Video>> bySource =
+                new java.util.LinkedHashMap<String, List<Movie.Video>>();
+        for (Movie.Video v : candidates) {
+            if (v == null || TextUtils.isEmpty(v.id) || TextUtils.isEmpty(v.sourceKey)) {
+                continue;
+            }
+            List<Movie.Video> list = bySource.get(v.sourceKey);
+            if (list == null) {
+                list = new ArrayList<>();
+                bySource.put(v.sourceKey, list);
+            }
+            list.add(v);
+        }
+        boolean folded = false;
+        for (java.util.Map.Entry<String, List<Movie.Video>> entry : bySource.entrySet()) {
+            List<Movie.Video> list = entry.getValue();
+            Movie.Video keep = list.size() > 1 ? pickFoldKeeper(list) : list.get(0);
+            if (keep == null) {
+                // 判不出来（ref 空 / 打平）：原样保留多条
+                for (Movie.Video v : list) {
+                    out.add(slimOf(v));
+                }
+                continue;
+            }
+            out.add(slimOf(keep));
+            if (list.size() > 1) {
+                folded = true;
+                StringBuilder dropped = new StringBuilder();
+                for (Movie.Video v : list) {
+                    if (v != keep) {
+                        if (dropped.length() > 0) {
+                            dropped.append(',');
+                        }
+                        dropped.append(v.id);
+                    }
+                }
+                LOG.sw("[FB] poolFold station=" + entry.getKey() + " keep=" + keep.id
+                        + " drop=[" + dropped + "] refYear="
+                        + (detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year));
+            }
+        }
+        return folded;
+    }
+
+    /**
+     * 折叠时「留哪一条」：复用切源择优的同一套打分（口径必须一致，否则两处判定会分叉）。
+     *
+     * @return 唯一最高分的那条；ref 为空或最高分打平则返回 null（表示不折）
+     */
+    private Movie.Video pickFoldKeeper(List<Movie.Video> list) {
+        if (detailFallbackRefVideo == null) {
+            return null;                 // 守卫 1：没有基准就无从判断
+        }
+        Movie.Video best = null;
+        int bestScore = Integer.MIN_VALUE;
+        int tie = 0;
+        for (Movie.Video v : list) {
+            int score = referenceMatchScore(detailFallbackRefVideo, v);
+            if (score > bestScore) {
+                bestScore = score;
+                best = v;
+                tie = 1;
+            } else if (score == bestScore) {
+                tie++;
+            }
+        }
+        if (best == null || tie > 1) {
+            return null;                 // 守卫 2：打平不折（折了等于「取第一条」换个地方发生）
+        }
+        return best;
+    }
+
     private void persistDetailFallbackCache(String title) {
         title = title == null ? "" : title.trim();
         // ★ v99-r56：落盘键与内存池键同为 familyKey（原文键会让写法变体各落一份）
@@ -4047,12 +4205,9 @@ public class DetailActivity extends BaseActivity {
         boolean askedBelongsHere = TextUtils.equals(askedOwner, title);
         List<String[]> slim = new ArrayList<>();
         List<Movie.Video> candidates = poolOf(title);
+        boolean folded = false;
         if (candidates != null) {
-            for (Movie.Video v : candidates) {
-                if (v != null && !TextUtils.isEmpty(v.id) && !TextUtils.isEmpty(v.sourceKey)) {
-                    slim.add(new String[]{v.sourceKey, v.id, v.name == null ? "" : v.name});
-                }
-            }
+            folded = foldSlimForPersist(candidates, slim);
         }
         List<String> askedToWrite = (askedBelongsHere && !detailFallbackPoolAskedKeys.isEmpty())
                 ? new ArrayList<String>(detailFallbackPoolAskedKeys) : null;
@@ -4060,7 +4215,10 @@ public class DetailActivity extends BaseActivity {
         if (slim.isEmpty() && askedToWrite == null) {
             return;
         }
-        FallbackCacheStore.put(title, slim, askedToWrite);
+        // ★ v99-r66：只有<b>真的折叠过</b>才写 refYear（0 = 未折叠 = 不做有效性校验）。
+        //   没折叠的池不该因为「换了进片的源、ref 年份不同」被丢弃。
+        int refYear = (folded && detailFallbackRefVideo != null) ? detailFallbackRefVideo.year : 0;
+        FallbackCacheStore.put(title, slim, askedToWrite, refYear);
         detailFallbackCacheDirty = false;
         if (askedBelongsHere) {
             detailFallbackAskedDirty = false;
@@ -4122,6 +4280,20 @@ public class DetailActivity extends BaseActivity {
             //   若还按老顺序在 entries 检查处返回，这条记录永远读不回来，
             //   也就永远判不出「问过了」—— 而那正是最需要跳过的场景。
             if (System.currentTimeMillis() - box.savedAt > FallbackCacheStore.TTL_MS) {
+                FallbackCacheStore.clearFor(hawkTitle);
+                return;
+            }
+            // ★★ v99-r66（守卫 4）：折叠结果的有效性校验。
+            //   上一次落盘时，如果池子被「择优折叠」过（每站只留一条），那是基于<b>当时那份 ref</b>
+            //   判出来的。最坏情况：上次是从错片源进来的（ref 年份不同），于是整池被收敛到错片，
+            //   而候选已只剩一条、无法回退 —— 这条记录必须整体判废，让本次重新攒（元数据完整、ref 正确）。
+            //   年份对同一部片稳定、对错片敏感（真机《人世间》正片 2022 / 错片 2024），比封面可靠。
+            int savedRefYear = box.refYear;
+            int nowRefYear = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
+            if (savedRefYear > 0 && nowRefYear > 0 && savedRefYear != nowRefYear) {
+                LOG.sw("[FB] poolFoldInvalid key=" + poolKey
+                        + " savedRefYear=" + savedRefYear + " nowRefYear=" + nowRefYear
+                        + " => 丢弃该池重新攒");
                 FallbackCacheStore.clearFor(hawkTitle);
                 return;
             }
