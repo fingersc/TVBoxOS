@@ -6,6 +6,7 @@ import com.orhanobut.hawk.Hawk;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -102,8 +103,55 @@ public final class FallbackCacheStore {
         }
     }
 
-    public static String poolKeyOf(String title) {
-        return ShowTitleKey.familyKey(title == null ? "" : title.trim());
+    /**
+     * ★ v99-r69：这里接收的是<b>桶键</b>（形如 {@code 片名|y2020|d李路}），不再自己算 familyKey。
+     *
+     * <p>同名不同片（如《隐秘而伟大》国产版 2020 与韩国版 2013）此前共用一份池 —— 换到另一部片时
+     * 27/29 个站被判年份硬矛盾、池子被剔到只剩 2 条（真机实证）。分桶后每部片各占一份，互不影响。
+     * 桶键由调用方（DetailActivity）按「片名 + 年份 + 导演首名」构造，本类只负责加前缀 ——
+     * 若这里再跑一次 familyKey，可能把 {@code |} 或年份吞掉，导致不同桶碰撞。</p>
+     */
+    public static String poolKeyOf(String bucket) {
+        return bucket == null ? "" : bucket.trim();
+    }
+
+    /**
+     * ★ v99-r69：删除某个片名下的<b>所有桶</b>。
+     *
+     * <p>历史记录是<b>合并</b>的（{@code removeSameNameVodRecords} 按片名删），而池是<b>分桶</b>的
+     * （可能 2 个甚至 3 个版本）⇒ 删历史时必须前缀匹配全部清掉，否则会留下无人认领的池，
+     * 下次进片又被恢复出来。</p>
+     */
+    public static void clearForFamily(String title) {
+        String base = ShowTitleKey.familyKey(title == null ? "" : title.trim());
+        if (TextUtils.isEmpty(base)) {
+            return;
+        }
+        try {
+            List<String> raw = Hawk.get(INDEX);
+            if (raw == null) {
+                return;
+            }
+            List<String> index = new ArrayList<String>(raw);
+            Iterator<String> it = index.iterator();
+            List<String> hit = new ArrayList<>();
+            while (it.hasNext()) {
+                String k = it.next();
+                if (k != null && (k.equals(base) || k.startsWith(base + "|"))) {
+                    hit.add(k);
+                    it.remove();
+                }
+            }
+            for (String k : hit) {
+                Hawk.delete(PREFIX + k);
+            }
+            if (!hit.isEmpty()) {
+                Hawk.put(INDEX, index);
+                LOG.i("FallbackCacheStore.clearForFamily " + base + " buckets=" + hit.size());
+            }
+        } catch (Throwable th) {
+            LOG.e("FallbackCacheStore.clearForFamily fail: " + th);
+        }
     }
 
     /**

@@ -14,6 +14,7 @@ import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.RoomDataManger;
+import com.github.tvbox.osc.util.FallbackCacheStore;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.ui.adapter.HistoryAdapter;
@@ -142,6 +143,10 @@ public class HistoryActivity extends BaseActivity {
                     if (delMode) {
                         historyAdapter.remove(position);
                         RoomDataManger.deleteVodRecord(vodInfo.sourceKey, vodInfo);
+                        // ★ v99-r69：历史记录是「按片名合并」的，而候选池是「按片名|年份|导演分桶」的
+                        //   （一部同名片可能有 2~3 个桶）。删历史必须把该片名下所有桶一起清掉，
+                        //   否则会留下无人认领的池，下次进片又被恢复出来。
+                        FallbackCacheStore.clearForFamily(vodInfo.name);
                     } else {
                         Bundle bundle = new Bundle();
                         bundle.putString("id", vodInfo.id);

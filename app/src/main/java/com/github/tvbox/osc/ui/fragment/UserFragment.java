@@ -20,6 +20,7 @@ import com.github.tvbox.osc.base.BaseLazyFragment;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.RoomDataManger;
+import com.github.tvbox.osc.util.FallbackCacheStore;
 import com.github.tvbox.osc.event.ServerEvent;
 import com.github.tvbox.osc.ui.activity.CollectActivity;
 import com.github.tvbox.osc.ui.activity.DetailActivity;
@@ -238,6 +239,8 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
                 if ((vod.id != null && !vod.id.isEmpty()) && (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 2) && HawkConfig.hotVodDelete) {
                     homeHotVodAdapter.remove(position);
                     RoomDataManger.deleteVodRecord(vod.sourceKey, vod.id);
+                    // ★ v99-r69：删历史 = 删这部片名下所有候选池桶（历史合并、池分桶，数量不对称）
+                    FallbackCacheStore.clearForFamily(vod.name);
                     Toast.makeText(mContext, "已删除当前记录", Toast.LENGTH_SHORT).show();
                 } else if (vod.id != null && vod.id.startsWith("msearch:")) {
                     jumpSearch(vod);

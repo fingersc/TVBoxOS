@@ -2309,8 +2309,13 @@ public class DetailActivity extends BaseActivity {
         //   ② 阈值从 1/2 收紧到 1/4 —— 1/2 会把「连载中的正确源」误杀：
         //      ref 58 集、某站只更新到 20 集 ⇒ 20*2=40 < 58 判错片。真机比值：
         //      错片 1/51=0.02 命中；连载 20/58=0.34、删减 30/58=0.52 都不命中。
-        return nowEpisodes > 0 && detailFallbackRefEpisodes > 0
-                && nowEpisodes * 4 < detailFallbackRefEpisodes;
+        // ★ v99-r69：补「多集」方向。真机：ref=1 集（韩国版）而候选 51 集（国产版）时被放行，
+        //   用户切过去看到的是另一部片。上界取 6 倍以免误杀"单集被拆成几段"的正常情况。
+        if (nowEpisodes <= 0 || detailFallbackRefEpisodes <= 0) {
+            return false;
+        }
+        return nowEpisodes * 4 < detailFallbackRefEpisodes
+                || nowEpisodes > detailFallbackRefEpisodes * 6;
     }
 
     /** ★ v67：统计一部片的总集数（seriesMap 各线路的剧集数之和）。 */
@@ -4216,40 +4221,11 @@ public class DetailActivity extends BaseActivity {
             kept.add(best);
             droppedCandidates += list.size() - 1;   // 同站多余的候选被收窄掉
         }
-        // ★★ v99-r68：先判「整池是不是属于另一部同名片」。
-        //
-        //   真机实证：用户从搜索页点了**另一部同名影片（韩国版 2013）**并点切源，
-        //   而池是按 familyKey(片名) 存的、里面积的是**国产版 2020** 的候选
-        //   ⇒ 27/29 个站被判年份硬矛盾 ⇒ r67 把它们全剔了，池子从 40 掉到 2，
-        //   而活下来的 2 条只是 year 缺失（不触发硬矛盾），也不是用户要的那部。
-        //
-        //   这种「大量站被剔」不是个别错源，而是**整个池属于另一部片**。
-        //   正确处置是「作废旧池 + 重搜重建」，而不是剔到只剩几条
-        //   （日志里系统后来正是走了"池不可用 → 重新搜索"这条路，只是绕了一大圈）。
-        //
-        //   判据：`>= 3 个站` 且 `过半`。实测正常情况 dropStations=0~2，
-        //   换片那次是 27/29（93%），两侧分得很开。
-        if (droppedStations >= 3 && droppedStations * 2 > bySource.size()) {
-            LOG.sw("[FB] poolFilmReplaced stations=" + droppedStations + "/" + bySource.size()
-                    + " refYear=" + (detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year)
-                    + " => 整池属于另一部同名片，作废并重攒");
-            // 先清内存状态，再停任务（stopPoolFilling 内部会落盘，那时池与已问集合已空 ⇒ 不会写出脏数据）
-            FallbackCacheStore.clearFor(title);
-            poolPut(title, new ArrayList<Movie.Video>());
-            detailFallbackPoolAskedKeys.clear();
-            detailFallbackAskedDirty = true;
-            detailFallbackCacheDirty = true;
-            detailFallbackPoolTried = false;
-            detailFallbackPoolVerifiedYear = 0;
-            detailFallbackCycleKeys.clear();
-            detailFallbackSoftTriedKeys.clear();
-            detailFallbackDeadKeys.clear();
-            if (detailFallbackPoolFilling) {
-                stopPoolFilling("filmReplaced");
-            }
-            scheduleDetailFallbackPoolFill();
-            return false;
-        }
+        // ★ v99-r69：r68 的「整池属于另一部同名片 ⇒ 清池重搜」分支已回退。
+        //   真机证明该做法行不通：清池后 SearchSession / restore 会把同一批候选与 askedKeys
+        //   重新填回来（poolFilmReplaced 成对触发），最终池子变 0 且 asked 仍满 101 ⇒
+        //   再也不搜，切源彻底没源（用户看到 21 次「正在切换片源，请稍候…」）。
+        //   分工改为「按片名@年份@导演分桶」：每部同名片各占一份池，不存在"整池是另一部片"。
         // ★ 守卫：剔完若池为空，放弃剔除 —— 否则 askedKeys 已记「问过」而池空，
         //   下次进片既不重搜也没有任何可切候选（用户看到的就是"点切源没反应"）。
         if (kept.isEmpty()) {
@@ -4319,7 +4295,7 @@ public class DetailActivity extends BaseActivity {
         // ★ v99-r66/r67：refYear 表示「这批候选是在哪一年的基准下校验过的」，
         //   0 = 从未校验过（老记录），恢复时不做有效性校验。
         int refYear = detailFallbackPoolVerifiedYear;
-        FallbackCacheStore.put(title, slim, askedToWrite, refYear, refActorDigest(title));
+        FallbackCacheStore.put(currentPoolKey(title), slim, askedToWrite, refYear, refActorDigest(title));
         detailFallbackCacheDirty = false;
         if (askedBelongsHere) {
             detailFallbackAskedDirty = false;
@@ -4381,39 +4357,13 @@ public class DetailActivity extends BaseActivity {
             //   若还按老顺序在 entries 检查处返回，这条记录永远读不回来，
             //   也就永远判不出「问过了」—— 而那正是最需要跳过的场景。
             if (System.currentTimeMillis() - box.savedAt > FallbackCacheStore.TTL_MS) {
-                FallbackCacheStore.clearFor(hawkTitle);
+                FallbackCacheStore.clearFor(currentPoolKey(hawkTitle));
                 return;
             }
-            // ★★ v99-r66（守卫 4）：折叠结果的有效性校验。
-            //   上一次落盘时，如果池子被「择优折叠」过（每站只留一条），那是基于<b>当时那份 ref</b>
-            //   判出来的。最坏情况：上次是从错片源进来的（ref 年份不同），于是整池被收敛到错片，
-            //   而候选已只剩一条、无法回退 —— 这条记录必须整体判废，让本次重新攒（元数据完整、ref 正确）。
-            //   年份对同一部片稳定、对错片敏感（真机《人世间》正片 2022 / 错片 2024），比封面可靠。
-            int savedRefYear = box.refYear;
-            int nowRefYear = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
-            if (savedRefYear > 0 && nowRefYear > 0 && savedRefYear != nowRefYear) {
-                LOG.sw("[FB] poolFoldInvalid key=" + poolKey
-                        + " savedRefYear=" + savedRefYear + " nowRefYear=" + nowRefYear
-                        + " => 丢弃该池重新攒");
-                FallbackCacheStore.clearFor(hawkTitle);
-                return;
-            }
-            // ★★ v99-r67：年份相同（或一方缺失）时，用<b>演员交叉</b>做换片辅助判定。
-            //   场景：用户先看 A 片，发现想看的是「同名的另一部 B」，重新搜索点进 B。
-            //   两者同年 ⇒ 上面的 refYear 比不出来，只能靠演员表。用 metaRelated（交叉）
-            //   而不是全同 —— 各站演员表完整度差异极大，全同几乎不可能。
-            //   两边任一为空则<b>不判</b>（信息不足时宁可沿用，避免误判换片导致重搜 101 源）。
-            String savedActor = box.refActor;
-            String nowActor = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.actor;
-            if (!TextUtils.isEmpty(savedActor) && !TextUtils.isEmpty(nowActor)
-                    && !metaRelated(savedActor, nowActor)) {
-                LOG.sw("[FB] poolFilmChanged key=" + poolKey + " reason=actorMismatch"
-                        + " savedRefYear=" + savedRefYear + " nowRefYear=" + nowRefYear
-                        + " => 判定换了另一部同名片，丢弃重攒");
-                FallbackCacheStore.clearFor(hawkTitle);
-                return;
-            }
-            // 池子仍然属于当前这部片 ⇒ 记住「它是在哪一年校验的」，落盘时原样写回。
+            // ★ v99-r69：r66 的「refYear 不符 ⇒ 清池重攒」与 r67 的「actorMismatch ⇒ 清池重攒」
+            //   两个分支已删除 —— 桶键（片名|年份|导演）本身就编码了影片身份，
+            //   读不到对应桶 = 第一次看这部片，重新攒即可，不需要"作废"任何东西。
+            //   这也消掉了 r68 那条坏分支（清池后 Session 会把同一批填回来 ⇒ 池空锁死）。
             detailFallbackPoolVerifiedYear = box.refYear;
             // ★ v99-r59：已问集合与候选解耦恢复。并入（不是覆盖）——
             //   锚 key 和 v66 兼容 key 两条记录可能各带一部分，取并集才不丢。
@@ -5037,16 +4987,68 @@ public class DetailActivity extends BaseActivity {
      * （要发给站点搜索，不能带 {@code |季4} 这类结构），只有「存取池子」用本键。</p>
      */
     private List<Movie.Video> poolOf(String title) {
-        String key = ShowTitleKey.familyKey(title);
+        String key = currentPoolKey(title);
         if (TextUtils.isEmpty(key)) {
             return null;
         }
         return detailFallbackCache.get(key);
     }
 
+    /**
+     * ★★ v99-r69：内存池与落盘池<b>统一按「片名 | 年份 | 导演」分桶</b>。
+     *
+     * <p>同名不同片（真机：《隐秘而伟大》国产版 2020 与韩国版 2013）此前共用一份池 ⇒
+     * 换到另一部片时 27/29 个站被判年份硬矛盾、池子被剔到只剩 2 条，而活下来的 2 条
+     * 只是 year 缺失、未必属于用户要的那部。分桶后每部片各占一份，互不影响。</p>
+     *
+     * <p><b>为什么用 ref（正在看的那条）的年份与导演，而不是候选自己的</b>：
+     * 候选的元数据差异极大（实测同一部片 actor 有 5 种写法、66 人 vs 5 人），
+     * 用候选自己的字段分桶会把一部片<b>打散成多个桶</b>；而 ref 同一时刻只有一个，
+     * 桶键稳定。候选归属的差异交给 {@link #verifyPool} 的打分剔除处理。</p>
+     */
+    private String currentPoolKey(String title) {
+        String base = ShowTitleKey.familyKey(title == null ? "" : title.trim());
+        if (TextUtils.isEmpty(base)) {
+            return "";
+        }
+        if (detailFallbackRefVideo == null) {
+            return base;                  // 无基准 ⇒ 退化成旧的单桶（兼容 r68 之前落的老记录）
+        }
+        StringBuilder sb = new StringBuilder(base);
+        int year = detailFallbackRefVideo.year;
+        if (year > 0) {
+            sb.append("|y").append(year);
+        }
+        String director = firstDirectorName(detailFallbackRefVideo.director);
+        if (!TextUtils.isEmpty(director)) {
+            sb.append("|d").append(director);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 桶键里的导演项：<b>只取第一个导演名</b>并去掉内部空白。
+     *
+     * <p>"李路 / 李某某" 与 "李路" 必须落到同一个桶 —— 否则联合署名会把同一部片拆成两个桶。
+     * 导演通常 1~2 人、写法统一（实测 27 条正片 director 全是"李路"），
+     * 不像演员表那样列十几个名字、各站差异极大（实测 actor 有 5 种写法）。</p>
+     */
+    private static String firstDirectorName(String director) {
+        if (TextUtils.isEmpty(director)) {
+            return "";
+        }
+        for (String part : director.split("[/,，、|;；\s]+")) {
+            String t = part.trim();
+            if (!t.isEmpty()) {
+                return t.length() > 8 ? t.substring(0, 8) : t;
+            }
+        }
+        return "";
+    }
+
     /** {@link #poolOf} 的写入侧，键口径必须一致（详见方法注释）。 */
     private void poolPut(String title, List<Movie.Video> candidates) {
-        String key = ShowTitleKey.familyKey(title);
+        String key = currentPoolKey(title);
         if (TextUtils.isEmpty(key)) {
             return;
         }
