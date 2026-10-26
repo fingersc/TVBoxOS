@@ -3,8 +3,6 @@ package com.github.tvbox.osc.sync;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
 
-import com.google.gson.Gson;
-
 import org.json.JSONObject;
 
 /**
@@ -19,8 +17,6 @@ public final class AccountService {
     public static final int NEED_ACTIVATE = 1;
     public static final int NOT_FOUND = 2;
     public static final int WRONG_PASSWORD = 3;
-
-    private static final Gson GSON = new Gson();
 
     public static class Result {
         public final int status;
@@ -77,7 +73,17 @@ public final class AccountService {
         }
     }
 
-    /** 首次激活：写 profile.json + 空的数据包。 */
+    /**
+     * 首次激活：只写 profile.json。
+     *
+     * <p>★ v99-r81：不再写空的 data.bin —— 否则另一台设备首次登录时，
+     * {@link SyncEngine} 的 migrateLegacy 会把这个空 data.bin 当「旧格式」迁移，
+     * 用空包 PUT 覆盖 4 个 scope 文件（激活设备刚上传的真实数据被清掉），
+     * 并把空文件的 ETag 存进本机 ⇒ 当次同步全部 304，一台数据都拉不到。
+     * 新账号云端只有 profile.json ⇒ migrateLegacy 读不到 data.bin 自然跳过。</p>
+     *
+     * @param deviceId 保留参数（调用方已传）；data.bin 取消后暂无用途
+     */
     public static void activate(WebDavClient dav, String name, byte[] key, String deviceId) throws Exception {
         String normalized = AccountPaths.normalize(name);
         JSONObject profile = new JSONObject();
@@ -87,14 +93,6 @@ public final class AccountService {
         profile.put("kdf", "pbkdf2-sha1-200k");
         profile.put("verify", Crypto.accountVerify(key));
         dav.put(AccountPaths.profile(normalized), profile.toString().getBytes("UTF-8"), null);
-
-        SyncPayload empty = new SyncPayload();
-        empty.owner = Crypto.userKey(normalized);
-        empty.epoch = 0;
-        empty.updatedAt = System.currentTimeMillis();
-        empty.dev = deviceId;
-        byte[] encrypted = Crypto.encrypt(key, GSON.toJson(empty).getBytes("UTF-8"));
-        dav.put(AccountPaths.data(normalized), encrypted, null);
     }
 
     /** 同步前确保 profile 存在（老数据/手动搬移时补写）。 */

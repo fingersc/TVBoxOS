@@ -76,6 +76,19 @@ public final class TvImeUtil {
                     return false;
                 }
             });
+            // ★ v99-r80：触屏设备（手机/平板）没有 OK 键 —— 「按 OK 唤出」永远到不了，
+            //   输入法完全唤不出来（r20~r24 只考虑了遥控器路径，属回归）。
+            //   补触摸路径：点击输入框 = 用户主动唤出。TV 端 OK 键已被上面的 OnKeyListener
+            //   消费（返回 true），不会触发 onClick，遥控器行为不变。
+            //   先置 MANUAL_SHOWN 再 showIme：聚焦时排下的 1/30/60ms 延迟收起检查会看到
+            //   该标记而全部跳过，不会把刚唤出的键盘立刻收掉（快速点按 <60ms 时也成立）。
+            et.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    MANUAL_SHOWN.put(et, Boolean.TRUE);
+                    showIme(et);
+                }
+            });
         }
     }
 

@@ -149,9 +149,18 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
     private void refreshAll() {        AccountContext.load();
         // v99-r6b：页面标题下那行身份说明已删除（用户要求），登录状态改由账号卡片的
         //          「当前账号」高亮体现，不再单独占一行文字
-        etDavUrl.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""));
-        etDavUser.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""));
-        etDavPass.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
+        // ★ v99-r81：refreshAll 在 onResume 也会跑 —— 无条件回填会把「已输入未保存」的内容
+        //   冲掉（手机切后台回来必清，实测；典型场景：切到别的应用抄存储地址）。
+        //   改为只在输入框为空时回填已保存值：首次进页面照常显示，正在输入的内容不被覆盖。
+        if (etDavUrl.getText() == null || etDavUrl.length() == 0) {
+            etDavUrl.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""));
+        }
+        if (etDavUser.getText() == null || etDavUser.length() == 0) {
+            etDavUser.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""));
+        }
+        if (etDavPass.getText() == null || etDavPass.length() == 0) {
+            etDavPass.setText(Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
+        }
         SyncScopes scopes = SyncScopes.load();
         tvScopeHistory.setText("历史 " + (scopes.history ? "开" : "关"));
         tvScopeProgress.setText("进度 " + (scopes.progress ? "开" : "关"));
