@@ -4347,9 +4347,20 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         try {
-            // ★ v99-r56：读键与写键同为 familyKey（旧版按原文落的盘读不到，冷启动一次即可）
-            FallbackCacheStore.FallbackCacheBox box = FallbackCacheStore.get(hawkTitle);
+            // ★★ v99-r69/r71：读写两侧必须同源 —— 写入侧用 currentPoolKey（含分桶后缀），
+            //   这里也要用；否则写的是 base|y…|d…、读的是 base ⇒ 永远读不到
+            //   （真机 r69：poolAskedRestore 一次没出现，8 次进片 poolSize 恒 0）。
+            FallbackCacheStore.FallbackCacheBox box = FallbackCacheStore.get(currentPoolKey(hawkTitle));
             if (box == null) {
+                // 兼容 r68 之前按「片名」落的旧记录（单桶键，无分桶后缀）
+                String legacyBucket = ShowTitleKey.familyKey(hawkTitle);
+                if (!TextUtils.isEmpty(legacyBucket)) {
+                    box = FallbackCacheStore.get(legacyBucket);
+                }
+            }
+            if (box == null) {
+                LOG.sw("[FB] poolRestoreMiss key=" + currentPoolKey(hawkTitle)
+                        + " title=" + hawkTitle);
                 return;
             }
             // ★ v99-r59：TTL 判定必须挪到「entries 为空就返回」<b>之前</b>。
@@ -6506,6 +6517,11 @@ public class DetailActivity extends BaseActivity {
                 + " -> " + newSourceKey + "/" + newVodId + " ep=" + newSeriesName
                 + " oldTime=" + oldTime + " newVal=" + newVal);
         if (oldTime > 0) {
+            // ★ v99-r71：取证日志 —— 与 PlayFragment.getSavedProgress 的 progressRead 成对。
+            //   两边 key 必须完全一致（源/片id/线路/集下标/集名），任何一处不一致都会导致
+            //   "迁移写入了、起播读不到"⇒ 从 0 播几秒就把迁移值覆盖掉。
+            LOG.sw("[FB] progressWrite key=" + newSourceKey + "/" + newVodId + "/" + newFlag
+                    + "/" + newIndex + "/" + newSeriesName + " => " + oldTime);
             PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
             // ★ 防丢：仅当新集名确实是旧集名的"同一集"时才写（同集名，或由匹配器判定同集）。
             //   名称不同且无法互认时，额外保底写一份"按旧集名"的记录——

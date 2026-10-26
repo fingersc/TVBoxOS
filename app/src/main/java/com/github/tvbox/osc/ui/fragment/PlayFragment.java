@@ -370,6 +370,13 @@ public class PlayFragment extends BaseLazyFragment {
                 }
             }
         }
+        // ★ v99-r71：取证日志 —— 起播 seek 用的就是本方法返回值。
+        //   真机现象"同片切源后从 0 开始"：迁移明明把旧进度写进了新源（migrate oldTime>0），
+        //   但这里如果读到的 rec=0 或 key 与写入侧不一致 ⇒ 写入与读取的键不同源。
+        //   拿到一份日志就能钉死根因，不用再猜。
+        LOG.sw("[FB] progressRead key=" + pkSourceKey + "/" + pkVodId + "/" + pkFlag
+                + "/" + pkPlayIndex + "/" + pkEpName
+                + " rec=" + rec + " skip=" + skip + " => " + Math.max(rec, skip));
         return Math.max(rec, skip);
     }
 
