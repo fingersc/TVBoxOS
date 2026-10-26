@@ -620,7 +620,7 @@ public class RoomDataManger {
                                 sourceKey, vodInfo.id, newEpNames);
                     } else {
                         LOG.i("[Hist] progressMigrateSkip reason=otherFilm"
-                                + " old=" + record.sourceKey + "/" + record.id + "/y" + history.year
+                                + " old=" + record.sourceKey + "/" + record.vodId + "/y" + history.year
                                 + " new=" + sourceKey + "/" + vodInfo.id + "/y" + vodInfo.year);
                     }
                     // ★ v99-r73：同名换片与同片切源在数据上**不可区分**（跨站换片时
