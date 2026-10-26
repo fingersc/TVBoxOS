@@ -222,9 +222,15 @@ public class RoomDataManger {
                 }
             }
             // 先迁进度（按集名对齐），迁移失败也照删——进度是"尽力而为"，不能因为迁移失败留下重复行
+            // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标）——
+            //   旧实现沿用旧源的 flag/下标，写进新源后**永远读不到**
+            //   （真机：同片连切 4 站，migrateVod 的 moved 逐跳 1→2→2→9→10，
+            //   库里堆出 9 条坐标错乱的行，trimByVod 的 10 条配额被占满
+            //   ⇒ 有效进度被挤掉，表现为"切源后进度归零"）。
             try {
                 PlayProgressManager.migrateByVod(fromSourceKey, fromVodId,
-                        toSourceKey, toVodInfo.id, collectAllEpisodeNames(toVodInfo));
+                        toSourceKey, toVodInfo.id, collectAllEpisodeNames(toVodInfo),
+                        PlayProgressManager.collectEpisodeCoords(toVodInfo, toVodInfo.playFlag));
             } catch (Throwable ignored) {
             }
             dao.delete(from);
@@ -343,9 +349,33 @@ public class RoomDataManger {
                 String name = getVodRecordName(info);
                 VodRecord keep = winner.get(name);
                 if (keep != null && !TextUtils.equals(keep.sourceKey, r.sourceKey)) {
-                    // 删旧源前先把该片全部集的进度搬到新源，否则会丢掉"看到第几集/位置"
-                    PlayProgressManager.migrateByVod(r.sourceKey, r.vodId,
-                            keep.sourceKey, keep.vodId, collectAllEpisodeNames(winnerInfo.get(name)));
+                    // ★ v99-r77：同名**不同片**（如《隐秘而伟大》2020 国产版 vs 2013 韩国版）
+                    //   不得互搬进度 —— 否则 2020 版的进度会跑到 2013 版名下。
+                    //   判据与 {@code removeSameNameVodRecords} / 详情页迁移保持同一口径
+                    //   （{@link FilmIdentity#isSameFilm}：年份冲突或导演交叉不上 ⇒ 不同片）。
+                    //
+                    //   真机实证（2026-10-26）：库里同时存在《隐秘而伟大》2020（jinying/36323）
+                    //   与 2013（iqiyi/29946）两条同名记录，每次同步 compact 都 dedupe=1，
+                    //   两片的进度被反复互搬。
+                    VodInfo keepInfo = winnerInfo.get(name);
+                    boolean sameFilm = FilmIdentity.isSameFilm(
+                            keepInfo == null ? 0 : keepInfo.year,
+                            keepInfo == null ? null : keepInfo.director,
+                            info == null ? 0 : info.year,
+                            info == null ? null : info.director);
+                    if (sameFilm) {
+                        // 删旧源前先把该片全部集的进度搬到新源，否则会丢掉"看到第几集/位置"
+                        // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标），
+                        //   否则搬过去的行在新源读不到（真机：同片连切 4 站堆出 9 条错行）。
+                        PlayProgressManager.migrateByVod(r.sourceKey, r.vodId,
+                                keep.sourceKey, keep.vodId, collectAllEpisodeNames(keepInfo),
+                                PlayProgressManager.collectEpisodeCoords(keepInfo,
+                                        keepInfo == null ? null : keepInfo.playFlag));
+                    } else {
+                        LOG.i("[Hist] dedupeProgressSkip reason=otherFilm"
+                                + " old=" + r.sourceKey + "/" + r.vodId + "/y" + (info == null ? 0 : info.year)
+                                + " keep=" + keep.sourceKey + "/" + keep.vodId + "/y" + (keepInfo == null ? 0 : keepInfo.year));
+                    }
                 }
                 dao.delete(r);
                 // ★ v99-r55：同名合并的删除**必须写墓碑**。
@@ -616,8 +646,12 @@ public class RoomDataManger {
                     boolean sameFilm = FilmIdentity.isSameFilm(vodInfo.year, vodInfo.director,
                             history.year, history.director);
                     if (sameFilm) {
+                        // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标），
+                        //   否则搬过去的行在新源读不到（真机：同片连切 4 站堆出 9 条错行，
+                        //   有效进度被 trimByVod 的 10 条配额挤掉 ⇒ 切源后进度归零）。
                         PlayProgressManager.migrateByVod(record.sourceKey, record.vodId,
-                                sourceKey, vodInfo.id, newEpNames);
+                                sourceKey, vodInfo.id, newEpNames,
+                                PlayProgressManager.collectEpisodeCoords(vodInfo, vodInfo.playFlag));
                     } else {
                         LOG.i("[Hist] progressMigrateSkip reason=otherFilm"
                                 + " old=" + record.sourceKey + "/" + record.vodId + "/y" + history.year

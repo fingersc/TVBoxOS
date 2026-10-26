@@ -1396,13 +1396,15 @@ public class DetailActivity extends BaseActivity {
                             if (positionTrusted) {
                                 migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
                                         currentEpisode.name, vodInfoRecord,
-                                        PlayProgressManager.collectAllEpisodeNames(vodInfo));
+                                        PlayProgressManager.collectAllEpisodeNames(vodInfo),
+                                        PlayProgressManager.collectEpisodeCoords(vodInfo, vodInfo.playFlag));
                             }
                         } else if (fallbackFromValid) {
                             if (positionTrusted) {
                                 migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
                                         currentEpisode.name, null,
-                                        PlayProgressManager.collectAllEpisodeNames(vodInfo));
+                                        PlayProgressManager.collectAllEpisodeNames(vodInfo),
+                                        PlayProgressManager.collectEpisodeCoords(vodInfo, vodInfo.playFlag));
                             }
                         }
                         
@@ -6095,7 +6097,8 @@ public class DetailActivity extends BaseActivity {
     
     private void migratePlaybackTimeFromOldSource(String newSourceKey, String newVodId, String newFlag, int newIndex,
                                               String newSeriesName, VodInfo oldRecord,
-                                              java.util.List<String> newEpNames) {
+                                              java.util.List<String> newEpNames,
+                                              java.util.Map<String, PlayProgressManager.EpCoord> newEpCoords) {
     try {
         if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId) || TextUtils.isEmpty(newSeriesName)) {
             return;
@@ -6144,8 +6147,13 @@ public class DetailActivity extends BaseActivity {
         //     （真机：同一部片 28134 的进度散在 feifancj / 730acd68 / 73b5c89a 三个源）
         PlayProgressManager.trimByVod(oldRecord.sourceKey, oldRecord.id,
                 com.github.tvbox.osc.sync.HistorySyncManager.KEEP_PROGRESS_EPISODES);
+        // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标）。
+        //   旧实现沿用旧源的 flag/下标 ⇒ 搬过去的行在新源**永远读不到**
+        //   （真机 2026-10-26：同片连切 4 站，migrateVod 的 moved 逐跳
+        //   1→2→2→9→10，库里堆出 9 条坐标错乱的行，有效进度被 trimByVod
+        //   的 10 条配额挤掉 ⇒ 表现为「切源后进度归零」）。
         int movedRows = PlayProgressManager.migrateByVod(oldRecord.sourceKey, oldRecord.id,
-                newSourceKey, newVodId, newEpNames);
+                newSourceKey, newVodId, newEpNames, newEpCoords);
         LOG.sw("[FB] migrateVod " + oldRecord.sourceKey + "/" + oldRecord.id
                 + " -> " + newSourceKey + "/" + newVodId + " moved=" + movedRows
                 + " eps=" + (newEpNames == null ? 0 : newEpNames.size()));

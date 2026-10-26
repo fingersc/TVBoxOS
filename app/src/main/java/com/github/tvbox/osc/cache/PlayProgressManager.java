@@ -329,12 +329,36 @@ public class PlayProgressManager {
      *   <li>实在匹配不上 → 该行随旧源一起清除（留着也永远读不到）。</li>
      * </ol></p>
      *
+     * <p><b>★ v99-r77：写入坐标必须换算到「新源的坐标系」。</b>
+     * 旧实现把旧源的 {@code flag}（线路名）与 {@code playIndex}（集下标）原样带进新源，
+     * 而读侧（{@code PlayFragment.getSavedProgress}）用的是
+     * <b>新源自己的</b> {@code playFlag} 与 {@code playIndex} —— 两边坐标系不同，
+     * 搬过去的行<b>永远读不到</b>。
+     * 真机实证（2026-10-26）：同一部片连切 4 站，{@code migrateVod} 的 moved 逐跳递增
+     * {@code 1 → 2 → 2 → 9 → 10}，库里堆出 9 条坐标错乱的行；
+     * 而 {@code trimByVod} 按 {@code updateTime} 只留 10 条 ⇒ <b>有效进度被垃圾行挤掉</b>，
+     * 表现为「切源后进度归零」。</p>
+     *
+     * <p>本版：写入坐标取自 {@code toCoords}（新源的「集名 → (线路, 线路内下标)」），
+     * 与读侧完全同源；匹配不到坐标的行<b>不写</b>（而不是搬成一条读不到的错行）。</p>
+     *
+     * <p><b>★ v99-r77：清空旧源时逐行登记进度墓碑。</b>
+     * 旧实现直接 {@code dao.deleteByVod}，云端那份旧行还在 ⇒ 下次同步 LWW 合并把它<b>复活</b>回本机
+     * ⇒ 旧源名下进度越滚越多（真机：同名旧源反复被扫出 9 行）。
+     * 与 {@link #migrateByFlag} 的既有做法对齐：先 {@code SyncTombstones.addProgress} 再删。</p>
+     *
+     * <p><b>★ v99-r77：{@code toCoords} 为空 ⇒ 整体不动。</b>
+     * 拿不到新源坐标系时若照旧搬移，只会产出读不到的垃圾行并挤掉新源的真实进度；
+     * 此时<b>既不搬也不删</b>，旧源的行留在原处（用户日后从搜索重新点进该片时进度仍在）。</p>
+     *
      * @param toEpNames 新源的全部集名（用于跨源集名匹配）；传 null 则只做集名精确搬移
+     * @param toCoords  新源「集名 → {@link EpCoord}」坐标表；空 ⇒ 不做任何搬移
      * @return 实际搬移的行数
      */
     public static int migrateByVod(String fromSourceKey, String fromVodId,
                                    String toSourceKey, String toVodId,
-                                   java.util.List<String> toEpNames) {
+                                   java.util.List<String> toEpNames,
+                                   java.util.Map<String, EpCoord> toCoords) {
         try {
             if (TextUtils.isEmpty(fromSourceKey) || TextUtils.isEmpty(fromVodId)
                     || TextUtils.isEmpty(toSourceKey) || TextUtils.isEmpty(toVodId)) {
@@ -342,6 +366,10 @@ public class PlayProgressManager {
             }
             if (TextUtils.equals(fromSourceKey, toSourceKey)
                     && TextUtils.equals(fromVodId, toVodId)) {
+                return 0;
+            }
+            // ★ v99-r77：没有新源坐标系 ⇒ 不搬不删（详见方法注释）
+            if (toCoords == null || toCoords.isEmpty()) {
                 return 0;
             }
             PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
@@ -362,21 +390,110 @@ public class PlayProgressManager {
                         targetEp = toEpNames.get(idx);
                     }
                 }
-                // 新源该集已有记忆则以新源为准，不覆盖
-                if (get(toSourceKey, toVodId, row.flag, row.playIndex, targetEp) > 0) {
+                // ★ v99-r77：坐标取自新源（线路 + 该线路内下标），与读侧同源
+                EpCoord coord = toCoords.get(targetEp);
+                if (coord == null) {
+                    // 新源没有这一集 ⇒ 无处可落 ⇒ 不写（写了也读不到）
                     continue;
                 }
-                save(toSourceKey, toVodId, row.flag, row.playIndex, targetEp, row.position);
+                // 新源该集已有记忆则以新源为准，不覆盖
+                if (get(toSourceKey, toVodId, coord.flag, coord.index, coord.epName) > 0) {
+                    continue;
+                }
+                save(toSourceKey, toVodId, coord.flag, coord.index, coord.epName, row.position);
                 moved++;
             }
             // ★ v99-r75：旧源该片的进度<b>整体清空</b> —— 这正是既有口径
             //   「同片只保留最新 10 集记录，并且都随着迁移到新源里去」：
             //   进度跟着"当前所在的源"走，旧源不留副本 ⇒ 同一部片不会在多个源各留一份。
+            // ★ v99-r77：删之前**逐行登记进度墓碑**，否则云端那份旧行会被 LWW 合并复活
+            //   （真机：旧源名下进度反复被扫出 9 行）。
+            for (PlayProgress row : rows) {
+                if (row != null) {
+                    SyncTombstones.addProgress(s(fromSourceKey), s(fromVodId),
+                            row.flag, row.playIndex, row.epName);
+                }
+            }
             dao.deleteByVod(s(fromSourceKey), s(fromVodId));
+            HistorySyncManager.markDirty(SyncScope.PROGRESS);
             return moved;
         } catch (Throwable th) {
             th.printStackTrace();
             return 0;
+        }
+    }
+
+    /**
+     * ★ v99-r77：某个源里某部影片的<b>坐标</b>（线路名 + 该线路内的集下标）。
+     *
+     * <p>播放进度的主键是 {@code (源, 片, 线路, 集下标, 集名)}，
+     * 其中「线路」与「集下标」都是<b>相对于该源该线路</b>的本地坐标 ——
+     * 跨源搬移时必须换算，否则读侧（用新源自己的 {@code playFlag}/{@code playIndex}）
+     * 永远查不到搬过去的行。</p>
+     */
+    public static final class EpCoord {
+        /** 线路名（源内的多线路标识）。 */
+        public final String flag;
+        /** 该集在这条线路里的下标。 */
+        public final int index;
+        /** 该集在线路里的集名（与 index 对应，作为主键的一部分）。 */
+        public final String epName;
+
+        public EpCoord(String flag, int index, String epName) {
+            this.flag = flag == null ? "" : flag;
+            this.index = index;
+            this.epName = epName == null ? "" : epName;
+        }
+    }
+
+    /**
+     * ★ v99-r77：建立某部影片的「集名 → {@link EpCoord}」坐标表。
+     *
+     * <p>同一个集名可能出现在多条线路里（各线路集序不同）；
+     * 优先取<b>当前播放线路</b>（{@code preferFlag}）上的位置 ——
+     * 读侧正是用它来查进度的。</p>
+     *
+     * @param vodInfo     影片信息（须带 {@code seriesMap}）
+     * @param preferFlag  优先采用的线路名（通常是新源的 {@code playFlag}）
+     */
+    public static java.util.Map<String, EpCoord> collectEpisodeCoords(
+            com.github.tvbox.osc.bean.VodInfo vodInfo, String preferFlag) {
+        java.util.Map<String, EpCoord> out = new java.util.LinkedHashMap<>();
+        if (vodInfo == null || vodInfo.seriesMap == null) {
+            return out;
+        }
+        try {
+            // 1) 先放当前播放线路（读侧按它查进度）
+            if (!TextUtils.isEmpty(preferFlag)) {
+                putCoords(out, preferFlag, vodInfo.seriesMap.get(preferFlag));
+            }
+            // 2) 其余线路补齐（该集只在别的线路存在时也能落位）
+            for (java.util.Map.Entry<String, java.util.List<com.github.tvbox.osc.bean.VodInfo.VodSeries>> entry
+                    : vodInfo.seriesMap.entrySet()) {
+                if (TextUtils.equals(entry.getKey(), preferFlag)) {
+                    continue;
+                }
+                putCoords(out, entry.getKey(), entry.getValue());
+            }
+        } catch (Throwable ignored) {
+        }
+        return out;
+    }
+
+    private static void putCoords(java.util.Map<String, EpCoord> out, String flag,
+                                  java.util.List<com.github.tvbox.osc.bean.VodInfo.VodSeries> list) {
+        if (TextUtils.isEmpty(flag) || list == null) {
+            return;
+        }
+        for (int i = 0; i < list.size(); i++) {
+            com.github.tvbox.osc.bean.VodInfo.VodSeries s = list.get(i);
+            if (s == null || TextUtils.isEmpty(s.name)) {
+                continue;
+            }
+            String n = s.name.trim();
+            if (!TextUtils.isEmpty(n) && !out.containsKey(n)) {
+                out.put(n, new EpCoord(flag, i, n));
+            }
         }
     }
 
