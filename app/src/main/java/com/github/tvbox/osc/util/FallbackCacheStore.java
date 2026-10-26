@@ -301,7 +301,18 @@ public final class FallbackCacheStore {
                 if (key == null || key.isEmpty()) {
                     continue;
                 }
-                if (alivePoolKeys.contains(key)) {
+                // ★ v99-r70：分桶后桶键形如 base|y2022|d李路，alive 集合里只有 base
+                //   ⇒ 必须"精确命中 base"或"base| 前缀命中"都算活着，否则整批被误删。
+                boolean alive = alivePoolKeys.contains(key);
+                if (!alive) {
+                    for (String base : alivePoolKeys) {
+                        if (!TextUtils.isEmpty(base) && key.startsWith(base + "|")) {
+                            alive = true;
+                            break;
+                        }
+                    }
+                }
+                if (alive) {
                     keep.add(key);
                 } else {
                     dropped.add(key);
@@ -329,7 +340,11 @@ public final class FallbackCacheStore {
         Set<String> keys = new HashSet<String>();
         if (titles != null) {
             for (String t : titles) {
-                String k = poolKeyOf(t);
+                // ★★ v99-r70：**不能**再走 poolKeyOf —— 它现在是"桶键直通"（不加 familyKey），
+                //   传进来的却是历史里的**原始片名**，会得到"人世间"而不是归一化后的 base，
+                //   进而与桶键（人世间|y2022|d李路）永远匹配不上 ⇒ gcOrphan 把全部池当孤儿删光
+                //   （真机：poolGc dropped=1 kept=0 ⇒ 缓存 100% 失效，每次进片都要重攒 101 源）。
+                String k = ShowTitleKey.familyKey(t == null ? "" : t.trim());
                 if (!TextUtils.isEmpty(k)) {
                     keys.add(k);
                 }
