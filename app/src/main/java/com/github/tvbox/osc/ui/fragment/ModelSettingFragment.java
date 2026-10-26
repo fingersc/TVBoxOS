@@ -1577,8 +1577,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 //    · 站点质量统计（起播/搜索打点累积，直接决定切源与搜索的排序）。
                 //      一旦某批站点的历史因网络波动失真，只能卸载重装才能重置 —— 现在不用了。
                 SourceQualityStore.clearAll();
-                //    · 切源候选池缓存（每部片一条，24h TTL 的纯缓存）
-                DetailActivity.clearPersistedFallbackCache();
+                //    ★ v99-r73：切源候选池<b>已不再落盘</b>（r58/r59 回退）⇒ 这里没有可清的
+                //      持久化副本，调用点一并删除（否则编译报"找不到符号"）。
                 //    · 观看历史 + 全部播放进度（含「上次看到第几集 / 第几分钟」）。
                 //      历史记着某部剧的播放时间，与「清干净运行期数据」的要求直接冲突，
                 //      按用户拍板：一并清掉（已覆盖上面的 deleteOrphanedPlayProgress）。
