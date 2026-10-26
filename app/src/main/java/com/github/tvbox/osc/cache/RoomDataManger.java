@@ -12,6 +12,7 @@ import com.github.tvbox.osc.sync.SyncTombstones;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
+import com.github.tvbox.osc.util.FilmIdentity;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.VodNameNormalizer;
 import com.google.gson.FieldAttributes;
@@ -607,8 +608,21 @@ public class RoomDataManger {
                     if (newEpNames == null) {
                         newEpNames = collectAllEpisodeNames(vodInfo);
                     }
-                    PlayProgressManager.migrateByVod(record.sourceKey, record.vodId,
-                            sourceKey, vodInfo.id, newEpNames);
+                    // ★★ v99-r74：同名收敛时区分「同片换源」与「换片」。
+                    //   同片（年份/导演一致）⇒ 进度延续（migrateByVod 搬移语义：复制到新片 + 删旧片）。
+                    //   换片（另一部同名片）⇒ **不搬**：进度是每部片各自的观看记忆，
+                    //   把上一部片的进度搬到另一部片上会让新片从错误的位置起播
+                    //   （真机：国产版 431676ms 被搬到韩国版 2013 上）。
+                    boolean sameFilm = FilmIdentity.isSameFilm(vodInfo.year, vodInfo.director,
+                            history.year, history.director);
+                    if (sameFilm) {
+                        PlayProgressManager.migrateByVod(record.sourceKey, record.vodId,
+                                sourceKey, vodInfo.id, newEpNames);
+                    } else {
+                        LOG.i("[Hist] progressMigrateSkip reason=otherFilm"
+                                + " old=" + record.sourceKey + "/" + record.id + "/y" + history.year
+                                + " new=" + sourceKey + "/" + vodInfo.id + "/y" + vodInfo.year);
+                    }
                     // ★ v99-r73：同名换片与同片切源在数据上**不可区分**（跨站换片时
                     //   sourceKey 也不同），故这里只 migrate 复制、不删除任何进度；
                     //   孤儿清理只清 position<=0 的空行（r72）—— 有观看记忆的行一律保留：

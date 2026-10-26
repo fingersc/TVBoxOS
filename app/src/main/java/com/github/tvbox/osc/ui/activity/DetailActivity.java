@@ -61,6 +61,7 @@ import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.SearchHelper;
+import com.github.tvbox.osc.util.FilmIdentity;
 import com.github.tvbox.osc.util.ShowTitleKey;
 import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
@@ -2449,36 +2450,12 @@ public class DetailActivity extends BaseActivity {
      * （{@code 雷佳音,辛柏青} vs {@code 辛柏青/雷佳音}）；③叫法一致但组合不同
      * （{@code 剧情} vs {@code 剧情/家庭}）。任一侧为空返回 false（不猜）。</p>
      */
+    /**
+     * ★ v99-r74：演员/导演/类型/地区的交叉匹配 —— 实现已收敛到 {@link FilmIdentity}，
+     * 避免 DetailActivity 与 RoomDataManger 各留一份口径（那是最容易分叉的地方）。
+     */
     private static boolean metaRelated(String a, String b) {
-        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
-            return false;
-        }
-        Set<String> sa = splitMetaTags(a);
-        Set<String> sb = splitMetaTags(b);
-        if (sa.isEmpty() || sb.isEmpty()) {
-            return false;
-        }
-        if (sa.containsAll(sb) || sb.containsAll(sa)) {
-            return true;
-        }
-        // ★★ v99-r67：子集匹配之外，**交叉（部分重叠）也要算匹配**。
-        //
-        //   原先只认「一方包含另一方」，而各站演员表完整度差异极大（真机实测同一部片：
-        //   一侧列 66 人、另一侧只列 5 人、交集 3 人）⇒ 子集关系不成立 ⇒ 白丢 20 分。
-        //   用真机抓的 27 条正片做 351 对两两比较：子集口径只命中 79%，交叉口径 100%。
-        //
-        //   但不能退化成「有一个重名就算」：那会让「同班人马的两部片」互相匹配。
-        //   故要求「交集 ≥ 2 且 ≥ 较小一侧的一半」—— 实测正片 351 对全过，
-        //   而「不同片只共演 1 人」仍判不匹配。
-        Set<String> small = sa.size() <= sb.size() ? sa : sb;
-        Set<String> big = sa.size() <= sb.size() ? sb : sa;
-        int common = 0;
-        for (String tag : small) {
-            if (big.contains(tag)) {
-                common++;
-            }
-        }
-        return common >= 2 && common * 2 >= small.size();
+        return FilmIdentity.metaRelated(a, b);
     }
 
     /** 按常见分隔符拆元数据字段为标签集合（统一 trim，滤空）。 */
@@ -6096,6 +6073,20 @@ public class DetailActivity extends BaseActivity {
             }
         }
         if (TextUtils.isEmpty(oldSeriesName)) {
+            return;
+        }
+        // ★★ v99-r74：换片（点了另一部同名片）时**不迁移进度**。
+        //   本方法假设「新旧是同一部片」（同片换源要延续进度），但换片时该前提不成立。
+        //   真机实证：看《隐秘而伟大》国产版（ref=28134, 2020）→ 搜索页点韩国版
+        //   （ref=29946, 2013）⇒ 国产版的 431676ms（7 分 11 秒）被搬到了韩国版上。
+        //   判据用跨站稳定的字段（年份 + 导演），见 {@link FilmIdentity#isSameFilm}。
+        if (detailFallbackRefVideo != null
+                && !FilmIdentity.isSameFilm(detailFallbackRefVideo.year, detailFallbackRefVideo.director,
+                        oldRecord.year, oldRecord.director)) {
+            LOG.sw("[FB] migrateSkip reason=otherFilm"
+                    + " ref=" + detailFallbackRefVideo.id + "/refYear=" + detailFallbackRefVideo.year
+                    + " old=" + oldRecord.id + "/oldYear=" + oldRecord.year
+                    + " => 换片，不迁移进度");
             return;
         }
         long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
