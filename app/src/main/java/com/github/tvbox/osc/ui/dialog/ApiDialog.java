@@ -47,6 +47,9 @@ public class ApiDialog extends BaseDialog {
     private EditText inputApi;
     private EditText inputApiLive;
     private View inputConfirm;
+    /** ★ v99-r79：弹窗打开时的初始值（草稿优先），跟随逻辑用它作「旧点播地址」。 */
+    private String initApi;
+    private String initLive;
 
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void refresh(RefreshEvent event) {
@@ -204,21 +207,35 @@ public class ApiDialog extends BaseDialog {
         String newLiveApi = inputApiLive.getText().toString().trim();
         if (!newApi.isEmpty()) {
             HistoryHelper.setApiHistory(newApi);
-            String oldApi = Hawk.get(HawkConfig.API_URL, "");
-            String oldLive = Hawk.get(HawkConfig.LIVE_API_URL, "");
-            // v79：只有"直播为空"或"直播原本等于旧点播地址"时才跟随，避免覆盖用户单独填的直播地址
-            boolean liveFollowsApi = newLiveApi.isEmpty() || newLiveApi.equals(oldApi);
-            if (!newApi.equals(oldApi) && liveFollowsApi) {
-                inputApiLive.setText(newApi);
-                newLiveApi = newApi;
-            }
+        }
+        // v79：只有"直播为空"或"直播原本等于旧点播地址"时才跟随，避免覆盖用户单独填的直播地址
+        // ★ v99-r79：「旧点播地址」改用弹窗打开时显示的值（草稿值），不再查 Hawk
+        String oldApiShown = initApi == null ? "" : initApi.trim();
+        boolean liveFollowsApi = newLiveApi.isEmpty() || newLiveApi.equals(oldApiShown);
+        if (!newApi.isEmpty() && !newApi.equals(oldApiShown) && liveFollowsApi) {
+            inputApiLive.setText(newApi);
+            newLiveApi = newApi;
         }
         if (!newLiveApi.isEmpty()) {
             HistoryHelper.setLiveApiHistory(newLiveApi);
         }
-        Hawk.put(HawkConfig.LIVE_API_URL, newLiveApi);
-        if (listener != null) listener.onchange(newApi);
+        // ★ v99-r79：两个地址都**不再直接落盘**，统一交设置页草稿
+        //   （旧实现只把 LIVE_API_URL 真写进 Hawk，而 API_URL 走草稿、配置重载完成后被还原删除
+        //   ⇒ 重开弹窗时"点播空、地址跑到直播栏"；且放弃保存时点播地址彻底丢失、直播地址漏网残留）
+        if (listener != null) listener.onchange(newApi, newLiveApi);
         dismiss();
+    }
+
+    /**
+     * ★ v99-r79：由宿主页面传入**草稿优先**的初始值（{@code cur(API_URL)} / {@code cur(LIVE_API_URL)}）。
+     * 旧实现直接读 Hawk —— 而设置页是草稿机制，API 类键在"保存"前会被还原，
+     * 重开弹窗就会显示旧值/空值。
+     */
+    public void setInitialValues(String api, String liveApi) {
+        initApi = api;
+        initLive = liveApi;
+        inputApi.setText(api == null ? "" : api);
+        inputApiLive.setText(liveApi == null ? "" : liveApi);
     }
 
     public void setOnListener(OnListener listener) {
@@ -236,7 +253,7 @@ public class ApiDialog extends BaseDialog {
     OnListener listener = null;
 
     public interface OnListener {
-        void onchange(String api);
+        void onchange(String api, String liveApi);
 
         void onLocalConfig(boolean live);
     }

@@ -362,16 +362,23 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 FastClickCheckUtil.check(v);
                 apiDialog = new ApiDialog(mActivity);
                 ApiDialog dialog = apiDialog;
+                // ★ v99-r79：弹窗初始值读**草稿优先**（cur），否则保存前重开弹窗会显示被还原的旧值
+                dialog.setInitialValues(cur(HawkConfig.API_URL, ""),
+                        cur(HawkConfig.LIVE_API_URL, cur(HawkConfig.API_URL, "")));
                 EventBus.getDefault().register(dialog);
                 dialog.setOnListener(new ApiDialog.OnListener() {
                     @Override
-                    public void onchange(String api) {
-                        draftPut(HawkConfig.API_URL, api);
-                        if (!HistoryHelper.isApiLineHistory(api)) {
+                    public void onchange(String api, String liveApi) {
+                        // ★ v99-r79：两个地址统一走草稿（旧实现直播直接落 Hawk、点播走草稿，两路不一致
+                        //   ⇒ 首次安装填点播后重开弹窗"点播空、地址跑到直播栏"，放弃保存时点播还丢了）
+                        draftPutApiPair(api, liveApi);
+                        if (!TextUtils.isEmpty(api) && !HistoryHelper.isApiLineHistory(api)) {
                             HistoryHelper.clearApiLineList();
                         }
-                        tvApi.setText(api);
-                        refreshApiLineText();
+                        if (!TextUtils.isEmpty(api)) {
+                            tvApi.setText(api);
+                            refreshApiLineText();
+                        }
                     }
 
                     @Override
@@ -1015,6 +1022,34 @@ public class ModelSettingFragment extends BaseLazyFragment {
         return false;
     }
 
+    /**
+     * ★ v99-r79：点播 + 直播两个地址**一次快照、一次临时落盘、一次重载**的成对草稿入口。
+     * 逐键 draftPut 会对每个 API 键各触发一次配置重载；且两个地址必须同进同出草稿
+     * ——旧实现直播真落盘、点播走草稿，放弃保存时两路状态不一致。
+     * 空值不写（沿用旧口径：本弹窗不支持"清空地址"）。
+     */
+    private void draftPutApiPair(String api, String liveApi) {
+        boolean apiTouched = !TextUtils.isEmpty(api);
+        boolean liveTouched = !TextUtils.isEmpty(liveApi);
+        if (!apiTouched && !liveTouched) {
+            return;
+        }
+        if (apiTouched) {
+            draft.put(HawkConfig.API_URL, api);
+        }
+        if (liveTouched) {
+            draft.put(HawkConfig.LIVE_API_URL, liveApi);
+        }
+        snapshotApiKeys();
+        if (apiTouched) {
+            Hawk.put(HawkConfig.API_URL, api);
+        }
+        if (liveTouched) {
+            Hawk.put(HawkConfig.LIVE_API_URL, liveApi);
+        }
+        reloadApiForDraft();
+    }
+
     /** API 改动前的现场（只记一次）。 */
     private void snapshotApiKeys() {
         if (!apiSnapshot.isEmpty() || !apiAbsent.isEmpty()) {
@@ -1109,7 +1144,15 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 || draft.containsKey(HawkConfig.LIVE_API_URL));
         draft.clear();
         if (apiTouched) {
-            reloadApiForDraft();      // Hawk 里是旧值 ⇒ 内存态回到旧配置
+            // ★ v99-r79：先**同步**还原 API 键快照，再重载。
+            //   旧实现假设「Hawk 里是旧值」，但那依赖配置重载回调已跑完——若用户在重载返回前
+            //   就点了「不保存」，这里会把**新地址**载入内存，随后早先那次重载完成才还原 Hawk 键
+            //   ⇒ Hawk 正确而内存停留在新配置，直到下次重载/重启。
+            boolean touched = !apiSnapshot.isEmpty() || !apiAbsent.isEmpty();
+            if (touched) {
+                restoreApiSettingsOnly();
+            }
+            reloadApiForDraft();      // Hawk 里此刻必是旧值 ⇒ 内存态回到旧配置
         }
         captureBaseline();
         refreshUi();
