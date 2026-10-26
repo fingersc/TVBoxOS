@@ -369,12 +369,45 @@ public class PlayProgressManager {
                 save(toSourceKey, toVodId, row.flag, row.playIndex, targetEp, row.position);
                 moved++;
             }
+            // ★ v99-r75：旧源该片的进度<b>整体清空</b> —— 这正是既有口径
+            //   「同片只保留最新 10 集记录，并且都随着迁移到新源里去」：
+            //   进度跟着"当前所在的源"走，旧源不留副本 ⇒ 同一部片不会在多个源各留一份。
             dao.deleteByVod(s(fromSourceKey), s(fromVodId));
             return moved;
         } catch (Throwable th) {
             th.printStackTrace();
             return 0;
         }
+    }
+
+    /**
+     * ★ v99-r75：收集一部影片在<b>所有线路</b>下的集名（供跨源集名匹配）。
+     *
+     * <p>原先是 {@code RoomDataManger} 里的私有方法；现在提到这里做<b>单一实现</b> ——
+     * DetailActivity 的迁移（{@code migratePlaybackTimeFromOldSource}）也需要它，
+     * 两边各留一份必然分叉。</p>
+     */
+    public static java.util.List<String> collectAllEpisodeNames(com.github.tvbox.osc.bean.VodInfo vodInfo) {
+        java.util.List<String> out = new ArrayList<>();
+        if (vodInfo == null || vodInfo.seriesMap == null) {
+            return out;
+        }
+        try {
+            for (java.util.Map.Entry<String, java.util.List<com.github.tvbox.osc.bean.VodInfo.VodSeries>> entry
+                    : vodInfo.seriesMap.entrySet()) {
+                java.util.List<com.github.tvbox.osc.bean.VodInfo.VodSeries> list = entry.getValue();
+                if (list == null) continue;
+                for (com.github.tvbox.osc.bean.VodInfo.VodSeries series : list) {
+                    if (series == null || TextUtils.isEmpty(series.name)) continue;
+                    String n = series.name.trim();
+                    if (!TextUtils.isEmpty(n) && !out.contains(n)) {
+                        out.add(n);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return out;
     }
 
     /** 删除整部影片所有集的进度（配合删除历史） */

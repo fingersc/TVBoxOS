@@ -591,6 +591,40 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * ★ v99-r76：<b>严格</b>的"是否确属同一集"判定（用户口径：<b>日期对不上就不是同一集</b>）。
+     *
+     * <p>与 {@link #sameEpisode} 的差别：那个是"两集名是否可认作同一集"（宽松、用于定位），
+     * 这个是"目标源里到底有没有这一集"（严格、用于决定要不要续切）。</p>
+     *
+     * <p>规则：</p>
+     * <ul>
+     *   <li><b>同域</b>（都是期号式，或都是日期式）⇒ 期号/日期必须一致，且分段（上/中/下）一致；
+     *       对不上 ⇒ <b>false</b>（不是同一集）。日期式下"差一天"就是差一集。</li>
+     *   <li><b>跨域</b>（期号式 ↔ 日期式）⇒ 量纲不同无法直接比（见 {@link #sameEpisode} 的说明），
+     *       交给探路机制处理，此处<b>放行</b>（true），避免一次都不迁移播放时间。</li>
+     *   <li>任一方无法解析出期号/日期（DOMAIN_UNKNOWN）或名字为空 ⇒ 无从判定，<b>放行</b>。</li>
+     * </ul>
+     */
+    public static boolean isSameEpisodeStrict(String a, String b) {
+        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
+            return true;                        // 无从判定 ⇒ 放行
+        }
+        EpisodeKey ka = parse(a);
+        EpisodeKey kb = parse(b);
+        if (ka == null || kb == null
+                || ka.domain == DOMAIN_UNKNOWN || kb.domain == DOMAIN_UNKNOWN) {
+            return true;                        // 无从判定 ⇒ 放行
+        }
+        if (ka.domain != kb.domain) {
+            return true;                        // 跨域 ⇒ 放行（量纲不同）
+        }
+        if (ka.ordinal != kb.ordinal) {
+            return false;                       // 同域但期号/日期不一致 ⇒ 不是同一集
+        }
+        return normalizePart(ka.part) == normalizePart(kb.part);
+    }
+
+    /**
      * 「日期 + 期号」混合式名字 → 去掉日期后的<b>期数式形态</b>；非此形态返回 {@code null}。
      *
      * <p><b>为什么需要它</b>：采集源普遍存在 {@code 20260906第2期上} 这种"日期打头、

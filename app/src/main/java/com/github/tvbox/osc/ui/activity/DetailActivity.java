@@ -1358,16 +1358,51 @@ public class DetailActivity extends BaseActivity {
                         boolean positionTrusted = EpisodeNameMatcher.positionTrustedAcrossDomain(
                                 expectedName, currentEpisode.name);
 
+                        // ★★ v99-r76：该源到底有没有「当前正在看的那一集」？
+                        //   口径（用户定稿）：**日期对不上就不是同一集** ⇒ 不该在这个源上就近猜一集播放。
+                        //   · expectedName 为空 ⇒ 没有"当前这一集"的概念（首次进入/无快照）⇒ 放行
+                        //   · 用户指定的源（搜索页点卡片 / 历史点卡片，fallbackResult=false）
+                        //     ⇒ 暂停播放 + 提示「该源没有当前这一集」，不去乱切别的源
+                        //   · 切源队列（fallbackResult=true）⇒ 软失败续切下一个源（独立预算 6 次）
+                        //   · 预算耗尽 ⇒ 提示「没有其他源包含这一集」并停止（不播任何内容）
+                        if (!TextUtils.isEmpty(expectedName)
+                                && !EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentEpisode.name)) {
+                            LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
+                                    + " expected=" + expectedName + " actual=" + currentEpisode.name
+                                    + " userPicked=" + (fallbackResult ? 0 : 1)
+                                    + " alignFailover=" + detailFallbackAlignFailover);
+                            detailFallbackLoadingCandidate = false;
+                            llLayout.removeCallbacks(detailFallbackDetailTimeout);
+                            if (!fallbackResult) {
+                                // 用户指定的源 ⇒ 暂停并提示，不擅自换到别的源
+                                Toast.makeText(DetailActivity.this,
+                                        "该源没有当前这一集", Toast.LENGTH_SHORT).show();
+                                return;
+                            }
+                            if (detailFallbackAlignFailover >= DETAIL_FALLBACK_MAX_ALIGN_FAILOVER) {
+                                Toast.makeText(DetailActivity.this,
+                                        "没有其他源包含这一集", Toast.LENGTH_SHORT).show();
+                                finishDetailFallbackWithoutResult();
+                                return;
+                            }
+                            detailFallbackAlignFailover++;
+                            detailFallbackSoftTriedKeys.add(sourceKey);
+                            loadNextDetailFallbackSource();
+                            return;
+                        }
+
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
                             if (positionTrusted) {
                                 migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                        currentEpisode.name, vodInfoRecord);
+                                        currentEpisode.name, vodInfoRecord,
+                                        PlayProgressManager.collectAllEpisodeNames(vodInfo));
                             }
                         } else if (fallbackFromValid) {
                             if (positionTrusted) {
                                 migratePlaybackTimeFromOldSource(sourceKey, vodId, vodInfo.playFlag, vodInfo.playIndex,
-                                        currentEpisode.name, null);
+                                        currentEpisode.name, null,
+                                        PlayProgressManager.collectAllEpisodeNames(vodInfo));
                             }
                         }
                         
@@ -4768,6 +4803,13 @@ public class DetailActivity extends BaseActivity {
      * 而这条路径<b>一行日志都没有</b>，出问题只能靠反推（真机奶酪源那次就是）。</p>
      */
     private String detailFallbackDenyMsg = "";
+    /**
+     * ★ v99-r76：因「该源没有当前这一集」而续切的次数（<b>独立预算</b>，不占用通用 failover 预算 ——
+     * 「找有对应集的源」比「起播失败重试」需要更多次，用户定稿为 6 次）。
+     */
+    private int detailFallbackAlignFailover = 0;
+    /** ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（用户定稿 6）。 */
+    private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = 6;
     private boolean detailFallbackLoadingCandidate;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
@@ -6052,7 +6094,8 @@ public class DetailActivity extends BaseActivity {
     }
     
     private void migratePlaybackTimeFromOldSource(String newSourceKey, String newVodId, String newFlag, int newIndex,
-                                              String newSeriesName, VodInfo oldRecord) {
+                                              String newSeriesName, VodInfo oldRecord,
+                                              java.util.List<String> newEpNames) {
     try {
         if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId) || TextUtils.isEmpty(newSeriesName)) {
             return;
@@ -6093,13 +6136,34 @@ public class DetailActivity extends BaseActivity {
         LOG.sw("[FB] migrate " + oldRecord.sourceKey + "/" + oldRecord.id + " ep=" + oldSeriesName
                 + " -> " + newSourceKey + "/" + newVodId + " ep=" + newSeriesName
                 + " oldTime=" + oldTime + " newVal=" + newVal);
+        // ★★ v99-r75：同片 ⇒ **整片搬移**（统一到切源时的既有口径：
+        //   「每部片只保留最新 10 集记录，并且都随着迁移到新源里去」）。
+        //   · 旧源先裁到最新 10 集（KEEP_PROGRESS_EPISODES）—— 只搬有价值的那些
+        //   · migrateByVod 逐集搬到新源（新源 save 时会自动裁到 10 集）
+        //   · 已搬走的行从旧源删除 ⇒ 同一部片不再在多个源各留一份「当前集」进度
+        //     （真机：同一部片 28134 的进度散在 feifancj / 730acd68 / 73b5c89a 三个源）
+        PlayProgressManager.trimByVod(oldRecord.sourceKey, oldRecord.id,
+                com.github.tvbox.osc.sync.HistorySyncManager.KEEP_PROGRESS_EPISODES);
+        int movedRows = PlayProgressManager.migrateByVod(oldRecord.sourceKey, oldRecord.id,
+                newSourceKey, newVodId, newEpNames);
+        LOG.sw("[FB] migrateVod " + oldRecord.sourceKey + "/" + oldRecord.id
+                + " -> " + newSourceKey + "/" + newVodId + " moved=" + movedRows
+                + " eps=" + (newEpNames == null ? 0 : newEpNames.size()));
         if (oldTime > 0) {
             // ★ v99-r71：取证日志 —— 与 PlayFragment.getSavedProgress 的 progressRead 成对。
             //   两边 key 必须完全一致（源/片id/线路/集下标/集名），任何一处不一致都会导致
             //   "迁移写入了、起播读不到"⇒ 从 0 播几秒就把迁移值覆盖掉。
             LOG.sw("[FB] progressWrite key=" + newSourceKey + "/" + newVodId + "/" + newFlag
                     + "/" + newIndex + "/" + newSeriesName + " => " + oldTime);
-            PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+            // 新源该集已有记忆（整片搬移时可能已搬到）⇒ 以新源为准，不覆盖
+            long nowVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            if (nowVal <= 0) {
+                PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+            }
+            // ★ v99-r75：旧源这一条已复制到新源 ⇒ 删掉，避免同一部片在多个源各留一份。
+            //   （打墓碑 + markDirty ⇒ 同步侧能正确知道"这条被迁走了"）
+            PlayProgressManager.delete(oldRecord.sourceKey, oldRecord.id,
+                    oldFlag, oldRecord.playIndex, oldSeriesName);
             // ★ 防丢：仅当新集名确实是旧集名的"同一集"时才写（同集名，或由匹配器判定同集）。
             //   名称不同且无法互认时，额外保底写一份"按旧集名"的记录——
             //   这样即便本次落点有偏差，用户回到该集仍能拿回时间，不会凭空丢记忆。

@@ -635,26 +635,9 @@ public class RoomDataManger {
     }
 
     /** 收集一部影片在<b>所有线路</b>下的集名，供换源时做跨源集名匹配。 */
+    /** ★ v99-r75：集名收集已提到 {@link PlayProgressManager#collectAllEpisodeNames}（单一实现）。 */
     private static List<String> collectAllEpisodeNames(VodInfo vodInfo) {
-        List<String> out = new ArrayList<>();
-        if (vodInfo == null || vodInfo.seriesMap == null) {
-            return out;
-        }
-        try {
-            for (Map.Entry<String, List<VodInfo.VodSeries>> entry : vodInfo.seriesMap.entrySet()) {
-                List<VodInfo.VodSeries> list = entry.getValue();
-                if (list == null) continue;
-                for (VodInfo.VodSeries series : list) {
-                    if (series == null || TextUtils.isEmpty(series.name)) continue;
-                    String n = series.name.trim();
-                    if (!TextUtils.isEmpty(n) && !out.contains(n)) {
-                        out.add(n);
-                    }
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-        return out;
+        return PlayProgressManager.collectAllEpisodeNames(vodInfo);
     }
 
     /**
