@@ -1258,6 +1258,25 @@ public class DetailActivity extends BaseActivity {
                             }
                             sameNameRestored = (vodInfoRecord != null);
                         }
+                        // ★ v99-r78：同名 ≠ 同片 —— 恢复播放状态前必须过同片判据。
+                        //   真机案例（2026-10-26「人世间」）：2022 正剧（李路/58集/剧情）与
+                        //   2024 版（现代都市/82集·合集行）同名。点开 2024 版时本段按片名
+                        //   恢复了 2022 版的播放位置（第3集）⇒ 详情页处处找不到「第3集」，
+                        //   连环提示「没有当前这一集」。r74 的拦截挂在迁移侧（migrateSkip），
+                        //   但本段只恢复 UI 状态、不写库，迁移可能根本不被调用
+                        //   （remap 失败 ⇒ positionTrusted=false）⇒ 必须在此独立判定。
+                        //   vodInfo 的 year/director 已由 setVideo(mVideo) 填充（详情解析侧，
+                        //   非空可信）；库记录侧由写入时的同一链路保证。
+                        if (vodInfoRecord != null
+                                && !FilmIdentity.isSameFilm(vodInfo.year, vodInfo.director,
+                                        vodInfoRecord.year, vodInfoRecord.director)) {
+                            LOG.sw("[FB] sameNameRestoreSkip reason=otherFilm"
+                                    + " cur=" + vodInfo.id + "/y" + vodInfo.year
+                                    + " rec=" + vodInfoRecord.id + "/y" + vodInfoRecord.year
+                                    + " => 换片，不恢复播放状态");
+                            vodInfoRecord = null;
+                            sameNameRestored = false;
+                        }
                         if (vodInfoRecord != null) {
                             vodInfo.playIndex = Math.max(vodInfoRecord.playIndex, 0);
                             vodInfo.playFlag = vodInfoRecord.playFlag;
