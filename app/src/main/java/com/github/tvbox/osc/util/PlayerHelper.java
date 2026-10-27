@@ -34,7 +34,8 @@ public class PlayerHelper {
     }
     public static void updateCfg(VideoView videoView, JSONObject playerCfg,int forcePlayerType) {
         int playerType = Hawk.get(HawkConfig.PLAY_TYPE, 2);
-        int renderType = Hawk.get(HawkConfig.PLAY_RENDER, 0);
+        // ★ v99-r82：渲染方式默认改为 SurfaceView（1），只影响新安装设备（不做旧值迁移）。
+        int renderType = Hawk.get(HawkConfig.PLAY_RENDER, 1);
         String ijkCode = Hawk.get(HawkConfig.IJK_CODEC, "硬解码");
         int scale = Hawk.get(HawkConfig.PLAY_SCALE, 0);
         try {
@@ -122,7 +123,8 @@ public class PlayerHelper {
         } else {
             playerFactory = ExoMediaPlayerFactory.create();
         }
-        int renderType = Hawk.get(HawkConfig.PLAY_RENDER, 0);
+        // ★ v99-r82：与 updateCfg(3 参) 保持同一默认值（SurfaceView）
+        int renderType = Hawk.get(HawkConfig.PLAY_RENDER, 1);
         RenderViewFactory renderViewFactory = null;
         switch (renderType) {
             case 0:

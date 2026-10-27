@@ -2171,7 +2171,8 @@ public class LivePlayActivity extends BaseActivity {
         if (!liveFirstFrameShown) {
             return LIVE_BOOT_TIMEOUT_MAX_MS;
         }
-        return (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5000L;
+        // ★ v99-r82：默认档位改为 5 秒（下标 0）。只影响新安装设备，不迁移旧值。
+        return (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 0) + 1) * 5000L;
     }
 
     private long delayForLiveFailure() {
@@ -3277,7 +3278,8 @@ public class LivePlayActivity extends BaseActivity {
                     });
                     String sortJson = null;
                     try {
-                        sortJson = future.get(ApiConfig.get().getLiveConnectTimeoutSeconds(), TimeUnit.SECONDS);
+                        // v99-r82：列表等待独立于换源档位（至少 10 秒），见 getLiveListTimeoutSeconds
+                        sortJson = future.get(ApiConfig.get().getLiveListTimeoutSeconds(), TimeUnit.SECONDS);
                     } catch (TimeoutException e) {
                         e.printStackTrace();
                         future.cancel(true);
@@ -3487,7 +3489,7 @@ public class LivePlayActivity extends BaseActivity {
     private void initLiveSettingGroupList() {
         liveSettingGroupList=ApiConfig.get().getLiveSettingGroupList();
         if (liveSettingGroupList.size() < 7) return;
-        liveSettingGroupList.get(3).getLiveSettingItems().get(Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1)).setItemSelected(true);
+        liveSettingGroupList.get(3).getLiveSettingItems().get(Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 0)).setItemSelected(true);
         liveSettingGroupList.get(4).getLiveSettingItems().get(0).setItemSelected(Hawk.get(HawkConfig.LIVE_SHOW_TIME, false));
         liveSettingGroupList.get(4).getLiveSettingItems().get(1).setItemSelected(Hawk.get(HawkConfig.LIVE_SHOW_NET_SPEED, false));
         liveSettingGroupList.get(4).getLiveSettingItems().get(2).setItemSelected(Hawk.get(HawkConfig.LIVE_CHANNEL_REVERSE, false));

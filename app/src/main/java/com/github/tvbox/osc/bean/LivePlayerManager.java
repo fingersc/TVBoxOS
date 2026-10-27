@@ -51,7 +51,7 @@ public class LivePlayerManager {
             }
             defaultPlayerConfig.put("pl", pl);
             defaultPlayerConfig.put("ijk", Hawk.get(HawkConfig.IJK_CODEC, IJK_HARD));
-            defaultPlayerConfig.put("pr", Hawk.get(HawkConfig.PLAY_RENDER, 0));
+            defaultPlayerConfig.put("pr", Hawk.get(HawkConfig.PLAY_RENDER, 1));
             defaultPlayerConfig.put("sc", Hawk.get(HawkConfig.LIVE_PLAY_SCALE, 0));
         } catch (JSONException e) {
             e.printStackTrace();
@@ -59,7 +59,7 @@ public class LivePlayerManager {
         getDefaultLiveChannelPlayer(videoView);
         LOG.live("livePlayerInit pl=" + defaultPlayerConfig.optInt("pl", 2)
                 + " ijk=" + defaultPlayerConfig.optString("ijk", IJK_HARD)
-                + " render=" + defaultPlayerConfig.optInt("pr", 0));
+                + " render=" + defaultPlayerConfig.optInt("pr", 1));
     }
 
     /**

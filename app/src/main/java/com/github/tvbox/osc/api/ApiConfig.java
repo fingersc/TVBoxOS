@@ -1559,8 +1559,22 @@ public class ApiConfig {
     }
 
     public int getLiveConnectTimeoutSeconds() {
-        return (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 1) + 1) * 5;
+        return (Hawk.get(HawkConfig.LIVE_CONNECT_TIMEOUT, 0) + 1) * 5;
     }
+
+    /**
+     * 拉取直播频道列表 / 节目单时的等待上限。
+     *
+     * <p>★ v99-r82：换源档位默认已降到 5 秒（用户希望更快换源），但「等 Spider 返回频道列表」
+     * 是另一回事——它慢一点只是列表晚出现，掐早了会直接拿到空列表并回落到默认播放列表。
+     * 所以这里给一个 10 秒下限：用户把换源设成 5 秒不影响列表加载，设得更大仍按用户值。</p>
+     */
+    public int getLiveListTimeoutSeconds() {
+        return Math.max(LIVE_LIST_TIMEOUT_MIN_SECONDS, getLiveConnectTimeoutSeconds());
+    }
+
+    /** 直播列表 / EPG 等待下限（秒），见 {@link #getLiveListTimeoutSeconds()}。 */
+    private static final int LIVE_LIST_TIMEOUT_MIN_SECONDS = 10;
 
     private boolean isLiveSpiderApi(String api) {
         return api.contains(".py") || api.contains(".js");

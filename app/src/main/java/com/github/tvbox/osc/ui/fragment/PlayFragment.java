@@ -1646,7 +1646,8 @@ public class PlayFragment extends BaseLazyFragment {
             if (mVodPlayerCfg.optInt("pl", 2) == 0) {
                 mVodPlayerCfg.put("pl", 2);
             }
-            mVodPlayerCfg.put("pr", Hawk.get(HawkConfig.PLAY_RENDER, 0));
+            // ★ v99-r82：默认渲染方式 = SurfaceView（只影响新安装设备，不迁移旧值）
+            mVodPlayerCfg.put("pr", Hawk.get(HawkConfig.PLAY_RENDER, 1));
             if (!mVodPlayerCfg.has("ijk")) {
                 mVodPlayerCfg.put("ijk", Hawk.get(HawkConfig.IJK_CODEC, "硬解码"));
             }
