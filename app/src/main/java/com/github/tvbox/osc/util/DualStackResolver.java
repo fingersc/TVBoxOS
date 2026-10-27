@@ -70,7 +70,9 @@ public final class DualStackResolver {
      * 真正有用的"翻族后到底选了谁"反而被埋掉。这里按 host 去重。</p>
      */
     private static final ConcurrentHashMap<String, String> LOGGED_ORDER = new ConcurrentHashMap<>();
-    private static final ExecutorService POOL = Executors.newFixedThreadPool(2);
+    /** 每族最多探几个地址（v99-r90）：同族两个地址能力可以完全不同，只探第一个会误判。 */
+    private static final int MAX_PROBE_PER_FAMILY = 2;
+    private static final ExecutorService POOL = Executors.newFixedThreadPool(4);
 
     private DualStackResolver() {
     }
@@ -125,8 +127,11 @@ public final class DualStackResolver {
 
             final Result[] best = new Result[1];
             final Object lock = new Object();
-            probe(v4.get(0), port, best, lock);
-            probe(v6.get(0), port, best, lock);
+            // v99-r90：每族探前 2 个。实测同一域名的两个 IPv4 节点能力完全互补
+            //   （39.135.49.25 只开 6610、112.50.244.106 只开 6060），只探第一个等于把
+            //   "第二个能通"直接判死 —— 这正是那次 8.6 秒的来源。
+            probeFirst(v4, port, best, lock);
+            probeFirst(v6, port, best, lock);
             synchronized (lock) {
                 lock.wait(PROBE_TIMEOUT_MS + 200L);          // 等最快者（超时兜底）
             }
@@ -140,6 +145,15 @@ public final class DualStackResolver {
             }
         } catch (Throwable t) {
             return null;                                     // 铁律 2
+        }
+    }
+
+    /** 把该族前 {@link #MAX_PROBE_PER_FAMILY} 个地址都丢进线程池并行探。 */
+    private static void probeFirst(List<InetAddress> family, int port,
+                                   final Result[] best, final Object lock) {
+        int n = Math.min(family.size(), MAX_PROBE_PER_FAMILY);
+        for (int i = 0; i < n; i++) {
+            probe(family.get(i), port, best, lock);
         }
     }
 
@@ -189,6 +203,9 @@ public final class DualStackResolver {
      * <ol>
      *   <li>显式地址族偏好（{@link DualStackPrefs}，播放器 403/404 翻族时登记）⇒ 该族全部排前；
      *       该族<b>内部</b>再按"探测证据 → 轮转 → 粘性缓存"挑第一个（见 {@link #pickWithinFamily}）</li>
+     *   <li>v99-r90 <b>并行探测最快者</b>（{@link #probeFastest}）⇒ 该地址排最前。
+     *       这是 Happy Eyeballs 的等价物：OkHttp 3.12 没有 fastFallback，只会按我们给的顺序
+     *       串行连接，第一个是死端口就要吃满 8s；并行探一下就能把"能通但排后面"的地址提上来</li>
      *   <li>粘性缓存（真实连接观测）⇒ 该地址排最前</li>
      *   <li>都没有 ⇒ IPv4 优先，AAAA 保留在尾部（配合 8s connect 仍有兜底价值）</li>
      *   <li>纯 IPv6 / 单地址 ⇒ 原序返回</li>
@@ -204,6 +221,9 @@ public final class DualStackResolver {
         if (all == null || all.size() <= 1) return all;
         try {
             List<InetAddress> out = new ArrayList<>(all.size());
+            // v99-r90：Dns.lookup 的签名里没有端口，用播放器 setDataSource 时记下的端口提示补上。
+            // 拿不到端口就跳过并行探测（探不了），退回原来的排序策略。
+            int probePort = probePortOf(host, port);
 
             // 1) 显式族偏好最优先：翻族重试必须真的换族，不能被下面的粘性缓存顶回去
             int pref = DualStackPrefs.preferFamily(host);
@@ -221,8 +241,13 @@ public final class DualStackResolver {
                     //   排查"翻了族还是连不上"时，这一行能直接区分：
                     //   ① DNS 没按偏好排（order 逻辑问题）；② 排了但那条路本身不通（网络问题）。
                     //   v99-r87 增加 via=，直接看出这个"第一"是怎么来的（地址证据 / 轮转 / 粘性缓存）。
-                    String why = DualStackPrefs.preferAddress(host, pref) != null ? "addr-pref"
-                            : (DualStackPrefs.rotationIndex(host, pref) >= 0 ? "rotate" : "cache");
+                    // v99-r90：修正 via= 的语义。原来"既没有地址证据也没有游标"也会被标成 cache，
+                    // 但那种情况可能是 pickWithinFamily 什么都没给出（回落该族 DNS 原序）——
+                    // 排查时按 via=cache 去理解会得到错误结论。
+                    boolean hasAddrPref = DualStackPrefs.preferAddress(host, pref) != null;
+                    boolean hasRotate = DualStackPrefs.rotationIndex(host, pref) >= 0;
+                    String why = hasAddrPref ? "addr-pref"
+                            : (hasRotate ? "rotate" : (cachedFirst(host, port) != null ? "cache" : "none"));
                     logOrderOnce(host, "pref=v" + pref + " via=" + why
                             + " first=" + addrText(out.get(0)) + " total=" + out.size());
                     return out;                                  // 另一族仍在尾部（铁律 1）
@@ -231,7 +256,26 @@ public final class DualStackResolver {
                 logOrderOnce(host, "pref=v" + pref + " no-such-family->default");
             }
 
-            // 2) 粘性缓存
+            // 2) v99-r90 并行探测最快者 —— Happy Eyeballs 的等价物。
+            //    必须排在默认的"IPv4 优先"之前：OkHttp 3.12.11 没有 fastFallback，它完全按
+            //    我们返回的顺序串行试，第一个是死端口就要吃满 8s connectTimeout；
+            //    而实测同一域名的 IPv4 节点可能只开 6610、不开我们请求的 6060。
+            //    探测本身并行（线程池，单地址 1.2s 上限），有一个先通就立刻返回。
+            if (probePort > 0) {
+                Result fast = probeFastest(host, probePort);
+                if (fast != null && fast.address != null && all.contains(fast.address)) {
+                    out.add(fast.address);
+                    for (InetAddress a : all) {
+                        if (!a.equals(fast.address)) out.add(a);
+                    }
+                    logOrderOnce(host, "via=probe first=" + addrText(fast.address)
+                            + " " + fast.probeMs + "ms v6=" + fast.viaV6
+                            + (fast.fromCache ? " cached" : "") + " total=" + out.size());
+                    return out;
+                }
+            }
+
+            // 3) 粘性缓存
             InetAddress first = cachedFirst(host, port);
             if (first != null) {
                 out.add(first);
@@ -241,12 +285,29 @@ public final class DualStackResolver {
                 return out;
             }
 
-            // 3) 默认：IPv4 优先
+            // 4) 默认：IPv4 优先（探测不可用时的最后兜底）
             for (InetAddress a : all) if (a instanceof Inet4Address) out.add(a);
             for (InetAddress a : all) if (!(a instanceof Inet4Address)) out.add(a);
             return out.isEmpty() ? all : out;
         } catch (Throwable t) {
             return all;                                       // 铁律 2
+        }
+    }
+
+    /**
+     * 探测用的端口：调用方给了就用（真实端口），没给就查播放器记下的端口提示（v99-r90）。
+     *
+     * <p>抽成独立方法是为了能被断言：{@code Dns.lookup} 传进来的永远是 0，
+     * 真正的端口只可能来自 {@code DualStackPrefs.notePort}。返回 0 表示"探不了"，调用方跳过探测。</p>
+     */
+    static int probePortOf(String host, int port) {
+        try {
+            if (port > 0 && port <= 65535) {
+                return port;
+            }
+            return DualStackPrefs.portOf(host);
+        } catch (Throwable ignored) {
+            return 0;
         }
     }
 

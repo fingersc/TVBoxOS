@@ -151,6 +151,16 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         PlayLog.i("echo-setDataSource:"+path);
         currentPlayPath = path;
         currentHeaders = copyHeaders(headers);
+        // v99-r90：把真实端口告诉排序层。okhttp3.Dns#lookup 的签名里没有端口，
+        // 而"同一个 IP 的 6060 不通、6610 通"是实测存在的差异 —— 没有端口就无法并行探测最快地址，
+        // 只能按 DNS 原序串行试，第一个是死端口就要吃满 8s connectTimeout。
+        try {
+            String dsHost = hostOfPath(path);
+            if (!dsHost.isEmpty()) {
+                DualStackPrefs.notePort(dsHost, DualStackProbe.portOf(path));
+            }
+        } catch (Throwable ignored) {
+        }
         mRetriedAsHls = false;
         mFlippedFamily = false;
         mFlipAbandoned = false;

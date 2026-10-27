@@ -123,6 +123,19 @@ public final class DualStackPrefs {
     private static final long ROTATION_TTL_MS = 10 * 60 * 1000L;
     private static final int ROTATION_MAX = 128;
 
+    /**
+     * 端口提示：host → 最近一次真实请求用的端口（v99-r90）。
+     *
+     * <p><b>为什么需要</b>：{@code okhttp3.Dns#lookup} 的签名里<b>没有端口</b>，
+     * 所以排序层拿到的 port 一直是 0，而并行探测必须知道端口。
+     * 播放器在 {@code setDataSource} 时是知道 URL 与端口的，由它记一笔，排序层再读。</p>
+     *
+     * <p>只影响"探测谁更快"，不影响任何地址的可用性；过期即丢。</p>
+     */
+    private static final ConcurrentHashMap<String, PortHint> PORTS = new ConcurrentHashMap<>();
+    private static final long PORT_TTL_MS = 30 * 60 * 1000L;
+    private static final int PORT_MAX = 128;
+
     private static final class Pref {
         final int family;
         final long at;
@@ -152,6 +165,16 @@ public final class DualStackPrefs {
 
         Rotation(int index, long at) {
             this.index = index;
+            this.at = at;
+        }
+    }
+
+    private static final class PortHint {
+        final int port;
+        final long at;
+
+        PortHint(int port, long at) {
+            this.port = port;
             this.at = at;
         }
     }
@@ -332,6 +355,46 @@ public final class DualStackPrefs {
         }
     }
 
+    // -------------------------------------------------------------------- 端口提示
+
+    /**
+     * 记下"这个 host 最近一次真实请求用的是这个端口"（v99-r90）。
+     *
+     * <p>唯一写入点：播放器 {@code setDataSource}。存在的理由只有一个 ——
+     * {@code okhttp3.Dns#lookup} 拿不到端口，而并行探测必须有端口才能探
+     * （同一个 IP 的 6060 不通、6610 通，实测就是这个差异让我们卡了 8 秒）。</p>
+     */
+    public static void notePort(String host, int port) {
+        try {
+            if (host == null || host.isEmpty() || port <= 0 || port > 65535) {
+                return;
+            }
+            PORTS.put(host, new PortHint(port, System.currentTimeMillis()));
+            trim(PORTS, PORT_MAX, PORT_TTL_MS);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 取该 host 最近一次真实请求的端口；没有记录返回 0（调用方据此跳过探测）。 */
+    public static int portOf(String host) {
+        try {
+            if (host == null || host.isEmpty()) {
+                return 0;
+            }
+            PortHint p = PORTS.get(host);
+            if (p == null) {
+                return 0;
+            }
+            if (System.currentTimeMillis() - p.at >= PORT_TTL_MS) {
+                PORTS.remove(host);
+                return 0;
+            }
+            return p.port;
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
     // -------------------------------------------------------------------- 内部
 
     /**
@@ -436,6 +499,9 @@ public final class DualStackPrefs {
         }
         if (v instanceof Rotation) {
             return ((Rotation) v).at;
+        }
+        if (v instanceof PortHint) {
+            return ((PortHint) v).at;
         }
         return 0L;
     }
