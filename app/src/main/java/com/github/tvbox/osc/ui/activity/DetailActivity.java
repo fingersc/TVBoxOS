@@ -291,6 +291,16 @@ public class DetailActivity extends BaseActivity {
     private TextView tvQuickSearch;
     private TextView tvChangeSource;
     private TextView tvCollect;
+    /**
+     * 当前详情页是否为「索引源」（只提供影片资料、不提供任何播放线路的源，例如豆瓣影视库）。
+     *
+     * <p>由 spider 在 {@code detailContent} 里以 {@code action=indexOnly} 自报，见
+     * {@link #applyIndexOnlyUi(boolean)}。为 false 时下面所有新增逻辑一律不生效，
+     * 行为与本补丁之前逐字节一致。
+     */
+    private boolean indexOnlyDetail = false;
+    /** 剧集区空占位里的提示文案控件；索引源下改写成「点搜索片源」。 */
+    private TextView tvEmptyPlaylistTip;
     /** 「正在切换片源…」提示最长驻留时长；超时自动关闭，避免候选源全挂时弹窗永久残留。 */
     private static final long SWITCHING_SOURCE_TOAST_TIMEOUT_MS = 8000L;
     /** 切源进行中的提示弹窗实例（同一会话内复用，避免连点堆叠）。 */
@@ -384,6 +394,7 @@ public class DetailActivity extends BaseActivity {
         tvQuickSearch = findViewById(R.id.tvQuickSearch);
         tvChangeSource = findViewById(R.id.tvChangeSource);
         mEmptyPlayList = findViewById(R.id.mEmptyPlaylist);
+        tvEmptyPlaylistTip = findViewById(R.id.tvEmptyPlaylistTip);
         mGridView = findViewById(R.id.mGridView);
         mGridView.setHasFixedSize(false);
         this.mGridViewLayoutMgr = new V7GridLayoutManager(this.mContext, 6);
@@ -485,6 +496,15 @@ public class DetailActivity extends BaseActivity {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
+                // ★ 索引源没有播放线路：「立即播放」在这里的含义是"我要马上看"，
+                //   即去全网自动找一个能播的站跳过去（走切源流程；到目标站后由用户起播）。
+                //   不能落到下面的 jumpToPlay()：它剧集列表为空会静默 return，
+                //   而 showPreview 为真时还会先 enterFullPreview() 进一个空播放器黑屏。
+                if (indexOnlyDetail) {
+                    LOG.sw("[IDX] 立即播放 -> 切源 key=" + sourceKey + " id=" + vodId);
+                    startDetailFallbackFromMenu();
+                    return;
+                }
                 if (showPreview) {
                     enterFullPreview();
                     if(firstReverse){
@@ -500,38 +520,21 @@ public class DetailActivity extends BaseActivity {
         tvQuickSearch.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startQuickSearch();
-                QuickSearchDialog quickSearchDialog = new QuickSearchDialog(DetailActivity.this);
-                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_QUICK_SEARCH, quickSearchData));
-                EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_QUICK_SEARCH_WORD, quickSearchWord));
-                quickSearchDialog.show();
-                if (pauseRunnable != null && pauseRunnable.size() > 0) {
-                    searchExecutorService = Executors.newFixedThreadPool(5);
-                    for (Runnable runnable : pauseRunnable) {
-                        searchExecutorService.execute(runnable);
-                    }
-                    pauseRunnable.clear();
-                    pauseRunnable = null;
-                }
-                quickSearchDialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
-                    @Override
-                    public void onDismiss(DialogInterface dialog) {
-                        try {
-                            if (searchExecutorService != null) {
-                                pauseRunnable = searchExecutorService.shutdownNow();
-                                searchExecutorService = null;
-                            }
-                        } catch (Throwable th) {
-                            th.printStackTrace();
-                        }
-                    }
-                });
+                openQuickSearchDialog();
             }
         });
         tvChangeSource.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 FastClickCheckUtil.check(v);
+                // ★ 索引源下这个按钮的文案是「搜索片源」：改为弹聚合搜索，由用户自己挑站点。
+                //   （"自动帮你挑一个站跳过去"放在「立即播放」上，见 tvPlay 的索引源分支。）
+                //   非索引源一律走原来的切源，行为不变。
+                if (indexOnlyDetail) {
+                    LOG.sw("[IDX] quick search dialog from 搜索片源");
+                    openQuickSearchDialog();
+                    return;
+                }
                 startDetailFallbackFromMenu();
             }
         });
@@ -566,7 +569,10 @@ public class DetailActivity extends BaseActivity {
             @SuppressLint("NotifyDataSetChanged")
             @Override
             public void onClick(View v) {
-                if (vodInfo != null && vodInfo.seriesMap.size() > 0) {
+                // ★ seriesMap 可能为 null（索引源 / 详情没带回任何线路）。
+                //   原写法直接 .size() 会 NPE：过去空详情会被自动切走、用户点不到这，
+                //   现在索引源页面会原地停住并可交互，这条路径从此真的会被点到，故补判空。
+                if (vodInfo != null && vodInfo.seriesMap != null && vodInfo.seriesMap.size() > 0) {
                     vodInfo.reverseSort = !vodInfo.reverseSort;
                     isReverse = !isReverse;
                     tvSeriesSort.setText(isReverse?"倒序":"正序");
@@ -1186,6 +1192,11 @@ public class DetailActivity extends BaseActivity {
                         ivThumb.setImageDrawable(com.github.tvbox.osc.util.ImgUtil.createTextDrawable(mVideo.name));
                     }
 
+                    // ★ 索引源识别必须在剧集区分支之前：下面 seriesMap 为空时会走
+                    //   handleNoPlayableDetail()，那是给「播放源」设计的坏死判定 ——
+                    //   对索引源必须先自报身份，否则资料页会被自动切走。
+                    applyIndexOnlyUi("indexOnly".equals(mVideo.action));
+
                     if (vodInfo.seriesMap != null && vodInfo.seriesMap.size() > 0) {
                         // ★ v67：首轮记录基准集数（同站多资源择优的兜底信号，见字段注释）
                         if (!fallbackResult && detailFallbackRefEpisodes <= 0) {
@@ -1635,6 +1646,16 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void handleNoPlayableDetail() {
+        // ★ 索引源（豆瓣这类只有影片资料、没有播放线路的源）：这不是「坏死源」。
+        //   原逻辑会调 startDetailFallback() 发起全网搜索并切到别的站，
+        //   于是海报/评分/简介刚渲染出来就被另一个站的详情整页替换 ——
+        //   而用户点开豆瓣想看的就是那份资料。
+        //   停在本页，剧集区换成占位提示，找片源交给按钮行的「搜索片源」。
+        if (indexOnlyDetail) {
+            LOG.sw("[IDX] index-only detail, stay. key=" + sourceKey + " id=" + vodId);
+            showIndexOnlyPlaceholder();
+            return;
+        }
         if (detailFallbackActive) {
             detailFallbackLoadingCandidate = false;
             if (!consumeFailoverBudget("noPlayableDetail")) {
@@ -1644,6 +1665,89 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         startDetailFallback();
+    }
+
+    /**
+     * 弹聚合搜索窗。
+     *
+     * <p>原本是 {@code tvQuickSearch} 匿名内部类里的点击体，原样抽成成员方法，
+     * 供两个入口共用（索引源下的「搜索片源」与普通源下的「快速搜索」）。
+     * 逻辑一字未改，只是换了位置，行为零变化。
+     */
+    private void openQuickSearchDialog() {
+        startQuickSearch();
+        QuickSearchDialog quickSearchDialog = new QuickSearchDialog(DetailActivity.this);
+        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_QUICK_SEARCH, quickSearchData));
+        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_QUICK_SEARCH_WORD, quickSearchWord));
+        quickSearchDialog.show();
+        if (pauseRunnable != null && pauseRunnable.size() > 0) {
+            searchExecutorService = Executors.newFixedThreadPool(5);
+            for (Runnable runnable : pauseRunnable) {
+                searchExecutorService.execute(runnable);
+            }
+            pauseRunnable.clear();
+            pauseRunnable = null;
+        }
+        quickSearchDialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override
+            public void onDismiss(DialogInterface dialog) {
+                try {
+                    if (searchExecutorService != null) {
+                        pauseRunnable = searchExecutorService.shutdownNow();
+                        searchExecutorService = null;
+                    }
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                }
+            }
+        });
+    }
+
+    /**
+     * 索引源页面适配（只改文案/可见性；三处按钮的点击分支另在各自回调里判 indexOnlyDetail）。
+     *
+     * <p>索引源下按钮行变成两个找片入口：
+     * <ul>
+     *   <li>「搜索片源」（原「切源」位）→ 弹聚合搜索窗，各站命中列出来由用户挑；</li>
+     *   <li>「立即播放」（原位保留）→ 走切源，后台全网找一个站自动跳过去。</li>
+     * </ul>
+     * 「快速搜索」在索引源下隐藏：它和「搜索片源」是同一个弹窗，完全重复，
+     * 而这一行已经有五个按钮。别的源不受影响（GONE 只针对当前这一页）。
+     *
+     * <p>★ 向后兼容：不认识 {@code action=indexOnly} 的源（含原先的豆瓣 jar）
+     * 传进来的是 false，文案与可见性复位成原样，三处点击逻辑也各自走原分支，
+     * 行为与本补丁之前完全一致。每次详情返回都会调用一次，因此从豆瓣切到
+     * 别的站时按钮会自动还原。
+     */
+    private void applyIndexOnlyUi(boolean on) {
+        indexOnlyDetail = on;
+        if (tvChangeSource != null) {
+            tvChangeSource.setText(on ? "搜索片源" : "切源");
+        }
+        if (tvQuickSearch != null) {
+            tvQuickSearch.setVisibility(on ? View.GONE : View.VISIBLE);
+        }
+    }
+
+    /**
+     * 索引源详情页的剧集区占位。
+     *
+     * <p>与切源失败时的空态区别在于文案：切源失败是"暂时没有"，这里是"本来就没有"，
+     * 并直接告诉用户下一步该点哪里。隐藏线路/剧集是为了让遥控器焦点落在按钮行上
+     * （GONE 的 View 会被焦点系统跳过，布局里也没有指向这些控件的 nextFocusRight
+     * 引用，不会出现焦点丢失）。
+     *
+     * <p>「立即播放」刻意**不隐藏**：它在索引源下改走切源（见 tvPlay 的 indexOnlyDetail
+     * 分支），是按钮行上的第二个找片入口，删掉就少一条路。
+     */
+    private void showIndexOnlyPlaceholder() {
+        mGridViewFlag.setVisibility(View.GONE);
+        mGridView.setVisibility(View.GONE);
+        tvSeriesGroup.setVisibility(View.GONE);
+        mEmptyPlayList.setVisibility(View.VISIBLE);
+        if (tvEmptyPlaylistTip != null) {
+            tvEmptyPlaylistTip.setText("该源只提供影片资料 · 搜索片源＝自己挑，立即播放＝自动找");
+        }
     }
 
     public boolean startDetailFallbackAfterLinesExhausted() {
