@@ -2161,6 +2161,7 @@ public class LivePlayActivity extends BaseActivity {
     private void armLiveBootTimeout() {
         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
         long ms = liveBootTimeoutMs();
+        mSwitchTimerReason = "arm-" + ms;
         LOG.i("[live] arm boot timeout " + ms + "ms");
         mHandler.postDelayed(mConnectTimeoutChangeSourceRun, ms);
     }
@@ -2596,11 +2597,14 @@ public class LivePlayActivity extends BaseActivity {
                         // 错误或播放结束状态：先判定失败发生在哪个阶段 ——
                         // 起播阶段（还没出画面）直接换线路，播放中才先换播放器
                         hideSwitchChannelSnapshot();
-                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, delayForLiveFailure());
+                        long failDelay = delayForLiveFailure();
+                        mSwitchTimerReason = "error-" + failDelay;
+                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, failDelay);
                         break;
                     case VideoView.STATE_PREPARING:
                     case VideoView.STATE_BUFFERING:
                         // 正在准备或缓冲状态：表示当前源正在加载中
+                        mSwitchTimerReason = "preparing";
                         mHandler.postDelayed(mConnectTimeoutChangeSourceRun, liveBootTimeoutMs());
                         break;
                     default:
@@ -2660,15 +2664,26 @@ public class LivePlayActivity extends BaseActivity {
         return true;
     }
 
+    /**
+     * v99-r85：换源定时器的真实触发原因。
+     *
+     * <p>这个 Runnable 有<b>三个</b>排期点（起播兜底 / 播放错误重试 / 缓冲超时），
+     * 之前只在超时分支里硬编码打印 {@code LIVE_BOOT_TIMEOUT_MAX_MS}，
+     * 于是"播放错误后 800ms 的重试"也会被印成 "boot timeout after 15000ms" —— 排查时必然误判
+     * （实测 20.594 报错 → 21.400 换线 = 806ms，却显示 15 秒）。现在按排期点记录真实原因。</p>
+     */
+    private String mSwitchTimerReason = "boot";
+
     private Runnable mConnectTimeoutChangeSourceRun = new Runnable() {
         @Override
         public void run() {
-            LOG.i("[live] timeout fired firstFrame=" + liveFirstFrameShown);
+            LOG.i("[live] switch timer fired reason=" + mSwitchTimerReason
+                    + " firstFrame=" + liveFirstFrameShown);
             if (!liveFirstFrameShown) {
-                // v94：起播阶段只等不猜 —— 等满 15 秒直接换下一条源；
+                // v94：起播阶段只等不猜 —— 等满预算直接换下一条源；
                 //      不做 2 秒探测、不换播放器：IPTV 首包本来就慢，探测必然误判"线路不通"，
                 //      提前取消请求还会打断服务端的建流过程。
-                LOG.i("[live] boot timeout after " + LIVE_BOOT_TIMEOUT_MAX_MS + "ms, switch source");
+                LOG.i("[live] switch source (not ready, reason=" + mSwitchTimerReason + ")");
                 switchToNextLiveSource();
                 return;
             }

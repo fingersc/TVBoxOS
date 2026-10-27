@@ -35,12 +35,36 @@ public final class DualStackPrefs {
 
     private static final ConcurrentHashMap<String, Pref> PREFS = new ConcurrentHashMap<>();
 
+    /**
+     * v99-r85：已知<b>不可用</b>的 (host, 族) 组合 —— 实测翻族后 3 秒仍起不来才登记。
+     *
+     * <p>与 {@link #PREFS} 相反：{@code PREFS} 是"这次该走哪族"的建议，
+     * 这里是"走过了，走不通"的事实记录。有了它，翻族失败的代价每个 host 只用付一次，
+     * 之后同 host 直接不翻、立刻换线，回到最快路径。见 {@link #isFamilyDead}。</p>
+     */
+    private static final ConcurrentHashMap<String, Dead> DEAD = new ConcurrentHashMap<>();
+
+    /**
+     * 30 分钟。比 {@link #TTL_MS} 长得多：换网络、运营商开通 IPv6、DHCP 重下发都可能让
+     * 一条路从死变活，但都比 2 分钟慢，所以不能按偏好那个周期过期。
+     */
+    private static final long DEAD_TTL_MS = 30 * 60 * 1000L;
+    private static final int DEAD_MAX = 64;
+
     private static final class Pref {
         final int family;
         final long at;
 
         Pref(int family, long at) {
             this.family = family;
+            this.at = at;
+        }
+    }
+
+    private static final class Dead {
+        final long at;
+
+        Dead(long at) {
             this.at = at;
         }
     }
@@ -91,6 +115,85 @@ public final class DualStackPrefs {
                 PREFS.remove(host);
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 登记 (host, family) 实测不可用（v99-r85）。
+     *
+     * <p>唯一写入点是播放器的翻族 watchdog：翻过去 3 秒还没就绪，才判定这条路不通。
+     * 不靠 DNS、不靠本机接口列表猜 —— 那些判据都可能在"有地址但路由不通"时说谎。</p>
+     */
+    public static void markFamilyDead(String host, int family) {
+        try {
+            if (host == null || host.isEmpty()) {
+                return;
+            }
+            if (family != FAMILY_V4 && family != FAMILY_V6) {
+                return;
+            }
+            DEAD.put(deadKey(host, family), new Dead(System.currentTimeMillis()));
+            trimDead();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** (host, family) 是否已在 {@link #DEAD_TTL_MS} 内被判定不可用；过期或异常一律 false。 */
+    public static boolean isFamilyDead(String host, int family) {
+        try {
+            if (host == null || host.isEmpty()) {
+                return false;
+            }
+            if (family != FAMILY_V4 && family != FAMILY_V6) {
+                return false;
+            }
+            String key = deadKey(host, family);
+            Dead d = DEAD.get(key);
+            if (d == null) {
+                return false;
+            }
+            if (System.currentTimeMillis() - d.at >= DEAD_TTL_MS) {
+                DEAD.remove(key);
+                return false;
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 该族翻身成功时撤销死亡记录，避免"曾经死过"永久压制一条已经恢复的路。 */
+    public static void clearFamilyDead(String host, int family) {
+        try {
+            if (host != null && !host.isEmpty()) {
+                DEAD.remove(deadKey(host, family));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String deadKey(String host, int family) {
+        return host + "|v" + family;
+    }
+
+    private static void trimDead() {
+        if (DEAD.size() <= DEAD_MAX) {
+            return;
+        }
+        long cutoff = System.currentTimeMillis() - DEAD_TTL_MS;
+        for (Iterator<Map.Entry<String, Dead>> it = DEAD.entrySet().iterator(); it.hasNext(); ) {
+            if (it.next().getValue().at < cutoff) {
+                it.remove();
+            }
+        }
+        if (DEAD.size() <= DEAD_MAX) {
+            return;
+        }
+        // 全是新记录也超限：丢掉最早的一半，宁可多付一次探测也不要无限增长
+        int drop = DEAD.size() - DEAD_MAX / 2;
+        for (Iterator<Map.Entry<String, Dead>> it = DEAD.entrySet().iterator(); it.hasNext() && drop > 0; drop--) {
+            it.next();
+            it.remove();
         }
     }
 
