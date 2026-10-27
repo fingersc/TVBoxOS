@@ -206,7 +206,7 @@ public final class DualStackResolver {
      *   <li>v99-r90 <b>并行探测最快者</b>（{@link #probeFastest}）⇒ 该地址排最前。
      *       这是 Happy Eyeballs 的等价物：OkHttp 3.12 没有 fastFallback，只会按我们给的顺序
      *       串行连接，第一个是死端口就要吃满 8s；并行探一下就能把"能通但排后面"的地址提上来</li>
-     *   <li>粘性缓存（真实连接观测）⇒ 该地址排最前</li>
+     *   <li>粘性缓存（真实连接观测）⇒ 该地址排最前。<b>v99-r91：必须仍在本次 DNS 名单内</b></li>
      *   <li>都没有 ⇒ IPv4 优先，AAAA 保留在尾部（配合 8s connect 仍有兜底价值）</li>
      *   <li>纯 IPv6 / 单地址 ⇒ 原序返回</li>
      * </ol>
@@ -246,8 +246,14 @@ public final class DualStackResolver {
                     // 排查时按 via=cache 去理解会得到错误结论。
                     boolean hasAddrPref = DualStackPrefs.preferAddress(host, pref) != null;
                     boolean hasRotate = DualStackPrefs.rotationIndex(host, pref) >= 0;
+                    boolean hasCache = cachedFirst(host, port, all) != null;
+                    // v99-r91：cache-miss = 缓存里有记录，但那个地址已经不在本次 DNS 应答里
+                    //   （典型是 302 目标边缘的地址被记到了原 host 名下）。见到这两个词就能区分
+                    //   "没有证据"和"有证据但被否掉"，不必再猜。
                     String why = hasAddrPref ? "addr-pref"
-                            : (hasRotate ? "rotate" : (cachedFirst(host, port) != null ? "cache" : "none"));
+                            : (hasRotate ? "rotate"
+                            : (hasCache ? "cache"
+                            : (hasCacheRecord(host, port) ? "cache-miss" : "none")));
                     logOrderOnce(host, "pref=v" + pref + " via=" + why
                             + " first=" + addrText(out.get(0)) + " total=" + out.size());
                     return out;                                  // 另一族仍在尾部（铁律 1）
@@ -275,8 +281,8 @@ public final class DualStackResolver {
                 }
             }
 
-            // 3) 粘性缓存
-            InetAddress first = cachedFirst(host, port);
+            // 3) 粘性缓存（v99-r91 起校验名单，见 cachedFirst）
+            InetAddress first = cachedFirst(host, port, all);
             if (first != null) {
                 out.add(first);
                 for (InetAddress a : all) {
@@ -352,21 +358,71 @@ public final class DualStackResolver {
             }
             if (!fam.isEmpty()) return fam.get(rot % fam.size());
         }
-        // ③ 粘性缓存
-        InetAddress first = cachedFirst(host, port);
+        // ③ 粘性缓存（v99-r91：必须仍在本次 DNS 名单内，理由见 cachedFirst）
+        InetAddress first = cachedFirst(host, port, all);
         if (first != null && familyOf(first) == family) return first;
         return null;
     }
 
-    private static InetAddress cachedFirst(String host, int port) {
+    /**
+     * 取"上次真实连接成功过的地址"，且<b>必须仍在本次 DNS 名单 {@code all} 里</b>。
+     *
+     * <p>v99-r91 修正：此前不看 {@code all}，直接把缓存地址排第一，结果会被重定向污染 ——
+     * {@link #recordSuccess} 记的是 {@code call.request().url().host()}（<b>重定向前</b>的 host）
+     * 配上<b>实际连上的</b>地址，所以 302 目标的 CDN 边缘 IP 会被记在原 host 名下、
+     * 端口还是原 host 的端口。实测日志里出现过
+     * {@code order ott.fj.chinamobile.com ... first=[2409:8087:3410:20:110:3000:0:2a] total=5}——
+     * ott 的 DNS 只有 4 个地址，那个 v6 是 <b>zterr</b> 的，且它的 80 端口是 SYN 黑洞，
+     * 于是白白烧掉 3 秒 watchdog。</p>
+     *
+     * <p>加了这道校验后，只会把"这台 host 自己解析出来的地址"提到最前，
+     * 别人的边缘 IP 再也不会被拿去敲本 host 的端口。缓存记录本身<b>不删除</b>
+     * （DNS 每次应答可能只给部分节点，留着不影响任何判断）。</p>
+     */
+    private static InetAddress cachedFirst(String host, int port, List<InetAddress> all) {
         if (host == null || host.isEmpty()) return null;
         if (port > 0) {
             Entry byPort = CACHE.get(host + ":" + port);
-            if (byPort != null && now() - byPort.at < CACHE_TTL_MS) return byPort.address;
+            if (byPort != null && now() - byPort.at < CACHE_TTL_MS
+                    && inAnswer(all, byPort.address)) {
+                return byPort.address;
+            }
         }
         Entry byHost = HOST_LATEST.get(host);
-        if (byHost != null && now() - byHost.at < CACHE_TTL_MS) return byHost.address;
+        if (byHost != null && now() - byHost.at < CACHE_TTL_MS
+                && inAnswer(all, byHost.address)) {
+            return byHost.address;
+        }
         return null;
+    }
+
+    /** 缓存里到底有没有这条记录（不管它是否还在 DNS 名单里）——只用于日志区分 cache / cache-miss。 */
+    private static boolean hasCacheRecord(String host, int port) {
+        if (host == null || host.isEmpty()) return false;
+        if (port > 0) {
+            Entry byPort = CACHE.get(host + ":" + port);
+            if (byPort != null && now() - byPort.at < CACHE_TTL_MS) return true;
+        }
+        Entry byHost = HOST_LATEST.get(host);
+        return byHost != null && now() - byHost.at < CACHE_TTL_MS;
+    }
+
+    /**
+     * 该地址是否出现在本次 DNS 应答里。
+     *
+     * <p>先比对象（{@link InetAddress#equals} 比字节），再比文本 —— 同一个 IP 若来自不同来源的
+     * {@link InetAddress} 实例，IPv6 的作用域 id 可能不同导致 {@code equals} 为 false，
+     * 但文本相同就是同一个地址。</p>
+     */
+    static boolean inAnswer(List<InetAddress> all, InetAddress a) {
+        if (all == null || a == null || all.isEmpty()) return false;
+        String ip = a.getHostAddress();
+        for (InetAddress x : all) {
+            if (x == null) continue;
+            if (x.equals(a)) return true;
+            if (ip != null && ip.equals(x.getHostAddress())) return true;
+        }
+        return false;
     }
 
     private static int familyOf(InetAddress a) {

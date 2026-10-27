@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 import okhttp3.Call;
 import okhttp3.EventListener;
@@ -24,30 +25,61 @@ import okhttp3.Response;
  * </ul>
  *
  * <p>只在单步超过 300ms 时打印，日常不刷屏；日志受调试模式门控。</p>
+ *
+ * <p><b>v99-r91：计时状态改成「每个 Call 一份」。</b>
+ * 这个 Listener 注册在 OkHttpClient.Builder 上是<b>单实例</b>，被所有并发请求共用。
+ * 原来把 {@code connectStart}/{@code dnsStart}/… 存成实例字段，并发时后一个请求会把前一个的起点覆盖掉，
+ * 日志里的耗时于是张冠李戴 —— 实测出现过 {@code connectFailed … after 3776ms}，
+ * 而那次连接实际只挂了 3.0 秒（watchdog 到期被 cancel），差出来的 776ms 是别的请求的计时。
+ * 排查"到底哪一段慢"时，这种假数字比没有更坏，所以按 {@link Call} 分开存。</p>
  */
 public final class NetEventListener extends EventListener {
 
     private static final long SLOW_MS = 300L;
+    /** 被 cancel 的 Call 不会回调 callEnd，兜底上限，防止计时表无界增长。 */
+    private static final int MARKS_MAX = 512;
 
-    private long dnsStart;
-    private long connectStart;
-    private long tlsStart;
-    private long requestStart;
-    private String connectAddr = "";
-    private String tlsHost = "";
+    /** 一个 Call 的分段计时。字段语义与旧的实例字段一一对应，只是不再跨请求共享。 */
+    private static final class Mark {
+        long dnsStart;
+        long connectStart;
+        long tlsStart;
+        long requestStart;
+        String tlsHost = "";
+    }
+
+    private final ConcurrentHashMap<Call, Mark> marks = new ConcurrentHashMap<>();
 
     private static long now() {
         return System.currentTimeMillis();
     }
 
+    private Mark mark(Call call) {
+        Mark m = marks.get(call);
+        if (m != null) {
+            return m;
+        }
+        m = new Mark();
+        Mark prev = marks.putIfAbsent(call, m);
+        if (prev != null) {
+            return prev;
+        }
+        if (marks.size() > MARKS_MAX) {
+            // 极简上限：漏删只影响日志，不做精细清理
+            marks.clear();
+            marks.put(call, m);
+        }
+        return m;
+    }
+
     @Override
     public void dnsStart(Call call, String domainName) {
-        dnsStart = now();
+        mark(call).dnsStart = now();
     }
 
     @Override
     public void dnsEnd(Call call, String domainName, List<java.net.InetAddress> inetAddressList) {
-        long cost = now() - dnsStart;
+        long cost = now() - mark(call).dnsStart;
         if (cost >= SLOW_MS) {
             StringBuilder sb = new StringBuilder();
             for (java.net.InetAddress a : inetAddressList) {
@@ -63,15 +95,15 @@ public final class NetEventListener extends EventListener {
 
     @Override
     public void connectStart(Call call, InetSocketAddress inetSocketAddress, Proxy proxy) {
-        connectStart = now();
-        connectAddr = inetSocketAddress.toString();
+        mark(call).connectStart = now();
     }
 
     @Override
     public void connectEnd(Call call, InetSocketAddress inetSocketAddress, Proxy proxy, Protocol protocol) {
-        long cost = now() - connectStart;
+        long cost = now() - mark(call).connectStart;
         if (cost >= SLOW_MS) {
-            LOG.i("[net] connect " + connectAddr + " " + cost + "ms " + protocol);
+            // v99-r91：地址直接用回调参数，不再借用实例字段（旧版借的那份可能是别的请求的）
+            LOG.i("[net] connect " + inetSocketAddress + " " + cost + "ms " + protocol);
         }
         // v97：连接成功即证明该地址/该族可用，回填给双栈优选做粘性排序
         try {
@@ -84,7 +116,7 @@ public final class NetEventListener extends EventListener {
     @Override
     public void connectFailed(Call call, InetSocketAddress inetSocketAddress, Proxy proxy,
                               Protocol protocol, IOException ioe) {
-        long cost = now() - connectStart;
+        long cost = now() - mark(call).connectStart;
         LOG.i("[net] connectFailed " + inetSocketAddress + " after " + cost + "ms " + ioe);
         // v97-r2：连不上就作废该 host 的探测缓存，下次重新解析/重新探测（IPTV CDN 节点会变）
         try {
@@ -95,26 +127,28 @@ public final class NetEventListener extends EventListener {
 
     @Override
     public void secureConnectStart(Call call) {
-        tlsStart = now();
-        tlsHost = call.request().url().host();
+        Mark m = mark(call);
+        m.tlsStart = now();
+        m.tlsHost = call.request().url().host();
     }
 
     @Override
     public void secureConnectEnd(Call call, Handshake handshake) {
-        long cost = now() - tlsStart;
+        Mark m = mark(call);
+        long cost = now() - m.tlsStart;
         if (cost >= SLOW_MS) {
-            LOG.i("[net] tls " + tlsHost + " " + cost + "ms");
+            LOG.i("[net] tls " + m.tlsHost + " " + cost + "ms");
         }
     }
 
     @Override
     public void requestHeadersStart(Call call) {
-        requestStart = now();
+        mark(call).requestStart = now();
     }
 
     @Override
     public void responseHeadersStart(Call call) {
-        long cost = now() - requestStart;
+        long cost = now() - mark(call).requestStart;
         if (cost >= 1000L) {
             Request req = call.request();
             LOG.i("[net] ttfb " + req.url().host() + " " + cost + "ms");
@@ -124,10 +158,12 @@ public final class NetEventListener extends EventListener {
     @Override
     public void callFailed(Call call, IOException ioe) {
         LOG.i("[net] callFailed " + call.request().url().host() + " " + ioe);
+        marks.remove(call);
     }
 
     @Override
     public void callEnd(Call call) {
+        marks.remove(call);
     }
 
     @Override
