@@ -49,6 +49,13 @@ public final class DualStackResolver {
     private static final ConcurrentHashMap<String, Entry> CACHE = new ConcurrentHashMap<>();
     /** host → 该 host 最近一次参与排序的地址（与端口无关，供端口未知时兜底） */
     private static final ConcurrentHashMap<String, Entry> HOST_LATEST = new ConcurrentHashMap<>();
+    /**
+     * v99-r84 取证：host → 上一次记下的排序结论，只在结论变化时打日志。
+     *
+     * <p>HLS 播放时每个分片请求都会走一次 DNS，无条件打日志会把 buffer 刷满，
+     * 真正有用的"翻族后到底选了谁"反而被埋掉。这里按 host 去重。</p>
+     */
+    private static final ConcurrentHashMap<String, String> LOGGED_ORDER = new ConcurrentHashMap<>();
     private static final ExecutorService POOL = Executors.newFixedThreadPool(2);
 
     private DualStackResolver() {
@@ -192,9 +199,15 @@ public final class DualStackResolver {
                     for (InetAddress a : all) {
                         if (!out.contains(a)) out.add(a);
                     }
+                    // v99-r84 取证：翻族/族偏好生效时，把最终首选地址记一条。
+                    //   排查"翻了族还是连不上"时，这一行能直接区分两种情况：
+                    //   ① DNS 没按偏好排（order 逻辑问题）；② 排了但那条路本身不通（网络问题）。
+                    logOrderOnce(host, "pref=v" + pref + " first=" + addrText(out.get(0))
+                            + " total=" + out.size());
                     return out;                                  // 另一族仍在尾部（铁律 1）
                 }
                 out.clear();                                     // 该族一个地址都没有 ⇒ 落回默认
+                logOrderOnce(host, "pref=v" + pref + " no-such-family->default");
             }
 
             // 2) 粘性缓存
@@ -237,6 +250,32 @@ public final class DualStackResolver {
         if (a instanceof Inet4Address) return DualStackPrefs.FAMILY_V4;
         if (a instanceof Inet6Address) return DualStackPrefs.FAMILY_V6;
         return DualStackPrefs.FAMILY_DEFAULT;
+    }
+
+    /** 地址文本（IPv6 带方括号，便于和 URL 里的写法对照）。 */
+    private static String addrText(InetAddress a) {
+        if (a == null) return "null";
+        String s = a.getHostAddress();
+        return a instanceof Inet6Address ? "[" + s + "]" : s;
+    }
+
+    /**
+     * v99-r84 取证日志：同一个 host 的排序结论不变就不重复打。
+     *
+     * <p>只在"有明确族偏好"的路径上调用 —— 也就是翻族之后。
+     * 平时（IPv4 优先的默认分支）不打，避免每条 HLS 分片都刷一行。</p>
+     */
+    private static void logOrderOnce(String host, String what) {
+        try {
+            String prev = LOGGED_ORDER.put(host, what);
+            if (!what.equals(prev)) {
+                LOG.i("[net] order " + host + " " + what);
+            }
+            if (LOGGED_ORDER.size() > 256) {
+                LOGGED_ORDER.clear();                            // 极简上限，防无界增长
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
