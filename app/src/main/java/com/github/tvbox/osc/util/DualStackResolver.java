@@ -42,7 +42,21 @@ import xyz.doikki.videoplayer.util.DualStackPrefs;
 public final class DualStackResolver {
 
     private static final int PROBE_TIMEOUT_MS = 1200;          // 单地址探测上限
-    private static final long CACHE_TTL_MS = 2 * 60 * 1000L;   // 缓存 2 分钟（IPTV 节点会变，别固化太久）
+    /**
+     * 30 分钟（v89：原来 2 分钟）。
+     *
+     * <p>缓存里存的是<b>真实连接成功过的地址</b>（{@link #recordSuccess}，由
+     * {@code NetEventListener.connectEnd} 在 OkHttp 真正建连成功后写入），这是所有证据里最硬的一条：
+     * 实测日志里 {@code via=cache} 的那几台全部 349~529ms 出画，且落在"能出流的那个边缘"上
+     * （同一 host 的 v6 有 4~5 个边缘，个别边缘对某些频道回 404）。</p>
+     *
+     * <p>2 分钟意味着"看完一个台再换回来就忘了"，等于每次都要重新赌一次边缘；
+     * 放长到 30 分钟让这个证据真正发挥作用。</p>
+     *
+     * <p>失败自纠仍在：{@code connectFailed} 会 {@link #invalidate}，探测/轮转也会改写顺序，
+     * 而且这条缓存只决定<b>先试谁</b>，不会让任何地址消失。</p>
+     */
+    private static final long CACHE_TTL_MS = 30 * 60 * 1000L;
     private static final int CACHE_MAX = 128;                  // 缓存上限，防无限增长
 
     /** host:port → 上次最快可达（或真实连接观测到成功）的地址 */

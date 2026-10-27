@@ -5,7 +5,6 @@ import android.content.res.AssetFileDescriptor;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 
@@ -46,6 +45,7 @@ import xyz.doikki.videoplayer.player.AbstractPlayer;
 import xyz.doikki.videoplayer.player.VideoViewManager;
 import xyz.doikki.videoplayer.util.DualStackPrefs;
 import xyz.doikki.videoplayer.util.DualStackProbe;
+import xyz.doikki.videoplayer.util.PlayLog;
 import xyz.doikki.videoplayer.util.PlayerUtils;
 
 public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
@@ -148,7 +148,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
 
     @Override
     public void setDataSource(String path, Map<String, String> headers) {
-        Log.i("Tvbox-runtime","echo-setDataSource:"+path);
+        PlayLog.i("echo-setDataSource:"+path);
         currentPlayPath = path;
         currentHeaders = copyHeaders(headers);
         mRetriedAsHls = false;
@@ -357,11 +357,11 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
 
     @Override
     public void onPlayerError(PlaybackException error) {
-        Log.e("Tvbox-runtime", "echo-Exo player error: " + currentPlayPath, error);
+        PlayLog.e("echo-Exo player error: " + currentPlayPath, error);
         if (mFlipAbandoned) {
             // v99-r85：watchdog 已判定翻族失败并把错误交回上层了，
             // 这里吞掉 Exo 迟到的回调，否则会重复触发一次换线
-            Log.i("Tvbox-runtime", "echo-Exo error after flip watchdog, ignored: " + currentPlayPath);
+            PlayLog.i("echo-Exo error after flip watchdog, ignored: " + currentPlayPath);
             return;
         }
         // v99-r83：403/404 先翻地址族重试一次 —— 同一域名的 IPv4/IPv6 可能落在完全不同后端
@@ -371,9 +371,64 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         if (retryAsHls(error)) {
             return;
         }
+        // v99-r89：连接层失败（根本没拿到响应）才是"这一族的路不通"的证据。
+        // 反过来，403/404 说明服务器活着、只是这个资源不在它这儿 —— 那是信道级/边缘级的，
+        // 实测同一频道 25 分钟前在 v6 上 404、之后在 v6 上 200，拿它降级族偏好会误伤一整串。
+        if (isTransportError(error) && dropFamilyOnTransportError()) {
+            return;
+        }
         if (mPlayerEventListener != null) {
             mPlayerEventListener.onError();
         }
+    }
+
+    /**
+     * 连接层失败时降级该 host 的族偏好（v99-r89）。
+     *
+     * <p>为什么单独抽出来：降级与否只看"是不是连接层失败"，这是族级信号；
+     * 而 4xx 是资源级信号（见 {@link #isTransportError} 的注释）。</p>
+     *
+     * <p>为什么保留了还要交回上层：降级只影响<b>下一次</b>先试哪个族，
+     * 本次播放已经失败，必须让上层换线 —— 所以返回 false 继续往下走。</p>
+     */
+    private boolean dropFamilyOnTransportError() {
+        try {
+            String host = hostOfPath(currentPlayPath);
+            if (host.isEmpty()) {
+                return false;
+            }
+            if (DualStackPrefs.preferFamily(host) == DualStackPrefs.FAMILY_DEFAULT) {
+                return false;                        // 本来就没偏好，不用记日志
+            }
+            DualStackPrefs.clear(host);              // 只降级族偏好，地址证据由探测/轮转各自纠
+            PlayLog.i("echo-Exo transport failure => drop family pref (next time default order) host=" + host);
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * 是否"连接层失败"：异常链里是 {@link java.io.IOException} 但<b>不是</b> HTTP 状态码异常。
+     *
+     * <p>{@code InvalidResponseCodeException} 本身也继承 IOException，所以必须先判它 ——
+     * 否则 404 会被当成连接层失败，族偏好又会被一次偶发 404 打掉。</p>
+     */
+    private boolean isTransportError(Throwable error) {
+        Throwable t = error;
+        for (int guard = 0; t != null && guard < 8; guard++) {
+            if (t instanceof HttpDataSource.InvalidResponseCodeException) {
+                return false;
+            }
+            if (t instanceof java.io.IOException) {
+                return true;
+            }
+            Throwable cause = t.getCause();
+            if (cause == t) {
+                break;
+            }
+            t = cause;
+        }
+        return false;
     }
 
     /**
@@ -423,12 +478,13 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         }
         if (mFlippedFamily) {
             // 两族都 403/404 ⇒ 与地址族无关（多半是资源本身没了）。
-            // v87：只清掉族偏好，<b>不记任何"这条 URL 别再用"的记录</b> —— 源站随时会修、源会更新、
-            // 调度会变，一次失败不该换来一段时间的静默跳过。
-            // v88：连"本族优先哪个地址"也清掉 —— 这个地址确实没给出资源，是最直接的否证。
+            // v87：不记任何"这条 URL 别再用"的记录 —— 源站随时会修、源会更新、调度会变。
+            // v88：清掉翻过去那族的地址偏好（这个地址确实没给出资源）。
+            // v89：**不再清族偏好**。两族都 404 是资源级结论，和"哪个族通常更好"无关；
+            //      清掉只会把上一族攒下的知识一起丢掉，害得后面每一个换台都从默认族重新试探。
+            //      这里不是"跳过" —— 每条 URL 依然会依次被两族真实请求一遍。
             DualStackPrefs.clearPreferAddress(host, mFlipTargetFamily);
-            DualStackPrefs.clear(host);
-            Log.i("Tvbox-runtime", "echo-Exo flip-family exhausted: " + host
+            PlayLog.i("echo-Exo flip-family exhausted: " + host
                     + " code=" + code + (mFlipVerified ? " (family proven ok)" : "")
                     + " => switch source, no record kept " + currentPlayPath);
             return false;
@@ -442,14 +498,14 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
                 target == DualStackPrefs.FAMILY_V6 ? DualStackPrefs.FAMILY_V4 : DualStackPrefs.FAMILY_V6);
         if (!hasLocalNetwork(target)) {
             // 这台设备连该族的全局地址都没有：翻过去物理上不可能成功（不是"这门坏过"，是"本机没有这门"）
-            Log.i("Tvbox-runtime", "echo-Exo flip skipped: no local v" + target + " " + host);
+            PlayLog.i("echo-Exo flip skipped: no local v" + target + " " + host);
             return false;
         }
         mFlippedFamily = true;
         mFlipTargetFamily = target;
         DualStackPrefs.setPreferFamily(host, target);
         mMediaSourceHelper.evictConnections();           // 不清连接池会复用旧族连接，翻族形同虚设
-        Log.i("Tvbox-runtime", "echo-Exo retry flipped family: " + host
+        PlayLog.i("echo-Exo retry flipped family: " + host
                 + " code=" + code + " -> v" + target + " " + currentPlayPath);
         mMediaSource = mMediaSourceHelper.getMediaSource(currentPlayPath, copyHeaders(currentHeaders));
         mIsPreparing = true;
@@ -467,7 +523,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
      * <p>翻过去之后只有两种结局：就绪（{@link #onFlipBootOk} 取消它），或者 3 秒内什么都没发生 ——
      * 后者多半是目标族的 SYN 黑洞，靠 Exo 自己的 {@code connectTimeout}(8s) 或上层 15 秒起播预算都太慢。</p>
      *
-     * <p>到点后<b>只放弃这一次尝试</b>：清族偏好 → 主动交回上层换线，并置 {@link #mFlipAbandoned}
+     * <p>到点后<b>只放弃这一次尝试</b>：主动交回上层换线，并置 {@link #mFlipAbandoned}
      * 让 Exo 迟到的 {@code onPlayerError} 被吞掉（否则一次失败会触发两轮换线）。</p>
      *
      * <p><b>不写任何"这段路径不能用了"的记录。</b>失败只用来改进下一次的顺序：后台探测该族每个地址的
@@ -477,6 +533,13 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
      *
      * <p>v88 补充：{@code bumpRotation} 会顺手清掉该族的地址偏好 —— 否则排序层
      * "地址证据 → 轮转"的优先级会让游标在证据有效期内永远轮不到，"换个门牌先敲"就成了空转。</p>
+     *
+     * <p><b>v89 关键修正：这里不再 {@code clear(host)}。</b>原来那行是整条链路里破坏力最大的一处 ——
+     * 族偏好一被清空，排序层就落到"纯 IPv4 优先"的默认分支，地址偏好 / 轮转 / 粘性缓存
+     * <b>三级全部不再参与</b>，等于一次 3 秒超时把后面一整串换台都打回原点（实测日志：一次超时之后
+     * 连续多个台都在 v4 起点撞 404，其中一台还挂在 8.5 秒的 connectTimeout 上）。
+     * 3 秒没出画只说明"这次落到的地址/边缘不行"，不说明"这一族不行" ——
+     * 那由探测/轮转去纠正地址级，由 {@link #isTransportError} 的判据去纠正族级。</p>
      */
     private void armFlipWatchdog(final String host, final int targetFamily) {
         final int token = ++mFlipToken;
@@ -491,8 +554,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
                     return;
                 }
                 mFlipAbandoned = true;
-                DualStackPrefs.clear(host);
-                Log.i("Tvbox-runtime", "echo-Exo flip attempt timeout: v" + targetFamily
+                PlayLog.i("echo-Exo flip attempt timeout: v" + targetFamily
                         + " no frame in " + FLIP_BOOT_WATCHDOG_MS + "ms => switch source, no record kept"
                         + " host=" + host);
                 // 换线不等探测：探测在后台跑，只用来决定"下次先试哪个地址"。
@@ -516,7 +578,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
                             int next = DualStackPrefs.bumpRotation(host, targetFamily);
                             action = "=> no conclusion, rotate to index " + next;
                         }
-                        Log.i("Tvbox-runtime", "echo-Exo flip probe: v" + targetFamily
+                        PlayLog.i("echo-Exo flip probe: v" + targetFamily
                                 + " reachable=" + r.reachable + "/" + r.total
                                 + " " + action + " host=" + host);
                     }
@@ -536,7 +598,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         if (!host.isEmpty()) {
             // 成功是"这条顺序对"的最强证据：保留地址级建议（下次还用这个地址），只清轮转游标
             DualStackPrefs.clearRotation(host, mFlipTargetFamily);
-            Log.i("Tvbox-runtime", "echo-Exo flip family ok: v" + mFlipTargetFamily + " " + host);
+            PlayLog.i("echo-Exo flip family ok: v" + mFlipTargetFamily + " " + host);
         }
     }
 
@@ -645,7 +707,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
             return false;
         }
         mRetriedAsHls = true;
-        Log.i("Tvbox-runtime", "echo-Exo retry as HLS: " + currentPlayPath);
+        PlayLog.i("echo-Exo retry as HLS: " + currentPlayPath);
         mMediaSource = mMediaSourceHelper.getHlsMediaSource(currentPlayPath, copyHeaders(currentHeaders));
         mIsPreparing = true;
         mInternalPlayer.setMediaSource(mMediaSource, getStartPosition());

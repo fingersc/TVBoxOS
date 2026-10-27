@@ -2,9 +2,14 @@ package com.github.tvbox.osc.util;
 
 import android.util.Log;
 
+import xyz.doikki.videoplayer.util.PlayLog;
+
 /**
  * 应用日志统一出口。<b>全量受「调试模式」开关（{@link HawkConfig#DEBUG_OPEN}）控制</b>：
  * 关 = 所有通道零输出；开 = 全通道输出。
+ *
+ * <p>v99-r89：player 模块的 {@link PlayLog} 由本类 {@link #setDebugEnabled} 单向同步，
+ * 所以「调试模式」是唯一真相源 —— 不要再往 player 模块里直接写 {@code android.util.Log}。</p>
  *
  * <p>开关状态由 {@link #setDebugEnabled(boolean)} 运行时设置：
  * App 启动时按 Hawk 里的调试模式初始化（每次启动会重置为关，避免忘记关着影响日常），
@@ -23,6 +28,12 @@ public class LOG {
 
     public static void setDebugEnabled(boolean enabled) {
         debug = enabled;
+        // v99-r89：player 模块不能反向依赖 app，那边的日志出口（PlayLog）需要这里单向同步。
+        // 不同步的话，翻族/探测那批日志会绕过调试模式一直刷 —— 它们过去正是这么干的。
+        try {
+            PlayLog.setDebugEnabled(enabled);
+        } catch (Throwable ignored) {
+        }
     }
 
     public static boolean isDebugEnabled() {

@@ -62,8 +62,25 @@ public final class DualStackPrefs {
     public static final int FAMILY_V4 = 4;
     public static final int FAMILY_V6 = 6;
 
-    /** 2 分钟，与 DualStackResolver 的探测缓存同期：两者错开会造成"排序用旧、偏好用新"的抖动。 */
-    private static final long TTL_MS = 2 * 60 * 1000L;
+    /**
+     * 30 分钟（v89：原来 2 分钟）。
+     *
+     * <p><b>为什么必须放长</b>：族偏好不只是"先试谁"，它还是<b>整条地址级排序的入场券</b> ——
+     * 排序层只有在族偏好存在时才走 {@code pickWithinFamily}（地址证据 → 轮转 → 粘性缓存），
+     * 没有就落到"纯 IPv4 优先"的默认分支。所以 2 分钟过期 ≈ 每隔 2 分钟就把攒下的
+     * "这个 host 的 v6 能出画"和"哪个地址连得通"一起作废，下次换台又从 v4 裸试一遍。</p>
+     *
+     * <p><b>为什么敢放长</b>（两条兜底都在 {@code ExoMediaPlayer} 里）：</p>
+     * <ol>
+     *   <li>连接层失败（IOException / 超时，不是 4xx）会立刻降级族偏好；</li>
+     *   <li>403/404 <b>不再</b>降级 —— 那是资源级/边缘级偶发（实测同一频道 25 分钟前在 v6 上 404、
+     *       之后在 v6 上 200），拿它降级会误伤后面一整串换台。</li>
+     * </ol>
+     *
+     * <p>与 {@code DualStackResolver.CACHE_TTL_MS} 保持同一个量级：两者错得太远会造成
+     * "排序用旧、偏好用新"的抖动。</p>
+     */
+    private static final long TTL_MS = 30 * 60 * 1000L;
     private static final int MAX = 128;
 
     /** 族级建议：host → 首选族。翻族时写入，决定哪一族排前面。 */
