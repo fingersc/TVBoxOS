@@ -295,8 +295,11 @@ public class OkGoHelper {
                 // v97：双栈优选 —— 只排序、不删除地址。
                 //      未命中缓存时 IPv4 排前、AAAA 保留在尾部（配合 8s connect 仍有兜底价值）；
                 //      缓存命中（含真实连接观测）时把上次最快可达的地址排最前。
+                // v99-r83：这里传 0（端口未知）—— Dns.lookup 的签名拿不到端口，原先写死 443，
+                //      而写缓存用的是真实端口（直播流多为 80），key 永不相等 ⇒ 粘性排序从未生效、
+                //      实际恒走"IPv4 优先"，遇到"两族后端不同"的源就会稳定 404。
                 if (all != null && all.size() > 1) {
-                    return DualStackResolver.order(all, hostname, 443);
+                    return DualStackResolver.order(all, hostname, 0);
                 }
                 return all;
             }

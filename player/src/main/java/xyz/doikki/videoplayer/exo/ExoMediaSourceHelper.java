@@ -55,6 +55,22 @@ public final class ExoMediaSourceHelper {
         mHttpDataSourceFactory = null;
     }
 
+    /**
+     * 丢弃连接池里所有已建立的连接（v99-r83）。
+     *
+     * <p>翻地址族重试前必须调用：OkHttp 的连接复用只看 host/port/协议，
+     * 不看实际连的是哪个 IP。不清池的话，重试会直接复用那条<b>旧族</b>的 keep-alive 连接，
+     * 于是"翻族"形同虚设，仍然 404。</p>
+     */
+    public void evictConnections() {
+        try {
+            if (mClient != null) {
+                mClient.connectionPool().evictAll();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public MediaSource getMediaSource(String uri) {
         return getMediaSource(uri, null, false);
     }
