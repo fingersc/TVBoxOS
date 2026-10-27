@@ -1084,6 +1084,17 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void applyThumbPreviewStyle() {
+        // ★ 索引源（action=indexOnly）没有可播内容：showPreview 为真时这里会摆一个
+        //   空的黑播放器，左上角一片漆黑看着像加载失败。索引源直接借用**非预览模式**
+        //   那一套海报位（thumbContainer + ivThumb，图在 setDetail 里已 load 过），
+        //   不新增任何控件、不改布局。
+        if (indexOnlyDetail && showPreview) {
+            thumbContainer.setVisibility(View.VISIBLE);
+            thumbContainer.setBackgroundResource(R.drawable.shape_detail_thumb_idle_bg);
+            llPlayerPlace.setVisibility(View.GONE);
+            ivThumb.setVisibility(View.VISIBLE);
+            return;
+        }
         thumbContainer.setVisibility(showPreview ? View.GONE : View.VISIBLE);
         llPlayerPlace.setVisibility(showPreview ? View.VISIBLE : View.GONE);
         ivThumb.setVisibility(!showPreview ? View.VISIBLE : View.GONE);
@@ -1726,6 +1737,29 @@ public class DetailActivity extends BaseActivity {
         }
         if (tvQuickSearch != null) {
             tvQuickSearch.setVisibility(on ? View.GONE : View.VISIBLE);
+        }
+        // 左上角从「空播放器」切到「海报」/切回。applyThumbPreviewStyle 依赖
+        // indexOnlyDetail，所以必须在它赋值之后调用；换到别的源时 on=false 会复位。
+        applyThumbPreviewStyle();
+        if (llPlayerFragmentContainer != null) {
+            llPlayerFragmentContainer.setVisibility(!on && showPreview ? View.VISIBLE : View.GONE);
+        }
+        if (llPlayerFragmentContainerBlock != null) {
+            llPlayerFragmentContainerBlock.setVisibility(!on && showPreview ? View.VISIBLE : View.GONE);
+        }
+        // 初始化时（见 initView 末尾）showPreview 为真会把焦点交给 llPlayerFragmentContainerBlock，
+        // 索引源下这个 Block 刚被 GONE 掉 ⇒ 焦点悬空、遥控器第一次按键无响应。
+        // 这里把焦点补到「立即播放」（索引源下它是第一个有效入口）。
+        if (on && tvPlay != null) {
+            final View target = tvPlay;
+            target.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (!isFinishing() && !isDestroyed() && target.isShown()) {
+                        target.requestFocus();
+                    }
+                }
+            });
         }
     }
 
@@ -6702,10 +6736,12 @@ public class DetailActivity extends BaseActivity {
             playFragment.setAutoSwitchLineEnabled(!fullWindows);
             playFragment.setPreviewMode(!fullWindows);
         }
-        llPlayerFragmentContainer.setVisibility(fullWindows || showPreview ? View.VISIBLE : View.GONE);
+        // 索引源恒不带播放器（见 applyThumbPreviewStyle 的海报分支），
+        // 否则 setFullPreview 会把它重新摆成 VISIBLE，把海报盖住。
+        llPlayerFragmentContainer.setVisibility((fullWindows || showPreview) && !indexOnlyDetail ? View.VISIBLE : View.GONE);
         llPlayerFragmentContainer.setLayoutParams(fullWindows ? windowsFull : windowsPreview);
-        setPreviewRoundClip(!fullWindows);
-        llPlayerFragmentContainerBlock.setVisibility(!fullWindows && showPreview ? View.VISIBLE : View.GONE);
+        setPreviewRoundClip(!fullWindows && !indexOnlyDetail);
+        llPlayerFragmentContainerBlock.setVisibility(!fullWindows && showPreview && !indexOnlyDetail ? View.VISIBLE : View.GONE);
         mGridView.setVisibility(fullWindows ? View.GONE : View.VISIBLE);
         mGridViewFlag.setVisibility(fullWindows ? View.GONE : View.VISIBLE);
         if (fullWindows) {
