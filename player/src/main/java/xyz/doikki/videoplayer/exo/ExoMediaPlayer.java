@@ -45,6 +45,7 @@ import java.util.Map;
 import xyz.doikki.videoplayer.player.AbstractPlayer;
 import xyz.doikki.videoplayer.player.VideoViewManager;
 import xyz.doikki.videoplayer.util.DualStackPrefs;
+import xyz.doikki.videoplayer.util.DualStackProbe;
 import xyz.doikki.videoplayer.util.PlayerUtils;
 
 public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
@@ -69,28 +70,29 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
     private boolean mRetriedAsHls;
     /** v99-r83：本次播放已为重试翻过一次地址族（每次 setDataSource 重置）。 */
     private boolean mFlippedFamily;
-    /** v99-r85：翻族的目标族，用于 watchdog 记账与成功清账。 */
+    /** v99-r87：翻族的目标族，用于 watchdog 与成功清账。 */
     private int mFlipTargetFamily = DualStackPrefs.FAMILY_DEFAULT;
     /**
-     * v99-r85：翻族已被 watchdog 判死（3 秒没就绪）。
+     * v99-r85：本次翻族尝试已被 watchdog 放弃（3 秒没就绪）。
      *
      * <p>置位后本次播放不再翻族、也不再重复上抛 onError —— watchdog 已经交回上层一次，
-     * 换线会重新 setDataSource 把这个标志清掉。</p>
+     * 换线会重新 setDataSource 把这个标志清掉。<b>它只影响这一次尝试，不产生任何"以后别试"的记录。</b></p>
      */
     private boolean mFlipAbandoned;
     /**
      * v99-r85：翻族之后确实就绪过（这条路是真的通的）。
      *
-     * <p>用来区分"翻过去又 404"的两种含义：没验证过 ⇒ 这族没有该资源，该记账；
-     * 验证过 ⇒ 这条路本来是通的，只是资源没了/中途断了，<b>不能</b>把族判死。</p>
+     * <p>v87 起它只用于<b>日志措辞</b>：区分"翻过去就再没起来"与"翻过去通过、之后才断"。
+     * 两种情况现在都不写记录 —— 前者可能只是线路没了，后者本就与地址族无关。</p>
      */
     private boolean mFlipVerified;
     /**
-     * v99-r85：翻族重试的起播预算。
+     * v99-r85：翻族重试的起播预算（v87 起只是"这一次尝试"的时限，不是判决）。
      *
      * <p>为什么单给翻族一个短预算：翻族是"已知这条线路有问题"之后的二次尝试，
      * 两族都正常时首帧实测都在 1 秒内（同机日志 0.26~0.64 秒）；3 秒仍不出画面，
-     * 说明这条路（多半是 IPv6 黑洞）不通，继续等 8 秒 connectTimeout 纯属白等。</p>
+     * 说明这条路的首选地址多半是 SYN 黑洞，继续等 8 秒 connectTimeout 纯属白等。
+     * 到点只放弃本次尝试，下一次照样会重新翻（没有禁用记录）。</p>
      */
     private static final long FLIP_BOOT_WATCHDOG_MS = 3000L;
     private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
@@ -375,7 +377,7 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
     }
 
     /**
-     * 403/404 时翻到另一个地址族重试一次（v99-r83，v99-r85 重做判据）。
+     * 403/404 时翻到另一个地址族重试一次（v99-r83，v85 重做判据，v87 去掉全部禁用记录）。
      *
      * <p>实测场景：移动 OTT 直播地址 {@code ott.fj.chinamobile.com/PLTV/.../index.m3u8}，
      * IPv6 走 OTT 自己的 CDN 正常出流；IPv4 被 302 到 IPTV 平台，而该频道号在那边不存在 → 404。</p>
@@ -388,18 +390,24 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
      * <p>更关键的是：<b>"有地址"根本不是"能连通"</b>。设备有 IPv6 地址但路由不通时，
      * DNS 照样返回 AAAA（见 DualStackResolver 里记的 20.8 秒黑洞），拿地址判断必然放行。</p>
      *
-     * <p>所以 v85 换成<b>两层实测判据 + 一层时间兜底</b>：</p>
+     * <p><b>v87 删掉了 r86 的两张死亡表</b>（资源级 / 路径级）。它们命中就把这条线路整段跳过，
+     * 等于让某个 URL 从此不再被真正请求 —— 而实测里"3 秒没起来"可能只是撞上黑洞地址或网络慢，
+     * 11 秒后同一族 95ms 就正常回了。现在<b>每次都真的翻</b>：坏线路每次多付 3 秒，
+     * 换来的是任何一次误判都不会长期挡住一条线路。</p>
+     *
+     * <p>现在只剩两条判据，且都不涉及"记住谁不行"：</p>
      * <ol>
-     *   <li><b>本机网络</b>（{@link #hasLocalNetwork}，毫秒级、纯本地）：连该族的全局地址都没有，
-     *       翻过去必然失败，直接不翻 —— 单栈设备零代价；</li>
-     *   <li><b>死族记录</b>（{@link DualStackPrefs#isFamilyDead}）：这个 host 的该族 30 分钟内
-     *       实测死过，不再重复付代价；</li>
-     *   <li><b>watchdog</b>（{@link #armFlipWatchdog}）：真翻了就以 3 秒为限，
-     *       不出画面才判死并记账 —— 这是唯一可信的判据，因为它是"试出来的"。</li>
+     *   <li><b>本机网络</b>（{@link #hasLocalNetwork}，毫秒级、纯本地）：这台设备连该族的全局地址
+     *       都没有，翻过去物理上不可能成功 —— 这是"本机没有这扇门"，不是"这门坏过"；</li>
+     *   <li><b>watchdog</b>（{@link #armFlipWatchdog}）：真翻了就以 3 秒为限，到点只放弃<b>这一次
+     *       尝试</b>并交回上层换线，不写任何"以后别试"的记录。</li>
      * </ol>
      *
+     * <p>失败信息只用于<b>改进下一次的尝试顺序</b>：探测到目标族里哪个地址活着，下次就优先试它；
+     * 探不出结论就轮转，保证多个地址会被逐个试到（见 {@link DualStackPrefs}）。</p>
+     *
      * <p>只重试一次：{@code mFlippedFamily} 由 {@link #setDataSource} 重置。两族都失败就交回上层换线，
-     * 并且清掉偏好 —— 说明与地址族无关，别让它继续影响该 host 的其它请求。</p>
+     * 并且清掉族偏好 —— 说明与地址族无关，别让它继续影响该 host 的其它请求。</p>
      */
     private boolean retryWithFlippedFamily(PlaybackException error) {
         if (mInternalPlayer == null || currentPlayPath == null) {
@@ -414,30 +422,27 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
             return false;
         }
         if (mFlippedFamily) {
-            if (mFlipVerified) {
-                // 翻族后确实就绪过，说明这条路是通的：这次失败与地址族无关，别把族判死
-                DualStackPrefs.clear(host);
-                Log.i("Tvbox-runtime", "echo-Exo flip-family later error: " + host
-                        + " code=" + code + " (family proven ok, not marked dead)");
-                return false;
-            }
-            // 翻过去之后又 403/404 ⇒ 目标族这条路确实没有这个资源，记账，别再试
+            // 两族都 403/404 ⇒ 与地址族无关（多半是资源本身没了）。
+            // v87：只清掉族偏好，<b>不记任何"这条 URL 别再用"的记录</b> —— 源站随时会修、源会更新、
+            // 调度会变，一次失败不该换来一段时间的静默跳过。
+            // v88：连"本族优先哪个地址"也清掉 —— 这个地址确实没给出资源，是最直接的否证。
+            DualStackPrefs.clearPreferAddress(host, mFlipTargetFamily);
             DualStackPrefs.clear(host);
-            DualStackPrefs.markFamilyDead(host, mFlipTargetFamily);
             Log.i("Tvbox-runtime", "echo-Exo flip-family exhausted: " + host
-                    + " code=" + code + " dead=v" + mFlipTargetFamily);
+                    + " code=" + code + (mFlipVerified ? " (family proven ok)" : "")
+                    + " => switch source, no record kept " + currentPlayPath);
             return false;
         }
         int target = DualStackPrefs.preferFamily(host) == DualStackPrefs.FAMILY_V6
                 ? DualStackPrefs.FAMILY_V4 : DualStackPrefs.FAMILY_V6;
+        // v88：这次 4xx 是**当前族**回的（target 是另一族），说明当前族里排在首位的那个地址
+        // 拿不出这个资源。不清掉它，它会一直排第一，直到 2 小时的 TTL 到期。
+        // 清的是"建议"不是地址：它仍留在 DNS 顺序里，该试的时候照样会试到。
+        DualStackPrefs.clearPreferAddress(host,
+                target == DualStackPrefs.FAMILY_V6 ? DualStackPrefs.FAMILY_V4 : DualStackPrefs.FAMILY_V6);
         if (!hasLocalNetwork(target)) {
-            // 本机这一族连地址都没有，翻过去 100% 失败，别浪费一轮超时
+            // 这台设备连该族的全局地址都没有：翻过去物理上不可能成功（不是"这门坏过"，是"本机没有这门"）
             Log.i("Tvbox-runtime", "echo-Exo flip skipped: no local v" + target + " " + host);
-            return false;
-        }
-        if (DualStackPrefs.isFamilyDead(host, target)) {
-            Log.i("Tvbox-runtime", "echo-Exo flip skipped: v" + target
-                    + " known dead " + host);
             return false;
         }
         mFlippedFamily = true;
@@ -457,18 +462,25 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
     }
 
     /**
-     * 翻族重试的起播 watchdog（v99-r85）。
+     * 翻族重试的起播 watchdog（v99-r85，v87 改为纯"本次尝试时限"）。
      *
-     * <p>翻过去之后只有两种结局：就绪（{@link #onFlipBootOk} 取消并清账），
-     * 或者 3 秒内什么都没发生 —— 后者多半是目标族 SYN 黑洞，靠 Exo 自己的
-     * {@code connectTimeout}(8s) 或上层 15 秒起播预算兜底都太慢。</p>
+     * <p>翻过去之后只有两种结局：就绪（{@link #onFlipBootOk} 取消它），或者 3 秒内什么都没发生 ——
+     * 后者多半是目标族的 SYN 黑洞，靠 Exo 自己的 {@code connectTimeout}(8s) 或上层 15 秒起播预算都太慢。</p>
      *
-     * <p>超时后：判该族死 → 清偏好 → 主动把错误交回上层换线。
-     * 同时置 {@link #mFlipAbandoned}，让 Exo 迟到的 {@code onPlayerError} 被吞掉，
-     * 避免同一次失败触发两轮换线。</p>
+     * <p>到点后<b>只放弃这一次尝试</b>：清族偏好 → 主动交回上层换线，并置 {@link #mFlipAbandoned}
+     * 让 Exo 迟到的 {@code onPlayerError} 被吞掉（否则一次失败会触发两轮换线）。</p>
+     *
+     * <p><b>不写任何"这段路径不能用了"的记录。</b>失败只用来改进下一次的顺序：后台探测该族每个地址的
+     * TCP 可达性，探到活着的就下次优先试它；探不出结论（防火墙拦探测端口 / 全部不可达 / DNS 没给地址）
+     * 就推进轮转游标，下次换一个地址先试。这样跨多次尝试必然把所有地址都试到，
+     * 而且因为探测本身会误判，它<b>只影响顺序</b>，绝不影响任何地址的可用性。</p>
+     *
+     * <p>v88 补充：{@code bumpRotation} 会顺手清掉该族的地址偏好 —— 否则排序层
+     * "地址证据 → 轮转"的优先级会让游标在证据有效期内永远轮不到，"换个门牌先敲"就成了空转。</p>
      */
     private void armFlipWatchdog(final String host, final int targetFamily) {
         final int token = ++mFlipToken;
+        final int port = DualStackProbe.portOf(currentPlayPath);
         sMainHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -480,17 +492,40 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
                 }
                 mFlipAbandoned = true;
                 DualStackPrefs.clear(host);
-                DualStackPrefs.markFamilyDead(host, targetFamily);
-                Log.i("Tvbox-runtime", "echo-Exo flip watchdog fired: v" + targetFamily
-                        + " unreachable in " + FLIP_BOOT_WATCHDOG_MS + "ms, host=" + host);
+                Log.i("Tvbox-runtime", "echo-Exo flip attempt timeout: v" + targetFamily
+                        + " no frame in " + FLIP_BOOT_WATCHDOG_MS + "ms => switch source, no record kept"
+                        + " host=" + host);
+                // 换线不等探测：探测在后台跑，只用来决定"下次先试哪个地址"。
                 if (mPlayerEventListener != null) {
                     mPlayerEventListener.onError();
                 }
+                DualStackProbe.probeAsync(host, port, targetFamily, new DualStackProbe.Callback() {
+                    @Override
+                    public void onResult(DualStackProbe.Result r) {
+                        if (r == null) {
+                            return;
+                        }
+                        String action;
+                        if (r.hasReachable()) {
+                            // 有硬证据：这族有地址活着，下次直接优先它（只排序，不排除其它地址）
+                            DualStackPrefs.setPreferAddress(host, targetFamily, r.firstReachableIp);
+                            DualStackPrefs.clearRotation(host, targetFamily);
+                            action = "=> prefer " + r.firstReachableIp + " next time";
+                        } else {
+                            // 探测没结论：不能据此判断"这族死了"，只能下次换个地址先试
+                            int next = DualStackPrefs.bumpRotation(host, targetFamily);
+                            action = "=> no conclusion, rotate to index " + next;
+                        }
+                        Log.i("Tvbox-runtime", "echo-Exo flip probe: v" + targetFamily
+                                + " reachable=" + r.reachable + "/" + r.total
+                                + " " + action + " host=" + host);
+                    }
+                });
             }
         }, FLIP_BOOT_WATCHDOG_MS);
     }
 
-    /** 翻族后的这次起播真的就绪了：撤销 watchdog、清掉死亡记录。 */
+    /** 翻族后的这次起播真的就绪了：撤销 watchdog、清掉轮转游标。 */
     private void onFlipBootOk() {
         if (!mFlippedFamily || mFlipAbandoned || mFlipVerified) {
             return;
@@ -499,7 +534,8 @@ public class ExoMediaPlayer extends AbstractPlayer implements Player.Listener {
         mFlipToken++;                                    // 作废 watchdog
         String host = hostOfPath(currentPlayPath);
         if (!host.isEmpty()) {
-            DualStackPrefs.clearFamilyDead(host, mFlipTargetFamily);
+            // 成功是"这条顺序对"的最强证据：保留地址级建议（下次还用这个地址），只清轮转游标
+            DualStackPrefs.clearRotation(host, mFlipTargetFamily);
             Log.i("Tvbox-runtime", "echo-Exo flip family ok: v" + mFlipTargetFamily + " " + host);
         }
     }

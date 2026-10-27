@@ -171,13 +171,17 @@ public final class DualStackResolver {
     /**
      * 按"预计速度"重排 DNS 结果。<b>不删除任何地址。</b>
      *
-     * <p>优先级（v99-r83）：</p>
+     * <p>优先级（v99-r87）：</p>
      * <ol>
-     *   <li>显式地址族偏好（{@link DualStackPrefs}，播放器 403/404 翻族时登记）⇒ 该族全部排前</li>
-     *   <li>粘性缓存（探测结论 / 真实连接观测）⇒ 该地址排最前</li>
+     *   <li>显式地址族偏好（{@link DualStackPrefs}，播放器 403/404 翻族时登记）⇒ 该族全部排前；
+     *       该族<b>内部</b>再按"探测证据 → 轮转 → 粘性缓存"挑第一个（见 {@link #pickWithinFamily}）</li>
+     *   <li>粘性缓存（真实连接观测）⇒ 该地址排最前</li>
      *   <li>都没有 ⇒ IPv4 优先，AAAA 保留在尾部（配合 8s connect 仍有兜底价值）</li>
      *   <li>纯 IPv6 / 单地址 ⇒ 原序返回</li>
      * </ol>
+     *
+     * <p><b>任何一级都只是排序</b>：v87 起这里不再有"某条路径已被判死、丢弃偏好"的分支 ——
+     * 记录层已改成只存"建议先试谁"，是否能用一律由真实请求决定。</p>
      *
      * @param port 真实端口；<b>未知时传 0</b>（{@link okhttp3.Dns#lookup} 拿不到端口）。
      *             0 时按 host 级最近记录兜底，不会退化成"永远 IPv4 优先"。
@@ -190,8 +194,8 @@ public final class DualStackResolver {
             // 1) 显式族偏好最优先：翻族重试必须真的换族，不能被下面的粘性缓存顶回去
             int pref = DualStackPrefs.preferFamily(host);
             if (pref == DualStackPrefs.FAMILY_V4 || pref == DualStackPrefs.FAMILY_V6) {
-                InetAddress first = cachedFirst(host, port);
-                if (first != null && familyOf(first) == pref) out.add(first);
+                InetAddress first = pickWithinFamily(all, host, pref, port);
+                if (first != null) out.add(first);
                 for (InetAddress a : all) {
                     if (familyOf(a) == pref && !out.contains(a)) out.add(a);
                 }
@@ -200,10 +204,13 @@ public final class DualStackResolver {
                         if (!out.contains(a)) out.add(a);
                     }
                     // v99-r84 取证：翻族/族偏好生效时，把最终首选地址记一条。
-                    //   排查"翻了族还是连不上"时，这一行能直接区分两种情况：
+                    //   排查"翻了族还是连不上"时，这一行能直接区分：
                     //   ① DNS 没按偏好排（order 逻辑问题）；② 排了但那条路本身不通（网络问题）。
-                    logOrderOnce(host, "pref=v" + pref + " first=" + addrText(out.get(0))
-                            + " total=" + out.size());
+                    //   v99-r87 增加 via=，直接看出这个"第一"是怎么来的（地址证据 / 轮转 / 粘性缓存）。
+                    String why = DualStackPrefs.preferAddress(host, pref) != null ? "addr-pref"
+                            : (DualStackPrefs.rotationIndex(host, pref) >= 0 ? "rotate" : "cache");
+                    logOrderOnce(host, "pref=v" + pref + " via=" + why
+                            + " first=" + addrText(out.get(0)) + " total=" + out.size());
                     return out;                                  // 另一族仍在尾部（铁律 1）
                 }
                 out.clear();                                     // 该族一个地址都没有 ⇒ 落回默认
@@ -235,6 +242,47 @@ public final class DualStackResolver {
      * <p>v99-r83：端口未知（port<=0）时走 host 级记录；<b>即使调用方给了端口也允许回落</b> ——
      * 这样即便将来再有人写死一个端口，也不会像 r83 之前那样永久失效。</p>
      */
+    /**
+     * 在已选定的地址族内部挑"先试哪一个"（v99-r87）。<b>只排序，不排除任何地址。</b>
+     *
+     * <p>为什么需要：一个族的 DNS 结果通常有 2 个地址，OkHttp 串行试，第一个是 SYN 黑洞时
+     * 3 秒预算全耗在它身上，第二个永远轮不到（实测盒子日志：首选 {@code 2409:...::20a} 是黑洞，
+     * 同族的 {@code 2409:8087:3408:20:1040::206} 从未被请求过）。</p>
+     *
+     * <p>三级来源，前面没用上才看后面：</p>
+     * <ol>
+     *   <li><b>探测证据</b>：翻族失败后探测到"这个地址真能连"，下次优先它 —— 最硬的依据；</li>
+     *   <li><b>轮转</b>：探不出结论（防火墙拦了探测端口 / 全部不可达 / DNS 没给地址）时，
+     *       换个地址先试。跨多次尝试必然把同族所有地址都试到，<b>这是"每条路都被走过"的兜底</b>；</li>
+     *   <li><b>粘性缓存</b>：真实连接成功过的地址（{@link #cachedFirst}）。</li>
+     * </ol>
+     *
+     * <p>返回 null 表示这一族没有可用线索，调用方按 DNS 原序排（不会丢地址）。</p>
+     */
+    private static InetAddress pickWithinFamily(List<InetAddress> all, String host, int family, int port) {
+        // ① 探测证据
+        String wantIp = DualStackPrefs.preferAddress(host, family);
+        if (wantIp != null && !wantIp.isEmpty()) {
+            for (InetAddress a : all) {
+                if (familyOf(a) == family && wantIp.equals(a.getHostAddress())) return a;
+            }
+            // 记录里的地址已经不在 DNS 结果里（边缘换了）⇒ 建议自然失效，继续往下走
+        }
+        // ② 轮转兜底
+        int rot = DualStackPrefs.rotationIndex(host, family);
+        if (rot >= 0) {
+            List<InetAddress> fam = new ArrayList<>();
+            for (InetAddress a : all) {
+                if (familyOf(a) == family) fam.add(a);
+            }
+            if (!fam.isEmpty()) return fam.get(rot % fam.size());
+        }
+        // ③ 粘性缓存
+        InetAddress first = cachedFirst(host, port);
+        if (first != null && familyOf(first) == family) return first;
+        return null;
+    }
+
     private static InetAddress cachedFirst(String host, int port) {
         if (host == null || host.isEmpty()) return null;
         if (port > 0) {
