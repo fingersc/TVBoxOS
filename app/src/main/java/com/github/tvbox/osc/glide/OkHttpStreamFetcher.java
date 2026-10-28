@@ -94,7 +94,7 @@ public class OkHttpStreamFetcher implements DataFetcher<InputStream>, Callback {
      */
     private boolean tryProxyRetry() {
         if (retried || request == null) return false;
-        String proxy = proxyUrl(url.getUrl());
+        String proxy = proxyUrl(url.toStringUrl());
         if (proxy == null) return false;
         retried = true;
         try {
