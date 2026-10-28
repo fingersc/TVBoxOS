@@ -682,6 +682,10 @@ public class SearchActivity extends BaseActivity {
         //   "一进搜索页就自动搜了上次那个词"（实测：首页进搜索直接搜了"歌手2026"，
         //   得再返回一次才回到默认搜索页）。
         boolean rebuiltWithTitle = false;
+        // ★ 索引源详情页「搜索片源」入口带 aggregate=true：
+        //   ①title 就是当前影片名，不得被 LAST_SEARCH_KEYWORD 覆盖（会搜成上一次的词）；
+        //   ②必须走本页聚合搜索，不按 FAST_SEARCH_MODE 转跳快速搜索。
+        boolean fromIndexAggregate = intent != null && intent.getBooleanExtra("aggregate", false);
         if (intent != null && intent.hasExtra("title")) {
             title = intent.getStringExtra("title");
             rebuiltWithTitle = true;
@@ -691,7 +695,7 @@ public class SearchActivity extends BaseActivity {
         // 仅当"本来就有 title"且本次尚未真正搜过（searchTitle 为空）时补跑。
         if (rebuiltWithTitle && TextUtils.isEmpty(searchTitle)) {
             String last = Hawk.get(HawkConfig.LAST_SEARCH_KEYWORD, "");
-            if (!TextUtils.isEmpty(last) && !TextUtils.equals(last, title)) {
+            if (!fromIndexAggregate && !TextUtils.isEmpty(last) && !TextUtils.equals(last, title)) {
                 title = last;
             }
         }
@@ -704,7 +708,7 @@ public class SearchActivity extends BaseActivity {
                 this.searchTitle = title;
                 showLoading();
                 session().resumeDispatch();
-            } else if (Hawk.get(HawkConfig.FAST_SEARCH_MODE, true)) {
+            } else if (!fromIndexAggregate && Hawk.get(HawkConfig.FAST_SEARCH_MODE, true)) {
                 showLoading();
                 Bundle bundle = new Bundle();
                 bundle.putString("title", title);

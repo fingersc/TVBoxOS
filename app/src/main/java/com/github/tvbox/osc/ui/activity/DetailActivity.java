@@ -537,6 +537,10 @@ public class DetailActivity extends BaseActivity {
                     // ★ 匿名监听器里 this 是 Listener 不是 Context，必须 DetailActivity.this
                     Intent searchIntent = new Intent(DetailActivity.this, SearchActivity.class);
                     searchIntent.putExtra("title", mVideo == null ? "" : mVideo.name);
+                    // ★ 聚合标记：SearchActivity 看到 aggregate=true 时
+                    //   ①不得用 LAST_SEARCH_KEYWORD 覆盖本次片名（会搜成上一次的词）
+                    //   ②不得按 FAST_SEARCH_MODE 转跳快速搜索（那不是聚合搜索）
+                    searchIntent.putExtra("aggregate", true);
                     searchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                     startActivity(searchIntent);
                     return;
@@ -1749,6 +1753,16 @@ public class DetailActivity extends BaseActivity {
         }
         // ★ 索引源下「立即播放」必须可见（自动找片入口）；空剧集分支也会置它，
         //   这里再保一次是防 detail 提前走到别的分支把 tvPlay 藏掉。
+        //   文案也要纠回来：initView 里 showPreview=true 时把它写成了「全屏」，
+        //   索引源没有播放器预览，这个按钮就是「立即播放」；离开索引源时按
+        //   showPreview 还原原状（showPreview=true 的源文案本就是「全屏」）。
+        if (tvPlay != null) {
+            if (on) {
+                tvPlay.setText("立即播放");
+            } else if (showPreview) {
+                tvPlay.setText("全屏");
+            }
+        }
         if (on && tvPlay != null) {
             tvPlay.setVisibility(View.VISIBLE);
         }
