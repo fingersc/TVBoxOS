@@ -16,9 +16,11 @@ import okhttp3.Call;
 
 public class OkHttpUrlLoader implements ModelLoader<GlideUrl, InputStream> {
     private final Call.Factory client;
+    private final Call.Factory retryClient;
 
-    public OkHttpUrlLoader(Call.Factory client) {
+    public OkHttpUrlLoader(Call.Factory client, Call.Factory retryClient) {
         this.client = client;
+        this.retryClient = retryClient;
     }
 
     @Override
@@ -29,20 +31,26 @@ public class OkHttpUrlLoader implements ModelLoader<GlideUrl, InputStream> {
     @Nullable
     @Override
     public LoadData<InputStream> buildLoadData(@NonNull GlideUrl model, int width, int height, @NonNull Options options) {
-        return new LoadData<>(model, new OkHttpStreamFetcher(client, model));
+        return new LoadData<>(model, new OkHttpStreamFetcher(client, retryClient, model));
     }
 
     public static class Factory implements ModelLoaderFactory<GlideUrl, InputStream> {
         private final Call.Factory client;
+        private final Call.Factory retryClient;
 
         public Factory(Call.Factory client) {
+            this(client, null);
+        }
+
+        public Factory(Call.Factory client, Call.Factory retryClient) {
             this.client = client;
+            this.retryClient = retryClient;
         }
 
         @NonNull
         @Override
         public ModelLoader<GlideUrl, InputStream> build(@NonNull MultiModelLoaderFactory multiFactory) {
-            return new OkHttpUrlLoader(client);
+            return new OkHttpUrlLoader(client, retryClient);
         }
 
         @Override

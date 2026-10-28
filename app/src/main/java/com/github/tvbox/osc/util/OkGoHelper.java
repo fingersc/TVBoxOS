@@ -182,6 +182,15 @@ public class OkGoHelper {
 
     public static DnsOverHttps dnsOverHttps = null;
 
+    /**
+     * 图片加载"换源重试"专用的 DoH 实例（v99-r98）。
+     *
+     * <p>与用户当前 DoH 设置无关，恒指向内置"腾讯"DoH。仅在图片直连失败后、作为"换一个解析源
+     * 再解析一次"用 —— 同一域名的不同解析源常给出不同的 CDN 边缘 IP，直连拿到被 RST 的坏 IP 时，
+     * 换源往往能拿到可用 IP。只发生在"这次真请求已失败"之后，不影响正常请求，也不缓存"判死"。</p>
+     */
+    private static DnsOverHttps altDoh = null;
+
     public static ArrayList<String> dnsHttpsList = new ArrayList<>();
 
     public static boolean is_doh = false;
@@ -266,6 +275,14 @@ public class OkGoHelper {
         String dohUrl = getDohUrl(Hawk.get(HawkConfig.DOH_URL, 0));
 //        if (!dohUrl.isEmpty()) is_doh = true;
         dnsOverHttps = new DnsOverHttps.Builder().client(dohClient).url(dohUrl.isEmpty() ? null : HttpUrl.get(dohUrl)).bootstrapDnsHosts((ips!=null && !dohUrl.equals("https://doh.pub/dns-query"))?DohIps(ips):null).build();
+        try {
+            // 图片失败重试用的"备用解析源"：恒用内置腾讯 DoH，与当前设置无关。
+            String altUrl = getDohUrl(1);
+            if (altUrl == null || altUrl.isEmpty()) altUrl = "https://doh.pub/dns-query";
+            altDoh = new DnsOverHttps.Builder().client(dohClient).url(HttpUrl.get(altUrl)).bootstrapDnsHosts(null).build();
+        } catch (Throwable ignored) {
+            altDoh = null;
+        }
     }
 
     // 自定义 DNS 解析器
@@ -358,6 +375,52 @@ public class OkGoHelper {
             }
             return true;
         }
+    }
+
+    /**
+     * 图片加载用的 DNS：复用与播放/API 完全一致的双栈优选（{@link CustomDns} → {@link DualStackResolver}）。
+     *
+     * <p>v99-r98：原先图片用 {@code OkHttp.ipv4FirstDns()}，只把 IPv4 排前，<b>绕开</b>了
+     * DualStackResolver 的"地址证据 / 轮转 / 粘性缓存"。于是同一个 host 上次明明在 104.21.x
+     * 上连通过，图片仍可能从 172.67.x 裸试起。这里直接复用 CustomDns，图片也能吃到
+     * "上次哪个地址真连通过"的证据（仍然只排序、不删除）。</p>
+     */
+    public static Dns imageDns() {
+        return new CustomDns();
+    }
+
+    /**
+     * 图片加载"换源重试"用的 DNS（v99-r98）。
+     *
+     * <p>取"备用 DoH（腾讯）∪ 系统 DNS"的并集并去重，再交给 DualStackResolver 排序。
+     * 目的：直连失败（多半是选中了被 RST 的坏 IPv4，或 IPv6 黑洞）后，换一个/多个解析源
+     * 重新拿一组地址，尽量把可用边缘 IP 也纳入这次重试 —— OkHttp 会按顺序把返回地址都试一遍。</p>
+     *
+     * <p>仍然是"只排序、不删除"，且只在"真请求失败一次之后"才走，符合项目铁律。</p>
+     */
+    public static Dns altImageDns() {
+        return hostname -> {
+            List<InetAddress> out = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            // 1) 备用 DoH（腾讯）
+            try {
+                if (altDoh != null) {
+                    for (InetAddress a : altDoh.lookup(hostname)) {
+                        if (a != null && seen.add(a.getHostAddress())) out.add(a);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            // 2) 系统 DNS
+            try {
+                for (InetAddress a : Dns.SYSTEM.lookup(hostname)) {
+                    if (a != null && seen.add(a.getHostAddress())) out.add(a);
+                }
+            } catch (Throwable ignored) {
+            }
+            if (out.isEmpty()) throw new UnknownHostException(hostname);
+            return out.size() > 1 ? DualStackResolver.order(out, hostname, 0) : out;
+        };
     }
 
     static OkHttpClient defaultClient = null;

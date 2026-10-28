@@ -70,10 +70,14 @@ public class OkHttp {
         return client().newBuilder().connectTimeout(timeout, TimeUnit.MILLISECONDS).readTimeout(timeout, TimeUnit.MILLISECONDS).writeTimeout(timeout, TimeUnit.MILLISECONDS).build();
     }
 
+    /** 图片/封面请求统一 tag：供 NetEventListener 识别"这是图片请求"（不污染播放器节点缓存）。 */
+    public static final String IMAGE_TAG = "img#cover";
+
     /**
-     * 封面/图片专用 client：
+     * 封面/图片专用 client（v99-r98）：
      * 1) 缩短超时 —— 死链快速失败，不长期占用连接槽；
-     * 2) DNS 结果按 IPv4 优先排序 —— 规避"设备解析到 IPv6 但 IPv6 不通盲等 20s"。
+     * 2) DNS 复用与播放/API 一致的双栈优选（CustomDns → DualStackResolver）：只排序、不删除，
+     *    能吃"上次哪个地址真连通过"的证据；不再用原先仅"IPv4 排前"的简易排序。
      * 仅用于图片加载，不影响播放/解析链路。
      */
     public static OkHttpClient imageClient() {
@@ -81,28 +85,21 @@ public class OkHttp {
                 .connectTimeout(8, TimeUnit.SECONDS)
                 .readTimeout(8, TimeUnit.SECONDS)
                 .writeTimeout(8, TimeUnit.SECONDS)
-                .dns(ipv4FirstDns())
+                .dns(OkGoHelper.imageDns())
                 .build();
     }
 
-    private static Dns ipv4FirstDns() {
-        return hostname -> {
-            List<InetAddress> list = dns().lookup(hostname);
-            if (list == null || list.size() < 2) return list;
-            List<InetAddress> sorted = new ArrayList<>(list);
-            // IPv4 排前：Android 下 InetAddress 无好用的类型判断，用 hostAddress 含 ':' 判定 IPv6
-            Collections.sort(sorted, (a, b) -> {
-                int ra = isIpv6(a) ? 1 : 0;
-                int rb = isIpv6(b) ? 1 : 0;
-                return ra - rb;
-            });
-            return sorted;
-        };
-    }
-
-    private static boolean isIpv6(InetAddress addr) {
-        String host = addr == null ? "" : addr.getHostAddress();
-        return host != null && host.contains(":");
+    /**
+     * 图片加载"换源重试"client（v99-r98）：配置同 {@link #imageClient()}，仅 DNS 换成
+     * "备用 DoH ∪ 系统 DNS"的并集。只在图片直连失败后由 OkHttpStreamFetcher 重试一次时使用。
+     */
+    public static OkHttpClient imageRetryClient() {
+        return client().newBuilder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(8, TimeUnit.SECONDS)
+                .dns(OkGoHelper.altImageDns())
+                .build();
     }
 
     public static OkHttpClient noRedirect() {

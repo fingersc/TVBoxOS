@@ -80,7 +80,7 @@ public final class NetEventListener extends EventListener {
     @Override
     public void dnsEnd(Call call, String domainName, List<java.net.InetAddress> inetAddressList) {
         long cost = now() - mark(call).dnsStart;
-        if (cost >= SLOW_MS) {
+        if (cost >= SLOW_MS || isImageCall(call)) {
             StringBuilder sb = new StringBuilder();
             for (java.net.InetAddress a : inetAddressList) {
                 if (sb.length() > 0) {
@@ -119,9 +119,13 @@ public final class NetEventListener extends EventListener {
         long cost = now() - mark(call).connectStart;
         LOG.i("[net] connectFailed " + inetSocketAddress + " after " + cost + "ms " + ioe);
         // v97-r2：连不上就作废该 host 的探测缓存，下次重新解析/重新探测（IPTV CDN 节点会变）
-        try {
-            DualStackResolver.invalidate(call.request().url().host(), call.request().url().port());
-        } catch (Throwable ignored) {
+        // v99-r98：图片/封面请求失败不在此列 —— 它走的是另一套 DNS，且失败多为"坏 IP"，
+        //          不应把播放器对同一 host 记录下来的"好节点"一起作废。
+        if (!isImageCall(call)) {
+            try {
+                DualStackResolver.invalidate(call.request().url().host(), call.request().url().port());
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -152,6 +156,15 @@ public final class NetEventListener extends EventListener {
         if (cost >= 1000L) {
             Request req = call.request();
             LOG.i("[net] ttfb " + req.url().host() + " " + cost + "ms");
+        }
+    }
+
+    /** 图片/封面请求（由 OkHttpStreamFetcher 打的 tag）—— 失败时不要污染播放器的 host 节点缓存。 */
+    private static boolean isImageCall(Call call) {
+        try {
+            return com.github.catvod.net.OkHttp.IMAGE_TAG.equals(call.request().tag());
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
