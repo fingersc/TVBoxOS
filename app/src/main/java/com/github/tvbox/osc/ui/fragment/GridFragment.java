@@ -533,9 +533,13 @@ public class GridFragment extends BaseLazyFragment {
                             sortData.filterSelect.remove(key);
                         }
                     }
-                    // 选中态统一交给适配器渲染（含"回归默认"落回第 0 个）
-                    adapter.setSelectedPosition(sortData.filterSelect.containsKey(key) ? position : 0);
-                    adapter.notifyDataSetChanged();
+                    // 选中态统一交给适配器渲染（含"回归默认"落回第 0 个）。
+                    // ★ onItemClick 的参数类型是 BaseQuickAdapter，会把外层的
+                    //   GridFilterKVAdapter adapter 遮蔽掉 —— 必须向下转型，
+                    //   否则 CI 的 javac 找不到 setSelectedPosition（r95 首包 CI 实测）。
+                    GridFilterKVAdapter kvAdapter = (GridFilterKVAdapter) adapter;
+                    kvAdapter.setSelectedPosition(sortData.filterSelect.containsKey(key) ? position : 0);
+                    kvAdapter.notifyDataSetChanged();
                     forceRefresh();
                 }
             });
