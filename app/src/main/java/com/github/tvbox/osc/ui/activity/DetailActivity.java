@@ -531,16 +531,14 @@ public class DetailActivity extends BaseActivity {
                 //   （"自动帮你挑一个站跳过去"放在「立即播放」上，见 tvPlay 的索引源分支。）
                 //   非索引源一律走原来的切源，行为不变。
                 if (indexOnlyDetail) {
-                    // ★ 聚合搜索（SearchActivity 全网跑一批再挑站），不是快速搜索弹窗：
-                    //   快速搜索只扫少量常用站，索引源找片源要的就是大范围撒网。
-                    LOG.sw("[IDX] 搜索片源 -> 聚合搜索 title=" + (mVideo == null ? "" : mVideo.name));
+                    // ★ 直接进聚合搜索的**结果页**（FastSearchActivity）：
+                    //   它带 title 进去就立即对全部已选源开搜，直接出各站命中列表，
+                    //   不经过 SearchActivity 的选词页（键盘/热门/历史那层）。
+                    //   其 LAST_SEARCH_KEYWORD 兜底只在 title 为空时生效，传了片名不会被覆盖。
+                    LOG.sw("[IDX] 搜索片源 -> 聚合搜索结果页 title=" + (mVideo == null ? "" : mVideo.name));
                     // ★ 匿名监听器里 this 是 Listener 不是 Context，必须 DetailActivity.this
-                    Intent searchIntent = new Intent(DetailActivity.this, SearchActivity.class);
+                    Intent searchIntent = new Intent(DetailActivity.this, FastSearchActivity.class);
                     searchIntent.putExtra("title", mVideo == null ? "" : mVideo.name);
-                    // ★ 聚合标记：SearchActivity 看到 aggregate=true 时
-                    //   ①不得用 LAST_SEARCH_KEYWORD 覆盖本次片名（会搜成上一次的词）
-                    //   ②不得按 FAST_SEARCH_MODE 转跳快速搜索（那不是聚合搜索）
-                    searchIntent.putExtra("aggregate", true);
                     searchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                     startActivity(searchIntent);
                     return;
