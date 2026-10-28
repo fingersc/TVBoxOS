@@ -74,31 +74,35 @@ public class OkHttp {
     public static final String IMAGE_TAG = "img#cover";
 
     /**
-     * 封面/图片专用 client（v99-r98）：
-     * 1) 缩短超时 —— 死链快速失败，不长期占用连接槽；
-     * 2) DNS 复用与播放/API 一致的双栈优选（CustomDns → DualStackResolver）：只排序、不删除，
-     *    能吃"上次哪个地址真连通过"的证据；不再用原先仅"IPv4 排前"的简易排序。
+     * 封面/图片专用 client（v99-r100）：
+     * 1) 收紧超时 —— 连接 4s / 读 5s：被墙或黑洞连接最多等 4~5s 就失败，尽快切到中转，
+     *    避免 Grid 里每张都先干等 8s 才转（这是"部分站点加载很慢/要很久"的主因）。
+     *    读超时是"两次收包间隔"，5s 对正常大图也够，不会误杀。
+     * 2) DNS 复用与播放/API 一致的双栈优选（CustomDns → DualStackResolver）：只排序、不删除。
      * 仅用于图片加载，不影响播放/解析链路。
      */
     public static OkHttpClient imageClient() {
         return client().newBuilder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .writeTimeout(8, TimeUnit.SECONDS)
+                .connectTimeout(4, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .writeTimeout(5, TimeUnit.SECONDS)
                 .dns(OkGoHelper.imageDns())
                 .build();
     }
 
     /**
-     * 图片加载"换源重试"client（v99-r98）：配置同 {@link #imageClient()}，仅 DNS 换成
-     * "备用 DoH ∪ 系统 DNS"的并集。只在图片直连失败后由 OkHttpStreamFetcher 重试一次时使用。
+     * 图片"中转重试"client（v99-r100）：直连失败后，用它对公共中转（images.weserv.nl）再取一次。
+     *
+     * <p>关键：DNS 用 {@link Dns#SYSTEM}，不再用 altImageDns()（腾讯 DoH ∪ 系统）。
+     * 因为这里要解析的是 weserv 自身域名（不被墙），走 DoH 只会白白增加几秒延迟、DoH 被拦时还会失败；
+     * 系统 DNS 快且会缓存。读取超时放宽到 20s —— 中转要回源取图，首字节可能较慢，需给足时间。</p>
      */
     public static OkHttpClient imageRetryClient() {
         return client().newBuilder()
-                .connectTimeout(8, TimeUnit.SECONDS)
-                .readTimeout(8, TimeUnit.SECONDS)
-                .writeTimeout(8, TimeUnit.SECONDS)
-                .dns(OkGoHelper.altImageDns())
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .dns(Dns.SYSTEM)
                 .build();
     }
 
