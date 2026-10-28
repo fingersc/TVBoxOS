@@ -32,6 +32,13 @@ public class OkHttpStreamFetcher implements DataFetcher<InputStream>, Callback {
     private Request request;                  // 保存以便失败重试
     private boolean retried = false;
 
+    /**
+     * 公共图片中转前缀（v99-r99）。
+     * 直连被网络 RST（如 WiFi 对部分图床域名的连接级阻断）时，把图片 URL 交给该中转再取一次。
+     * 只对"直连真失败"的请求生效，直连成功的图片不经过它。换域名只改这一处。
+     */
+    private static final String IMG_PROXY_BASE = "https://images.weserv.nl/?url=";
+
     @Nullable
     private volatile Call call;
 
@@ -68,26 +75,54 @@ public class OkHttpStreamFetcher implements DataFetcher<InputStream>, Callback {
             if (local != null) local.onLoadFailed(e);
             return;
         }
-        // v99-r98：第一次失败后，换"备用 DoH ∪ 系统 DNS"的解析源重试一次（换一组地址再试）。
-        if (tryRetry()) return;
+        // v99-r99：直连失败（如 WiFi 对图床域名的连接级 RST）后，改走公共中转再取一次。
+        if (tryProxyRetry()) return;
         DataCallback<? super InputStream> local = callback;
         if (local != null) local.onLoadFailed(e);
     }
 
     /**
-     * 失败重试一次：直连失败（多为选中被 RST 的坏 IPv4 / IPv6 黑洞）后，改用 retryClient
-     * （其 DNS 为备用源并集）重新发起同一请求，尽量换到可用边缘 IP。只重试一次。
+     * v99-r99：直连失败后，改用公共图片中转（默认 images.weserv.nl）把同一图片再取一次。
+     *
+     * <p>背景：部分网络（尤其某些 WiFi 宽带）会对特定"图床域名"做连接级重置
+     * （ERR_CONNECTION_RESET）。这种阻断发生在 DNS 之后，换 DNS/换 IP 都无效；
+     * 唯一实用绕法是让图片从一个未被阻断的中转地址进来：中转去源站取图、再回传给本机，
+     * 对本机而言只是访问 weserv 域名，从而避开原图床域名的阻断。</p>
+     *
+     * <p>只重试一次、且只对"确实失败"的请求生效（直连成功的图片不经过中转）；
+     * 用备用客户端 retryClient（其 DNS 为备用源并集）发出，顺带换一组解析。</p>
      */
-    private boolean tryRetry() {
-        if (retried || retryClient == null || request == null) return false;
+    private boolean tryProxyRetry() {
+        if (retried || request == null) return false;
+        String proxy = proxyUrl(url.getUrl());
+        if (proxy == null) return false;
         retried = true;
         try {
-            Call retryCall = retryClient.newCall(request);
+            Request proxyReq = request.newBuilder().url(proxy).build();
+            this.request = proxyReq;
+            Call.Factory cf = retryClient != null ? retryClient : client;
+            Call retryCall = cf.newCall(proxyReq);
             this.call = retryCall;
             retryCall.enqueue(this);
             return true;
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /** 把原图 URL 换成"公共中转 URL"；不适合代理的（data:/已是中转/本地proxy/非http）返回 null。 */
+    private static String proxyUrl(String raw) {
+        if (raw == null) return null;
+        String u = raw.trim();
+        if (u.isEmpty()) return null;
+        if (u.startsWith("data:")) return null;
+        if (u.contains("images.weserv.nl") || u.contains("wsrv.nl")) return null;
+        if (u.startsWith("proxy://") || u.contains("/proxy?")) return null;
+        if (!u.startsWith("http://") && !u.startsWith("https://")) return null;
+        try {
+            return IMG_PROXY_BASE + java.net.URLEncoder.encode(u, "UTF-8");
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -101,7 +136,13 @@ public class OkHttpStreamFetcher implements DataFetcher<InputStream>, Callback {
             stream = ContentLengthInputStream.obtain(responseBody.byteStream(), contentLength);
             local.onDataReady(stream);
         } else {
-            local.onLoadFailed(new HttpException(response.message(), response.code()));
+            int code = response.code();
+            // 403/451 多为防盗链/WAF：先关掉本次响应体，再走中转重取一次
+            if ((code == 403 || code == 451) && tryProxyRetry()) {
+                if (responseBody != null) responseBody.close();
+                return;
+            }
+            local.onLoadFailed(new HttpException(response.message(), code));
         }
     }
 
