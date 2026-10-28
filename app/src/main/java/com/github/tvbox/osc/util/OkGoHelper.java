@@ -279,7 +279,7 @@ public class OkGoHelper {
             // 图片失败重试用的"备用解析源"：恒用内置腾讯 DoH，与当前设置无关。
             String altUrl = getDohUrl(1);
             if (altUrl == null || altUrl.isEmpty()) altUrl = "https://doh.pub/dns-query";
-            altDoh = new DnsOverHttps.Builder().client(dohClient).url(HttpUrl.get(altUrl)).bootstrapDnsHosts(null).build();
+            altDoh = new DnsOverHttps.Builder().client(dohClient).url(HttpUrl.get(altUrl)).build();
         } catch (Throwable ignored) {
             altDoh = null;
         }
