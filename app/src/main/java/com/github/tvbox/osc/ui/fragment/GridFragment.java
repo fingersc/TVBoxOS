@@ -10,7 +10,6 @@ import android.view.animation.BounceInterpolator;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.core.content.ContextCompat;
 import androidx.lifecycle.Observer;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -492,8 +491,6 @@ public class GridFragment extends BaseLazyFragment {
         Context context = getContext();
         LayoutInflater inflater = LayoutInflater.from(context);
         assert context != null;
-        final int defaultColor = ContextCompat.getColor(context, R.color.color_FFFFFF);
-        final int selectedColor = ContextCompat.getColor(context, R.color.color_02F8E1);
         // 遍历过滤条件数据
         for (MovieSort.SortFilter filter : sortData.filters) {
             View line = inflater.inflate(R.layout.item_grid_filter, gridFilterDialog.filterRoot, false);
@@ -502,40 +499,44 @@ public class GridFragment extends BaseLazyFragment {
             TvRecyclerView gridView = line.findViewById(R.id.mFilterKv);
             gridView.setHasFixedSize(true);
             gridView.setLayoutManager(new V7LinearLayoutManager(context, LinearLayoutManager.HORIZONTAL, false));
-            GridFilterKVAdapter adapter = new GridFilterKVAdapter();
+            final GridFilterKVAdapter adapter = new GridFilterKVAdapter();
             gridView.setAdapter(adapter);
             final String key = filter.key;
             final ArrayList<String> values = new ArrayList<>(filter.values.keySet());
             final ArrayList<String> keys = new ArrayList<>(filter.values.values());
+            // ★ 默认档高亮：没选过 = 每行第一个值生效（与 spider 数据语义一致），
+            //   弹窗里必须把它显示成选中态，否则用户看不出"热门电影/全部"正在生效。
+            //   默认值不写进 filterSelect ⇒ 漏斗图标逻辑（filterSelectCount）不受影响，
+            //   默认状态仍是白色，只有偏离默认才转橙。
+            int effectiveIdx = 0;
+            String currentSelection = sortData.filterSelect.get(key);
+            if (currentSelection != null) {
+                int idx = keys.indexOf(currentSelection);
+                if (idx >= 0) effectiveIdx = idx;
+            }
+            final int initialIdx = effectiveIdx;
+            adapter.setSelectedPosition(initialIdx);
             adapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
-                // 用于记录上一次选中的 view
-                View previousSelectedView = null;
                 @Override
                 public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
-                    String currentSelection = sortData.filterSelect.get(key);
-                    String newSelection = keys.get(position);
-                    if (currentSelection == null || !currentSelection.equals(newSelection)) {
-                        // 更新选中状态
-                        sortData.filterSelect.put(key, newSelection);
-                        updateViewStyle(view, selectedColor, true);
-                        if (previousSelectedView != null) {
-                            updateViewStyle(previousSelectedView, defaultColor, false);
-                        }
-                        previousSelectedView = view;
-                    } else {
-                        // 取消选中
+                    String selection = keys.get(position);
+                    if (position == 0) {
+                        // ★ 第一个值 = 默认档：回归默认 = 从 filterSelect 移除。
+                        //   选默认值与"取消筛选"是同一件事，请求参数一致、图标同为白色。
                         sortData.filterSelect.remove(key);
-                        if (previousSelectedView != null) {
-                            updateViewStyle(previousSelectedView, defaultColor, false);
+                    } else {
+                        String currentSelection = sortData.filterSelect.get(key);
+                        if (currentSelection == null || !currentSelection.equals(selection)) {
+                            sortData.filterSelect.put(key, selection);
+                        } else {
+                            // 再点一次已选中的非默认值 = 取消，回归默认档
+                            sortData.filterSelect.remove(key);
                         }
-                        previousSelectedView = null;
                     }
+                    // 选中态统一交给适配器渲染（含"回归默认"落回第 0 个）
+                    adapter.setSelectedPosition(sortData.filterSelect.containsKey(key) ? position : 0);
+                    adapter.notifyDataSetChanged();
                     forceRefresh();
-                }
-                private void updateViewStyle(View view, int color, boolean isBold) {
-                    TextView valueTv = view.findViewById(R.id.filterValue);
-                    valueTv.getPaint().setFakeBoldText(isBold);
-                    valueTv.setTextColor(color);
                 }
             });
             adapter.setNewData(values);

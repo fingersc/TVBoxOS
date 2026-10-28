@@ -531,8 +531,14 @@ public class DetailActivity extends BaseActivity {
                 //   （"自动帮你挑一个站跳过去"放在「立即播放」上，见 tvPlay 的索引源分支。）
                 //   非索引源一律走原来的切源，行为不变。
                 if (indexOnlyDetail) {
-                    LOG.sw("[IDX] quick search dialog from 搜索片源");
-                    openQuickSearchDialog();
+                    // ★ 聚合搜索（SearchActivity 全网跑一批再挑站），不是快速搜索弹窗：
+                    //   快速搜索只扫少量常用站，索引源找片源要的就是大范围撒网。
+                    LOG.sw("[IDX] 搜索片源 -> 聚合搜索 title=" + (mVideo == null ? "" : mVideo.name));
+                    // ★ 匿名监听器里 this 是 Listener 不是 Context，必须 DetailActivity.this
+                    Intent searchIntent = new Intent(DetailActivity.this, SearchActivity.class);
+                    searchIntent.putExtra("title", mVideo == null ? "" : mVideo.name);
+                    searchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    startActivity(searchIntent);
                     return;
                 }
                 startDetailFallbackFromMenu();
@@ -1486,8 +1492,11 @@ public class DetailActivity extends BaseActivity {
                         mGridViewFlag.setVisibility(View.GONE);
                         mGridView.setVisibility(View.GONE);
                         tvSeriesGroup.setVisibility(View.GONE);
-                        tvPlay.setVisibility(View.GONE);
-                        mEmptyPlayList.setVisibility(View.VISIBLE);
+                        // ★ 索引源永远没有 seriesMap：「立即播放」不能跟着空剧集分支一起藏，
+                        //   它是索引源下的"自动找片"入口（tvPlay 点击的 indexOnlyDetail 分支）。
+                        //   applyIndexOnlyUi 在本分支之前已执行，indexOnlyDetail 此处已就位。
+                        tvPlay.setVisibility(indexOnlyDetail ? View.VISIBLE : View.GONE);
+                        mEmptyPlayList.setVisibility(indexOnlyDetail ? View.GONE : View.VISIBLE);
                         // ★ 详情判空（movie 有值但 seriesMap 为空）也要先把站点指示刷出来。
                         // 切源时这是常见情况：某些源的详情接口返回结构不符合预期，
                         // 但它的播放线路其实是好的。老逻辑直接走 handleNoPlayableDetail()
@@ -1679,11 +1688,11 @@ public class DetailActivity extends BaseActivity {
     }
 
     /**
-     * 弹聚合搜索窗。
+     * 弹快速搜索窗（QuickSearchDialog，扫少量常用站）。
      *
-     * <p>原本是 {@code tvQuickSearch} 匿名内部类里的点击体，原样抽成成员方法，
-     * 供两个入口共用（索引源下的「搜索片源」与普通源下的「快速搜索」）。
-     * 逻辑一字未改，只是换了位置，行为零变化。
+     * <p>原本是 {@code tvQuickSearch} 匿名内部类里的点击体，原样抽成成员方法。
+     * 索引源下的「搜索片源」已改走 SearchActivity（聚合搜索，全网撒网），
+     * 本方法现在只剩普通源「快速搜索」这一个入口。
      */
     private void openQuickSearchDialog() {
         startQuickSearch();
@@ -1719,7 +1728,7 @@ public class DetailActivity extends BaseActivity {
      *
      * <p>索引源下按钮行变成两个找片入口：
      * <ul>
-     *   <li>「搜索片源」（原「切源」位）→ 弹聚合搜索窗，各站命中列出来由用户挑；</li>
+     *   <li>「搜索片源」（原「切源」位）→ 跳聚合搜索页（SearchActivity），各站命中列出来由用户挑；</li>
      *   <li>「立即播放」（原位保留）→ 走切源，后台全网找一个站自动跳过去。</li>
      * </ul>
      * 「快速搜索」在索引源下隐藏：它和「搜索片源」是同一个弹窗，完全重复，
@@ -1737,6 +1746,11 @@ public class DetailActivity extends BaseActivity {
         }
         if (tvQuickSearch != null) {
             tvQuickSearch.setVisibility(on ? View.GONE : View.VISIBLE);
+        }
+        // ★ 索引源下「立即播放」必须可见（自动找片入口）；空剧集分支也会置它，
+        //   这里再保一次是防 detail 提前走到别的分支把 tvPlay 藏掉。
+        if (on && tvPlay != null) {
+            tvPlay.setVisibility(View.VISIBLE);
         }
         // 左上角从「空播放器」切到「海报」/切回。applyThumbPreviewStyle 依赖
         // indexOnlyDetail，所以必须在它赋值之后调用；换到别的源时 on=false 会复位。
@@ -1778,9 +1792,13 @@ public class DetailActivity extends BaseActivity {
         mGridViewFlag.setVisibility(View.GONE);
         mGridView.setVisibility(View.GONE);
         tvSeriesGroup.setVisibility(View.GONE);
-        mEmptyPlayList.setVisibility(View.VISIBLE);
+        // ★ 按需求：索引源详情页下方不留占位、不出文字说明 —— 剧集区直接空着。
+        //   找片入口全在按钮行（搜索片源/立即播放），占位提示没有信息增量。
+        //   这里必须显式 GONE：空剧集分支（seriesMap 为空）刚把 mEmptyPlayList 置 VISIBLE，
+        //   本方法在其后执行，不盖掉就会闪现占位框。
+        mEmptyPlayList.setVisibility(View.GONE);
         if (tvEmptyPlaylistTip != null) {
-            tvEmptyPlaylistTip.setText("该源只提供影片资料 · 搜索片源＝自己挑，立即播放＝自动找");
+            tvEmptyPlaylistTip.setText("");
         }
     }
 
