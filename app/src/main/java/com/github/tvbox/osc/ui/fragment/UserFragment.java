@@ -20,6 +20,7 @@ import com.github.tvbox.osc.base.BaseLazyFragment;
 import com.github.tvbox.osc.bean.Movie;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.RoomDataManger;
+import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.event.ServerEvent;
 import com.github.tvbox.osc.ui.activity.CollectActivity;
 import com.github.tvbox.osc.ui.activity.DetailActivity;
@@ -136,29 +137,8 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
             int paddingBottom = getResources().getDimensionPixelSize(R.dimen.vs_20);
             tvHotList.setPadding(paddingLeft, paddingTop, paddingRight, paddingBottom);
         }
-        if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 2) {
-            // ★ v99-r26：上限交给「历史记录条数」档位决定（15/30/50），不再写死 20 ——
-            //   否则把档位调到 30/50 时首页永远只显示 20 部，档位等于白设。
-            //   getAllVodRecord 内部会做 min(limit, hisNum)，传 MAX_VALUE 即"按档位"。
-            List<VodInfo> allVodRecord = RoomDataManger.getAllVodRecord(Integer.MAX_VALUE);
-            List<Movie.Video> vodList = new ArrayList<>();
-            for (VodInfo vodInfo : allVodRecord) {
-                Movie.Video vod = new Movie.Video();
-                vod.id = vodInfo.id;
-                vod.sourceKey = vodInfo.sourceKey;
-                vod.name = vodInfo.name;
-                vod.pic = vodInfo.pic;
-                if (vodInfo.playNote != null && !vodInfo.playNote.isEmpty())
-                    vod.note = "上次看到" + vodInfo.playNote;
-                vodList.add(vod);
-            }
-            // ★ v99-r64：adapter 同样是静态、同样会被兄弟实例释放 ⇒ 用前必须判空。
-            if (homeHotVodAdapter != null) {
-                homeHotVodAdapter.setNewData(vodList);
-            } else {
-                LOG.sw("[home] resume skip reason=noAdapter");
-            }
-        }
+        // ★ v99-rXX：历史行刷新抽成独立方法，供 onFragmentResume 与 RefreshEvent 两条路径复用。
+        reloadHistoryRow();
     }
 
     @Override
@@ -212,17 +192,70 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
         tvCollect.setOnFocusChangeListener(focusChangeListener);
         tvHotList = findViewById(R.id.tvHotList);
         myHotList = tvHotList;      // ★ v99-r64：记下「这份是我的」，onDestroy 据此判定归属
-        if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1 && homeSourceRec!=null) {
-            style=ImgUtil.initStyle();
+        // ★ v99-rXX：adapter 创建 + 点击/长按监听绑定抽成 ensureHomeAdapter()，
+        //   首次可见与「静态引用被释放后自愈重建」共用同一份逻辑。
+        ensureHomeAdapter();
+
+        tvHotList.setOnItemListener(new TvRecyclerView.OnItemListener() {
+            @Override
+            public void onItemPreSelected(TvRecyclerView parent, View itemView, int position) {
+                itemView.animate().scaleX(1.0f).scaleY(1.0f).setDuration(300).setInterpolator(new BounceInterpolator()).start();
+            }
+
+            @Override
+            public void onItemSelected(TvRecyclerView parent, View itemView, int position) {
+                itemView.animate().scaleX(1.05f).scaleY(1.05f).setDuration(300).setInterpolator(new BounceInterpolator()).start();
+            }
+
+            @Override
+            public void onItemClick(TvRecyclerView parent, View itemView, int position) {
+
+            }
+        });
+        tvHotList.setAdapter(homeHotVodAdapter);
+
+        initHomeHotVod(homeHotVodAdapter);
+        sourceViewModel.actionResult.observe(this, new Observer<JSONObject>() {
+            @Override
+            public void onChanged(JSONObject jsonObject) {
+                if (jsonObject == null) return;
+                String msg = jsonObject.optString("msg");
+                if (!msg.isEmpty()) Toast.makeText(getContext(), msg, Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /**
+     * ★ v99-rXX：确保首页 adapter 存在并绑定到 tvHotList（幂等）。
+     *
+     * <p>首次可见由 {@link #init()} 调用；加固 B：静态 adapter 可能被兄弟实例的 onDestroy
+     * 释放后不再重建（init 只跑第一次可见）⇒ {@link #reloadHistoryRow()} 也会调用本方法
+     * 重建，避免「被清后永久 noAdapter」导致首页历史行再也不刷新。</p>
+     */
+    private void ensureHomeAdapter() {
+        if (homeHotVodAdapter == null) {
+            if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1 && homeSourceRec != null) {
+                style = ImgUtil.initStyle();
+            }
+            String tvRate = "";
+            if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 0) {
+                tvRate = "豆瓣热播";
+            } else if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1) {
+                tvRate = homeSourceRec != null ? "站点推荐" : "豆瓣热播";
+            }
+            homeHotVodAdapter = new HomeHotVodAdapter(style, tvRate);
+            myHomeHotVodAdapter = homeHotVodAdapter;   // ★ v99-r64：同上，归属标记
+            installHomeAdapterListeners();
+            LOG.sw("[home] adapter created");
         }
-        String tvRate="";
-        if(Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 0){
-            tvRate="豆瓣热播";
-        }else if(Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1){
-          tvRate= homeSourceRec!=null?"站点推荐":"豆瓣热播";
+        if (tvHotList != null && tvHotList.getAdapter() != homeHotVodAdapter) {
+            tvHotList.setAdapter(homeHotVodAdapter);
         }
-        homeHotVodAdapter = new HomeHotVodAdapter(style,tvRate);
-        myHomeHotVodAdapter = homeHotVodAdapter;   // ★ v99-r64：同上，归属标记
+    }
+
+    /** ★ v99-rXX：给当前 homeHotVodAdapter 绑定点击/长按监听（adapter 为 null 时直接跳过）。 */
+    private void installHomeAdapterListeners() {
+        if (homeHotVodAdapter == null) return;
         homeHotVodAdapter.setOnItemClickListener(new BaseQuickAdapter.OnItemClickListener() {
             @Override
             public void onItemClick(BaseQuickAdapter adapter, View view, int position) {
@@ -252,7 +285,7 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
                 }
             }
         });
-        
+
         homeHotVodAdapter.setOnItemLongClickListener(new BaseQuickAdapter.OnItemLongClickListener() {
             @SuppressLint("NotifyDataSetChanged")
             @Override
@@ -274,39 +307,50 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
                 } else {
                     Bundle bundle = new Bundle();
                     bundle.putString("title", vod.name);
-                    jumpActivity(FastSearchActivity.class, bundle);                    
+                    jumpActivity(FastSearchActivity.class, bundle);
                 }
                 return true;
-            }    
-        });
-
-        tvHotList.setOnItemListener(new TvRecyclerView.OnItemListener() {
-            @Override
-            public void onItemPreSelected(TvRecyclerView parent, View itemView, int position) {
-                itemView.animate().scaleX(1.0f).scaleY(1.0f).setDuration(300).setInterpolator(new BounceInterpolator()).start();
-            }
-
-            @Override
-            public void onItemSelected(TvRecyclerView parent, View itemView, int position) {
-                itemView.animate().scaleX(1.05f).scaleY(1.05f).setDuration(300).setInterpolator(new BounceInterpolator()).start();
-            }
-
-            @Override
-            public void onItemClick(TvRecyclerView parent, View itemView, int position) {
-
             }
         });
-        tvHotList.setAdapter(homeHotVodAdapter);
+    }
 
-        initHomeHotVod(homeHotVodAdapter);
-        sourceViewModel.actionResult.observe(this, new Observer<JSONObject>() {
-            @Override
-            public void onChanged(JSONObject jsonObject) {
-                if (jsonObject == null) return;
-                String msg = jsonObject.optString("msg");
-                if (!msg.isEmpty()) Toast.makeText(getContext(), msg, Toast.LENGTH_SHORT).show();
-            }
-        });
+    /**
+     * ★ v99-rXX：刷新首页「最近观看」行（仅 HOME_REC==2 历史模式生效）。
+     *
+     * <p>首页历史行原先只有 {@link #onFragmentResume()} 一条刷新路径，而它依赖
+     * {@code BaseLazyFragment.dispatchUserVisibleHint()} —— 该函数在
+     * {@code currentVisibleState == isVisible} 时直接短路返回，从播放返回、尤其停留在同一页时
+     * 可能不触发重填 ⇒ 首页行保持旧数据。现在本方法同时被 onFragmentResume 和
+     * {@link #onHistoryRefresh(RefreshEvent)}（insertVod 写库那一刻就会 post
+     * RefreshEvent.TYPE_HISTORY_REFRESH）调用，保证「写完即更新」。</p>
+     *
+     * <p>加固 B：进入时先 {@link #ensureHomeAdapter()}，若 adapter 曾被抓释放则重建并重绑。</p>
+     */
+    private void reloadHistoryRow() {
+        if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) != 2) {
+            return;
+        }
+        ensureHomeAdapter();   // 加固 B：adapter 被释放时重建 + 重新绑定/装监听
+        // ★ v99-r26：上限交给「历史记录条数」档位决定（15/30/50），不再写死 20 ——
+        //   否则把档位调到 30/50 时首页永远只显示 20 部，档位等于白设。
+        //   getAllVodRecord 内部会做 min(limit, hisNum)，传 MAX_VALUE 即"按档位"。
+        List<VodInfo> allVodRecord = RoomDataManger.getAllVodRecord(Integer.MAX_VALUE);
+        List<Movie.Video> vodList = new ArrayList<>();
+        for (VodInfo vodInfo : allVodRecord) {
+            Movie.Video vod = new Movie.Video();
+            vod.id = vodInfo.id;
+            vod.sourceKey = vodInfo.sourceKey;
+            vod.name = vodInfo.name;
+            vod.pic = vodInfo.pic;
+            if (vodInfo.playNote != null && !vodInfo.playNote.isEmpty())
+                vod.note = "上次看到" + vodInfo.playNote;
+            vodList.add(vod);
+        }
+        if (homeHotVodAdapter != null) {
+            homeHotVodAdapter.setNewData(vodList);
+        } else {
+            LOG.sw("[home] resume skip reason=noAdapter");
+        }
     }
 
     private void initHomeHotVod(HomeHotVodAdapter adapter) {
@@ -427,6 +471,19 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void server(ServerEvent event) {
         if (event.type == ServerEvent.SERVER_CONNECTION) {
+        }
+    }
+
+    /**
+     * ★ v99-rXX：订阅历史刷新事件。{@code DetailActivity.insertVod(...)} 每次写入历史后都会
+     * post {@code RefreshEvent.TYPE_HISTORY_REFRESH}（该事件原本只被 HistoryActivity / CollectActivity
+     * 消费，首页历史行被漏掉）。这里补上，写库那一刻就把首页「最近观看」行刷新好，
+     * 不再依赖返回首页时那套容易被跳过的可见性分发。
+     */
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onHistoryRefresh(RefreshEvent event) {
+        if (event.type == RefreshEvent.TYPE_HISTORY_REFRESH) {
+            reloadHistoryRow();
         }
     }
 
