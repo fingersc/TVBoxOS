@@ -3,7 +3,6 @@ package com.github.tvbox.osc.util;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.drawable.BitmapDrawable;
@@ -39,26 +38,22 @@ import java.net.URLDecoder;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Random;
 
 import me.jessyan.autosize.utils.AutoSizeUtils;
 
 public class ImgUtil {
     /**
-     * 文字兜底图缓存的条目上限（配合「首字 key」使用，见 {@link #createTextDrawable}）。
+     * 封面兜底图 / 占位图缓存的条目上限。
      *
-     * <p>原实现是<b>无上限的 HashMap</b>，且 key 用的是<b>完整片名</b>，而 value 是一张
-     * 与海报同尺寸的 ARGB_8888 位图（1920×1080 盒子上：首页一张约 0.69 MB、
-     * 详情页一张约 1.03 MB）。更要命的是 {@code load()} 里<b>无条件</b>先建兜底图
-     * ——哪怕海报 URL 正常、图片加载成功，也会为每个见过的片名留一张常驻位图。
-     * 全仓唯一的清理点是 {@code PlayFragment.play()}，<b>不起播就永远不清</b>；
-     * 「搜索 → 进详情看简介 → 不感兴趣退出 → 再搜下一部」这种用法全程不起播，
+     * <p>这些位图与海报同尺寸（1920×1080 盒子上：首页一张约 0.69 MB、详情页一张约 1.03 MB），
+     * 且 {@code load()} 里会先构建占位图/兜底图。原实现是<b>无上限的 HashMap</b>，
+     * 「搜索 → 进详情看简介 → 不感兴趣退出 → 再搜下一部」这种全程不起播的用法会不断堆积，
      * 一个会话就能堆到几百 MB，最后 Bitmap.createBitmap 分配失败抛 OOM、或被 LMK 杀进程
      * （表现都是"用着用着突然回到首页"）。
      *
-     * <p>修法两条：① key 从「完整片名」降为「首字」（位图上本来就只画首字，key 与内容对齐）；
-     * ② 容器换成 access-order 的 LinkedHashMap 并限制条目数。叠加后最坏占用
-     * ≈ 32 × 0.69 MB ≈ 22 MB，且<b>不再随时间增长</b>。
+     * <p>修法：容器换成 access-order 的 LinkedHashMap 并限制条目数，最坏占用
+     * ≈ 32 × 1 MB ≈ 32 MB，且<b>不再随时间增长</b>。key 用「尺寸 + 圆角 + 配色」，
+     * 与位图内容对齐——同规格的兜底/占位图外观完全一致，无需按片名各存一份。
      */
     private static final int MAX_CACHE_ENTRIES = 32;
 
@@ -138,7 +133,7 @@ public class ImgUtil {
     public static void load(String url, ImageView view, int roundingRadius, int newWidth, int newHeight, String label, ImageView.ScaleType scaleType) {
         view.setScaleType(scaleType);
         if (roundingRadius <= 0) roundingRadius = 1;
-        Drawable fallback = createTextDrawable(TextUtils.isEmpty(label) ? "TVBox" : label, newWidth, newHeight, roundingRadius);
+        Drawable fallback = createFallbackDrawable(newWidth, newHeight, roundingRadius);
         Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
         if (isInvalidImageUrl(url)) {
             view.setImageDrawable(fallback);
@@ -165,7 +160,7 @@ public class ImgUtil {
     public static void load(String url, ImageView view, int roundingRadius, int newWidth, int newHeight, String label) {
         view.setScaleType(ImageView.ScaleType.CENTER_CROP);
         if (roundingRadius <= 0) roundingRadius = 1;
-        Drawable fallback = createTextDrawable(TextUtils.isEmpty(label) ? "TVBox" : label, newWidth, newHeight, roundingRadius);
+        Drawable fallback = createFallbackDrawable(newWidth, newHeight, roundingRadius);
         Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
         if (isInvalidImageUrl(url)) {
             view.setImageDrawable(fallback);
@@ -203,41 +198,43 @@ public class ImgUtil {
                 .into(imageView);
     }
 
-    public static int getRandomColor() {
-        Random random = new Random();
-        return Color.argb(255, random.nextInt(256), random.nextInt(256), random.nextInt(256));
+    /** 封面兜底图固定底色（深灰蓝），取代原先的随机颜色。 */
+    private static final int COVER_FALLBACK_COLOR = 0xFF4A4F58;
+
+    /** 外部调用方（详情、列表等）使用的兜底封面：默认尺寸 + 固定色 + 小电视。 */
+    public static Drawable createFallbackDrawable() {
+        return createFallbackDrawable(0, 0, AutoSizeUtils.mm2px(App.getInstance(), 10));
     }
 
-    public static Drawable createTextDrawable(String text) {
-        return createTextDrawable(text, 0, 0, AutoSizeUtils.mm2px(App.getInstance(), 10));
-    }
-
-    private static Drawable createTextDrawable(String text, int width, int height, float cornerRadius) {
-        if (TextUtils.isEmpty(text)) text = "TVBox";
+    /**
+     * 封面加载失败 / 图片 URL 无效时的兜底图：固定底色 {@link #COVER_FALLBACK_COLOR}
+     * + 居中小电视图标（{@code icon_img_placeholder}），不再绘制片名首字。
+     */
+    private static Drawable createFallbackDrawable(int width, int height, float cornerRadius) {
         if (width <= 0) width = 180;
         if (height <= 0) height = 240;
         if (cornerRadius <= 0) cornerRadius = 1;
-        // ★ key 必须与实际画上去的内容对齐：位图上只画首字，就用首字做 key。
-        //   旧实现用完整片名做 key —— 一万部片子就是一万张位图，可画出来的东西毫无区别
-        //   （同首字、同尺寸、同圆角的兜底图长完全一样），纯属白占内存。
-        text = text.substring(0, 1);
-        String key = text + "_" + width + "x" + height + "_" + (int) cornerRadius;
+        String key = "fallback_" + width + "x" + height + "_" + (int) cornerRadius;
         if (drawableCache.containsKey(key)) return drawableCache.get(key);
-        int randomColor = getRandomColor();
+
         Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        paint.setColor(randomColor);
-        paint.setStyle(Paint.Style.FILL);
-        RectF rectF = new RectF(0, 0, width, height);
-        canvas.drawRoundRect(rectF, cornerRadius, cornerRadius, paint);
-        paint.setColor(Color.WHITE);
-        paint.setTextSize(60);
-        paint.setTextAlign(Paint.Align.CENTER);
-        Paint.FontMetrics fontMetrics = paint.getFontMetrics();
-        float x = width / 2f;
-        float y = (height - fontMetrics.bottom - fontMetrics.top) / 2f;
-        canvas.drawText(text, x, y, paint);
+
+        Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        bgPaint.setColor(COVER_FALLBACK_COLOR);
+        bgPaint.setStyle(Paint.Style.FILL);
+        canvas.drawRoundRect(new RectF(0, 0, width, height), cornerRadius, cornerRadius, bgPaint);
+
+        // 小电视图标按短边 50% 居中缩放叠放，保证不同尺寸封面上都保持「小图标」观感且不溢出。
+        Bitmap icon = BitmapFactory.decodeResource(App.getInstance().getResources(), com.github.tvbox.osc.R.drawable.icon_img_placeholder);
+        if (icon != null) {
+            float box = Math.min(width, height) * 0.5f;
+            RectF dst = new RectF((width - box) / 2f, (height - box) / 2f, (width + box) / 2f, (height + box) / 2f);
+            Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            iconPaint.setFilterBitmap(true);
+            canvas.drawBitmap(icon, null, dst, iconPaint);
+        }
+
         Drawable drawable = new BitmapDrawable(App.getInstance().getResources(), bitmap);
         drawableCache.put(key, drawable);
         return drawable;

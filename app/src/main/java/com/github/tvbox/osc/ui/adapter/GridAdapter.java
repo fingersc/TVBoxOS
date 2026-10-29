@@ -45,7 +45,7 @@ public class GridAdapter extends BaseQuickAdapter<Movie.Video, BaseViewHolder> {
                     ImgUtil.load(pic, ivThumb, AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 240), AutoSizeUtils.mm2px(mContext, 336), item.name);
                 }
             } else {
-                ivThumb.setImageDrawable(ImgUtil.createTextDrawable(item.name));
+                ivThumb.setImageDrawable(ImgUtil.createFallbackDrawable());
             }
             return;
         }
@@ -84,7 +84,7 @@ public class GridAdapter extends BaseQuickAdapter<Movie.Video, BaseViewHolder> {
                 ImgUtil.load(pic, ivThumb, AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, newWidth), AutoSizeUtils.mm2px(mContext, newHeight), item.name);
             }
         } else {
-            ivThumb.setImageDrawable(ImgUtil.createTextDrawable(item.name));
+            ivThumb.setImageDrawable(ImgUtil.createFallbackDrawable());
         }
         applyStyleToImage(ivThumb);
     }
