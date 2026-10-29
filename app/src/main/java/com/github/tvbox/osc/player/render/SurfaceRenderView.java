@@ -52,7 +52,14 @@ public class SurfaceRenderView extends SurfaceView implements IRenderView, Surfa
         mMeasureHelper = new MeasureHelper();
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
-        surfaceHolder.setFormat(PixelFormat.RGBA_8888);
+        // ★ 修复「详情页预览框透出上一页(聚合搜索页)」：
+        //   原为 PixelFormat.RGBA_8888 —— Surface 带 alpha 通道，属「半透明」。
+        //   SurfaceView 的挖洞在首帧(或播放失败/缓冲中、无有效画面)时是透明的，
+        //   会透出窗口下方残留的上一 Activity(FastSearch)像素；首帧一到才盖住，
+        //   与「切源可恢复」的现象一致。
+        //   视频渲染表面本就应不透明：改为 OPAQUE 后，无画面时挖洞呈现黑色，
+        //   不再透出底层内容（也与 v99-r3 注释里「Surface 本身是黑的」的预期一致）。
+        surfaceHolder.setFormat(PixelFormat.OPAQUE);
     }
 
     @Override
