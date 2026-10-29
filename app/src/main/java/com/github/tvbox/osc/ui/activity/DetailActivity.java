@@ -1297,13 +1297,35 @@ public class DetailActivity extends BaseActivity {
                         //   （remap 失败 ⇒ positionTrusted=false）⇒ 必须在此独立判定。
                         //   vodInfo 的 year/director 已由 setVideo(mVideo) 填充（详情解析侧，
                         //   非空可信）；库记录侧由写入时的同一链路保证。
+                        // ★ r104 B1：元数据判"不同片"时，若旧记录的集名是**日期式/混合式**
+                        //   （高辨识度，dateOf>0），且该集名在新源能精确命中，则说明是同一部剧
+                        //   跨源年份元数据不一致（真机：Running Man 2010 在各源被标成 2010/2018），
+                        //   按内容找回该集、恢复播放位置，避免"切源后跳回第 0 集"。
+                        //   非日期式集名（如"第3集"）不做救援 —— 不同片可能同名同序号，误恢复风险高。
+                        int contentRescueIndex = -1;
+                        String contentRescueNote = "";
                         if (vodInfoRecord != null
                                 && !FilmIdentity.isSameFilm(vodInfo.year, vodInfo.director,
                                         vodInfoRecord.year, vodInfoRecord.director)) {
-                            LOG.sw("[FB] sameNameRestoreSkip reason=otherFilm"
-                                    + " cur=" + vodInfo.id + "/y" + vodInfo.year
-                                    + " rec=" + vodInfoRecord.id + "/y" + vodInfoRecord.year
-                                    + " => 换片，不恢复播放状态");
+                            String dropNote = vodInfoRecord.playNote == null ? "" : vodInfoRecord.playNote.trim();
+                            int rescued = -1;
+                            if (EpisodeNameMatcher.dateOf(dropNote) > 0) {
+                                rescued = remapPlayIndexFromNote(dropNote, -1);
+                            }
+                            if (rescued >= 0) {
+                                contentRescueIndex = rescued;
+                                contentRescueNote = dropNote;
+                                LOG.sw("[FB] sameNameRestoreContentRescue"
+                                        + " cur=" + vodInfo.id + "/y" + vodInfo.year
+                                        + " rec=" + vodInfoRecord.id + "/y" + vodInfoRecord.year
+                                        + " note=" + dropNote + " idx=" + rescued
+                                        + " => 元数据判不同片但按日期集名精确命中，恢复该集");
+                            } else {
+                                LOG.sw("[FB] sameNameRestoreSkip reason=otherFilm"
+                                        + " cur=" + vodInfo.id + "/y" + vodInfo.year
+                                        + " rec=" + vodInfoRecord.id + "/y" + vodInfoRecord.year
+                                        + " => 换片，不恢复播放状态");
+                            }
                             vodInfoRecord = null;
                             sameNameRestored = false;
                         }
@@ -1314,11 +1336,19 @@ public class DetailActivity extends BaseActivity {
                             vodInfo.reverseSort = vodInfoRecord.reverseSort;
                             vodInfo.playNote = vodInfoRecord.playNote == null ? "" : vodInfoRecord.playNote;
                         } else {
-                            vodInfo.playIndex = 0;
-                            vodInfo.playFlag = null;
-                            vodInfo.playerCfg = "";
-                            vodInfo.reverseSort = false;
-                            vodInfo.playNote = "";
+                            if (contentRescueIndex >= 0) {
+                                // 已按日期集名在新源定位到该集（playFlag 由 remapPlayIndexFromNote 设好）
+                                vodInfo.playIndex = contentRescueIndex;
+                                vodInfo.playerCfg = "";
+                                vodInfo.reverseSort = false;
+                                vodInfo.playNote = contentRescueNote;
+                            } else {
+                                vodInfo.playIndex = 0;
+                                vodInfo.playFlag = null;
+                                vodInfo.playerCfg = "";
+                                vodInfo.reverseSort = false;
+                                vodInfo.playNote = "";
+                            }
                         }
 
                         if (vodInfo.reverseSort) {
@@ -1329,7 +1359,7 @@ public class DetailActivity extends BaseActivity {
                             vodInfo.playFlag = (String) vodInfo.seriesMap.keySet().toArray()[0];
 
                         // 跨源换源：不同源的集数列表顺序/集数不一致，用历史记住的集数名重新映射到当前源
-                        boolean positionResolvedByContent = false;
+                        boolean positionResolvedByContent = (contentRescueIndex >= 0);
                         if (sameNameRestored && !TextUtils.isEmpty(vodInfo.playNote)) {
                             String flagBeforeRemap = vodInfo.playFlag;
                             int remapFallback = vodInfo.playIndex;
@@ -1430,7 +1460,10 @@ public class DetailActivity extends BaseActivity {
                             }
                             if (detailFallbackAlignFailover >= DETAIL_FALLBACK_MAX_ALIGN_FAILOVER) {
                                 Toast.makeText(DetailActivity.this,
-                                        "没有其他源包含这一集", Toast.LENGTH_SHORT).show();
+                                        detailFallbackHadEpisodePlaybackFail
+                                                ? "已找到含该集的源，但播放失败，请稍后重试"
+                                                : "没有其他源包含这一集",
+                                        Toast.LENGTH_SHORT).show();
                                 finishDetailFallbackWithoutResult();
                                 return;
                             }
@@ -1815,6 +1848,10 @@ public class DetailActivity extends BaseActivity {
     }
 
     public boolean startDetailFallbackAfterLinesExhausted() {
+        // ★ r103：此入口只由「当前源拉流/播放失败、所有线路已耗尽」触发 —— 说明我们刚离开的
+        //   这个源<b>确实含有当前这一集</b>，只是播不出来。记下，供最终收尾提示给出真实结论，
+        //   避免误报「没有其他源包含这一集」。
+        detailFallbackHadEpisodePlaybackFail = true;
         return startDetailFallback(false);
     }
 
@@ -3893,7 +3930,11 @@ public class DetailActivity extends BaseActivity {
                     + " count=" + detailFallbackFailoverCount
                     + " dead=" + detailFallbackDeadKeys.size()
                     + " soft=" + detailFallbackSoftTriedKeys.size());
-            Toast.makeText(this, "多个片源暂时不可用，请稍后重试", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this,
+                    detailFallbackHadEpisodePlaybackFail
+                            ? "已找到含该集的源，但播放失败，请稍后重试"
+                            : "多个片源暂时不可用，请稍后重试",
+                    Toast.LENGTH_SHORT).show();
             finishDetailFallbackWithoutResult();
             return false;
         }
@@ -4639,6 +4680,12 @@ public class DetailActivity extends BaseActivity {
      */
     private void resetDetailFallback(boolean keepCache) {
         detailFallbackFailoverCount = 0;
+        // ★ r103：只有「换片/全新一轮」的彻底复位才清「有集但播放失败」标记；
+        //   keepCache=true 是同一轮内的成功重新定位，标记要保留到本轮真正收尾，
+        //   否则会漏掉此前「有集却超时」的事实（详见字段注释）。
+        if (!keepCache) {
+            detailFallbackHadEpisodePlaybackFail = false;
+        }
         detailFallbackActive = false;
         // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
         dismissSwitchingSourceToast();
@@ -4999,6 +5046,17 @@ public class DetailActivity extends BaseActivity {
     private int detailFallbackAlignFailover = 0;
     /** ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（用户定稿 6）。 */
     private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = 6;
+    /**
+     * ★ r103：本轮兜底是否遇到过「源<b>确实有</b>当前这一集、但拉流/播放失败（起播超时、解析失败）」。
+     *
+     * <p>问题背景（真机 10-30）：一批 778 集的同片源（feifan/43-HG/7~9-非凡 等）集名对得上、
+     * 也定位到了「20100711期」，但 {@code guardEnd reason=timeout} 拉不出流；随后逐源空切，
+     * 最终却提示「没有其他源包含这一集」——这是<b>错误结论</b>：明明有源包含、只是播不出来。</p>
+     *
+     * <p>收尾提示据此区分：为 true ⇒「已找到含该集的源，但播放失败，请稍后重试」；
+     * 为 false ⇒ 才沿用「没有其他源包含这一集 / 多个片源暂时不可用」。</p>
+     */
+    private boolean detailFallbackHadEpisodePlaybackFail = false;
     private boolean detailFallbackLoadingCandidate;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;

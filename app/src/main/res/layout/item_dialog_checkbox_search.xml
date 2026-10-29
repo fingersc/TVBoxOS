@@ -19,7 +19,6 @@
             android:clickable="true"
             android:focusable="true"
             android:textColor="@color/dialog_text_primary"
-            android:textSize="@dimen/ts_24"
-            android:text="1111"/>
+            android:textSize="@dimen/ts_24"/>
     </LinearLayout>
 </FrameLayout>

@@ -124,6 +124,21 @@ public final class EpisodeNameMatcher {
             Pattern.compile("(?<!\\d)(\\d{8})(?!\\d)");
 
     /**
+     * ★ r103：6 位「YYMMDD」紧凑日期（年份只写后两位）。
+     *
+     * <p>现实语料里同一期综艺，有的源写 8 位（{@code 20100711期}），有的源只写 6 位
+     * （{@code 100711期} / {@code 100711}）。旧实现所有日期正则都以 {@code 20\d{2}}
+     * 限定为「8 位」，6 位一律落 {@link #DOMAIN_UNKNOWN}，于是同一集在两源间无法对齐
+     * （切源匹配失败）。本 Pattern 用于兜住这一形态。</p>
+     *
+     * <p><b>只按"6 位数字"捕捉，是否采纳为日期由 {@link #sixDigitDateOrdinal}
+     * 二次判定</b>：必须"紧随 期/集/话"或"整名去非数字后恰为这 6 位"，否则不认
+     * （避免把编号、清晰度等任意 6 位数字误判成日期）。</p>
+     */
+    private static final Pattern SIX_DIGIT_DATE =
+            Pattern.compile("(?<!\\d)(\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)");
+
+    /**
      * 分集段（上/中/下），出现在名称<b>末尾</b>。
      *
      * <p>为什么必须在"去括号"之前提取：站点会把分集写在括号里
@@ -420,6 +435,13 @@ public final class EpisodeNameMatcher {
             if (v > 0) {
                 return new EpisodeKey(v, DOMAIN_DATE, part, raw);
             }
+        }
+
+        // 2.6 ★ r103：6 位 YYMMDD 紧凑日期（年份只写后两位，如 100711 → 2010-07-11）。
+        //     必须排在期数分支之前，否则 6 位数会落 UNKNOWN（原子 bug 根因）。
+        int sixDate = sixDigitDateOrdinal(work);
+        if (sixDate > 0) {
+            return new EpisodeKey(sixDate, DOMAIN_DATE, part, raw);
         }
 
         // 3. 期数/集数（阿拉伯数字），优先于纯序号兜底
@@ -1427,6 +1449,11 @@ public final class EpisodeNameMatcher {
         Matcher separated = DATE_SEPARATED.matcher(name);
         if (separated.find()) {
             return buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3));
+        }
+        // ★ r103：6 位 YYMMDD（年份只写后两位），与 parse 同步识别。
+        int sixDate = sixDigitDateOrdinal(name);
+        if (sixDate > 0) {
+            return sixDate;
         }
         return -1;
     }
@@ -4902,6 +4929,36 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
     /** 让调用方（VodSeries 等）无需为转换额外写循环。 */
     public interface VodSeriesName {
         String getName();
+    }
+
+    /**
+     * 从字符串中识别「6 位 YYMMDD」紧凑日期并换算为 YYYYMMDD 整数；无则 -1。
+     *
+     * <p>世纪推断（用户口径）：{@code YY<=40 → 20YY，其余 → 19YY}。
+     * 仅当匹配到的 6 位数字<b>紧随 期/集/话</b>，或<b>全名去非数字后恰为这 6 位</b>时
+     * 才采纳为日期，降低误判（编号/分辨率等任意 6 位数字）。</p>
+     */
+    private static int sixDigitDateOrdinal(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return -1;
+        }
+        Matcher m = SIX_DIGIT_DATE.matcher(s);
+        String digitsOnly = s.replaceAll("\\D+", "");
+        boolean wholeNumber = digitsOnly.length() == 6;
+        while (m.find()) {
+            String tail = s.substring(m.end());
+            boolean suffix = tail.matches("^\\s*[期集话話].*");
+            if (!suffix && !wholeNumber) {
+                continue;
+            }
+            int yy = parseIntSafe(m.group(1));
+            if (yy < 0) {
+                continue;
+            }
+            int year = yy <= 40 ? 2000 + yy : 1900 + yy;
+            return buildDateOrdinal(String.valueOf(year), m.group(2), m.group(3));
+        }
+        return -1;
     }
 
     private static int buildDateOrdinal(String y, String m, String d) {
