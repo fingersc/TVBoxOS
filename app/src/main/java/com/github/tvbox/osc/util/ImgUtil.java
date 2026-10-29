@@ -134,11 +134,12 @@ public class ImgUtil {
         view.setScaleType(scaleType);
         if (roundingRadius <= 0) roundingRadius = 1;
         Drawable fallback = createFallbackDrawable(newWidth, newHeight, roundingRadius);
-        Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
-        if (isInvalidImageUrl(url)) {
+        if (isInvalidImageUrl(url) || isFailedUrl(url)) {
             view.setImageDrawable(fallback);
             return;
         }
+        // 加载中占位：透明底 + 与兜底图等大的小电视（图标尺寸一致，避免加载/失败切换时图标跳变）。
+        Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
         RequestOptions options = new RequestOptions()
                 .format(DecodeFormat.PREFER_RGB_565)
                 .diskCacheStrategy(DiskCacheStrategy.AUTOMATIC)
@@ -152,7 +153,7 @@ public class ImgUtil {
                 .load(getUrl(url))
                 .placeholder(placeholder)
                 .error(fallback)
-                .listener(getListener(view, scaleType, fallback))
+                .listener(getListener(view, scaleType, fallback, url))
                 .apply(options)
                 .into(view);
     }
@@ -161,11 +162,12 @@ public class ImgUtil {
         view.setScaleType(ImageView.ScaleType.CENTER_CROP);
         if (roundingRadius <= 0) roundingRadius = 1;
         Drawable fallback = createFallbackDrawable(newWidth, newHeight, roundingRadius);
-        Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
-        if (isInvalidImageUrl(url)) {
+        if (isInvalidImageUrl(url) || isFailedUrl(url)) {
             view.setImageDrawable(fallback);
             return;
         }
+        // 加载中占位：透明底 + 与兜底图等大的小电视（图标尺寸一致，避免加载/失败切换时图标跳变）。
+        Drawable placeholder = createImagePlaceholderDrawable(newWidth, newHeight, roundingRadius);
         RequestOptions options = new RequestOptions()
                 .format(DecodeFormat.PREFER_RGB_565)
                 .diskCacheStrategy(DiskCacheStrategy.AUTOMATIC)
@@ -179,7 +181,7 @@ public class ImgUtil {
                 .load(getUrl(url))
                 .placeholder(placeholder)
                 .error(fallback)
-                .listener(getListener(view, ImageView.ScaleType.CENTER_CROP, fallback))
+                .listener(getListener(view, ImageView.ScaleType.CENTER_CROP, fallback, url))
                 .apply(options)
                 .into(view);
     }
@@ -200,6 +202,49 @@ public class ImgUtil {
 
     /** 封面兜底图固定底色（深灰蓝），取代原先的随机颜色。 */
     private static final int COVER_FALLBACK_COLOR = 0xFF4A4F58;
+
+    /** 已确认加载失败的封面 URL 上限（LRU，防止无限增长）。 */
+    private static final int MAX_FAILED_URLS = 256;
+
+    /** 失败标记有效期：超过该时长再次绑定会重新尝试加载（避免一次网络抖动永久钉死为兜底图）。 */
+    private static final long FAILED_URL_TTL_MS = 5 * 60 * 1000L;
+
+    /**
+     * 已确认加载失败的封面 URL → 失败时间戳（access-order LRU）。
+     *
+     * <p>用于"加载机制"修正：某张封面一旦确认加载失败，其卡片在滑动回收复用、
+     * 再次绑定到列表/网格时直接显示失败兜底图，而不再重新走「透明占位→失败底色」
+     * 这段流程，从而消除一遍遍"透明底→底色"的闪烁；成功加载会清除该标记，
+     * 且标记超过 {@link #FAILED_URL_TTL_MS} 后失效以便重试。
+     */
+    private static final Map<String, Long> failedUrls = new LinkedHashMap<String, Long>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > MAX_FAILED_URLS;
+        }
+    };
+
+    private static boolean isFailedUrl(String url) {
+        if (TextUtils.isEmpty(url)) return false;
+        synchronized (failedUrls) {
+            Long ts = failedUrls.get(url);
+            return ts != null && (System.currentTimeMillis() - ts) < FAILED_URL_TTL_MS;
+        }
+    }
+
+    private static void markFailedUrl(String url) {
+        if (TextUtils.isEmpty(url)) return;
+        synchronized (failedUrls) {
+            failedUrls.put(url, System.currentTimeMillis());
+        }
+    }
+
+    private static void clearFailedUrl(String url) {
+        if (TextUtils.isEmpty(url)) return;
+        synchronized (failedUrls) {
+            failedUrls.remove(url);
+        }
+    }
 
     /** 外部调用方（详情、列表等）使用的兜底封面：默认尺寸 + 固定色 + 小电视。 */
     public static Drawable createFallbackDrawable() {
@@ -225,10 +270,10 @@ public class ImgUtil {
         bgPaint.setStyle(Paint.Style.FILL);
         canvas.drawRoundRect(new RectF(0, 0, width, height), cornerRadius, cornerRadius, bgPaint);
 
-        // 小电视图标按短边 75%（原 50% 基础上放大 1.5 倍）居中缩放叠放，视觉更饱满且不溢出。
+        // 小电视图标按短边 80% 居中缩放叠放，视觉更饱满且仍不溢出（80% 短边 < 长边）。
         Bitmap icon = BitmapFactory.decodeResource(App.getInstance().getResources(), com.github.tvbox.osc.R.drawable.icon_img_placeholder);
         if (icon != null) {
-            float box = Math.min(width, height) * 0.75f;
+            float box = Math.min(width, height) * 0.8f;
             RectF dst = new RectF((width - box) / 2f, (height - box) / 2f, (width + box) / 2f, (height + box) / 2f);
             Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
             iconPaint.setFilterBitmap(true);
@@ -250,11 +295,14 @@ public class ImgUtil {
         Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         Canvas canvas = new Canvas(bitmap);
 
+        // 与 createFallbackDrawable 使用同一"短边 80% 居中"尺寸，保证加载中/失败两态图标大小一致。
         Bitmap icon = BitmapFactory.decodeResource(App.getInstance().getResources(), com.github.tvbox.osc.R.drawable.icon_img_placeholder);
         if (icon != null) {
-            float left = (width - icon.getWidth()) / 2f;
-            float top = (height - icon.getHeight()) / 2f;
-            canvas.drawBitmap(icon, left, top, null);
+            float box = Math.min(width, height) * 0.8f;
+            RectF dst = new RectF((width - box) / 2f, (height - box) / 2f, (width + box) / 2f, (height + box) / 2f);
+            Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            iconPaint.setFilterBitmap(true);
+            canvas.drawBitmap(icon, null, dst, iconPaint);
         }
 
         Drawable drawable = new BitmapDrawable(App.getInstance().getResources(), bitmap);
@@ -264,6 +312,9 @@ public class ImgUtil {
 
     public static void clearCache() {
         drawableCache.clear();
+        synchronized (failedUrls) {
+            failedUrls.clear();
+        }
     }
 
     /**
@@ -378,10 +429,12 @@ public class ImgUtil {
         headers.put(key, value.trim());
     }
 
-    private static RequestListener<Bitmap> getListener(final ImageView view, final ImageView.ScaleType scaleType, final Drawable fallback) {
+    private static RequestListener<Bitmap> getListener(final ImageView view, final ImageView.ScaleType scaleType, final Drawable fallback, final String url) {
         return new RequestListener<Bitmap>() {
             @Override
             public boolean onLoadFailed(@Nullable GlideException e, Object model, Target<Bitmap> target, boolean isFirstResource) {
+                // 记录失败，后续复用该卡片时直接显示兜底图，不再重复"透明占位→底色"闪烁。
+                markFailedUrl(url);
                 view.setScaleType(scaleType);
                 view.setImageDrawable(fallback);
                 return true;
@@ -389,6 +442,8 @@ public class ImgUtil {
 
             @Override
             public boolean onResourceReady(Bitmap resource, Object model, Target<Bitmap> target, DataSource dataSource, boolean isFirstResource) {
+                // 加载成功则清除历史失败标记（网络恢复后仍可正常显示）。
+                clearFailedUrl(url);
                 view.setScaleType(scaleType);
                 return false;
             }
