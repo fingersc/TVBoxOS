@@ -126,7 +126,7 @@ public class SubtitleViewModel extends ViewModel {
         }
     }
 
-    Pattern regexShooterFileOnclick = Pattern.compile("onthefly\\(\"(\\d+)\",\"(\\d+)\",\"([\\s\\S]*)\"\\)");
+    private static final Pattern REGEX_SHOOTER_FILE_ONCLICK = Pattern.compile("onthefly\\(\"(\\d+)\",\"(\\d+)\",\"([\\s\\S]*)\"\\)");
 
     private void getSearchResultSubtitleUrlsFromAssrt(Subtitle subtitle) {
         try {
@@ -143,7 +143,7 @@ public class SubtitleViewModel extends ViewModel {
                             for (Element item : items) {
                                 String onclick = item.attr("onclick");
                                 if (TextUtils.isEmpty(onclick)) continue;
-                                Matcher matcher = regexShooterFileOnclick.matcher(onclick);
+                                Matcher matcher = REGEX_SHOOTER_FILE_ONCLICK.matcher(onclick);
                                 if (matcher.find()) {
                                     String fileName = matcher.group(3);
                                     if (!isSupportedSubtitleFile(fileName)) continue;

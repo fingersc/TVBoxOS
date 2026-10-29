@@ -65,6 +65,7 @@ import com.github.tvbox.osc.util.LiveFailureDiagnoser;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.PlayerHelper;
+import com.github.tvbox.osc.util.RegexUtils;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.live.TxtSubscribe;
 import com.google.gson.JsonArray;
@@ -184,6 +185,8 @@ public class LivePlayActivity extends BaseActivity {
     private static final String DEFAULT_EPG_ADDRESS = "http://epg.51zmt.top:8000/api/diyp/?ch={name}&date={date}";
     private static final Pattern CATCHUP_TOKEN_PATTERN = Pattern.compile("(\\$?\\{[^}]*\\})");
     private static final Pattern CATCHUP_TAG_PATTERN = Pattern.compile("\\{([^}]*)\\}");
+    /** 频道名里的 CCTV 前缀归一（静态预编译，避免每次 normalizeEpgChannelName 调用都编译一次）。 */
+    private static final Pattern EPG_CCTV_PATTERN = Pattern.compile("(?i)^(CCTV\\d+(?:\\+|K)?)(?:[\\u4e00-\\u9fa5].*|$)");
     private final Runnable mLoadEpgRun = new Runnable() {
         @Override
         public void run() {
@@ -955,7 +958,7 @@ public class LivePlayActivity extends BaseActivity {
         }
         String trimName = channelName.trim();
         String compactName = trimName.replace("-", "").replace(" ", "");
-        Matcher cctvMatcher = Pattern.compile("(?i)^(CCTV\\d+(?:\\+|K)?)(?:[\\u4e00-\\u9fa5].*|$)").matcher(compactName);
+        Matcher cctvMatcher = EPG_CCTV_PATTERN.matcher(compactName);
         if (cctvMatcher.matches()) {
             return cctvMatcher.group(1).toUpperCase(Locale.ROOT);
         }
@@ -1897,7 +1900,7 @@ public class LivePlayActivity extends BaseActivity {
             String regex = getCatchupValue(catchupObj, "regex");
             if (TextUtils.isEmpty(regex)) return true;
             try {
-                return url.contains(regex) || Pattern.compile(regex).matcher(url).find();
+                return url.contains(regex) || RegexUtils.getPattern(regex).matcher(url).find();
             } catch (Throwable ignored) {
                 return false;
             }

@@ -174,14 +174,16 @@ public final class EpisodeDict {
         return lookup(showName, date);
     }
 
+    /** 8 位播出日期（YYYYMMDD）识别，静态预编译，避免每次 extractDate 调用都重新编译。 */
+    private static final java.util.regex.Pattern DATE_YYYYMMDD_PATTERN =
+            java.util.regex.Pattern.compile("(?<!\\d)(20\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)");
+
     /** 从任意名称中提取 8 位播出日期（YYYYMMDD）。 */
     public static String extractDate(String name) {
         if (TextUtils.isEmpty(name)) {
             return "";
         }
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("(?<!\\d)(20\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)")
-                .matcher(name);
+        java.util.regex.Matcher m = DATE_YYYYMMDD_PATTERN.matcher(name);
         return m.find() ? m.group(0) : "";
     }
 

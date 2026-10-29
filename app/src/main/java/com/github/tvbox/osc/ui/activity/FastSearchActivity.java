@@ -74,6 +74,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class FastSearchActivity extends BaseActivity {
     private static final int SEARCH_THREAD_COUNT = 6;
+    /** 空白归一化/切分，静态预编译：搜索逐条匹配时高频调用，避免每次 replaceAll/split 重新编译。 */
+    private static final java.util.regex.Pattern WS_PATTERN = java.util.regex.Pattern.compile("\\s+");
     private static final int SEARCH_MAX_THREAD_COUNT = Build.VERSION.SDK_INT >= 35 ? 24 : Build.VERSION.SDK_INT >= 30 ? 18 : 12;
     private static final int SEARCH_PUMP_SECONDS = 2;
     private static final int SEARCH_NEXT_BATCH_SECONDS = 3;
@@ -756,7 +758,7 @@ public class FastSearchActivity extends BaseActivity {
     private boolean matchSearchResult(String name, String searchTitle) {
         if (TextUtils.isEmpty(name) || TextUtils.isEmpty(searchTitle)) return false;
         searchTitle = searchTitle.trim();
-        String[] arr = searchTitle.split("\\s+");
+        String[] arr = WS_PATTERN.split(searchTitle);
         int matchNum = 0;
         for(String one : arr) {
             if (name.contains(one)) matchNum++;
@@ -771,7 +773,7 @@ public class FastSearchActivity extends BaseActivity {
 
     private boolean isHighMatchSearchResult(Movie.Video video) {
         return video != null && !TextUtils.isEmpty(video.name) && !TextUtils.isEmpty(searchTitle)
-                && video.name.replaceAll("\\s+", "").startsWith(searchTitle.replaceAll("\\s+", ""));
+                && WS_PATTERN.matcher(video.name).replaceAll("").startsWith(WS_PATTERN.matcher(searchTitle).replaceAll(""));
     }
 
     private boolean shouldShowHighMatchResults() {

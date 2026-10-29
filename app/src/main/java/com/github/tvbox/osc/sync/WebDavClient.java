@@ -161,6 +161,11 @@ public final class WebDavClient {
      *
      * @return ETag；服务端未提供返回 null
      */
+    /** 从 PROPFIND 207 多状态体里取 getetag（命名空间前缀各家不同，宽松匹配），静态预编译。 */
+    private static final java.util.regex.Pattern ETAG_PATTERN =
+            java.util.regex.Pattern.compile("<[^>]*:?getetag>\\s*([^<]+?)\\s*</[^>]*:?getetag>",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
     public String getEtag(String path) throws IOException {
         Request req = new Request.Builder()
                 .url(url(path))
@@ -180,10 +185,7 @@ public final class WebDavClient {
             // 响应头没有 ⇒ 从 207 多状态体的 XML 里取 <...:getetag>"xxx"</...:getetag>
             //   命名空间前缀各家不同（D:/d:/lp1: 等），用宽松正则匹配任意前缀
             String body = resp.body() == null ? "" : resp.body().string();
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                    .compile("<[^>]*:?getetag>\\s*([^<]+?)\\s*</[^>]*:?getetag>",
-                            java.util.regex.Pattern.CASE_INSENSITIVE)
-                    .matcher(body);
+            java.util.regex.Matcher m = ETAG_PATTERN.matcher(body);
             if (m.find()) {
                 String v = m.group(1).trim();
                 // 去掉 XML 实体与可能的引号包裹
