@@ -225,10 +225,10 @@ public class ImgUtil {
         bgPaint.setStyle(Paint.Style.FILL);
         canvas.drawRoundRect(new RectF(0, 0, width, height), cornerRadius, cornerRadius, bgPaint);
 
-        // 小电视图标按短边 50% 居中缩放叠放，保证不同尺寸封面上都保持「小图标」观感且不溢出。
+        // 小电视图标按短边 75%（原 50% 基础上放大 1.5 倍）居中缩放叠放，视觉更饱满且不溢出。
         Bitmap icon = BitmapFactory.decodeResource(App.getInstance().getResources(), com.github.tvbox.osc.R.drawable.icon_img_placeholder);
         if (icon != null) {
-            float box = Math.min(width, height) * 0.5f;
+            float box = Math.min(width, height) * 0.75f;
             RectF dst = new RectF((width - box) / 2f, (height - box) / 2f, (width + box) / 2f, (height + box) / 2f);
             Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
             iconPaint.setFilterBitmap(true);
