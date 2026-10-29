@@ -321,7 +321,10 @@ public class HomeActivity extends BaseActivity {
                             FileUtils.deleteFile(jarFullCacheDir);
                             FileUtils.clearSpiderCacheFiles();
                             ApiConfig.get().clearSpiderCache();
-                            refreshHome();
+                            // v109：清 jar 后原地重载（refreshHome(false)=loadHomeSort(true)，保留当前页面可点），
+                            //       不再整页 CLEAR_TASK 重建 —— 否则重建期间首页要等爬虫 JS 下载完才有页面，
+                            //       这段时间点“历史/账号”等按钮无反应（实测 cnb.cool 首连挂 IPv6 黑洞 ~8s）。
+                            refreshHome(false);
                         } catch (Exception e) {
                             e.printStackTrace();
                         }

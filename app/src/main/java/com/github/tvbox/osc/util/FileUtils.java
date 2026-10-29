@@ -293,14 +293,14 @@ public class FileUtils {
                     String cache = getCache(MD5.encode(name));
                     rel= cache;
                     if (StringUtils.isEmpty(cache)) {
-                        String netStr = get(name);
+                        String netStr = getV4First(name);
                         if (!TextUtils.isEmpty(netStr)) {
                             setCache(604800, MD5.encode(name), netStr);
                         }
                         rel= netStr;
                     }
                 } else {
-                    rel= get(name);
+                    rel= getV4First(name);
                 }
             } else if (name.startsWith("assets://")) {
                 rel= getAsOpen(name.substring(9));
@@ -410,6 +410,17 @@ public class FileUtils {
             headerMap.put("User-Agent",str.startsWith("https://gitcode.net/") ? UA.random() : "okhttp/3.15");
         }
         return OkHttp.string(str, headerMap);
+    }
+
+    /**
+     * v109：模块/爬虫包下载专用取址（IPv4 优先，见 {@link OkHttp#stringV4First(String, Map)}）。
+     * 仅用于 {@link #loadModule(String)} 里对远程 js/txt/json 的加载（启动期拉爬虫脚本），
+     * 不走播放/直播/弹幕等内容链路，避免 cnb.cool 这类域名 IPv6 黑洞导致首连空等 8s。
+     */
+    public static String getV4First(String str) {
+        Map<String, String> headerMap = new HashMap<>();
+        headerMap.put("User-Agent", str.startsWith("https://gitcode.net/") ? UA.random() : "okhttp/3.15");
+        return OkHttp.stringV4First(str, headerMap);
     }
 
     public static File open(String str) {

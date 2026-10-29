@@ -62,6 +62,50 @@ public class OkHttp {
         return client = builder.build();
     }
 
+    /**
+     * 模块/爬虫包下载专用 client（v109）。
+     *
+     * <p>只用于启动时拉取 JS 爬虫/module（{@link com.github.tvbox.osc.util.FileUtils#loadModule(String)}）
+     * 这类"配置/脚本"下载，<b>不用于播放、直播、弹幕或点播内容接口</b>，因此不影响点播/直播链路。</p>
+     *
+     * <p>1) DNS 固定 IPv4 优先（只排序、不删除，IPv6-only 主机仍能回退）：绕开 cnb.cool 这类
+     * "DoH 把 AAAA 排在前面、而该 IPv6 实为黑洞"的域名 —— 否则 OkHttp 会先试 IPv6、
+     * 挂满 connectTimeout 才回退 IPv4（实测每次约 8 秒，冷启动和刷新 jar 各吃一次）。</p>
+     * <p>2) 连接超时收紧到 4s：即便真的纯黑洞，最坏 4s 失败，远好于 8s。</p>
+     */
+    private static final Dns MODULE_DNS = hostname -> {
+        Dns base = OkGoHelper.dnsOverHttps != null ? OkGoHelper.dnsOverHttps : Dns.SYSTEM;
+        List<InetAddress> all = base.lookup(hostname);
+        if (all == null || all.size() <= 1) return all;
+        List<InetAddress> out = new ArrayList<>(all.size());
+        for (InetAddress a : all) if (a instanceof java.net.Inet4Address) out.add(a);
+        for (InetAddress a : all) if (!(a instanceof java.net.Inet4Address)) out.add(a);
+        return out;
+    };
+
+    public static OkHttpClient moduleClient() {
+        return client().newBuilder()
+                .connectTimeout(4, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .dns(MODULE_DNS)
+                .build();
+    }
+
+    /** 与 {@link #string(String, Map)} 等价，但走 IPv4 优先的模块下载 client（见 {@link #moduleClient()}）。 */
+    public static String stringV4First(String url, Map<String, String> headers) {
+        if (url == null || !url.startsWith("http")) return "";
+        try {
+            Request.Builder rb = new Request.Builder().url(url);
+            if (headers != null) for (Map.Entry<String, String> e : headers.entrySet()) rb.addHeader(e.getKey(), e.getValue());
+            try (Response res = moduleClient().newCall(rb.build()).execute()) {
+                return res.body() != null ? res.body().string() : "";
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "";
+        }
+    }
+
     public static OkHttpClient player() {
         return client();
     }
