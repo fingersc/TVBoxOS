@@ -156,6 +156,9 @@ public class UserFragment extends BaseLazyFragment implements View.OnClickListen
     }
 
     private void jumpSearch(Movie.Video vod) {
+        if (!isAdded() || getActivity() == null) {
+            return;
+        }
         Intent newIntent;
         if (Hawk.get(HawkConfig.FAST_SEARCH_MODE, true)) {
             newIntent = new Intent(mContext, FastSearchActivity.class);

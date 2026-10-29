@@ -569,6 +569,8 @@ public class HomeActivity extends BaseActivity {
     }
 
     private void initViewPager(AbsSortXml absXml) {
+        // r108：重建前先清空页面列表，避免在旧列表上累加造成 fragment 越积越多/错位。
+        fragments.clear();
         if (sortAdapter.getData().size() > 0) {
             for (MovieSort.SortData data : sortAdapter.getData()) {
                 if (data.id.equals("my0")) {

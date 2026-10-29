@@ -1410,7 +1410,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
     }
 
     private void restartApp() {
-        if (mContext == null) return;
+        if (mContext == null || !isAdded() || getActivity() == null) return;
         Intent intent = mContext.getPackageManager().getLaunchIntentForPackage(mContext.getPackageName());
         if (intent != null) {
             intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);

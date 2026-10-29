@@ -282,12 +282,21 @@ public abstract class BaseLazyFragment extends Fragment implements CustomAdapt {
     }
 
     public void jumpActivity(Class<? extends BaseActivity> clazz) {
-        Intent intent = new Intent(mContext, clazz);
+        // r108：Fragment 已分离（getActivity()==null / !isAdded）时直接 return，
+        // 避免 crash：IllegalStateException: Fragment ... not attached to Activity
+        // （碎片级 startActivity 在 Fragment 脱离 Activity 后调用必抛此异常）。
+        if (!isAdded() || getActivity() == null) {
+            return;
+        }
+        Intent intent = new Intent(getActivity(), clazz);
         startActivity(intent);
     }
 
     public void jumpActivity(Class<? extends BaseActivity> clazz, Bundle bundle) {
-        Intent intent = new Intent(mContext, clazz);
+        if (!isAdded() || getActivity() == null) {
+            return;
+        }
+        Intent intent = new Intent(getActivity(), clazz);
         intent.putExtras(bundle);
         startActivity(intent);
     }
