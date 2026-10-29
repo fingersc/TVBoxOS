@@ -1442,7 +1442,7 @@ public class DetailActivity extends BaseActivity {
                         //   · expectedName 为空 ⇒ 没有"当前这一集"的概念（首次进入/无快照）⇒ 放行
                         //   · 用户指定的源（搜索页点卡片 / 历史点卡片，fallbackResult=false）
                         //     ⇒ 暂停播放 + 提示「该源没有当前这一集」，不去乱切别的源
-                        //   · 切源队列（fallbackResult=true）⇒ 软失败续切下一个源（独立预算 6 次）
+                        //   · 切源队列（fallbackResult=true）⇒ 软失败续切下一个源（独立预算 12 次 + 20s 墙钟封顶，r106）
                         //   · 预算耗尽 ⇒ 提示「没有其他源包含这一集」并停止（不播任何内容）
                         if (!TextUtils.isEmpty(expectedName)
                                 && !EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentEpisode.name)) {
@@ -1458,7 +1458,12 @@ public class DetailActivity extends BaseActivity {
                                         "该源没有当前这一集", Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            if (detailFallbackAlignFailover >= DETAIL_FALLBACK_MAX_ALIGN_FAILOVER) {
+                            boolean alignBudgetExhausted =
+                                    detailFallbackAlignFailover >= DETAIL_FALLBACK_MAX_ALIGN_FAILOVER
+                                    || (detailFallbackRoundStartMs > 0
+                                        && System.currentTimeMillis() - detailFallbackRoundStartMs
+                                            >= DETAIL_FALLBACK_ALIGN_MAX_MS);
+                            if (alignBudgetExhausted) {
                                 Toast.makeText(DetailActivity.this,
                                         detailFallbackHadEpisodePlaybackFail
                                                 ? "已找到含该集的源，但播放失败，请稍后重试"
@@ -2010,6 +2015,7 @@ public class DetailActivity extends BaseActivity {
             //   唯一解释，但此前一个日志都没有（r65 日志里 idx 突然回 0 查不出原因）。
             LOG.sw("[FB] filmSwitch title=" + detailFallbackCycleTitle + "（清空 cycle/dead/soft/ref）");
             detailFallbackCycleKeys.clear();
+            detailFallbackAttemptedVideoIds.clear();
             detailFallbackNewCycle = true;
             // ★ 换片必须清 DeadKeys / SoftTriedKeys：
             // 「某站没有 A 片」不代表「没有 B 片」，跨片沿用拉黑列表会让新片的
@@ -2040,6 +2046,8 @@ public class DetailActivity extends BaseActivity {
         detailFallbackActive = true;
         // 手动发起切源 → 重置失败续切预算。自动续切不清零，那正是要限制的连跳。
         detailFallbackFailoverCount = 0;
+        // ★ r105：本轮切源墙钟起点（供「该源没有该集」续切的时间封顶用）。
+        detailFallbackRoundStartMs = System.currentTimeMillis();
         // ★ 每次切源前，把搜索会话候选池的「最新增量」并入本地缓存。
         //   搜索是边跑边补的（单一真相源在 SearchSession），而本地 detailFallbackCache
         //   是进页面那一刻的副本；不重新拉取的话，切源能在几个站之间轮转，
@@ -2210,7 +2218,11 @@ public class DetailActivity extends BaseActivity {
         }
         // ★ 第一轮只挑「别的站」：本圈内还有没轮过的其它站点时，跳过当前正在播放的源。
         //   点切源却切回自己 = 页面原地重载一遍，用户只会以为没生效。
-        String picked = scanOrderedSources(orderedSources, false);
+        String picked = scanOrderedSources(orderedSources, false, false);
+        if (TextUtils.isEmpty(picked)) {
+            // ★ r105：本圈的新上游都轮完，再放开「重复上游」兜底复扫一次（不永久跳过）。
+            picked = scanOrderedSources(orderedSources, false, true);
+        }
         if (!TextUtils.isEmpty(picked)) {
             return picked;
         }
@@ -2226,6 +2238,8 @@ public class DetailActivity extends BaseActivity {
         // 不清的话新圈里每一个站点都还被判为「试过」，等于开新圈立刻死空。
         detailFallbackCycleKeys.clear();
         detailFallbackSoftTriedKeys.clear();
+        // ★ r105：开新圈 ⇒ 上游去重集合同步清空（与 cycle/soft 同生命周期）。
+        detailFallbackAttemptedVideoIds.clear();
         // ★ v69：开新圈 ⇒ 冻结顺序作废，按此刻最新的得分重新定一整圈。
         //   这就是「循环一圈之后，下一圈应该从得分最高的站开始」的落点。
         detailFallbackCycleFrozenOrder.clear();
@@ -2235,14 +2249,18 @@ public class DetailActivity extends BaseActivity {
         LOG.sw("[FB] newCycle #" + detailFallbackCycleCount
                 + " pool=" + orderedSources.size());
         List<String> newOrder = currentCycleOrder(cachedCandidates);
-        picked = scanOrderedSources(newOrder, false);
+        picked = scanOrderedSources(newOrder, false, false);
+        if (TextUtils.isEmpty(picked)) {
+            // ★ r105：新圈里先试没试过的上游，再放开重复上游。
+            picked = scanOrderedSources(newOrder, false, true);
+        }
         if (TextUtils.isEmpty(picked)) {
             // ★ v70：圈尾兜底顺序调整（用户拍板「跳过当前最高分切第二名」）。
             // v69 这里先「切回当前源」再开新圈，圈尾会多出一次原地重载，
             // 用户看到的又是一次「重复」。改为先开新圈取「非当前源里分数最高的」；
             // 只有新圈里连非当前源都选不出来（实际只剩当前源可用）才允许回到当前源，
             // 避免用户彻底切不动。
-            picked = scanOrderedSources(newOrder, true);
+            picked = scanOrderedSources(newOrder, true, true);
         }
         if (TextUtils.isEmpty(picked)) {
             detailFallbackPickedVideoId = "";
@@ -2257,6 +2275,19 @@ public class DetailActivity extends BaseActivity {
      *                     传 false 时跳过它，保证用户点切源一定能看到别的站。
      */
     private String scanOrderedSources(List<String> orderedSources, boolean allowCurrent) {
+        return scanOrderedSources(orderedSources, allowCurrent, true);
+    }
+
+    /**
+     * ★ r105：带「上游去重」开关的重载。
+     *
+     * <p>{@code allowDuplicateUpstream=false} 时，本圈已试过同一上游 {@code videoId} 的站点
+     * 在本轮扫描里被跳过（先不试镜像站）；整表扫完一个都没选出来时，由调用方再以
+     * {@code true} 复扫一次兜底 —— <b>只降优先级、不永久跳过</b>（万一同 id 不同线路还能试）。
+     * 目的：让开局先把每个不同上游各试一次（广度优先），而不是在
+     * 量子/暴风/15-量子/20-量子 几个镜像上把「该源没有该集」的预算烧光。</p>
+     */
+    private String scanOrderedSources(List<String> orderedSources, boolean allowCurrent, boolean allowDuplicateUpstream) {
         int total = orderedSources.size();
         // ★ v69：起点恒为 0 —— 从头扫 == 取「本圈还没轮过、且不是当前源」里分数最高的。
         //
@@ -2284,6 +2315,7 @@ public class DetailActivity extends BaseActivity {
         List<String> skipSoft = new ArrayList<>();
         List<String> skipCur = new ArrayList<>();
         List<String> skipNovid = new ArrayList<>();
+        List<String> skipDup = new ArrayList<>();
         for (int step = 0; step < total; step++) {
             int index = (startIdx + step) % total;
             String cycleKey = orderedSources.get(index);
@@ -2332,8 +2364,17 @@ public class DetailActivity extends BaseActivity {
                 }
                 continue;
             }
+            // ★ r105：上游去重（广度优先）。本圈已试过同一上游 videoId 的镜像站先跳过，
+            //   避免 量子/暴风/15-量子/20-量子 等换皮站反复烧「该源没有该集」的预算。
+            if (!allowDuplicateUpstream && detailFallbackAttemptedVideoIds.contains(videoId)) {
+                if (skipDup.size() < SKIP_LOG_MAX) {
+                    skipDup.add(cycleKey);
+                }
+                continue;
+            }
             detailFallbackCycleKeys.add(cycleKey);
             detailFallbackSoftTriedKeys.add(cycleKey);
+            detailFallbackAttemptedVideoIds.add(videoId);
             detailFallbackPickedVideoId = videoId;
             LOG.sw("[FB] pollPick source=" + cycleKey
                     + " name=" + detailFallbackDisplayName(cycleKey)
@@ -2345,6 +2386,7 @@ public class DetailActivity extends BaseActivity {
                     + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
                     + buildSkipReasonLog(skipCur, "cur", skipCur.size())
                     + buildSkipReasonLog(skipNovid, "novid", skipNovid.size())
+                    + buildSkipReasonLog(skipDup, "dup", skipDup.size())
                     + buildSkipReasonLog(skipCycled, "cycled", skipCycled.size()));
             return cycleKey;
         }
@@ -2356,6 +2398,7 @@ public class DetailActivity extends BaseActivity {
                 + buildSkipReasonLog(skipSoft, "soft", skipSoft.size())
                 + buildSkipReasonLog(skipCur, "cur", skipCur.size())
                 + buildSkipReasonLog(skipNovid, "novid", skipNovid.size())
+                + buildSkipReasonLog(skipDup, "dup", skipDup.size())
                 + buildSkipReasonLog(skipCycled, "cycled", skipCycled.size()));
         return "";
     }
@@ -4680,6 +4723,12 @@ public class DetailActivity extends BaseActivity {
      */
     private void resetDetailFallback(boolean keepCache) {
         detailFallbackFailoverCount = 0;
+        // ★ r105：「该源没有该集」预算必须按轮计、跨轮不累加。
+        //   此前这里从不清 detailFallbackAlignFailover（全文件只有声明处 =0），
+        //   于是第一次切源烧到 6 后，之后每轮起点就 ≥6、一进门直接放弃 —— 与注释
+        //   「独立预算 6 次（每轮）」不符，是「切一次不成就永远切不动」的元凶之一。
+        detailFallbackAlignFailover = 0;
+        detailFallbackRoundStartMs = 0L;
         // ★ r103：只有「换片/全新一轮」的彻底复位才清「有集但播放失败」标记；
         //   keepCache=true 是同一轮内的成功重新定位，标记要保留到本轮真正收尾，
         //   否则会漏掉此前「有集却超时」的事实（详见字段注释）。
@@ -5044,8 +5093,28 @@ public class DetailActivity extends BaseActivity {
      * 「找有对应集的源」比「起播失败重试」需要更多次，用户定稿为 6 次）。
      */
     private int detailFallbackAlignFailover = 0;
-    /** ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（用户定稿 6）。 */
-    private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = 6;
+    /** ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（r105：6→12，配合上游去重与时间封顶）。 */
+    private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = 12;
+    /**
+     * ★ r105：本轮切源「该源没有该集」续切的总墙钟上限（毫秒）。
+     *
+     * <p>{@code alignNoEpisode} 是详情<b>已成功返回</b>后的快速判定（约 1s），不是慢超时；
+     * 用时间封顶既能穿过一大串「没该集」的源走到池子后段真正含该集的源（如非凡系），
+     * 又能兜住网络差时「连跳十几个站、页面不停变化无法中断」的老问题。</p>
+     */
+    private static final long DETAIL_FALLBACK_ALIGN_MAX_MS = 20000L;
+    /** ★ r105：本轮切源开始时刻（用于上面的墙钟封顶）；0 表示未开始 / 不限。 */
+    private long detailFallbackRoundStartMs = 0L;
+    /**
+     * ★ r105：本圈已尝试过的「上游影片 id」集合。
+     *
+     * <p>日志实证不同聚合站会镜像同一上游（lezi/量子 同为 {@code id=4933}、
+     * baofeng/暴风 同为 {@code id=89597}），换皮后各占一次预算、把「该源没有该集」的预算
+     * 耗在同一内容上。{@link #scanOrderedSources} 用它做「广度优先」：先试没试过的上游，
+     * 新上游轮完才回落重复上游。生命周期与 {@code detailFallbackCycleKeys} 一致：
+     * 开新圈 / 换片时清空。</p>
+     */
+    private final Set<String> detailFallbackAttemptedVideoIds = new HashSet<>();
     /**
      * ★ r103：本轮兜底是否遇到过「源<b>确实有</b>当前这一集、但拉流/播放失败（起播超时、解析失败）」。
      *
