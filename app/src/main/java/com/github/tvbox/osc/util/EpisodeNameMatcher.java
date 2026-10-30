@@ -638,7 +638,15 @@ public final class EpisodeNameMatcher {
             return true;                        // 无从判定 ⇒ 放行
         }
         if (ka.domain != kb.domain) {
-            return true;                        // 跨域 ⇒ 放行（量纲不同）
+            // ★ r110：跨域（期号式 ↔ 日期式）期号/日期量纲不同，无法直接比；
+            //   但「上/中/下」分段是跨域可比的语义。若双方都带【显式】分段且冲突，
+            //   则判定不是同一集 —— 修复「第2期下」跨域反查落到「20260906上」后
+            //   守卫无条件放行、静默播「上」。任一方无显式分段（含"无后缀≡上"）时
+            //   无从判断，仍放行，维持旧行为避免误伤。
+            if (ka.part == PART_NONE || kb.part == PART_NONE) {
+                return true;
+            }
+            return ka.part == kb.part;
         }
         if (ka.ordinal != kb.ordinal) {
             return false;                       // 同域但期号/日期不一致 ⇒ 不是同一集
@@ -3758,8 +3766,10 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
      *   <li>{@code currentName} 为 null/空（口径未知）：同日期优先正片，
      *       只有非正片时返回首个非正片（兼容旧行为）。</li>
      * </ul>
-     * <p>同日期多条（上/中/下）时一律返回<b>第一条</b>，
-     * 与"无后缀 ≡ 上"的既有归一一致。</p>
+     * <p>同日期多条（上/中/下）时的落位（★r110）：
+     * 若 {@code currentName} 带<b>显式</b>分段（上/中/下），取同分段那条；
+     * 该日期没有同分段的正片则返回 <b>-1</b>（跳过该源，宁可不切不可切错）；
+     * 若 {@code currentName} 无显式分段，沿用旧行为取同日期第一条（与"无后缀 ≡ 上"一致）。</p>
      *
      * @param date        YYYYMMDD
      * @param names       目标源集名列表
@@ -3783,6 +3793,8 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
 
         int nonMainFallback = -1;      // 口径未知时的兜底
         int sameTokenFallback = -1;    // 非正片的"同词"命中
+        int mainFirst = -1;            // ★r110：同日期首个正片（无显式分段时的旧兜底）
+        int mainPartMatch = -1;        // ★r110：同日期中分段与当前【显式】分段一致的正片
         for (int i = 0; i < names.size(); i++) {
             String name = names.get(i);
             if (TextUtils.isEmpty(name)) {
@@ -3806,9 +3818,15 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
 
             if (!curIsNonMain) {
-                // 当前是正片：只认正片
+                // 当前是正片：只认正片；按分段挑（同分段优先，见方法末尾落位规则）
                 if (!nonMain) {
-                    return i;
+                    if (mainFirst < 0) {
+                        mainFirst = i;
+                    }
+                    if (mainPartMatch < 0
+                            && normalizePart(extractPart(name)) == normalizePart(extractPart(currentName))) {
+                        mainPartMatch = i;
+                    }
                 }
                 continue;
             }
@@ -3824,8 +3842,15 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         if (!curKnown) {
             return nonMainFallback;
         }
-        // 非正片：同词优先，找不到才降级到该日期的任意条目
-        return curIsNonMain ? sameTokenFallback : -1;
+        if (!curIsNonMain) {
+            // ★r110：当前是正片时按显式分段落位，而非永远取第一条
+            if (extractPart(currentName) != PART_NONE) {
+                return mainPartMatch;   // >=0 命中同分段；-1 表示该日期无对应分段 → 跳过该源
+            }
+            return mainFirst;           // 当前无显式分段：沿用旧行为（同日期首个正片）
+        }
+        // 当前是非正片：同词优先，找不到才降级到该日期的任意条目
+        return sameTokenFallback;
     }
 
     /**
