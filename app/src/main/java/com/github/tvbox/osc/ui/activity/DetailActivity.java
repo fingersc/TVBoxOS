@@ -1217,6 +1217,18 @@ public class DetailActivity extends BaseActivity {
                     applyIndexOnlyUi("indexOnly".equals(mVideo.action));
 
                     if (vodInfo.seriesMap != null && vodInfo.seriesMap.size() > 0) {
+                        // ★ r112：收割本源的「日期↔真期号」混合锚点（供跨源切源按播出日期定位）。
+                        //   只从带『日期+第N期』真混合名的条目建表；按片名隔离；异常绝不影响主流程。
+                        try {
+                            java.util.List<java.util.List<String>> anchorLists = new java.util.ArrayList<>();
+                            for (java.util.List<VodInfo.VodSeries> al : vodInfo.seriesMap.values()) {
+                                anchorLists.add(seriesNames(al));
+                            }
+                            String anchorShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                                    ? vod_name : detailFallbackAnchorTitle;
+                            EpisodeNameMatcher.harvestDateOrdinalAnchors(anchorShow, anchorLists);
+                        } catch (Throwable ignored) {
+                        }
                         // ★ v67：首轮记录基准集数（同站多资源择优的兜底信号，见字段注释）
                         if (!fallbackResult && detailFallbackRefEpisodes <= 0) {
                             detailFallbackRefEpisodes = countSeriesEpisodes(vodInfo);
@@ -4636,6 +4648,8 @@ public class DetailActivity extends BaseActivity {
                     || TextUtils.isEmpty(video.id) || !isSameFallbackTitle(title, video.name)) {
                 continue;
             }
+            // ★ r113：复数入口同样为同名片候选收割锚点（无 urlBean 时空转）。
+            harvestAnchorsFromCandidate(video);
             String candidateKey = getDetailFallbackKey(video.sourceKey, video.id);
             if (existingKeys.add(candidateKey)) {
                 cachedCandidates.add(video);
@@ -4651,7 +4665,57 @@ public class DetailActivity extends BaseActivity {
         trimDetailFallbackPool(title);
     }
 
+    /**
+     * ★ r113「锚点加强」：把候选视频自带的剧集列表也喂给跨域锚表。
+     *
+     * <p><b>为什么</b>：r112 只在详情真正加载进页面（{@code 1219} 块）时建锚，而预热/攒池
+     * 链路（{@code scheduleDetailFallbackPoolFill → onDetailFallbackSearchResult}）不经过那里，
+     * 于是「池里有、但从没被切到过」的源贡献不了锚点；若坏切源前落地过的源里恰无真混合名
+     * （{@code 20260410(第5期上)} 这类），锚表为空 → L0 不介入 → 旧错切复现。
+     * 此处在候选入池路径顺手收割，让整个预热池贡献「播出日期↔真期号」锚点。</p>
+     *
+     * <p>只做精确收割（逻辑全在 {@link EpisodeNameMatcher#harvestDateOrdinalAnchors}），
+     * 无 urlBean 的搜索结果卡自然空转；异常绝不影响主流程。</p>
+     */
+    private void harvestAnchorsFromCandidate(Movie.Video video) {
+        if (video == null || video.urlBean == null || video.urlBean.infoList == null) {
+            return;
+        }
+        try {
+            java.util.List<java.util.List<String>> anchorLists = new java.util.ArrayList<>();
+            for (Movie.Video.UrlBean.UrlInfo urlInfo : video.urlBean.infoList) {
+                if (urlInfo == null || urlInfo.beanList == null || urlInfo.beanList.isEmpty()) {
+                    continue;
+                }
+                java.util.List<String> names = new java.util.ArrayList<>(urlInfo.beanList.size());
+                for (Movie.Video.UrlBean.UrlInfo.InfoBean bean : urlInfo.beanList) {
+                    if (bean != null && !TextUtils.isEmpty(bean.name)) {
+                        names.add(bean.name);
+                    }
+                }
+                if (!names.isEmpty()) {
+                    anchorLists.add(names);
+                }
+            }
+            if (anchorLists.isEmpty()) {
+                return;
+            }
+            String anchorShow = TextUtils.isEmpty(detailFallbackAnchorTitle) ? vod_name : detailFallbackAnchorTitle;
+            if (TextUtils.isEmpty(anchorShow)) {
+                return;
+            }
+            EpisodeNameMatcher.harvestDateOrdinalAnchors(anchorShow, anchorLists);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void cacheDetailFallbackCandidate(Movie.Video video) {
+        if (video == null) {
+            return;
+        }
+        // ★ r113：候选入池即收割锚点；即使它已在池中，后到的「详情版」可能才带 urlBean，
+        //   所以收割放在去重返回之前，保证带剧集列表的版本一定被喂进锚表。
+        harvestAnchorsFromCandidate(video);
         List<Movie.Video> cachedCandidates = poolOf(detailFallbackAnchorTitle);
         if (cachedCandidates == null) {
             cachedCandidates = new ArrayList<>();
@@ -5849,6 +5913,33 @@ public class DetailActivity extends BaseActivity {
         final List<String> targetNames = seriesNames(targetList);
         final String currentName = currentSeries.name;
 
+        // ---------- 第0层：播放流日期锚 + 混合锚点 → 规范期号（r112，必须先于同域匹配）----------
+        // 同一「第N期」在不同源可能指向不同播出日期：172116 把 0410 标「第4期」，jisu 把 0403 标「第4期」。
+        // 若先做同域匹配，「第4期上」会直接命中 jisu「第4期上」(实为 0403) —— 这正是错切。
+        // 因此当①当前集名无日期、②播放流 URL 里带真实播出日期、③混合锚点给出的规范期号（该日期对应的真期号）
+        // 与当前名自身期号**不同**（即当前源期号标签偏了）时，以规范期号为准重新定位。
+        // 只在三者同时成立时介入；其余情况完全放行旧链路（零回归）。
+        if (TextUtils.isEmpty(extractDateFromName(currentName))
+                && !EpisodeNameMatcher.isNonMainEntryName(currentName)
+                && currentSeries.url != null && !currentSeries.url.isEmpty()) {
+            String curUrlDate = extractDateFromName(currentSeries.url);
+            if (!TextUtils.isEmpty(curUrlDate)) {
+                String anchorShow0 = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                        ? vod_name : detailFallbackAnchorTitle;
+                int anchorOrd0 = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShow0, curUrlDate);
+                int selfOrd0 = EpisodeNameMatcher.extractOrdinal(currentName);
+                if (anchorOrd0 > 0 && selfOrd0 > 0 && selfOrd0 != anchorOrd0) {
+                    int byAnchor0 = EpisodeNameMatcher.findIndexByEpisode(currentName, anchorOrd0, targetNames);
+                    if (byAnchor0 >= 0) {
+                        LOG.sw("[FB] urlDateAnchorOrdPre url=" + curUrlDate + " self=" + selfOrd0
+                                + " ord=" + anchorOrd0 + " ep=" + currentName
+                                + " -> idx=" + byAnchor0 + " tgt=" + targetNames.get(byAnchor0));
+                        return byAnchor0;
+                    }
+                }
+            }
+        }
+
         // ---------- 第1层：本地同域精确匹配 ----------
         // 含"前导零 / 多字少字"等同域变体，全部在此解决，不联网。
         int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
@@ -5878,6 +5969,22 @@ public class DetailActivity extends BaseActivity {
                     LOG.sw("[FB] urlDateAnchor url=" + urlDate + " ep=" + currentName
                             + " -> idx=" + byUrlDate + " tgt=" + targetNames.get(byUrlDate));
                     return byUrlDate;
+                }
+                // ★ r112：目标源只有期号、没有日期（如 jisu「第N期上」）时，findIndexByDate 落空。
+                //   此时用「当前播放流 URL 里的播出日期」查『日期↔真期号』混合锚点得到**规范期号**
+                //   （不信当前源自己的期号标签——正是修 172116 第4期(实为0410=第5期)→jisu 第4期 的关键），
+                //   再按规范期号在目标源定位。锚点缺失/不可信则原样放行给旧链路（宁可不切不切错）。
+                String anchorShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                        ? vod_name : detailFallbackAnchorTitle;
+                int anchorOrd = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShow, urlDate);
+                if (anchorOrd > 0) {
+                    int byAnchor = EpisodeNameMatcher.findIndexByEpisode(currentName, anchorOrd, targetNames);
+                    if (byAnchor >= 0) {
+                        LOG.sw("[FB] urlDateAnchorOrd url=" + urlDate + " ord=" + anchorOrd
+                                + " ep=" + currentName + " -> idx=" + byAnchor
+                                + " tgt=" + targetNames.get(byAnchor));
+                        return byAnchor;
+                    }
                 }
             }
         }

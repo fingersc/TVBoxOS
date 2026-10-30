@@ -2249,6 +2249,128 @@ public final class EpisodeNameMatcher {
         }
     }
 
+    // ============ r112：真混合集名锚点（日期 ↔ 期号，按片名隔离）============
+    //
+    // 【要解决的问题】同一「第N期」在不同采集源可能指不同播出日期：实测《魔力歌先生》
+    //   源 172116 把 20260410 标成「第4期上」，而 jisu/101839 把 20260403 标成「第4期上」。
+    //   切源若按「期号名字」比（4==4），会把 20260410 的内容切到 jisu 的「第4期上」(实为 0403)。
+    //   唯一可靠的不变量是「播出日期」。而 baofeng/136391 这类源用『20260410(第5期上)』
+    //   这种「日期+真期号」的混合名，本身就是权威锚点：0410 ↔ 第5期。
+    //
+    // 【做法】在任一源详情加载时，把该源列表里「同时带日期与真期号」的条目抽成
+    //   日期→期号 对照表（按片名隔离，避免跨剧污染）。切源遇到目标源只有期号、
+    //   没有日期时，用「当前播放流 URL 里的播出日期」查该表得到规范期号，再按规范期号定位。
+    //   注意：『第20260410期上』是"日期包在期号里"的伪期号（{@link #hybridOrdinalForm}
+    //   会返回 null），天然被排除。
+    //
+    // 【安全】只做精确命中，不做外推；同一天出现两个不同期号 → 判为不可信并剔除该日，
+    //   宁可退回旧链路（可能不切）也不切错。整表按片名隔离 + 有上限，避免无界增长。
+    private static final Map<String, Map<Integer, Integer>> ANCHOR_DATE_TO_ORD =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Map<String, java.util.Set<Integer>> ANCHOR_AMBIGUOUS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Object ANCHOR_LOCK = new Object();
+    private static final int ANCHOR_LIMIT_PER_SHOW = 4000;
+
+    /**
+     * 从某源的完整集名列表收割「日期 ↔ 真期号」锚点（r112）。
+     *
+     * @param showKey 片名（用于按剧隔离；为空则忽略）
+     * @param lists   该源各线路的完整集名列表（可多条线路）
+     */
+    public static void harvestDateOrdinalAnchors(String showKey,
+                                                 java.util.Collection<java.util.List<String>> lists) {
+        if (TextUtils.isEmpty(showKey) || lists == null || lists.isEmpty()) {
+            return;
+        }
+        String k = showKey.trim();
+        if (k.isEmpty()) {
+            return;
+        }
+        synchronized (ANCHOR_LOCK) {
+            Map<Integer, Integer> map = ANCHOR_DATE_TO_ORD.get(k);
+            if (map == null) {
+                map = new java.util.HashMap<>();
+                ANCHOR_DATE_TO_ORD.put(k, map);
+            }
+            java.util.Set<Integer> amb = ANCHOR_AMBIGUOUS.get(k);
+            if (amb == null) {
+                amb = new java.util.HashSet<>();
+                ANCHOR_AMBIGUOUS.put(k, amb);
+            }
+            for (java.util.List<String> names : lists) {
+                if (names == null || names.isEmpty()) {
+                    continue;
+                }
+                for (String name : names) {
+                    if (TextUtils.isEmpty(name)) {
+                        continue;
+                    }
+                    int d = dateOf(name);
+                    if (d < 19900101) {
+                        continue;               // 无有效播出日期
+                    }
+                    // 真混合式：日期 + 可解析的真期号；伪期号（第YYYYMMDD期）返回 null 被排除
+                    String of = hybridOrdinalForm(name);
+                    if (TextUtils.isEmpty(of)) {
+                        continue;
+                    }
+                    int o = extractOrdinal(of);
+                    if (o <= 0 || o >= 1000) {
+                        continue;
+                    }
+                    Integer prev = map.get(d);
+                    if (prev == null) {
+                        if (map.size() < ANCHOR_LIMIT_PER_SHOW) {
+                            map.put(d, o);
+                        }
+                    } else if (prev.intValue() != o) {
+                        // 同一天被不同源标成不同期号 → 该日不可信，剔除
+                        amb.add(d);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 用日期查规范期号（r112，仅精确命中，不外推）。
+     *
+     * @return 期号；未收录/该日不可信时返回 -1
+     */
+    public static int ordinalOfDateFromAnchor(String showKey, String dateStr) {
+        if (TextUtils.isEmpty(dateStr)) {
+            return -1;
+        }
+        int d;
+        try {
+            d = Integer.parseInt(dateStr.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        return ordinalOfDateFromAnchor(showKey, d);
+    }
+
+    /** @see #ordinalOfDateFromAnchor(String, String) */
+    public static int ordinalOfDateFromAnchor(String showKey, int date) {
+        if (date <= 0 || TextUtils.isEmpty(showKey)) {
+            return -1;
+        }
+        String k = showKey.trim();
+        synchronized (ANCHOR_LOCK) {
+            Map<Integer, Integer> map = ANCHOR_DATE_TO_ORD.get(k);
+            if (map == null || map.isEmpty()) {
+                return -1;
+            }
+            java.util.Set<Integer> amb = ANCHOR_AMBIGUOUS.get(k);
+            if (amb != null && amb.contains(date)) {
+                return -1;
+            }
+            Integer v = map.get(date);
+            return v == null ? -1 : v;
+        }
+    }
+
     /**
      * 在目标列表里定位指定日期的条目（记事实时用来反查分段口径）。
      *
