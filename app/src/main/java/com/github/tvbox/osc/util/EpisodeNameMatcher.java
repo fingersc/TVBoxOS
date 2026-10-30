@@ -618,7 +618,10 @@ public final class EpisodeNameMatcher {
                 return 0;
             }
             if (isNonMainFeature(currentName)) {
-                return sameNonMainSeries(currentName, targetName) ? 80 : NON_MAIN_PENALTY;
+                // ★ r117：非正片 vs 非正片、但规范系列不同 → 0（不再给 30 弱匹配）。
+                //   30 会把「彩蛋」和「特别加更」这类完全不同的衍生系列当成弱候选，
+                //   findIndex 接受 score>0 就会切错。用户口径：不同系列一律不同集。
+                return sameNonMainSeries(currentName, targetName) ? 80 : 0;
             }
             return 80;
         }
@@ -636,7 +639,9 @@ public final class EpisodeNameMatcher {
                 return NON_MAIN_PENALTY;       // 一正一副：降权但仍保留为候选（沿用旧口径）
             }
             if (cn) {
-                return sameNonMainSeries(currentName, targetName) ? 80 : NON_MAIN_PENALTY;
+                // ★ r117：非正片 vs 非正片、规范系列不同 → 0（理由同轴 1）。
+                //   轴 2 里 cn!=tn（正↔副）仍返回 NON_MAIN_PENALTY（见上），由主集守卫处理。
+                return sameNonMainSeries(currentName, targetName) ? 80 : 0;
             }
             return 80;
         }
@@ -655,10 +660,16 @@ public final class EpisodeNameMatcher {
         return 0;
     }
 
-    /** 两条都是衍生内容且共享同一系列词（如都「重温」或都「直拍REACTION」）→ 视为同源。 */
+    /**
+     * 两条都是衍生内容且共享<b>同一规范系列</b>（如都「直拍」、都「纯享」、都「加更」）→ 视为同源。
+     *
+     * <p>★ r117：改用 {@link #canonicalNonMainSeries} 归一，使「直拍 / 直拍REACTION / 直拍机位」
+     * 视为同一系列、「纯享 / 舞台纯享 / 纯享典藏」同系列、「加更 / 加更版」同系列；
+     * 同时把「特别加更」从「加更」中剥离（用户口径：<b>加更 ≠ 特别加更</b>）。</p>
+     */
     private static boolean sameNonMainSeries(String a, String b) {
-        String ta = nonMainFeatureToken(a);
-        String tb = nonMainFeatureToken(b);
+        String ta = canonicalNonMainSeries(a);
+        String tb = canonicalNonMainSeries(b);
         return ta != null && ta.equals(tb);
     }
 
@@ -1453,6 +1464,49 @@ public final class EpisodeNameMatcher {
         }
         Matcher m = NON_MAIN_FEATURE.matcher(name);
         return m.find() ? m.group() : null;
+    }
+
+    /**
+     * ★ r117：把非正片条目的系列词归一到<b>同一个规范系列名</b>，用于判断两条非正片是否"同一系列"。
+     *
+     * <p>背景：{@link #nonMainFeatureToken} 只返回正则里命中的第一个词根，写法稍变就不相等
+     * （{@code 直拍REACTION} 得「直拍」而 {@code 直拍机位} 得「直拍机位」；{@code 舞台纯享}
+     * 与 {@code 纯享} 也不同；更要命的是 {@code 特别加更} 与 {@code 加更} 都命中「加更」，
+     * 会被当成同一系列 —— 正是 r117 要修的错切）。本方法按用户 2026-10-30 确认的等价口径归一。</p>
+     *
+     * <p>等价口径：直拍≡直拍REACTION≡直拍机位→「直拍」；纯享≡纯享版≡舞台纯享≡纯享典藏→「纯享」；
+     * 加更≡加更版→「加更」；超前≡超前营业≡超前企划→「超前」；<b>特别加更 独立</b>；
+     * 其余按命中词根原样返回（彩蛋、会员版、发布会、熟人局… 各自独立）。</p>
+     *
+     * @param name 集名
+     * @return 规范系列名；当前条目不是可识别的非正片时返回 {@code null}
+     */
+    public static String canonicalNonMainSeries(String name) {
+        String tok = nonMainFeatureToken(name);
+        if (tok == null) {
+            return null;
+        }
+        // 特别加更 ≠ 加更：必须优先于「加更」判定（两者都含"加更"）
+        if (name.contains("特别加更")) {
+            return "特别加更";
+        }
+        // 直拍家族
+        if ("直拍".equals(tok) || "直拍机位".equals(tok) || "REACTION".equalsIgnoreCase(tok)) {
+            return "直拍";
+        }
+        // 纯享家族
+        if ("纯享".equals(tok) || "舞台纯享".equals(tok) || "纯享典藏".equals(tok)) {
+            return "纯享";
+        }
+        // 超前家族
+        if ("超前".equals(tok)) {
+            return "超前";
+        }
+        // 加更家族（含 加更版）
+        if ("加更".equals(tok)) {
+            return "加更";
+        }
+        return tok;
     }
 
     /**
@@ -4108,6 +4162,71 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
         }
         return matched;
+    }
+
+    /**
+     * ★ r117：<b>非正片（衍生集）安全定位</b>——只在目标源里找"确定同一集"的非正片，找不到返回 -1。
+     *
+     * <p><b>为什么需要它</b>：切源锚（URL 日期锚 / 混合锚 / 正片簇秩）全部以正片为轴，且对
+     * 非正片关门；一旦当前在播非正片，就只能落到 {@code alignByMainFeatureRank / alignByGroupPosition /
+     * alignByOrder} 这些按位置猜的层 —— 实测「第20260511期彩蛋」被猜成「20260511特别加更」（错切）。
+     * 用户口径（原则 A）：<b>宁可不切，也绝不按位置/簇秩/裸下标猜非正片</b>。</p>
+     *
+     * <p>匹配口径：①两侧都必须是可识别非正片；②{@link #canonicalNonMainSeries} 规范系列必须相同；
+     * ③分段（上/中/下）必须相同；④在可用轴上必须一致——当前带播出日期则要求同日，否则当前带期号
+     * 则要求同期号；一侧有日期一侧无（另一侧只有期号）不做跨域换算猜测。命中唯一才采纳，
+     * 多义（多条同系列同名同日期）→ -1。</p>
+     *
+     * @param currentName 当前在播集名（旧源）
+     * @param targetNames 目标源集名列表
+     * @return 确定性命中的下标；无法确定返回 -1
+     */
+    public static int findIndexForNonMain(String currentName, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        final String curSeries = canonicalNonMainSeries(currentName);
+        if (curSeries == null) {
+            return -1;                       // 当前非正片系列无法确定 → 宁可不切
+        }
+        final int curDate = dateOf(currentName);
+        final int curEp = parse(currentName).epOrdinal;
+        final int curPart = normalizePart(extractPart(currentName));
+        int hit = -1;
+        for (int i = 0; i < targetNames.size(); i++) {
+            String name = targetNames.get(i);
+            if (TextUtils.isEmpty(name)) {
+                continue;
+            }
+            if (!isNonMainFeature(name)) {
+                continue;
+            }
+            if (!curSeries.equals(canonicalNonMainSeries(name))) {
+                continue;
+            }
+            if (normalizePart(extractPart(name)) != curPart) {
+                continue;
+            }
+            int tgtDate = dateOf(name);
+            int tgtEp = parse(name).epOrdinal;
+            if (curDate > 0) {
+                // 当前有播出日期：只认同日的非正片（目标无日期 → 无法确认，跳过）
+                if (tgtDate != curDate) {
+                    continue;
+                }
+            } else if (curEp > 0) {
+                // 当前有期号：只认同期号的非正片
+                if (tgtEp != curEp) {
+                    continue;
+                }
+            }
+            // 其余（当前无日期也无期号）：只按规范系列 + 分段判等
+            if (hit >= 0) {
+                return -1;                   // 多义 → 宁可不切
+            }
+            hit = i;
+        }
+        return hit;
     }
 
     /**

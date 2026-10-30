@@ -5788,6 +5788,21 @@ public class DetailActivity extends BaseActivity {
      * @return 目标源下标；无法可靠匹配返回 -1
      */
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        // ---------- 第-1层 r117：非正片（衍生集）安全入口 ----------
+        // 当前在播的是非正片时，切源锚（URL日期锚/混合锚/正片簇秩）全对它关门，只能落到
+        //   按位置/簇秩/裸下标猜的层 —— 实测「第20260511期彩蛋」被猜成「20260511特别加更」错切。
+        //   用户口径（原则A）：宁可不切，也绝不按位置猜非正片。故此处只做"确定同一集"匹配：
+        //   命中才切，否则返回 -1（交给上层跳过该源/提示手动），绝不进入后续猜测层。
+        if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
+                && targetList != null && targetList.size() > 1
+                && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+            int byNonMain = EpisodeNameMatcher.findIndexForNonMain(
+                    currentSeries.name, seriesNames(targetList));
+            LOG.sw("[FB] nonMainSafe ep=" + currentSeries.name + (byNonMain >= 0
+                    ? " -> idx=" + byNonMain + " tgt=" + targetList.get(byNonMain).name
+                    : " miss -> -1"));
+            return byNonMain;
+        }
         // ---------- 第0.95层 r115：当前=纯期号正片(无日期)、目标含「日期(第N期)」同期正片 → 精确落位 ----------
         // 防：同序号的衍生条（直拍REACTION第N期）虽然也叫「第N期」，但名字没有 8 位日期，会被 L1 findIndex
         //   先到先得抢走。实测（歌手2026）：Clun/117150「第4期」切 baofeng/143726 被错落到 idx13=直拍REACTION第4期，
