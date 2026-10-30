@@ -1457,8 +1457,14 @@ public class DetailActivity extends BaseActivity {
                         //   · 切源队列（fallbackResult=true）⇒ 软失败续切下一个源（独立预算 12 次 + 20s 墙钟封顶，r106）
                         //   · 预算耗尽 ⇒ 提示「没有其他源包含这一集」并停止（不播任何内容）
                         boolean sameEpisodeConfirmed;
+                        // ★ r119 方案B：电影单片/多版本（集数≤4 且 名字含画质/语言/版本格式词）不走非正片守卫。
+                        //   否则对 "HD中字" 类：isNonMainEntryName=true → findIndexForNonMain 恒 -1 → alignNoEpisode 拦死整类电影
+                        //   （实测《呼啸山庄》id=11807 expected=HD中字 actual=HD中字 仍被判"该源没有该集"，全程 firstFrame=0）。
+                        boolean expectedIsMovie = EpisodeNameMatcher.isMovieMain(
+                                expectedName, countSeriesEpisodes(vodInfo));
                         if (!TextUtils.isEmpty(expectedName)
-                                && EpisodeNameMatcher.isNonMainEntryName(expectedName)) {
+                                && EpisodeNameMatcher.isNonMainEntryName(expectedName)
+                                && !expectedIsMovie) {
                             // ★ r118：非正片按「规范系列 + 同日期/同期号(锚表互译)」确证同一集。
                             //   跨轴（日期式↔期号式）在有混合锚表时可判；锚表缺失 → 不确证 → 拒绝，
                             //   绝不把"会员版"错就近猜成正片（实测会把 第20260511期会员版 播放成 第3期）。
@@ -5808,9 +5814,14 @@ public class DetailActivity extends BaseActivity {
         //   按位置/簇秩/裸下标猜的层 —— 实测「第20260511期彩蛋」被猜成「20260511特别加更」错切。
         //   用户口径（原则A）：宁可不切，也绝不按位置猜非正片。故此处只做"确定同一集"匹配：
         //   命中才切，否则返回 -1（交给上层跳过该源/提示手动），绝不进入后续猜测层。
+        // ★ r119 方案B：电影单片/多版本线路（集数≤4 且名字含格式词）跳过非正片安全入口，
+        //   交回下面的正常定位链路；否则 "HD中字"/"HD国语" 多版本电影会被 findIndexForNonMain 恒 -1 拦死。
+        boolean currentIsMovie = EpisodeNameMatcher.isMovieMain(
+                currentSeries == null ? null : currentSeries.name, countSeriesEpisodes(vodInfo));
         if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
                 && targetList != null && targetList.size() > 1
-                && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+                && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)
+                && !currentIsMovie) {
             String anchorShowName = TextUtils.isEmpty(detailFallbackAnchorTitle)
                     ? vod_name : detailFallbackAnchorTitle;
             int byNonMain = EpisodeNameMatcher.findIndexForNonMain(

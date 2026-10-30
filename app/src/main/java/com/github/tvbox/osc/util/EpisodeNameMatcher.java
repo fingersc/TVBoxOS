@@ -224,6 +224,20 @@ public final class EpisodeNameMatcher {
             + "|直拍|[Rr][Ee][Aa][Cc][Tt][Ii][Oo][Nn]");
 
     /**
+     * ★ r119：电影单片（单文件）条目的「画质/语言/版本」标签词表。
+     * 真实采集源里电影的"集名"是固定的小集合（HD中字 / BD国语 / 蓝光原盘 / 高清完整版 / 1080P中英双字…）。
+     * 这些条目本身不属衍生栏目，但结构化判定"无日期也无可识别期号"会把它们误判成非正片；
+     * r118 的切源守卫随后把它们送进 findIndexForNonMain（无系列词恒 -1）→ 判"该源没有该集"→
+     * 整类电影无法播放。把"含格式标签、且无日期无期号"的名字认作正片即可修复。
+     */
+    private static final Pattern MOVIE_FORMAT_TOKEN = Pattern.compile(
+            "(?i)(hd|bd|tc|ts|cam|web-?dl|webrip|hdtv|blu-?ray|remux|uhd|4k|2160p|1080p|720p|480p"
+            + "|x264|x265|h264|h265|hevc|aac"
+            + "|国语|粤语|英语|韩语|日语|中字|中英|双语|双字|中文字幕|英文字幕|国配|台配|中配"
+            + "|简繁|简体|繁体|无删减|未删减|完整版|导演剪辑版|加长版|修复版|重制版|高清版"
+            + "|蓝光|超清|高清|标清|原盘|高码率|高码|正片|全片|抢先版|抢先|抢鲜版|枪版|标准版|原声|无字幕|无字|特效中字|特效|国英|hdr|杜比|加长|数码修复|dvd)");
+
+    /**
      * 期号必须出现在名字<b>开头</b>（允许前置"第x季"），才算"期数式正片"。
      *
      * <p><b>为什么需要它（真实 case）</b>：综艺源里衍生内容的命名常把期号写在<b>尾部</b>——
@@ -917,7 +931,44 @@ public final class EpisodeNameMatcher {
         if (key.domain == DOMAIN_DATE && key.ordinal > 0) {
             return stripMainResidue(name).isEmpty();
         }
+        // ★ r119 方案B：电影身份不再在此纯名字函数里判（它无"线路/集数"上下文）。
+        //   改由 DetailActivity 调 isMovieMain(name, countSeriesEpisodes(vodInfo)) 按「集数≤N 且 格式词」判定。
         return false;
+    }
+
+    /**
+     * ★ r119：是否为「电影单片格式名」——不含日期/期号，且含画质/语言/版本标签词
+     * （HD中字 / BD国语 / 蓝光原盘 / 高清完整版 / 1080P中英双字 / 片名.HD中字 …）。
+     */
+    public static boolean isMovieFormatName(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        EpisodeKey key = parse(name);
+        if (key.date > 0 || key.ordinal > 0) {
+            return false;                      // 带日期/期号 → 不是单片，交回原有逻辑
+        }
+        String s = BRACKET_CONTENT.matcher(name).replaceAll("");
+        return MOVIE_FORMAT_TOKEN.matcher(s).find();
+    }
+
+    /** ★ r119 方案B：电影线路最大集数阈值（≤ 此值才可能是"单片电影/电影多版本"）。 */
+    public static final int MOVIE_LINE_MAX_EPISODES = 4;
+
+    /**
+     * ★ r119 方案B：「电影正片」判定 = <b>集数 ≤ N 且 名字含格式词</b>。
+     *
+     * <p>集数取 {@code countSeriesEpisodes} 口径（各线路条目数最大值，一集一条时即集数），
+     * 由调用方（DetailActivity）传入；本方法为纯函数便于单测。</p>
+     *
+     * <p>为什么必须带集数门槛：格式词（高清/正片/国语…）在很长的大剧集线路里也可能出现在
+     * 某个无日期无期号的条目上，只靠词会把长剧误判成"单片电影"；集数≤N 把这种误判挡掉。</p>
+     */
+    public static boolean isMovieMain(String name, int episodeCount) {
+        if (episodeCount <= 0 || episodeCount > MOVIE_LINE_MAX_EPISODES) {
+            return false;
+        }
+        return isMovieFormatName(name);
     }
 
     /** {@link #isMainFeatureEntry} 的取反，语义读起来更顺：该条目不是正片。 */
