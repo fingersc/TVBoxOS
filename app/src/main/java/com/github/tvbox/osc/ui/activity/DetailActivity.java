@@ -5947,6 +5947,33 @@ public class DetailActivity extends BaseActivity {
             return matchedIndex;
         }
 
+        // ---------- 第1.05层：当前集名自带播出日期 → 混合锚点(日期↔规范期号) → 目标纯期号落位（r114）----------
+        // 场景：切源时传入的「当前集名」(detailFallbackEpisode) 本身带真实播出日期，如「20260403下」或
+        //   「20260403(第4期下)」；而目标源用纯「第N期」命名（无日期）。此时上面的 L1 同域精确匹配在跨域时
+        //   必然落空；主线程下 tryResolveCrossDomainNow 被主动跳过(crossDomainSyncSkipped)，而 alignByMainFeatureRank
+        //   按「正片位置秩」对其又会漏算非正片条目导致少算秩（实测魔力歌先生：0403下被错落成 第3期下=0327，早一周）。
+        //   这里直接用「当前名自带的播出日期」查 r112/r113 收割的『日期→规范期号』混合锚表，得到该日期的规范期号后
+        //   按规范期号在目标源定位——既不需要目标源本身带日期，也不依赖易被非正片打乱的位置秩。
+        // 门控(零回归)：①当前名带 8 位播出日期且为在播正片口径；②规范期号必须由锚表精确给出(缺失/歧义不放行)；
+        //   ③ findIndexByEpisode 命中才采纳，否则原样放行给后续旧链路。
+        {
+            final String curNameDate = extractDateFromName(currentName);
+            if (!TextUtils.isEmpty(curNameDate) && !EpisodeNameMatcher.isNonMainEntryName(currentName)) {
+                String anchorShowName = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                        ? vod_name : detailFallbackAnchorTitle;
+                int curAnchorOrd = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShowName, curNameDate);
+                if (curAnchorOrd > 0) {
+                    int byAnchorDate = EpisodeNameMatcher.findIndexByEpisode(currentName, curAnchorOrd, targetNames);
+                    if (byAnchorDate >= 0) {
+                        LOG.sw("[FB] nameDateAnchor date=" + curNameDate + " ord=" + curAnchorOrd
+                                + " ep=" + currentName + " -> idx=" + byAnchorDate
+                                + " tgt=" + targetNames.get(byAnchorDate));
+                        return byAnchorDate;
+                    }
+                }
+            }
+        }
+
         // ---------- 第1.1层：当前播放流 URL 内含播出日期 → 权威日期锚（r111）----------
         // 场景：老源用「第N期」命名（当前集名本身没有日期），但它的播放地址里带着这一集的
         //   真实播出日期（如 https://c.baisiweiting.com:18443/hls/942/20260906/4417434/plist32.ts）。
