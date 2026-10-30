@@ -4209,6 +4209,8 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         int matched = -1;
         int bestScore = 0;
         boolean matchedIsMain = false;
+        final int curPartRaw = extractPart(currentName);
+        int matchedPartExact = -1;
         for (int i = 0; i < targetNames.size(); i++) {
             int s = score(currentName, targetNames.get(i));
             if (s <= 0) {
@@ -4221,10 +4223,26 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             // 「20260906第2期上」（80 分，索引 16）—— 旧规则取先到的那条，
             // 用户看到的就是切到衍生/错误集。衍生条目本就不该与正片同分竞争。
             boolean isMain = isMainFeatureEntry(targetNames.get(i));
-            if (s > bestScore || (s == bestScore && isMain && !matchedIsMain)) {
+            // ★ r120：分段精确优先。{@link #normalizePart} 把「无分段」等同「上」，于是「第2期」与
+            //   「第2期上」在 {@link #score} 里同为 80；当前集显式带分段（如「20260906第2期上」）时，
+            //   必须优先落到显式同分段的条目（「第2期上」），绝不能因无分段的「第2期」排在前面而错落。
+            //   （实测 migrate wujin/168783 ep=20260906第2期上 -> xinlang/232380 ep=第2期 oldTime=13326）
+            int partExact = (extractPart(targetNames.get(i)) == curPartRaw) ? 1 : 0;
+            boolean take = false;
+            if (s > bestScore) {
+                take = true;
+            } else if (s == bestScore) {
+                if (isMain && !matchedIsMain) {
+                    take = true;                       // 正片优先（r45 规则，优先级最高）
+                } else if (isMain == matchedIsMain && partExact > matchedPartExact) {
+                    take = true;                       // 正片性相同：分段精确者优先
+                }
+            }
+            if (take) {
                 bestScore = s;
                 matched = i;
                 matchedIsMain = isMain;
+                matchedPartExact = partExact;
             }
         }
         return matched;
