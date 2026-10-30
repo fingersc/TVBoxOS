@@ -797,10 +797,25 @@ public final class EpisodeNameMatcher {
         if (dateOf(rest) > 0) {
             return null;                       // 去掉一个日期后还有日期 → 不是本形态
         }
-        if (extractOrdinal(rest) <= 0) {
-            return null;                       // 去完解不出期号 → 取出来也没用
+        if (extractOrdinal(rest) > 0) {
+            return rest;
         }
-        return rest;
+        // ★ r118：兼容「日期(第N期…)」括号包住期号的写法（实测暴风源 bfzym3u8：
+        //   20260629(第10期特别加更)、20260511(第3期会员版)）。parse 会先把括号内容当
+        //   BRACKET_CONTENT 剔除，导致直接解不出期号；这里剥掉最外层成对括号后再解一次，
+        //   仅当剥离后能解出期号才采纳，否则仍返回 null（不影响既有语义）。
+        String inner = rest;
+        while (!inner.isEmpty() && (inner.charAt(0) == '(' || inner.charAt(0) == '（')) {
+            inner = inner.substring(1);
+        }
+        while (!inner.isEmpty() && (inner.charAt(inner.length() - 1) == ')' || inner.charAt(inner.length() - 1) == '）')) {
+            inner = inner.substring(0, inner.length() - 1);
+        }
+        inner = inner.trim();
+        if (!inner.equals(rest) && dateOf(inner) <= 0 && extractOrdinal(inner) > 0) {
+            return inner;
+        }
+        return null;
     }
 
     /**
@@ -4182,6 +4197,20 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
      * @return 确定性命中的下标；无法确定返回 -1
      */
     public static int findIndexForNonMain(String currentName, List<String> targetNames) {
+        return findIndexForNonMain(currentName, targetNames, null);
+    }
+
+    /**
+     * ★ r118：在 r117 "规范系列 + 同日期/同期号" 基础上，增加<b>日期↔期号锚表互译</b>，
+     * 使得"一侧日期式、另一侧期号式"的非正片也能确证同一集。
+     *
+     * <p>桥接只用<b>正向</b> {@link #ordinalOfDateFromAnchor(String, int)}（日期→期号）：
+     * 同一期号往往对应多个播出日派生条（正片/加更/会员版…），反向 ord→date 天然多义，
+     * 靠"目标日期译成期号"来比，等价且避免多义误判。锚表缺失则视为无法确证 → 跳过（宁可不切）。</p>
+     *
+     * @param showKey 片名（锚表按片隔离）；为 null 时退化为 r117 行为（不做跨轴互译）
+     */
+    public static int findIndexForNonMain(String currentName, List<String> targetNames, String showKey) {
         if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
             return -1;
         }
@@ -4192,6 +4221,8 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         final int curDate = dateOf(currentName);
         final int curEp = parse(currentName).epOrdinal;
         final int curPart = normalizePart(extractPart(currentName));
+        // 当前带日期 → 预算出规范期号，供"当前日期 vs 目标期号"互译
+        final int curAnchorOrd = curDate > 0 ? ordinalOfDateFromAnchor(showKey, curDate) : -1;
         int hit = -1;
         for (int i = 0; i < targetNames.size(); i++) {
             String name = targetNames.get(i);
@@ -4207,20 +4238,29 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             if (normalizePart(extractPart(name)) != curPart) {
                 continue;
             }
-            int tgtDate = dateOf(name);
-            int tgtEp = parse(name).epOrdinal;
-            if (curDate > 0) {
-                // 当前有播出日期：只认同日的非正片（目标无日期 → 无法确认，跳过）
-                if (tgtDate != curDate) {
-                    continue;
-                }
-            } else if (curEp > 0) {
-                // 当前有期号：只认同期号的非正片
-                if (tgtEp != curEp) {
-                    continue;
-                }
+            final int tgtDate = dateOf(name);
+            final int tgtEp = parse(name).epOrdinal;
+            final boolean sameIdentity;
+            if (curDate > 0 && tgtDate > 0) {
+                // 同为日期式：同日即同一集
+                sameIdentity = (tgtDate == curDate);
+            } else if (curDate > 0 && tgtEp > 0) {
+                // 当前日期式、目标期号式：锚表把当前日期译成期号再比
+                sameIdentity = (curAnchorOrd > 0 && tgtEp == curAnchorOrd);
+            } else if (curEp > 0 && tgtEp > 0) {
+                // 同为期号式：同期号即同一集
+                sameIdentity = (tgtEp == curEp);
+            } else if (curEp > 0 && tgtDate > 0) {
+                // 当前期号式、目标日期式：锚表把目标日期译成期号再比
+                int ordOfTgt = ordinalOfDateFromAnchor(showKey, tgtDate);
+                sameIdentity = (ordOfTgt > 0 && ordOfTgt == curEp);
+            } else {
+                // 双方都无日期也无期号：只按规范系列 + 分段判等
+                sameIdentity = true;
             }
-            // 其余（当前无日期也无期号）：只按规范系列 + 分段判等
+            if (!sameIdentity) {
+                continue;
+            }
             if (hit >= 0) {
                 return -1;                   // 多义 → 宁可不切
             }

@@ -1456,8 +1456,23 @@ public class DetailActivity extends BaseActivity {
                         //     ⇒ 暂停播放 + 提示「该源没有当前这一集」，不去乱切别的源
                         //   · 切源队列（fallbackResult=true）⇒ 软失败续切下一个源（独立预算 12 次 + 20s 墙钟封顶，r106）
                         //   · 预算耗尽 ⇒ 提示「没有其他源包含这一集」并停止（不播任何内容）
+                        boolean sameEpisodeConfirmed;
                         if (!TextUtils.isEmpty(expectedName)
-                                && !EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentEpisode.name)) {
+                                && EpisodeNameMatcher.isNonMainEntryName(expectedName)) {
+                            // ★ r118：非正片按「规范系列 + 同日期/同期号(锚表互译)」确证同一集。
+                            //   跨轴（日期式↔期号式）在有混合锚表时可判；锚表缺失 → 不确证 → 拒绝，
+                            //   绝不把"会员版"错就近猜成正片（实测会把 第20260511期会员版 播放成 第3期）。
+                            String guardShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                                    ? vod_name : detailFallbackAnchorTitle;
+                            sameEpisodeConfirmed = EpisodeNameMatcher.findIndexForNonMain(
+                                    expectedName,
+                                    java.util.Collections.singletonList(currentEpisode.name),
+                                    guardShow) == 0;
+                        } else {
+                            sameEpisodeConfirmed = EpisodeNameMatcher.isSameEpisodeStrict(
+                                    expectedName, currentEpisode.name);
+                        }
+                        if (!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
                                     + " expected=" + expectedName + " actual=" + currentEpisode.name
                                     + " userPicked=" + (fallbackResult ? 0 : 1)
@@ -5796,8 +5811,10 @@ public class DetailActivity extends BaseActivity {
         if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
                 && targetList != null && targetList.size() > 1
                 && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+            String anchorShowName = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                    ? vod_name : detailFallbackAnchorTitle;
             int byNonMain = EpisodeNameMatcher.findIndexForNonMain(
-                    currentSeries.name, seriesNames(targetList));
+                    currentSeries.name, seriesNames(targetList), anchorShowName);
             LOG.sw("[FB] nonMainSafe ep=" + currentSeries.name + (byNonMain >= 0
                     ? " -> idx=" + byNonMain + " tgt=" + targetList.get(byNonMain).name
                     : " miss -> -1"));
