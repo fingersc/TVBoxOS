@@ -3111,6 +3111,7 @@ public class DetailActivity extends BaseActivity {
         fallbackFromFlag = playing.playFlag;
         fallbackFromIndex = idx;
         fallbackFromName = list.get(idx).name == null ? "" : list.get(idx).name;
+        fallbackFromUrl = list.get(idx).url == null ? "" : list.get(idx).url;
         fallbackFromValid = !TextUtils.isEmpty(fallbackFromName);
 
     }
@@ -3303,6 +3304,7 @@ public class DetailActivity extends BaseActivity {
             // 各切换入口都会留 live 快照；用它合成兜底集，保证任何入口都按内容重定位
             fallback = new VodInfo.VodSeries();
             fallback.name = fallbackFromName;
+            fallback.url = fallbackFromUrl;
             fallbackIndex = fallbackFromIndex;
         }
         if (fallback == null || fallbackIndex < 0 || vodInfo == null || vodInfo.seriesMap == null) {
@@ -5040,6 +5042,7 @@ public class DetailActivity extends BaseActivity {
     private String fallbackFromFlag = "";
     private int fallbackFromIndex = -1;
     private String fallbackFromName = "";
+    private String fallbackFromUrl = ""; // r111：切源前实际在播集的播放地址（用于从 URL 取真实播出日期锚）
     private boolean fallbackFromValid = false;
 
     /**
@@ -5851,6 +5854,32 @@ public class DetailActivity extends BaseActivity {
         int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
         if (matchedIndex >= 0) {
             return matchedIndex;
+        }
+
+        // ---------- 第1.1层：当前播放流 URL 内含播出日期 → 权威日期锚（r111）----------
+        // 场景：老源用「第N期」命名（当前集名本身没有日期），但它的播放地址里带着这一集的
+        //   真实播出日期（如 https://c.baisiweiting.com:18443/hls/942/20260906/4417434/plist32.ts）。
+        //   此时 URL 里的日期是「用户此刻到底在看哪一期」的直接物证，比按老源列表做
+        //   位置/簇秩/联网猜测都可靠。
+        //   实测（10-30 11:23，我家那闺女2026）：老源 Clun/156428「第2期下」的播放流在
+        //   /20260906/，目标 153252 里 20260906下 在 index16，但旧的秩对齐把「第2期下」
+        //   当成第3期落到 20260913下(index22)，整整晚一期；用 URL 日期锚直接落 16。
+        // 门控（零回归）：
+        //   ① 仅当前集名自身没有日期时才启用（名字自带日期时以名字为准，保持旧链路）；
+        //   ② 仅当前集对象带 url 且能解出 8 位播出日期时；
+        //   ③ 只有目标列表确实存在该日期（findIndexByDate>=0）才采纳，否则原样放行。
+        if (TextUtils.isEmpty(extractDateFromName(currentName))
+                && !EpisodeNameMatcher.isNonMainEntryName(currentName)
+                && currentSeries.url != null && !currentSeries.url.isEmpty()) {
+            String urlDate = extractDateFromName(currentSeries.url);
+            if (!TextUtils.isEmpty(urlDate)) {
+                int byUrlDate = EpisodeNameMatcher.findIndexByDate(urlDate, targetNames, currentName);
+                if (byUrlDate >= 0) {
+                    LOG.sw("[FB] urlDateAnchor url=" + urlDate + " ep=" + currentName
+                            + " -> idx=" + byUrlDate + " tgt=" + targetNames.get(byUrlDate));
+                    return byUrlDate;
+                }
+            }
         }
 
         // ---------- 第1.2层：日期+期号混合式名的"期数式"直配 ----------
