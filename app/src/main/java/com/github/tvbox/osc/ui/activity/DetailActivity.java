@@ -5788,6 +5788,29 @@ public class DetailActivity extends BaseActivity {
      * @return 目标源下标；无法可靠匹配返回 -1
      */
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        // ---------- 第0.95层 r115：当前=纯期号正片(无日期)、目标含「日期(第N期)」同期正片 → 精确落位 ----------
+        // 防：同序号的衍生条（直拍REACTION第N期）虽然也叫「第N期」，但名字没有 8 位日期，会被 L1 findIndex
+        //   先到先得抢走。实测（歌手2026）：Clun/117150「第4期」切 baofeng/143726 被错落到 idx13=直拍REACTION第4期，
+        //   应落 idx22=「20260612(第4期)」正片。
+        // 门控零回归：只在「当前是纯期号正片(无日期) 且 目标确有该期『日期(第N期)』正片」时介入，其余原样放行。
+        try {
+            if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
+                    && targetList != null && targetList.size() > 1) {
+                int curOrdR = EpisodeNameMatcher.extractOrdinal(currentSeries.name);
+                if (curOrdR > 0 && EpisodeNameMatcher.dateOf(currentSeries.name) <= 0
+                        && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+                    int byPeriod = EpisodeNameMatcher.findDatePeriodMain(curOrdR,
+                            EpisodeNameMatcher.extractPart(currentSeries.name), seriesNames(targetList));
+                    if (byPeriod >= 0 && byPeriod < targetList.size()) {
+                        LOG.sw("[FB] datePeriodAnchor ep=" + currentSeries.name + " ord=" + curOrdR
+                                + " -> idx=" + byPeriod + " tgt=" + targetList.get(byPeriod).name);
+                        return byPeriod;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // 该层失败绝不影响主流程，继续走旧链路
+        }
         int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)
                 || targetList == null || targetList.isEmpty()) {

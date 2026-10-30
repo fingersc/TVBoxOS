@@ -218,7 +218,10 @@ public final class EpisodeNameMatcher {
             //   语义明确为衍生的词根：超前363 / 会员169 / 番外62 / 精编43 /
             //   未播36 / 手记36 / vlog23 / 发布会14 / 彩排6。
             //   「日记/营业/出发」频次也高但可能是正片名的一部分，暂不加入。
-            + "|超前|番外|精编|未播|手记|[vV]log|发布会|彩排|会员");
+            + "|超前|番外|精编|未播|手记|[vV]log|发布会|彩排|会员"
+            // ★ r116：真机「直拍REACTION第N期」是衍生（直拍机位/直拍/reaction 均非正片正片）。
+            //   旧表只有「直拍机位」，漏了「直拍REACTION」⇒ 与正片「第N期」同序号并列 80 分抢位。
+            + "|直拍|[Rr][Ee][Aa][Cc][Tt][Ii][Oo][Nn]");
 
     /**
      * 期号必须出现在名字<b>开头</b>（允许前置"第x季"），才算"期数式正片"。
@@ -300,20 +303,39 @@ public final class EpisodeNameMatcher {
      * 它们日期相同但分集不同，必须分别匹配。</p>
      */
     public static final class EpisodeKey {
+        /** legacy：日期域下为 YYYYMMDD，期号域下为期序，其余为 -1。 */
         public final int ordinal;
         public final int domain;
         public final int part;
         public final String raw;
 
+        /**
+         * ★ r116 双维轴：解析出的播出日期 YYYYMMDD（无则 0）。
+         * <b>与 domain 无关地独立保存</b>——所以「日期(第N期)」这类混合名会同时带上日期。
+         */
+        public final int date;
+
+        /**
+         * ★ r116 双维轴：解析出的期/集/话序号（无则 0）。
+         * <b>与 domain 无关地独立保存</b>——所以「日期(第N期)」这类混合名会同时带上期号。
+         */
+        public final int epOrdinal;
+
         EpisodeKey(int ordinal, int domain, String raw) {
-            this(ordinal, domain, PART_NONE, raw);
+            this(ordinal, domain, PART_NONE, raw, 0, 0);
         }
 
         EpisodeKey(int ordinal, int domain, int part, String raw) {
+            this(ordinal, domain, part, raw, 0, 0);
+        }
+
+        EpisodeKey(int ordinal, int domain, int part, String raw, int date, int epOrdinal) {
             this.ordinal = ordinal;
             this.domain = domain;
             this.part = part;
             this.raw = raw;
+            this.date = date;
+            this.epOrdinal = epOrdinal;
         }
 
         public boolean recognizable() {
@@ -389,6 +411,14 @@ public final class EpisodeNameMatcher {
      * 解析顺序：日期 → 期数(阿拉伯) → 期数(中文) → 纯序号兜底(≤4位)。
      */
     public static EpisodeKey parse(String name) {
+        return enrichDualAxis(parseLegacy(name), name);
+    }
+
+    /**
+     * ★ r116：旧版「单域」解析逻辑（原样保留），只负责给出 legacy 的 ordinal/domain。
+     * 真正的「双维轴」信息由 {@link #parse} 外面包一层 {@link #enrichDualAxis} 补齐。
+     */
+    private static EpisodeKey parseLegacy(String name) {
         if (TextUtils.isEmpty(name)) {
             return new EpisodeKey(-1, DOMAIN_UNKNOWN, "");
         }
@@ -470,6 +500,64 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * ★ r116 双维轴：把 legacy 单域 key 补成「日期 + 期号」两轴独立的 key。
+     * <ul>
+     *   <li>{@code date}：能从名字取到合法播出日期就填（YYYYMMDD），与 domain 无关；</li>
+     *   <li>{@code epOrdinal}：能取到「第N期/集/话」序数就填，与 domain 无关。</li>
+     * </ul>
+     * 于是 {@code 20260612(第4期)}（legacy 判为 DATE/20260612）同时带 epOrdinal=4；
+     * 反之 {@code 20260906第2期}（legacy 判为 ORDINAL/2）同时带 date=20260906。
+     * 匹配层即可按「可用轴」比对，而不是被迫二选一。
+     */
+    private static EpisodeKey enrichDualAxis(EpisodeKey k, String name) {
+        if (k == null) {
+            return new EpisodeKey(-1, DOMAIN_UNKNOWN, PART_NONE, "", 0, 0);
+        }
+        int date;
+        if (k.domain == DOMAIN_DATE && k.ordinal > 0) {
+            date = k.ordinal;                 // 日期域：ordinal 本就是 YYYYMMDD
+        } else {
+            date = dateOf(name);
+            if (date < 0) {
+                date = 0;
+            }
+        }
+        int ep;
+        if (k.domain == DOMAIN_ORDINAL && k.ordinal > 0) {
+            ep = k.ordinal;                   // 期号域：ordinal 本就是期序
+        } else {
+            ep = periodOrdinalFromRaw(name);
+        }
+        return new EpisodeKey(k.ordinal, k.domain, k.part, k.raw, date, ep);
+    }
+
+    /**
+     * ★ r116：从原始名字里取「期/集/话」序数（独立于日期）。
+     * 只认带 期/集/话 后缀的（{@code 第4期}/{@code 第4集}/{@code 第4话}，含中文数字），
+     * 因此 {@code 第20260612期}（8 位日期包裹）不会被误当期号（{@code \d{1,4}} 匹配不到 8 位）。
+     */
+    private static int periodOrdinalFromRaw(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        Matcher arabic = ORDINAL_ARABIC.matcher(name);
+        if (arabic.find()) {
+            int v = parseIntSafe(arabic.group(1));
+            if (v > 0) {
+                return v;
+            }
+        }
+        Matcher chinese = ORDINAL_CHINESE.matcher(name);
+        if (chinese.find()) {
+            int v = chineseToNumber(chinese.group(1));
+            if (v > 0) {
+                return v;
+            }
+        }
+        return 0;
+    }
+
+    /**
      * 兼容旧实现的返回值语义：返回可比较的集数序号，无法识别返回 -1。
      * 注意日期域下返回 YYYYMMDD（不再是被截断的年份）。
      */
@@ -505,62 +593,54 @@ public final class EpisodeNameMatcher {
         if (targetName.equalsIgnoreCase(currentName)) {
             return 100;
         }
-        // ★ v99-r45：日期锚同义 —— 用户口径「20260808 ≡ 第20260808期 ≡ 20260808期」的直接落地。
-        //
-        //   必须排在下面的同域判定【之前】：日期+期号复合名（{@code 20260906第2期上}）被
-        //   {@link #parse} 判成 ORDINAL 域（ordinal=2），而包裹日期式
-        //   （{@code 第20260906期上}）是 DATE 域（ordinal=20260906）—— 两侧 ordinal
-        //   量纲不同，同域判据永远不成立，旧实现一律返回 0。
-        //   实测（真机 2026-10-24）：iqiyi 的「第20260906期上」切到最大资源时
-        //   findIndex 返回 -1 ⇒ 上层退回落点兜底 ⇒ 切到「20260906第2期下」/「0905超前营业」。
-        //
-        //   两侧都取得到日期时日期就是真值：日期不同 ⇒ 不同集；日期相同再比分段，
-        //   分段语义不同（上/中/下）仍是不同集；衍生条目降权。
-        int curDate = dateOf(currentName);
-        int tgtDate = dateOf(targetName);
-        // ★ 「日期-序号」形态（实测 dytt 整库：{@code 20260703-01}/{@code 20260710-02}）的
-        //   尾部序号表示"该日期下的第 N 条"，与目标侧的期号/分段没有可靠对应 ——
-        //   语料2 有 12 条正是这么错的（{@code 20260703-01} 被配到
-        //   {@code 第20260703期第1期(一)}，而真值是同期另一条衍生）。
-        //   两侧任一是该形态时不采纳日期锚，落回下面的同域/模糊逻辑（即 r44 行为）。
+        // ★ r116 双维轴模型：
+        //   一条集名可同时携带【播出日期】与【期/集序号】两轴信息（如「20260612(第4期)」）。
+        //   匹配时按“两侧都可用的轴”比对，而不是把它硬塞进某一个域：
+        //     1) 两侧都有日期 ⇒ 日期为准（日期不同即不同集，再比分段/正片口径）；
+        //     2) 否则两侧都有期号 ⇒ 比期号（覆盖“日期(第N期)”这类混合名 ↔ 纯期号）；
+        //     3) 两侧都无可识别轴 ⇒ 退回包含式模糊（旧行为）。
         boolean curIndexTail = DATE_INDEX_TAIL.matcher(currentName).find();
         boolean tgtIndexTail = DATE_INDEX_TAIL.matcher(targetName).find();
-        if (curDate > 0 && tgtDate > 0 && !curIndexTail && !tgtIndexTail) {
-            if (curDate != tgtDate) {
+        EpisodeKey cur = parse(currentName);
+        EpisodeKey tgt = parse(targetName);
+        final boolean curHasDate = cur.date > 0;
+        final boolean tgtHasDate = tgt.date > 0;
+
+        // ── 轴 1：日期轴（两侧都有可用播出日期）──
+        if (curHasDate && tgtHasDate && !curIndexTail && !tgtIndexTail) {
+            if (cur.date != tgt.date) {
                 return 0;
             }
             if (normalizePart(extractPart(currentName)) != normalizePart(extractPart(targetName))) {
                 return 0;
             }
-            // ★ 正片/衍生属性必须一致：衍生（纯享/加更/特辑…）只与同期衍生对应，
-            //   与正片同分会把「20260703纯享」配到「第20260703期第1期(一)」（正片）。
-            //   实测语料2 有 18 条正是这么错的（喜剧之王单口季第三季 dytt→zy360）。
             if (isNonMainFeature(currentName) != isNonMainFeature(targetName)) {
                 return 0;
             }
-            if (isNonMainFeature(currentName) || isNonMainFeature(targetName)) {
-                return NON_MAIN_PENALTY;
+            if (isNonMainFeature(currentName)) {
+                return sameNonMainSeries(currentName, targetName) ? 80 : NON_MAIN_PENALTY;
             }
             return 80;
         }
-        EpisodeKey cur = parse(currentName);
-        EpisodeKey tgt = parse(targetName);
-        if (cur.domain != DOMAIN_UNKNOWN && tgt.domain != DOMAIN_UNKNOWN && cur.domain == tgt.domain) {
-            if (cur.ordinal != tgt.ordinal) {
+        // ── 轴 2：序号轴（两侧都有期/集序号）──
+        if (cur.epOrdinal > 0 && tgt.epOrdinal > 0) {
+            if (cur.epOrdinal != tgt.epOrdinal) {
                 return 0;
             }
-            // 序号相同：再比"分集语义"（无分集 ≡ 上）。语义不同即不同集，直接判 0。
             if (normalizePart(cur.part) != normalizePart(tgt.part)) {
                 return 0;
             }
-            // 非正片（重温/花絮/预告…）不是当期正片：即使序号撞上也要降权，
-            // 避免"重温经典2"与"第2期"同分后由 findIndex 的先到先得规则取错。
-            if (isNonMainFeature(currentName) || isNonMainFeature(targetName)) {
-                return NON_MAIN_PENALTY;
+            boolean cn = isNonMainFeature(currentName);
+            boolean tn = isNonMainFeature(targetName);
+            if (cn != tn) {
+                return NON_MAIN_PENALTY;       // 一正一副：降权但仍保留为候选（沿用旧口径）
+            }
+            if (cn) {
+                return sameNonMainSeries(currentName, targetName) ? 80 : NON_MAIN_PENALTY;
             }
             return 80;
         }
-        // 两侧都无法识别序号时，退回包含式模糊匹配（与旧行为一致）
+        // ── 轴 3：两侧都无法识别序号/日期 ⇒ 包含式模糊（旧行为）──
         if (cur.domain == DOMAIN_UNKNOWN && tgt.domain == DOMAIN_UNKNOWN) {
             String currentLower = currentName.toLowerCase(Locale.ROOT);
             String targetLower = targetName.toLowerCase(Locale.ROOT);
@@ -571,8 +651,15 @@ public final class EpisodeNameMatcher {
                 return 60;
             }
         }
-        // 跨域或一侧可识别一侧不可识别：单条不判定，交由列表级对齐处理
+        // 跨域/一侧不可识别：单条不判定，交由列表级对齐处理
         return 0;
+    }
+
+    /** 两条都是衍生内容且共享同一系列词（如都「重温」或都「直拍REACTION」）→ 视为同源。 */
+    private static boolean sameNonMainSeries(String a, String b) {
+        String ta = nonMainFeatureToken(a);
+        String tb = nonMainFeatureToken(b);
+        return ta != null && ta.equals(tb);
     }
 
     /**
@@ -633,25 +720,30 @@ public final class EpisodeNameMatcher {
         }
         EpisodeKey ka = parse(a);
         EpisodeKey kb = parse(b);
-        if (ka == null || kb == null
-                || ka.domain == DOMAIN_UNKNOWN || kb.domain == DOMAIN_UNKNOWN) {
+        if (ka == null || kb == null) {
             return true;                        // 无从判定 ⇒ 放行
         }
-        if (ka.domain != kb.domain) {
-            // ★ r110：跨域（期号式 ↔ 日期式）期号/日期量纲不同，无法直接比；
-            //   但「上/中/下」分段是跨域可比的语义。若双方都带【显式】分段且冲突，
-            //   则判定不是同一集 —— 修复「第2期下」跨域反查落到「20260906上」后
-            //   守卫无条件放行、静默播「上」。任一方无显式分段（含"无后缀≡上"）时
-            //   无从判断，仍放行，维持旧行为避免误伤。
-            if (ka.part == PART_NONE || kb.part == PART_NONE) {
-                return true;
+        // ★ r116 双维轴：按“两侧都可用的轴”判等，而不是被迫同一 domain。
+        //   轴 1：两侧都有日期 ⇒ 日期必须一致（差一天=差一集），再比显式分段；
+        if (ka.date > 0 && kb.date > 0) {
+            if (ka.date != kb.date) {
+                return false;
             }
-            return ka.part == kb.part;
+            return normalizePart(ka.part) == normalizePart(kb.part);
         }
-        if (ka.ordinal != kb.ordinal) {
-            return false;                       // 同域但期号/日期不一致 ⇒ 不是同一集
+        //   轴 2：两侧都有期号 ⇒ 期号必须一致，再比显式分段；
+        if (ka.epOrdinal > 0 && kb.epOrdinal > 0) {
+            if (ka.epOrdinal != kb.epOrdinal) {
+                return false;
+            }
+            return normalizePart(ka.part) == normalizePart(kb.part);
         }
-        return normalizePart(ka.part) == normalizePart(kb.part);
+        //   两侧没有共同可用的轴（一侧日期式一侧期号式，或一方无法解析）⇒ 放行，
+        //   交给探路机制；显式分段冲突时才判否（r110 口径）。
+        if (ka.part == PART_NONE || kb.part == PART_NONE) {
+            return true;
+        }
+        return ka.part == kb.part;
     }
 
     /**
@@ -4143,8 +4235,9 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
                 continue;
             }
             EpisodeKey key = parse(name);
-            // 必须是序号域，且序号等于权威期数（日期域量纲不同，排除）
-            if (key.domain != DOMAIN_ORDINAL || key.ordinal != episode) {
+            // ★ r116 双维轴：用 epOrdinal（期号轴）判定，兼容「20260612(第4期)」这类
+            //   日期+期号混合名（legacy domain=DATE，但 epOrdinal=4 仍应命中）。
+            if (key.epOrdinal <= 0 || key.epOrdinal != episode) {
                 continue;
             }
             if (curIsNonMain) {
@@ -5059,6 +5152,48 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
         }
         return anyPart;
+    }
+
+    /**
+     * ★ r115：当前是「纯期号正片」（如 第4期，无日期）时，在目标列表里找写成
+     * 「日期(第N期)」的<b>同期正片</b>（如 {@code 20260612(第4期)} / {@code 20260612第4期}）。
+     *
+     * <p>为什么需要：{@link #parse} 会先去掉括号，{@code 20260612(第4期)} 只剩日期域
+     * {@code 20260612}，与 {@code 第4期} 跨域 ⇒ {@link #score} 恒为 0；而同期号的衍生条
+     * （{@code 直拍REACTION第4期}）虽也叫「第4期」，却<b>没有 8 位日期</b>、且属衍生
+     * ⇒ 会被 {@code findIndex} 先到先得抢走（真机：歌手2026 切源把「第4期」错落到
+     * {@code 直拍REACTION第4期}，应落 {@code 20260612(第4期)} 正片）。</p>
+     *
+     * <p>这里直接按「原名里 日期 + 第ord期」的结构精确找正片，天然排除无日期的衍生条。
+     * 门控：只认同时带 8 位日期与「第ord期」、且不命中非正片词表、分段一致（无分段视作一致）的条目。</p>
+     *
+     * @param ordinal     当前期号（&gt;0）
+     * @param part        当前分段（PART_NONE/上/中/下），需与目标一致
+     * @param targetNames 目标源完整集名列表
+     * @return 命中的下标；找不到返回 -1
+     */
+    public static int findDatePeriodMain(int ordinal, int part, java.util.List<String> targetNames) {
+        if (targetNames == null || ordinal <= 0) {
+            return -1;
+        }
+        final int wantPart = normalizePart(part);
+        for (int i = 0; i < targetNames.size(); i++) {
+            String n = targetNames.get(i);
+            if (TextUtils.isEmpty(n)) {
+                continue;
+            }
+            Matcher m = DATE_THEN_ORD.matcher(n);
+            if (m.find() && parseIntSafe(m.group(1)) == ordinal) {
+                if (isNonMainFeature(n)) {
+                    continue;
+                }
+                if (normalizePart(extractPart(n)) != wantPart) {
+                    continue;
+                }
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** 把剧集名列表转为纯名称列表，便于调用方复用 locate/alignByOrder。 */
