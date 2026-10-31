@@ -50,6 +50,8 @@ public class ConfirmClearDialog extends BaseDialog {
                         HistoryActivity.historyAdapter.notifyDataSetChanged();
                     }
                     RoomDataManger.deleteVodRecordAllWithTombstones();
+                    // r121：清空历史时一并清空全部「日期↔期号」日期表
+                    try { com.github.tvbox.osc.util.EpisodeNameMatcher.clearAllDateTables(); } catch (Throwable ignored) { }
                 }
 
                 ConfirmClearDialog.this.dismiss();

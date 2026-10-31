@@ -2461,6 +2461,299 @@ public final class EpisodeNameMatcher {
         }
     }
 
+    // ============ r121：持久化「期号 ↔ 日期」日期表（按片名隔离，含情形4组序对齐）============
+    //
+    // 【背景】r112 的混合锚点只收割「日期+真期号」混合名；但大量节目是「纯期号源 × 纯日期源」
+    //   配对（如《我家那闺女2026》Clun/156428「第N期上」↔ 153252/99104「20260906上」），无任何
+    //   混合名，导致跨域切源只能退回"正片簇秩位置猜"，整期偏移（实测 第2期上→20260913上，应 20260906上）。
+    //
+    // 【做法】在该影片拿到播放列表时，把两两源列表按「正片(上/下)序列」组序对齐：折叠分段写法、
+    //   去衍生词、裸"第N期"在同列表存在"第N期上/下"时不单独计入、以 EP00/第0期 为 0 基准，
+    //   逐条「第k个期号单元 ↔ 第k个日期单元」，仅当分段形态一致且日期单调递增时写入。
+    //   混合名(日期+期号)则直接查表。表按片名 key 隔离，避免跨剧污染。
+    //
+    // 【安全】只写"分段形态一致 + 日期单调"的连续前缀；日期源须有足够衍生标记(>=3类)才可信
+    //   （否则如"全名日期式"误把先导/面对面当正片，整体偏一期）；冲突/歧义一律不写，宁缺毋滥。
+    private static final Map<String, Map<String, Integer>> TBL_ORD_TO_DATE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Map<String, Map<String, Integer>> TBL_DATE_TO_ORD =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int TBL_LIMIT_PER_SHOW = 600;
+    // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
+    private static final java.util.Set<String> TBL_CONFLICT =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+    private static final java.util.regex.Pattern TBL_ORD_RE =
+            java.util.regex.Pattern.compile("第(\\d{1,4})期");
+    private static final String[] TBL_DERIV = {
+            "面对面", "特别企划", "超前营业", "超前", "企划", "加更", "盲盒", "大放送",
+            "彩蛋", "直拍", "纯享", "舞台", "花絮", "预告", "先导片", "会员版", "特辑"
+    };
+
+    private static String tblOrdKey(int ord, int part) { return "o" + ord + "|" + part; }
+    private static String tblDateKey(int date, int part) { return "d" + date + "|" + part; }
+
+    // ---- r121 持久化：把日期表落到磁盘，关闭 TVBox 重开复用；历史删除时经 clearDateTable 清理 ----
+    private static java.io.File dateTableFile;
+
+    /** 应用启动时调用：设置持久化文件并载入历史日期表（异常静默，不影响启动）。 */
+    public static void initDateTablePersistence(String path) {
+        if (TextUtils.isEmpty(path)) return;
+        try {
+            dateTableFile = new java.io.File(path);
+            loadDateTables();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void loadDateTables() {
+        if (dateTableFile == null || !dateTableFile.exists()) return;
+        java.io.BufferedReader r = null;
+        try {
+            r = new java.io.BufferedReader(new java.io.InputStreamReader(
+                    new java.io.FileInputStream(dateTableFile), "UTF-8"));
+            String line;
+            while ((line = r.readLine()) != null) {
+                String[] p = line.split("\t");
+                if (p.length != 3) continue;
+                String show = p[0];
+                String k = p[1];
+                int bar = k.indexOf('|');
+                if (bar < 0) continue;
+                int ord, part, date;
+                try {
+                    ord = Integer.parseInt(k.substring(1, bar));
+                    part = Integer.parseInt(k.substring(bar + 1));
+                    date = Integer.parseInt(p[2]);
+                } catch (Exception ex) {
+                    continue;
+                }
+                tblPut(show, ord, date, part);
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try { if (r != null) r.close(); } catch (Exception ignore) { }
+        }
+    }
+
+    private static void persistDateTables() {
+        if (dateTableFile == null) return;
+        java.io.BufferedWriter w = null;
+        try {
+            w = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
+                    new java.io.FileOutputStream(dateTableFile), "UTF-8"));
+            for (Map.Entry<String, Map<String, Integer>> e : TBL_ORD_TO_DATE.entrySet()) {
+                for (Map.Entry<String, Integer> kv : e.getValue().entrySet()) {
+                    w.write(e.getKey());
+                    w.write('\t');
+                    w.write(kv.getKey());
+                    w.write('\t');
+                    w.write(String.valueOf(kv.getValue()));
+                    w.write('\n');
+                }
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try { if (w != null) w.close(); } catch (Exception ignore) { }
+        }
+    }
+
+    /** 只解析 1~4 位期号（排除 8 位日期包期号），无则 -1。 */
+    private static int tblOrdinalOf(String name) {
+        if (TextUtils.isEmpty(name)) return -1;
+        if (name.contains("EP00")) return 0;
+        java.util.regex.Matcher m = TBL_ORD_RE.matcher(name);
+        if (m.find()) {
+            try { return Integer.parseInt(m.group(1)); } catch (NumberFormatException e) { return -1; }
+        }
+        return -1;
+    }
+
+    private static boolean tblIsDeriv(String name) {
+        if (TextUtils.isEmpty(name)) return true;
+        for (String w : TBL_DERIV) if (name.contains(w)) return true;
+        return false;
+    }
+
+    /**
+     * 用一对源列表（通常=当前播放源列表 × 目标源列表）刷新该剧的「期号↔日期」日期表。
+     * 混合名直接入表；纯期号 × 纯日期则做正片组序对齐（情形4）。
+     */
+    public static void buildDateTableFromPair(String showKey, List<String> a, List<String> b) {
+        if (TextUtils.isEmpty(showKey)) return;
+        final String key = showKey.trim();
+        if (key.isEmpty()) return;
+        // 1) 混合名（日期+真期号）直接入表
+        List<List<String>> pair = new java.util.ArrayList<>();
+        pair.add(a);
+        pair.add(b);
+        for (List<String> lst : pair) {
+            if (lst == null) continue;
+            for (String n : lst) {
+                if (TextUtils.isEmpty(n)) continue;
+                String of = hybridOrdinalForm(n);
+                if (TextUtils.isEmpty(of)) continue;
+                int o = tblOrdinalOf(of);
+                int d = dateOf(n);
+                if (o > 0 && d > 0) tblPut(key, o, d, extractPart(n));
+            }
+        }
+        // 2) 情形4：判定哪侧是纯期号源、哪侧是纯日期源
+        if (a == null || b == null) return;
+        int aOrd = 0, aDate = 0, bOrd = 0, bDate = 0;
+        for (String n : a) { if (tblIsDeriv(n)) continue; if (dateOf(n) > 0) aDate++; else if (tblOrdinalOf(n) >= 0) aOrd++; }
+        for (String n : b) { if (tblIsDeriv(n)) continue; if (dateOf(n) > 0) bDate++; else if (tblOrdinalOf(n) >= 0) bOrd++; }
+        List<String> periodNames, dateNames;
+        if (aOrd >= aDate && bDate >= bOrd) { periodNames = a; dateNames = b; }
+        else if (bOrd >= bDate && aDate >= aOrd) { periodNames = b; dateNames = a; }
+        else return;
+        // 日期源可信度：需 >=3 类衍生标记，否则(全名日期式)不可信
+        java.util.Set<String> rich = new java.util.HashSet<>();
+        for (String n : dateNames) for (String w : TBL_DERIV) if (n != null && n.contains(w)) rich.add(w);
+        if (rich.size() < 3) return;
+        alignGroupSequence(key, periodNames, dateNames);
+        persistDateTables();
+    }
+
+    /** 期号源 × 日期源：按正片(上/下)单元序列逐条对齐，形态一致且日期单调才写。 */
+    private static void alignGroupSequence(String showKey, List<String> periodNames, List<String> dateNames) {
+        java.util.List<int[]> pu = new java.util.ArrayList<>(); // {ord, part}
+        java.util.Set<Integer> splitOrds = new java.util.HashSet<>();
+        for (String n : periodNames) {
+            if (tblIsDeriv(n)) continue;
+            if (dateOf(n) > 0) continue;
+            int o = tblOrdinalOf(n);
+            if (o < 0) continue;
+            if (extractPart(n) != PART_NONE) splitOrds.add(o);
+        }
+        for (String n : periodNames) {
+            if (tblIsDeriv(n)) continue;
+            if (dateOf(n) > 0) continue;
+            int o = tblOrdinalOf(n);
+            if (o < 0) continue;
+            int p = extractPart(n);
+            if (p == PART_NONE && splitOrds.contains(o)) continue; // 裸第N期 与上/下并存 → 去重
+            pu.add(new int[]{o, p});
+        }
+        java.util.List<int[]> du = new java.util.ArrayList<>(); // {date, part}
+        for (String n : dateNames) {
+            if (tblIsDeriv(n)) continue;
+            int d = dateOf(n);
+            if (d <= 0) continue;
+            du.add(new int[]{d, extractPart(n)});
+        }
+        int lastDate = 0;
+        int n = Math.min(pu.size(), du.size());
+        for (int i = 0; i < n; i++) {
+            int[] p = pu.get(i);
+            int[] d = du.get(i);
+            if (p[1] != d[1]) break;                 // 分段形态不一致 → 停止
+            if (d[0] < lastDate) break;              // 日期必须单调不降（上/下同日，允许相等）
+            lastDate = d[0];
+            tblPut(showKey, p[0], d[0], p[1]);
+        }
+    }
+
+    private static void tblPut(String showKey, int ord, int date, int part) {
+        int p = normalizePart(part);
+        String ok = tblOrdKey(ord, p);
+        String dk = tblDateKey(date, p);
+        if (TBL_CONFLICT.contains(showKey + "#" + ok)
+                || TBL_CONFLICT.contains(showKey + "#" + dk)) {
+            return;
+        }
+        Map<String, Integer> om = TBL_ORD_TO_DATE.get(showKey);
+        if (om == null) { om = new java.util.concurrent.ConcurrentHashMap<>(); TBL_ORD_TO_DATE.put(showKey, om); }
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey);
+        if (dm == null) { dm = new java.util.concurrent.ConcurrentHashMap<>(); TBL_DATE_TO_ORD.put(showKey, dm); }
+        Integer expD = om.get(ok);
+        if (expD != null && expD != date) {
+            // 同一期号被映射到不同日期 → 矛盾,整组作废
+            om.remove(ok);
+            dm.remove(tblDateKey(expD, p));
+            TBL_CONFLICT.add(showKey + "#" + ok);
+            return;
+        }
+        Integer expO = dm.get(dk);
+        if (expO != null && expO != ord) {
+            // 同一日期被映射到不同期号 → 矛盾,整组作废
+            dm.remove(dk);
+            om.remove(tblOrdKey(expO, p));
+            TBL_CONFLICT.add(showKey + "#" + dk);
+            return;
+        }
+        if (!om.containsKey(ok) && om.size() < TBL_LIMIT_PER_SHOW) om.put(ok, date);
+        if (!dm.containsKey(dk) && dm.size() < TBL_LIMIT_PER_SHOW) dm.put(dk, ord);
+    }
+
+    /** 查该剧「期号→日期」；part 未命中再回落无分段/上。未命中 -1。 */
+    public static int lookupDateOfOrdinal(String showKey, int ord, int part) {
+        if (TextUtils.isEmpty(showKey) || ord < 0) return -1;
+        Map<String, Integer> om = TBL_ORD_TO_DATE.get(showKey.trim());
+        if (om == null) return -1;
+        Integer v = om.get(tblOrdKey(ord, normalizePart(part)));
+        if (v == null) v = om.get(tblOrdKey(ord, PART_NONE));
+        if (v == null) v = om.get(tblOrdKey(ord, PART_UP));
+        return v == null ? -1 : v;
+    }
+
+    /** 查该剧「日期→期号」；未命中 -1。 */
+    public static int lookupOrdinalOfDate(String showKey, int date, int part) {
+        if (TextUtils.isEmpty(showKey) || date <= 0) return -1;
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+        if (dm == null) return -1;
+        Integer v = dm.get(tblDateKey(date, normalizePart(part)));
+        if (v == null) v = dm.get(tblDateKey(date, PART_NONE));
+        if (v == null) v = dm.get(tblDateKey(date, PART_UP));
+        return v == null ? -1 : v;
+    }
+
+    /** 清空某剧日期表（历史记录删除时调用）。 */
+    public static void clearDateTable(String showKey) {
+        if (TextUtils.isEmpty(showKey)) return;
+        TBL_ORD_TO_DATE.remove(showKey.trim());
+        TBL_DATE_TO_ORD.remove(showKey.trim());
+        persistDateTables();
+    }
+
+    /** 清空全部剧的日期表（"清空历史记录"时调用，随历史一并清理）。 */
+    public static void clearAllDateTables() {
+        TBL_ORD_TO_DATE.clear();
+        TBL_DATE_TO_ORD.clear();
+        TBL_CONFLICT.clear();
+        persistDateTables();
+    }
+
+    /**
+     * r121 匹配层：用日期表确定落点（优先于簇秩猜）。仅跨域时启用；命中才返回下标，否则 -1 原样放行。
+     */
+    public static int matchByDateTable(String showKey, String currentName,
+                                       List<String> sourceNames, List<String> targetNames) {
+        if (TextUtils.isEmpty(showKey) || TextUtils.isEmpty(currentName)
+                || targetNames == null || targetNames.isEmpty()) return -1;
+        if (isNonMainEntryName(currentName)) return -1;
+        if (!needsCrossDomainResolve(currentName, targetNames)) return -1;
+        buildDateTableFromPair(showKey, sourceNames, targetNames);
+        int curDate = dateOf(currentName);
+        int curOrd = tblOrdinalOf(currentName);
+        int curPart = extractPart(currentName);
+        if (curDate <= 0 && curOrd >= 0) {
+            int d = lookupDateOfOrdinal(showKey, curOrd, curPart);
+            if (d > 0) {
+                int idx = findIndexByDate(String.valueOf(d), targetNames, currentName);
+                if (idx >= 0) return idx;
+            }
+            return -1;
+        }
+        if (curDate > 0 && curOrd < 0) {
+            int o = lookupOrdinalOfDate(showKey, curDate, curPart);
+            if (o > 0) {
+                int idx = findIndexByEpisode(currentName, o, targetNames);
+                if (idx >= 0) return idx;
+            }
+        }
+        return -1;
+    }
+
     // ============ r112：真混合集名锚点（日期 ↔ 期号，按片名隔离）============
     //
     // 【要解决的问题】同一「第N期」在不同采集源可能指不同播出日期：实测《魔力歌先生》

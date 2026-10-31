@@ -142,6 +142,8 @@ public class HistoryActivity extends BaseActivity {
                     if (delMode) {
                         historyAdapter.remove(position);
                         RoomDataManger.deleteVodRecord(vodInfo.sourceKey, vodInfo);
+                        // r121：删除历史时一并清理该剧的「日期↔期号」日期表（随历史记录删除被清理）
+                        try { com.github.tvbox.osc.util.EpisodeNameMatcher.clearDateTable(vodInfo.name); } catch (Throwable ignored) { }
                         // ★ v99-r69：历史记录是「按片名合并」的，而候选池是「按片名|年份|导演分桶」的
                         //   （一部同名片可能有 2~3 个桶）。删历史必须把该片名下所有桶一起清掉，
                         //   否则会留下无人认领的池，下次进片又被恢复出来。

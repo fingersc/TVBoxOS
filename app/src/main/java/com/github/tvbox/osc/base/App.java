@@ -50,6 +50,12 @@ public class App extends MultiDexApplication {
         // 默认链路 = 本地同域匹配 → 跨域直连 → 按序兜底；离线字典默认关闭，
         // 如需长期无网部署可调用 EpisodeResolveInitializer.setOfflineDictEnabled(true)。
         EpisodeResolveInitializer.init(this);
+        // r121：载入持久化的「期号↔日期」日期表（关闭重开后复用；文件不存在则空载，静默）。
+        try {
+            com.github.tvbox.osc.util.EpisodeNameMatcher.initDateTablePersistence(
+                    new java.io.File(getFilesDir(), "ep_date_table.tsv").getAbsolutePath());
+        } catch (Throwable ignored) {
+        }
         // 后台补齐"新上线综艺"的节目名→slug 映射（缓存 24h 内不联网；失败静默）
         try {
             final java.util.concurrent.ExecutorService pool =

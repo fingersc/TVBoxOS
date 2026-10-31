@@ -6123,6 +6123,22 @@ public class DetailActivity extends BaseActivity {
             }
         }
 
+        // ---------- 第1.6层：日期表（期号↔日期；情形1混合名 + 情形4组序对齐）→ 查表按形态选条（r121）----------
+        // 优先于跨域簇秩猜：用两侧真实列表建/查「期号↔日期」表，期号式当前集名查得日期后按日期落位，
+        // 命中即返回；查不到（表未覆盖/该剧无配对源/不可信）原样放行给第2层旧链路（零回归）。
+        // 修《我家那闺女2026》「第2期上」被簇秩猜成「20260913上」（应 20260906上）。
+        {
+            String tblShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                    ? vod_name : detailFallbackAnchorTitle;
+            int byTable = EpisodeNameMatcher.matchByDateTable(
+                    tblShow, currentName, seriesNames(playList), targetNames);
+            if (byTable >= 0) {
+                LOG.sw("[FB] dateTableAnchor ep=" + currentName + " -> idx=" + byTable
+                        + " tgt=" + targetNames.get(byTable));
+                return byTable;
+            }
+        }
+
         // ---------- 第2层：跨域 → 权威换算 ----------
         // 严格门控：只有真正跨域（日期 ↔ 期数）才走这一步；同域失败属正常无对应，不联网。
         if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
