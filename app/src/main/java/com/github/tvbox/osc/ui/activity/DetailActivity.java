@@ -1125,6 +1125,13 @@ public class DetailActivity extends BaseActivity {
 
     private void initViewModel() {
         sourceViewModel = new ViewModelProvider(this).get(SourceViewModel.class);
+        // r134：攒池补拉的详情走独立出口，绝不与 detailResult 混流。
+        sourceViewModel.prefetchDetailResult.observe(this, new Observer<AbsXml>() {
+            @Override
+            public void onChanged(AbsXml absXml) {
+                onPrefetchDetailArrived(absXml);
+            }
+        });
         sourceViewModel.detailResult.observe(this, new Observer<AbsXml>() {
             @Override
             public void onChanged(AbsXml absXml) {
@@ -1638,13 +1645,6 @@ public class DetailActivity extends BaseActivity {
     private String  vod_picture="";
     private String  vod_name="";
     private void initData() {
-        // r133：补拉候选详情的独立出口（刻意不用 detailResult，避免污染切源判定）。
-        sourceViewModel.prefetchDetailResult.observe(this, new Observer<AbsXml>() {
-            @Override
-            public void onChanged(AbsXml xml) {
-                onPrefetchDetailArrived(xml);
-            }
-        });
         Intent intent = getIntent();
         if (intent != null && intent.getExtras() != null) {
             Bundle bundle = intent.getExtras();
@@ -2763,39 +2763,27 @@ public class DetailActivity extends BaseActivity {
      * {@link #stationGroupOf(String)} 去掉「1-」「2-」这类序号前缀后比较，
      * 使 1-非凡 / 2-非凡 / 3-非凡 这种本质同站的候选只贡献一次。
      */
-    private void harvestCandidateSeries(Movie.Video video) {
-        if (video == null) return;
+    private boolean harvestCandidateSeries(Movie.Video video) {
+        if (video == null) return false;
         String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
-        if (TextUtils.isEmpty(show)) return;
+        if (TextUtils.isEmpty(show)) return false;
         String station = stationGroupOf(video.sourceKey);
-        if (TextUtils.isEmpty(station)) return;
+        if (TextUtils.isEmpty(station)) return false;
         java.util.List<String> names = seriesNamesOf(video);
-        if (names == null || names.size() < 2) {
-            // 回包没带集列表 → 排进「补拉详情」队列（同站点组只排第一个）。
-            enqueuePrefetch(video, show.trim(), station);
-            return;
-        }
-        commitHarvest(show.trim(), station, names, video.sourceKey);
+        if (names == null || names.size() < 2) return false; // 回包没带集列表：交给补拉队列
+        return commitHarvest(show.trim(), station, names, video.sourceKey);
     }
 
-    /** r133：把一份集列表并入该剧日期表素材（同站只取第一份）。 */
-    private void commitHarvest(String show, String station, java.util.List<String> names, String sourceKey) {
-        if (names == null || names.size() < 2 || TextUtils.isEmpty(show)) return;
-        if (!detailTableStationSeen.add(show + "|" + station)) return;
+    /** r133：把一份集列表并入该剧日期表素材（同站只取第一份）。返回 true 表示本次真的入了表。 */
+    private boolean commitHarvest(String show, String station, java.util.List<String> names, String sourceKey) {
+        if (names == null || names.size() < 2 || TextUtils.isEmpty(show)) return false;
+        if (!detailTableStationSeen.add(show + "|" + station)) return false;
         java.util.List<java.util.List<String>> batch = new java.util.ArrayList<>(1);
         batch.add(names);
         EpisodeNameMatcher.buildDateTableForVod(show, batch);
         LOG.sw("[FB] harvestSeries show=" + show + " station=" + station
                 + " src=" + sourceKey + " n=" + names.size());
-    }
-
-    /** r133：候选没带集列表时补拉详情；同站点组只排一次，队列串行。 */
-    private void enqueuePrefetch(Movie.Video video, String show, String station) {
-        if (video == null || TextUtils.isEmpty(video.sourceKey) || TextUtils.isEmpty(video.id)) return;
-        if (!detailTableStationSeen.add("q|" + show + "|" + station)) return;
-        if (!prefetchQueuedKeys.add(video.sourceKey + "|" + video.id)) return;
-        prefetchQueue.add(video.sourceKey + "|" + video.id + '\u0001' + show + '\u0001' + station);
-        pumpPrefetch();
+        return true;
     }
 
     /** r133：切源前扫一遍当前候选池，把还没进过表的源补上（每个片名只扫一次）。 */
@@ -2807,61 +2795,10 @@ public class DetailActivity extends BaseActivity {
         if (pool == null || pool.isEmpty()) return;
         for (Movie.Video v : pool) {
             try {
-                harvestCandidateSeries(v);
+                if (!harvestCandidateSeries(v)) enqueuePrefetch(v);
             } catch (Throwable ignored) {
             }
         }
-    }
-
-    private void pumpPrefetch() {
-        if (prefetchBusy || prefetchQueue.isEmpty()) return;
-        String item = prefetchQueue.poll();
-        String[] parts = item.split("\u0001", 3);
-        String key = parts[0];
-        prefetchInFlightKey = key;
-        prefetchInFlightShow = parts.length > 1 ? parts[1] : "";
-        prefetchInFlightStation = parts.length > 2 ? parts[2] : "";
-        int bar = key.indexOf('|');
-        String sourceKey = bar < 0 ? key : key.substring(0, bar);
-        String id = bar < 0 ? "" : key.substring(bar + 1);
-        if (TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(id)) {
-            prefetchInFlightKey = null;
-            pumpPrefetch();
-            return;
-        }
-        prefetchBusy = true;
-        try {
-            sourceViewModel.prefetchDetail(sourceKey, id);
-        } catch (Throwable t) {
-            prefetchBusy = false;
-            prefetchInFlightKey = null;
-        }
-    }
-
-    /** r133：补拉详情回来 → 收集集列表并入日期表素材，然后放行下一个。 */
-    private void onPrefetchDetailArrived(AbsXml xml) {
-        String show = TextUtils.isEmpty(prefetchInFlightShow) ? detailFallbackAnchorTitle : prefetchInFlightShow;
-        String station = prefetchInFlightStation;
-        String key = prefetchInFlightKey;
-        try {
-            if (xml != null && xml.movie != null && xml.movie.videoList != null) {
-                for (Movie.Video v : xml.movie.videoList) {
-                    if (v == null) continue;
-                    java.util.List<String> names = seriesNamesOf(v);
-                    if (names != null) {
-                        commitHarvest(TextUtils.isEmpty(show) ? (v.name == null ? "" : v.name.trim()) : show,
-                                station, names, key);
-                        break;
-                    }
-                }
-            }
-        } catch (Throwable ignored) {
-        }
-        prefetchBusy = false;
-        prefetchInFlightKey = null;
-        prefetchInFlightShow = null;
-        prefetchInFlightStation = null;
-        pumpPrefetch();
     }
 
     /** r133：从候选的 urlBean 里取第一条有内容的线路的集名；没有则返回 null。 */
@@ -2889,6 +2826,78 @@ public class DetailActivity extends BaseActivity {
             if (c == '-' || c == '_' || c == '.' || c == ' ') s = s.substring(i + 1);
         }
         return s.trim().toLowerCase();
+    }
+
+    /**
+     * r134：把「urlBean 里没有集列表」的候选排进补拉队列。
+     *
+     * <p>同站点组已经贡献过集列表的（{@code detailTableStationSeen}）直接跳过，
+     * 使 1-非凡 / 2-非凡 / 3-非凡 这类本质同站的马甲只补拉第一份。</p>
+     */
+    private void enqueuePrefetch(Movie.Video video) {
+        if (video == null || TextUtils.isEmpty(video.sourceKey)) return;
+        String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
+        if (TextUtils.isEmpty(show)) return;
+        String station = stationGroupOf(video.sourceKey);
+        if (TextUtils.isEmpty(station)) return;
+        if (detailTableStationSeen.contains(show.trim() + "|" + station)) return;
+        String key = video.sourceKey + "|" + video.id;
+        if (!prefetchQueuedKeys.add(key)) return;
+        prefetchQueue.add(video);
+        pumpPrefetch();
+    }
+
+    /** r134：补拉队列单飞推进 —— 一次只放一个请求，9s 无回包算超时丢弃。 */
+    private void pumpPrefetch() {
+        if (prefetchBusy || prefetchQueue.isEmpty()) return;
+        Movie.Video video = prefetchQueue.poll();
+        if (video == null || TextUtils.isEmpty(video.sourceKey)) return;
+        String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
+        prefetchInFlightShow = show == null ? "" : show.trim();
+        prefetchInFlightKey = video.sourceKey + "|" + video.id;
+        prefetchBusy = true;
+        LOG.sw("[FB] prefetchStart key=" + prefetchInFlightKey + " show=" + prefetchInFlightShow);
+        prefetchWatchdog.removeCallbacks(prefetchWatchdogTask);
+        prefetchWatchdog.postDelayed(prefetchWatchdogTask, 9000);
+        try {
+            sourceViewModel.prefetchDetail(video.sourceKey, String.valueOf(video.id));
+        } catch (Throwable th) {
+            LOG.sw("[FB] prefetchStart fail " + th);
+            finishPrefetch();
+        }
+    }
+
+    /** r134：补拉回来的详情 —— 只取集名并入建表素材，不碰当前播放源任何状态。 */
+    private void onPrefetchDetailArrived(AbsXml absXml) {
+        if (!prefetchBusy) return;
+        String show = prefetchInFlightShow;
+        try {
+            java.util.List<String> names = null;
+            String srcKey = "";
+            if (absXml != null && absXml.movie != null
+                    && absXml.movie.videoList != null && !absXml.movie.videoList.isEmpty()) {
+                Movie.Video v = absXml.movie.videoList.get(0);
+                names = seriesNamesOf(v);
+                srcKey = absXml.sourceKey == null ? "" : absXml.sourceKey;
+            }
+            if (names != null && names.size() >= 2 && !TextUtils.isEmpty(show)) {
+                commitHarvest(show, stationGroupOf(srcKey), names, srcKey);
+                LOG.sw("[FB] prefetchSeries key=" + prefetchInFlightKey + " n=" + names.size());
+            } else {
+                LOG.sw("[FB] prefetchEmpty key=" + prefetchInFlightKey);
+            }
+        } catch (Throwable ignored) {
+        }
+        finishPrefetch();
+    }
+
+    /** r134：收尾当前补拉（清看门狗 / 释放单飞位 / 续跑队列）。 */
+    private void finishPrefetch() {
+        prefetchWatchdog.removeCallbacks(prefetchWatchdogTask);
+        prefetchBusy = false;
+        prefetchInFlightKey = null;
+        prefetchInFlightShow = null;
+        pumpPrefetch();
     }
 
     private int countSameStationCandidates(String sourceKey) {
@@ -3632,9 +3641,10 @@ public class DetailActivity extends BaseActivity {
                 // 只要片名精确命中就全部纳入（含当前正在播放的源，使一圈能真正闭合）。
                 cacheDetailFallbackCandidate(video);
                 cachedAny = true;
-                // r133：攒池回包若自带集列表，就地并入该剧日期表素材（同站只取第一份）。
+                // r133：攒池回包若自带集列表，就地并入该剧日期表素材（同站只取第一份）；
+                // r134：没带的排进补拉队列，等复用的详情通道取回集名。
                 try {
-                    harvestCandidateSeries(video);
+                    if (!harvestCandidateSeries(video)) enqueuePrefetch(video);
                 } catch (Throwable ignored) {
                 }
             }
@@ -5183,15 +5193,25 @@ public class DetailActivity extends BaseActivity {
      * 同一站点组（如 1-非凡 / 2-非凡 / 3-非凡）只取第一份集列表，避免同一份列表被反复并入日期表。
      */
     private final Set<String> detailTableStationSeen = new HashSet<>();
-    /** r133：「补拉候选详情」队列（一次只放一个在飞，等回包再发下一个）。 */
-    private final java.util.ArrayDeque<String> prefetchQueue = new java.util.ArrayDeque<>();
-    private final Set<String> prefetchQueuedKeys = new HashSet<>();
-    /** r133：已经扫过候选池的片名（每个片名只扫一次，避免反复排补拉）。 */
+    /** r133：已经扫过候选池的片名（每个片名只扫一次）。 */
     private final Set<String> prefetchSweptShows = new HashSet<>();
-    private boolean prefetchBusy;
-    private String prefetchInFlightKey;
-    private String prefetchInFlightShow;
-    private String prefetchInFlightStation;
+
+    /** r134：urlBean 里没有集列表、等补拉详情的候选（单飞队列，key = sourceKey|id）。 */
+    private final java.util.ArrayDeque<Movie.Video> prefetchQueue = new java.util.ArrayDeque<>();
+    private final Set<String> prefetchQueuedKeys = new HashSet<>();
+    private boolean prefetchBusy = false;
+    private String prefetchInFlightKey = null;
+    private String prefetchInFlightShow = null;
+    private final android.os.Handler prefetchWatchdog = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable prefetchWatchdogTask = new Runnable() {
+        @Override
+        public void run() {
+            if (prefetchBusy) {
+                LOG.sw("[FB] prefetchTimeout key=" + prefetchInFlightKey);
+                finishPrefetch();
+            }
+        }
+    };
 
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     /**

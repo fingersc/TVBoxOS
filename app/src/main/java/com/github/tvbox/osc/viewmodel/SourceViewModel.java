@@ -104,10 +104,10 @@ public class SourceViewModel extends ViewModel {
     public MutableLiveData<AbsXml> detailFallbackSearchResult;
     public MutableLiveData<AbsXml> detailResult;
     /**
-     * r133：攒池阶段「补拉候选源详情」的独立出口。
+     * r134：攒池阶段「补拉候选源详情」的独立出口。
      *
-     * <p>刻意不复用 {@link #detailResult}：详情页观察 detailResult 时会把它当作「当前播放源详情」，
-     * 补拉一个候选会污染 settled/fallbackResult 判定，把正常切源流程带偏。</p>
+     * <p>刻意不复用 {@link #detailResult}：详情页观察 detailResult 时会把它当作「当前播放源的详情」，
+     * 补拉一个候选若也走这条出口，会把 settled / fallbackResult 判定带偏，干扰正常切源。</p>
      */
     public MutableLiveData<AbsXml> prefetchDetailResult;
     public MutableLiveData<JSONObject> actionResult;
@@ -845,7 +845,16 @@ public class SourceViewModel extends ViewModel {
         getDetail(sourceKey, urlid, false);
     }
 
-    public void getDetail(String sourceKey, String urlid, boolean fallback) {
+    /**
+     * r134：取详情实现（多出口共用）。
+     *
+     * <p>抽出来的目的：攒池阶段要「补拉候选源详情」，但补拉结果绝不能写进
+     * {@link #detailResult} —— 详情页/播放页把它当「当前播放源详情」，误喂会带偏
+     * settled / fallbackResult 判定。故这里把结果出口参数化。</p>
+     *
+     * @param out 结果出口：正常详情传 {@link #detailResult}，补拉传 {@link #prefetchDetailResult}
+     */
+    private void doGetDetail(String sourceKey, String urlid, boolean fallback, MutableLiveData<AbsXml> out) {
         if (urlid.startsWith("push://") && ApiConfig.get().getSource(PUSH_AGENT) != null) {
             String pushUrl = urlid.substring(7);
             if (pushUrl.startsWith("b64:")) {
@@ -865,8 +874,13 @@ public class SourceViewModel extends ViewModel {
         String id = urlid;
     
         SourceBean sourceBean = ApiConfig.get().getSource(sourceKey);
+        if (sourceBean == null) {
+            // r134：补拉时站点可能已被删/改名，宁可回空也不抛 NPE 打断攒池。
+            out.postValue(null);
+            return;
+        }
         if (isPushFallback(sourceKey, sourceBean)) {
-            detailResult.postValue(createPushDetail(urlid, sourceKey));
+            out.postValue(createPushDetail(urlid, sourceKey));
             return;
         }
         int type = sourceBean.getType();
@@ -899,7 +913,7 @@ public class SourceViewModel extends ViewModel {
                     } catch (Exception e) {
                         LOG.i("echo--getDetail--error: " + e.getMessage());
                     } finally {
-                        json(detailResult, json, sourceBean.getKey());
+                        json(out, json, sourceBean.getKey());
                         executor.shutdown();
                     }
                 }
@@ -932,25 +946,41 @@ public class SourceViewModel extends ViewModel {
                         public void onSuccess(Response<String> response) {
                             if (type == 0) {
                                 String xml = response.body();
-                                xml(detailResult, xml, sourceBean.getKey());
+                                xml(out, xml, sourceBean.getKey());
                             } else {
                                 String json = response.body();
                                 logResponseBody(json);
-                                json(detailResult, json, sourceBean.getKey());
+                                json(out, json, sourceBean.getKey());
                             }
                         }
 
                         @Override
                         public void onError(Response<String> response) {
                             super.onError(response);
-                            json(detailResult, "", sourceBean.getKey());
+                            json(out, "", sourceBean.getKey());
                         }
                     });
         } else {
             AbsXml data = new AbsXml();
             data.sourceKey = sourceKey;
-            detailResult.postValue(data);
+            out.postValue(data);
         }
+    }
+
+    public void getDetail(String sourceKey, String urlid, boolean fallback) {
+        doGetDetail(sourceKey, urlid, fallback, detailResult);
+    }
+
+    /**
+     * r134：攒池阶段「补拉候选源详情」。
+     *
+     * <p>与 {@link #getDetail(String, String, boolean)} 共用同一条取详情通道（类型 0/1/3/4 全支持），
+     * 但结果只投到 {@link #prefetchDetailResult}，不会顶掉当前播放源的详情。</p>
+     *
+     * <p>固定按 fallback 口径取数（超时 6s、extend 走 6s 修复），避免补拉把攒池阶段拖住。</p>
+     */
+    public void prefetchDetail(String sourceKey, String urlid) {
+        doGetDetail(sourceKey, urlid, true, prefetchDetailResult);
     }
 
     public void action(String sourceKey, String action) {
