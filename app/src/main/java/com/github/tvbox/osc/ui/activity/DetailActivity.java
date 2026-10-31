@@ -1969,6 +1969,10 @@ public class DetailActivity extends BaseActivity {
      */
     private boolean startDetailFallback(boolean manual) {
         detailFallbackManualSwap = manual;
+        // ★ r129：把「手动点切源 / 自动兜底」写进日志——此前 manual 只存在字段里，
+        //   真机日志无法区分二者，容易把人工连续点按误读成"系统自动连切"。
+        LOG.sw("[FB] switchStart manual=" + (manual ? 1 : 0)
+                + " from=" + sourceKey + " cycleNo=" + detailFallbackCycleCount);
         detailFallbackDenyMsg = "";
         if (isFinishing()) {
             return false;
@@ -2182,7 +2186,8 @@ public class DetailActivity extends BaseActivity {
         String nextSource = pollNextCycledSource();
         LOG.sw("[FB] pick picked=" + nextSource + " poolSize=" + detailFallbackUsableCandidateCount()
                 + " cycleKeys=" + detailFallbackCycleKeys.size() + " newCycle=" + detailFallbackNewCycle
-                + " dead=" + detailFallbackDeadKeys.size() + " soft=" + detailFallbackSoftTriedKeys.size());
+                + " dead=" + detailFallbackDeadKeys.size() + " soft=" + detailFallbackSoftTriedKeys.size()
+                + " manual=" + (detailFallbackManualSwap ? 1 : 0) + " cycleNo=" + detailFallbackCycleCount);
         if (TextUtils.isEmpty(nextSource)) {
             // 一圈内确实没有可切的源了（所有源都试过且都失败），提示并结束
             if (detailFallbackKeepCurrentDetail && mVideo != null && vodInfo != null) {
