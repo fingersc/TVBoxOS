@@ -1227,6 +1227,8 @@ public class DetailActivity extends BaseActivity {
                             String anchorShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
                                     ? vod_name : detailFallbackAnchorTitle;
                             EpisodeNameMatcher.harvestDateOrdinalAnchors(anchorShow, anchorLists);
+                            // ★ r124 建表可靠化：整部剧所有线路两两配对建「期号↔日期」表，摆脱"切源时拿新源列表懒建"的空表缺陷
+                            EpisodeNameMatcher.buildDateTableForVod(anchorShow, anchorLists);
                         } catch (Throwable ignored) {
                         }
                         // ★ v67：首轮记录基准集数（同站多资源择优的兜底信号，见字段注释）
@@ -5808,7 +5810,24 @@ public class DetailActivity extends BaseActivity {
      *
      * @return 目标源下标；无法可靠匹配返回 -1
      */
+    /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
+    private void ensureDateTablesBuilt() {
+        try {
+            if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.size() < 2) return;
+            java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
+            for (java.util.List<VodInfo.VodSeries> l : vodInfo.seriesMap.values()) {
+                if (l == null) continue;
+                all.add(seriesNames(l));
+            }
+            String showKey = TextUtils.isEmpty(detailFallbackAnchorTitle) ? vod_name : detailFallbackAnchorTitle;
+            EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        // ★ r124：切源前保险——确保「期号↔日期」表已按整部剧所有线路建好（幂等，含历史跳播场景）
+        ensureDateTablesBuilt();
         // ---------- 第-1层 r117：非正片（衍生集）安全入口 ----------
         // 当前在播的是非正片时，切源锚（URL日期锚/混合锚/正片簇秩）全对它关门，只能落到
         //   按位置/簇秩/裸下标猜的层 —— 实测「第20260511期彩蛋」被猜成「20260511特别加更」错切。

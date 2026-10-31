@@ -2516,7 +2516,7 @@ public final class EpisodeNameMatcher {
      * 用一对源列表（通常=当前播放源列表 × 目标源列表）刷新该剧的「期号↔日期」日期表。
      * 混合名直接入表；纯期号 × 纯日期则做正片组序对齐（情形4）。
      */
-    public static void buildDateTableFromPair(String showKey, List<String> a, List<String> b) {
+    private static void buildDateTableFromPairNoPersist(String showKey, List<String> a, List<String> b) {
         if (TextUtils.isEmpty(showKey)) return;
         final String key = showKey.trim();
         if (key.isEmpty()) return;
@@ -2550,6 +2550,47 @@ public final class EpisodeNameMatcher {
         for (String n : dateNames) for (String w : TBL_DERIV) if (n != null && n.contains(w)) rich.add(w);
         if (rich.size() < 3) return;
         alignGroupSequence(key, periodNames, dateNames);
+    }
+
+    /** 一对源建表并立即落盘（对外保持 r121 原语义：建完即持久化）。 */
+    public static void buildDateTableFromPair(String showKey, List<String> a, List<String> b) {
+        buildDateTableFromPairNoPersist(showKey, a, b);
+        persistDateTables();
+    }
+
+    // ★ r124：已建表签名（按剧名缓存"各线路条数+首尾名 hash"），内容不变不重建，保证幂等/低开销。
+    private static final Map<String, String> TBL_BUILT_SIG =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * ★ r124 建表可靠化：传入本剧【所有线路】的集名列表，两两配对建「期号↔日期」表。
+     * 与"切源时拿新源列表懒建"解耦——拿到整部剧 seriesMap 时一次按「期号源×日期源」正确姿势建好，
+     * 覆盖详情页/搜索页/历史跳播等全部切源入口。幂等：同一批列表重复调用直接返回；每轮只 persist 一次。
+     */
+    public static void buildDateTableForVod(String showKey, java.util.Collection<List<String>> allLists) {
+        if (TextUtils.isEmpty(showKey) || allLists == null) return;
+        final String key = showKey.trim();
+        if (key.isEmpty()) return;
+        java.util.List<List<String>> lists = new java.util.ArrayList<>();
+        StringBuilder sig = new StringBuilder();
+        for (List<String> l : allLists) {
+            if (l == null || l.isEmpty()) continue;
+            lists.add(l);
+            sig.append(l.size()).append(':');
+            String f = l.get(0);
+            String last = l.get(l.size() - 1);
+            sig.append(f == null ? 0 : f.hashCode()).append('/')
+               .append(last == null ? 0 : last.hashCode()).append(';');
+        }
+        if (lists.size() < 2) return;
+        String s = sig.toString();
+        if (s.equals(TBL_BUILT_SIG.get(key))) return;
+        TBL_BUILT_SIG.put(key, s);
+        for (int i = 0; i < lists.size(); i++) {
+            for (int j = i + 1; j < lists.size(); j++) {
+                buildDateTableFromPairNoPersist(key, lists.get(i), lists.get(j));
+            }
+        }
         persistDateTables();
     }
 
@@ -2653,6 +2694,7 @@ public final class EpisodeNameMatcher {
         if (TextUtils.isEmpty(showKey)) return;
         TBL_ORD_TO_DATE.remove(showKey.trim());
         TBL_DATE_TO_ORD.remove(showKey.trim());
+        TBL_BUILT_SIG.remove(showKey.trim());
         persistDateTables();
     }
 
@@ -2661,6 +2703,7 @@ public final class EpisodeNameMatcher {
         TBL_ORD_TO_DATE.clear();
         TBL_DATE_TO_ORD.clear();
         TBL_CONFLICT.clear();
+        TBL_BUILT_SIG.clear();
         persistDateTables();
     }
 

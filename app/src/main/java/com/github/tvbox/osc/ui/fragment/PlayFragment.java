@@ -2485,7 +2485,24 @@ public class PlayFragment extends BaseLazyFragment {
      *
      * @return 目标源下标；无法可靠匹配返回 -1
      */
+    /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
+    private void ensureDateTablesBuilt() {
+        try {
+            if (mVodInfo == null || mVodInfo.seriesMap == null || mVodInfo.seriesMap.size() < 2) return;
+            java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
+            for (java.util.List<VodInfo.VodSeries> l : mVodInfo.seriesMap.values()) {
+                if (l == null) continue;
+                all.add(seriesNames(l));
+            }
+            String showKey = mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
+        // ★ r124：切源前保险——确保「期号↔日期」表已按整部剧所有线路建好（幂等，含历史跳播场景）
+        ensureDateTablesBuilt();
         int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)
                 || targetList == null || targetList.isEmpty()) {
@@ -2635,6 +2652,17 @@ public class PlayFragment extends BaseLazyFragment {
                     currentName, playIndex, seriesNames(playList), targetNames);
             if (byGroup >= 0) {
                 return byGroup;
+            }
+        }
+
+        // ---------- 第1.6层 r124：日期表（期号↔日期）→ 查表按形态选条 ----------
+        // 与 DetailActivity L1.6 同源同序（改一处必须改另一处）。表由 buildDateTableForVod 提前建好。
+        {
+            String tblShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            int byTable = EpisodeNameMatcher.matchByDateTable(
+                    tblShow, currentName, seriesNames(playList), targetNames);
+            if (byTable >= 0) {
+                return byTable;
             }
         }
 
