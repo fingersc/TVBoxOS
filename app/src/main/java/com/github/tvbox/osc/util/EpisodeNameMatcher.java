@@ -2218,6 +2218,14 @@ public final class EpisodeNameMatcher {
             //    源侧第5期曾被簇秩算成目标侧第6期）。
             int srcSpan = ordinalSpan(sourceNames, labels);
             if (byDay >= 0 && srcSpan > 0 && clusters.size() != srcSpan) {
+                // ★ r136：簇数连源侧期数的一半都不到 ⇒ 结构性崩坏（正片整段被误判成「日更衍生」删掉），
+                //   这时 byDay 的「首播日 + 7×(N-1)」基准同样不可信。
+                //   实测《奔跑吧 第十季》：源侧 12 期，正片 0424–0601 每周一更但相邻间隔 3–4 天，
+                //   被 CLUSTER_GAP_DAYS=3 并成大簇后整簇判日更删掉，只剩 6 簇、首簇变成 0605，
+                //   于是「第3期」被外推成 20260619（正确是 20260508）。宁可返回 -1（不落），也绝不猜。
+                if (clusters.size() * 2 <= srcSpan) {
+                    return -1;
+                }
                 return byDay;
             }
             // ★★ 簇数 < 源侧期数时，簇秩会把后续所有期**整体前移** —— 静默错一集。
@@ -4185,6 +4193,18 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
                 continue;
             }
             out.add(c);
+        }
+        // ★ r136 误杀守卫：一个列表里「日更衍生簇」不可能占多数。删掉一半以上，
+        //   说明判据把正片整段吃掉了，此时宁可不过滤。
+        //   实测《奔跑吧 第十季》：正片每周一更、相邻间隔 3–4 天，被并成大簇后整簇判日更删掉，
+        //   45 条只剩 6 簇、首簇变 0605 —— 直接导致「第3期」被外推成 20260619。
+        if (out.size() * 2 <= clusters.size()) {
+            return clusters;
+        }
+        // ★ r136 误杀守卫 2：首簇是整张表的「周期起点」。把它当衍生日更删掉，
+        //   byDay 的基准就会整体后移（实测后移 6 周，第3期→0619 而非 0508）。首簇被删则不过滤。
+        if (out.isEmpty() || out.get(0) != clusters.get(0)) {
+            return clusters;
         }
         return out.isEmpty() ? clusters : out;
     }

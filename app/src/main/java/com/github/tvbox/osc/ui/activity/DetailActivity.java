@@ -1474,6 +1474,16 @@ public class DetailActivity extends BaseActivity {
                         boolean expectedIsMovie = EpisodeNameMatcher.isMovieMain(
                                 expectedName, countSeriesEpisodes(vodInfo));
                         if (!TextUtils.isEmpty(expectedName)
+                                && EpisodeNameMatcher.isEpisodeRangeLabel(expectedName)) {
+                            // ★ r135：区间合集条目（第1-20集 / 第61-82集完结）不是"一集"，
+                            //   isSameEpisodeStrict 无域可解→false；findIndexForNonMain 按"同规范系列"比→恒 -1。
+                            //   于是入口第-1.5层刚按完全同名定位到的 idx 会被这里全盘否掉
+                            //   （实测《人世间 2024》11/11 次 rangeExact 命中仍全部 alignNoEpisode ⇒ 0 次 migrate）。
+                            //   口径与入口短路一致：完全同名 = 同一条区间；不同名 = 双方分段切法不同，判"没有这一集"，不猜。
+                            sameEpisodeConfirmed = TextUtils.equals(expectedName, currentEpisode.name);
+                            LOG.sw("[FB] rangeConfirm expected=" + expectedName
+                                    + " actual=" + currentEpisode.name + " -> " + sameEpisodeConfirmed);
+                        } else if (!TextUtils.isEmpty(expectedName)
                                 && EpisodeNameMatcher.isNonMainEntryName(expectedName)
                                 && !expectedIsMovie) {
                             // ★ r118：非正片按「规范系列 + 同日期/同期号(锚表互译)」确证同一集。
