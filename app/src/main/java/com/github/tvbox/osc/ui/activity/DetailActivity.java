@@ -5915,7 +5915,9 @@ public class DetailActivity extends BaseActivity {
             if (resolved >= 0 && resolved < targetList.size()) {
                 // ★ 传入两侧列表，让事实层做"序关系守卫"——
                 //   冷启动时的错切若被记成事实，会永久污染后续每一次切源。
-                EpisodeNameMatcher.learnCrossDomainFact(
+                String learnShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                        ? vod_name : detailFallbackAnchorTitle;
+                EpisodeNameMatcher.learnCrossDomainFact(learnShow,
                         currentSeries.name, targetList.get(resolved).name,
                         srcNames, tgtNames);
             }
@@ -5959,7 +5961,9 @@ public class DetailActivity extends BaseActivity {
             if (others.isEmpty()) {
                 return -1;
             }
-            return EpisodeNameMatcher.probeFactFromOtherSources(
+            String probeShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                    ? vod_name : detailFallbackAnchorTitle;
+            return EpisodeNameMatcher.probeFactFromOtherSources(probeShow,
                     currentSeries.name, srcNames, seriesNames(targetList), others);
         } catch (Throwable ignored) {
             return -1;
@@ -6157,7 +6161,9 @@ public class DetailActivity extends BaseActivity {
             //     此时才轮到下面的联网权威换算。
             List<String> rankSourceNames = getRankSourceList(currentName);
             int rankSourceIndex = rankSourceNames.indexOf(currentName);
-            int byRank = EpisodeNameMatcher.alignByMainFeatureRank(
+            String rankShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
+                    ? vod_name : detailFallbackAnchorTitle;
+            int byRank = EpisodeNameMatcher.alignByMainFeatureRank(rankShow,
                     currentName, rankSourceIndex, rankSourceNames, targetNames);
             if (byRank >= 0) {
                 return byRank;

@@ -2533,7 +2533,8 @@ public class PlayFragment extends BaseLazyFragment {
             // 跨源事实记忆：本次成功落位即一条"期号↔日期"的双侧强证据。
             if (resolved >= 0 && resolved < targetList.size()) {
                 // ★ 传入两侧列表，让事实层做"序关系守卫"（与 DetailActivity 同一机制）
-                EpisodeNameMatcher.learnCrossDomainFact(
+                String learnShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+                EpisodeNameMatcher.learnCrossDomainFact(learnShow,
                         currentSeries.name, targetList.get(resolved).name,
                         srcNames, tgtNames);
             }
@@ -2576,7 +2577,8 @@ public class PlayFragment extends BaseLazyFragment {
             if (others.isEmpty()) {
                 return -1;
             }
-            return EpisodeNameMatcher.probeFactFromOtherSources(
+            String probeShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            return EpisodeNameMatcher.probeFactFromOtherSources(probeShow,
                     currentSeries.name, srcNames, seriesNames(targetList), others);
         } catch (Throwable ignored) {
             return -1;
@@ -2651,7 +2653,8 @@ public class PlayFragment extends BaseLazyFragment {
             //     此时才轮到下面的联网权威换算。此前这里落空后由裸下标兜底，
             //     会把「第5期上」静默切到「20260508泳池特辑」这类错位条目上。
             if (playIndex >= 0 && !playList.isEmpty()) {
-                int byRank = EpisodeNameMatcher.alignByMainFeatureRank(
+                String rankShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+                int byRank = EpisodeNameMatcher.alignByMainFeatureRank(rankShow,
                         currentName, playIndex, seriesNames(playList), targetNames);
                 if (byRank >= 0) {
                     return byRank;

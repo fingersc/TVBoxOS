@@ -2032,6 +2032,15 @@ public final class EpisodeNameMatcher {
      */
     public static int alignByMainFeatureRank(String currentName, int sourceIndex,
                                              List<String> sourceNames, List<String> targetNames) {
+        return alignByMainFeatureRank(null, currentName, sourceIndex, sourceNames, targetNames);
+    }
+
+    /**
+     * 带剧名（showKey）的重载（r122）：日期表按剧名隔离，事实/外推均读写该剧的日期表。
+     * showKey 为空时退化为"无表"（等价旧版无事实的冷启动），不抛异常。
+     */
+    public static int alignByMainFeatureRank(String showKey, String currentName, int sourceIndex,
+                                             List<String> sourceNames, List<String> targetNames) {
         if (TextUtils.isEmpty(currentName) || sourceNames == null || targetNames == null
                 || sourceNames.isEmpty() || targetNames.isEmpty()) {
             return -1;
@@ -2106,7 +2115,7 @@ public final class EpisodeNameMatcher {
         // 之前某次切源已经把"这个期号 = 那个日期"两侧证实过了，直接查表落位。
         // 这一层不受列表形态影响——对"两侧都是密集日更/衍生夹心"的列表尤其关键，
         // 因为那些列表会让下面的簇秩与周更快照整体偏移一期。
-        int byFact = alignByRememberedFact(currentName, curOrdinal, curHasDate,
+        int byFact = alignByRememberedFact(showKey, currentName, curOrdinal, curHasDate,
                 cur.ordinal, wantPart0, targetNames);
         if (byFact >= 0) {
             return byFact;
@@ -2352,114 +2361,14 @@ public final class EpisodeNameMatcher {
     // 只记录"两侧都自证"的强证据（当前名带期号且命中名带日期，或反之），
     // 不记录任何推断结果；条目按节目无关的全局键存储，数量级极小（几十条），
     // 超出上限按插入顺序淘汰最旧的。
-    private static final int FACT_LIMIT = 128;
+    // 【r122】原全局 FACT_* 事实表（FACT_LIMIT / FACT_LOCK / FACT_ORDINAL_TO_DATE /
+    //   FACT_DATE_TO_ORDINAL / FACT_ORDER / factKeyOfOrdinal / factKeyOfDate）已全部删除：
+    //   事实、锚点、外推统一读写下方按剧名隔离的日期表(TBL_*)，不再有全局第二真相源。
+    private static final int FACT_LIMIT_REMOVED = 0;
 
-    /**
-     * 跨源事实记忆的写锁。
-     *
-     * <p><b>★ v43：新增</b>。此前三张表（{@code FACT_ORDINAL_TO_DATE} /
-     * {@code FACT_DATE_TO_ORDINAL} / {@code FACT_ORDER}）都是普通集合且<b>无同步</b>：
-     * 写入发生在切源决策的主线程（{@code learnCrossDomainFact}），而遍历发生在
-     * 探路/离线对齐的回调里，两者可并发 → {@code ConcurrentModificationException}
-     * 或 {@code HashMap} 结构损坏。</p>
-     *
-     * <p>调用点外层虽有 {@code catch (Throwable)} 兜住不至于崩溃，但异常会
-     * <b>静默丢掉一次事实记忆</b>，表现为「同一个跨域对齐要反复探路多次」。
-     * 现：容器换 {@link ConcurrentHashMap}（读安全）＋ 复合写操作加锁（一致性）。</p>
-     */
-    private static final Object FACT_LOCK = new Object();
-
-    /** key = 归一化期号 + "|" + 分段；value = 该期对应的播出日期 YYYYMMDD。 */
-    private static final Map<String, Integer> FACT_ORDINAL_TO_DATE = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** key = 日期 + "|" + 分段；value = 该日期对应的期号。 */
-    private static final Map<String, Integer> FACT_DATE_TO_ORDINAL = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
-     * 记录顺序，用于 FIFO 淘汰。
-     *
-     * <p>淘汰语义（「删最旧的」）依赖「查顺序 + 改映射」的原子性，
-     * 故所有写操作（{@link #rememberCrossDomainFact} / {@link #clearCrossDomainFacts}）
-     * 都必须在 {@link #FACT_LOCK} 内。</p>
-     */
-    private static final List<String> FACT_ORDER = new ArrayList<>();
-
-    /** 记忆键前缀：期号命名空间（避免与日期命名空间撞键）。 */
-    private static String factKeyOfOrdinal(int ordinal, int part) {
-        return "O" + ordinal + "|" + part;
-    }
-
-    /** 记忆键前缀：日期命名空间。 */
-    private static String factKeyOfDate(int date, int part) {
-        return "D" + date + "|" + part;
-    }
-
-    /**
-     * 记住一条"期号 ↔ 日期"的对应关系。
-     *
-     * @param ordinal 期号（>0）
-     * @param date    播出日期 YYYYMMDD（>0）
-     * @param part    {@link #normalizePart(int)} 归一化后的分段
-     */
-    public static void rememberCrossDomainFact(int ordinal, int date, int part) {
-        if (ordinal <= 0 || date <= 0) {
-            return;
-        }
-        int p = normalizePart(part);
-        String k1 = factKeyOfOrdinal(ordinal, p);
-        String k2 = factKeyOfDate(date, p);
-        // ★ v43：查存在性 + 写映射 + 追加顺序 + FIFO 淘汰必须原子。
-        //   否则并发下会出现「已淘汰但仍留在 FACT_ORDER」或反过来，
-        //   让淘汰逻辑删错表（它靠"这个 key 属于哪张表"来分派）。
-        synchronized (FACT_LOCK) {
-            // 冲突时以先到为准（先到者来自更早的一次成功对齐，同样可靠）
-            if (!FACT_ORDINAL_TO_DATE.containsKey(k1)) {
-                FACT_ORDINAL_TO_DATE.put(k1, date);
-                FACT_ORDER.add(k1);
-            }
-            if (!FACT_DATE_TO_ORDINAL.containsKey(k2)) {
-                FACT_DATE_TO_ORDINAL.put(k2, ordinal);
-                FACT_ORDER.add(k2);
-            }
-            while (FACT_ORDER.size() > FACT_LIMIT) {
-                String old = FACT_ORDER.remove(0);
-                if (FACT_ORDINAL_TO_DATE.containsKey(old)) {
-                    FACT_ORDINAL_TO_DATE.remove(old);
-                } else {
-                    FACT_DATE_TO_ORDINAL.remove(old);
-                }
-            }
-        }
-    }
-
-    /** 查询记住的"期号 → 日期"。未命中返回 -1。 */
-    public static int recallDateOfOrdinal(int ordinal, int part) {
-        if (ordinal <= 0) {
-            return -1;
-        }
-        Integer v = FACT_ORDINAL_TO_DATE.get(factKeyOfOrdinal(ordinal, normalizePart(part)));
-        return v == null ? -1 : v;
-    }
-
-    /** 查询记住的"日期 → 期号"。未命中返回 -1。 */
-    public static int recallOrdinalOfDate(int date, int part) {
-        if (date <= 0) {
-            return -1;
-        }
-        Integer v = FACT_DATE_TO_ORDINAL.get(factKeyOfDate(date, normalizePart(part)));
-        return v == null ? -1 : v;
-    }
-
-    /** 清空跨源事实记忆（切源列表整体变化时调用，避免陈旧事实干扰）。 */
-    public static void clearCrossDomainFacts() {
-        // ★ v43：清空同样要进锁 —— 否则与 rememberCrossDomainFact 并发时
-        //   可能出现「表已清空但 FACT_ORDER 仍留着旧 key」的不一致状态。
-        synchronized (FACT_LOCK) {
-            FACT_ORDINAL_TO_DATE.clear();
-            FACT_DATE_TO_ORDINAL.clear();
-            FACT_ORDER.clear();
-        }
-    }
+    // 【r122】rememberCrossDomainFact / recallDateOfOrdinal / recallOrdinalOfDate /
+    //   clearCrossDomainFacts 已删除（改由 tblPut / lookupDateOfOrdinal / lookupOrdinalOfDate /
+    //   clearDateTable / clearAllDateTables 承担；事实统一进按剧名的日期表）。
 
     // ============ r121：持久化「期号 ↔ 日期」日期表（按片名隔离，含情形4组序对齐）============
     //
@@ -2667,10 +2576,8 @@ public final class EpisodeNameMatcher {
         if (dm == null) { dm = new java.util.concurrent.ConcurrentHashMap<>(); TBL_DATE_TO_ORD.put(showKey, dm); }
         Integer expD = om.get(ok);
         if (expD != null && expD != date) {
-            // 同一期号被映射到不同日期 → 矛盾,整组作废
-            om.remove(ok);
-            dm.remove(tblDateKey(expD, p));
-            TBL_CONFLICT.add(showKey + "#" + ok);
+            // 同一期号被映射到多个日期（如正片与"加更/会员版"同标第N期）：保留首个，不覆盖也不作废。
+            //   对"日期→期号"查询无危害（每个日期仍唯一），故不触发墓碑，避免误伤真实的多日期同号情况。
             return;
         }
         Integer expO = dm.get(dk);
@@ -2693,6 +2600,8 @@ public final class EpisodeNameMatcher {
         Integer v = om.get(tblOrdKey(ord, normalizePart(part)));
         if (v == null) v = om.get(tblOrdKey(ord, PART_NONE));
         if (v == null) v = om.get(tblOrdKey(ord, PART_UP));
+        if (v == null) v = om.get(tblOrdKey(ord, PART_DOWN));
+        if (v == null) v = om.get(tblOrdKey(ord, PART_MIDDLE));
         return v == null ? -1 : v;
     }
 
@@ -2704,6 +2613,8 @@ public final class EpisodeNameMatcher {
         Integer v = dm.get(tblDateKey(date, normalizePart(part)));
         if (v == null) v = dm.get(tblDateKey(date, PART_NONE));
         if (v == null) v = dm.get(tblDateKey(date, PART_UP));
+        if (v == null) v = dm.get(tblDateKey(date, PART_DOWN));
+        if (v == null) v = dm.get(tblDateKey(date, PART_MIDDLE));
         return v == null ? -1 : v;
     }
 
@@ -2770,12 +2681,8 @@ public final class EpisodeNameMatcher {
     //
     // 【安全】只做精确命中，不做外推；同一天出现两个不同期号 → 判为不可信并剔除该日，
     //   宁可退回旧链路（可能不切）也不切错。整表按片名隔离 + 有上限，避免无界增长。
-    private static final Map<String, Map<Integer, Integer>> ANCHOR_DATE_TO_ORD =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static final Map<String, java.util.Set<Integer>> ANCHOR_AMBIGUOUS =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static final Object ANCHOR_LOCK = new Object();
-    private static final int ANCHOR_LIMIT_PER_SHOW = 4000;
+    // 【r122】原 ANCHOR_DATE_TO_ORD / ANCHOR_AMBIGUOUS / ANCHOR_LOCK / ANCHOR_LIMIT_PER_SHOW
+    //   已删除：锚点统一并入下方日期表(TBL_*)，按剧名隔离、持久化、冲突墓碑。
 
     /**
      * 从某源的完整集名列表收割「日期 ↔ 真期号」锚点（r112）。
@@ -2792,49 +2699,35 @@ public final class EpisodeNameMatcher {
         if (k.isEmpty()) {
             return;
         }
-        synchronized (ANCHOR_LOCK) {
-            Map<Integer, Integer> map = ANCHOR_DATE_TO_ORD.get(k);
-            if (map == null) {
-                map = new java.util.HashMap<>();
-                ANCHOR_DATE_TO_ORD.put(k, map);
+        boolean any = false;
+        for (java.util.List<String> names : lists) {
+            if (names == null || names.isEmpty()) {
+                continue;
             }
-            java.util.Set<Integer> amb = ANCHOR_AMBIGUOUS.get(k);
-            if (amb == null) {
-                amb = new java.util.HashSet<>();
-                ANCHOR_AMBIGUOUS.put(k, amb);
-            }
-            for (java.util.List<String> names : lists) {
-                if (names == null || names.isEmpty()) {
+            for (String name : names) {
+                if (TextUtils.isEmpty(name)) {
                     continue;
                 }
-                for (String name : names) {
-                    if (TextUtils.isEmpty(name)) {
-                        continue;
-                    }
-                    int d = dateOf(name);
-                    if (d < 19900101) {
-                        continue;               // 无有效播出日期
-                    }
-                    // 真混合式：日期 + 可解析的真期号；伪期号（第YYYYMMDD期）返回 null 被排除
-                    String of = hybridOrdinalForm(name);
-                    if (TextUtils.isEmpty(of)) {
-                        continue;
-                    }
-                    int o = extractOrdinal(of);
-                    if (o <= 0 || o >= 1000) {
-                        continue;
-                    }
-                    Integer prev = map.get(d);
-                    if (prev == null) {
-                        if (map.size() < ANCHOR_LIMIT_PER_SHOW) {
-                            map.put(d, o);
-                        }
-                    } else if (prev.intValue() != o) {
-                        // 同一天被不同源标成不同期号 → 该日不可信，剔除
-                        amb.add(d);
-                    }
+                int d = dateOf(name);
+                if (d < 19900101) {
+                    continue;               // 无有效播出日期
                 }
+                // 真混合式：日期 + 可解析的真期号；伪期号（第YYYYMMDD期）返回 null 被排除
+                String of = hybridOrdinalForm(name);
+                if (TextUtils.isEmpty(of)) {
+                    continue;
+                }
+                int o = extractOrdinal(of);
+                if (o <= 0 || o >= 1000) {
+                    continue;
+                }
+                // r122：写入统一日期表（按剧名隔离、冲突墓碑、持久化），不再建独立 ANCHOR 表
+                tblPut(k, o, d, extractPart(name));
+                any = true;
             }
+        }
+        if (any) {
+            persistDateTables();
         }
     }
 
@@ -2861,19 +2754,8 @@ public final class EpisodeNameMatcher {
         if (date <= 0 || TextUtils.isEmpty(showKey)) {
             return -1;
         }
-        String k = showKey.trim();
-        synchronized (ANCHOR_LOCK) {
-            Map<Integer, Integer> map = ANCHOR_DATE_TO_ORD.get(k);
-            if (map == null || map.isEmpty()) {
-                return -1;
-            }
-            java.util.Set<Integer> amb = ANCHOR_AMBIGUOUS.get(k);
-            if (amb != null && amb.contains(date)) {
-                return -1;
-            }
-            Integer v = map.get(date);
-            return v == null ? -1 : v;
-        }
+        // r122：锚点已并入统一日期表（按剧名隔离），精确查询 日期→期号。
+        return lookupOrdinalOfDate(showKey.trim(), date, PART_NONE);
     }
 
     /**
@@ -2937,7 +2819,7 @@ public final class EpisodeNameMatcher {
      * @param otherLists  其它可用源的完整列表（可为空）
      * @return 修正后的目标源下标；无修正返回 -1
      */
-    public static int probeFactFromOtherSources(String currentName,
+    public static int probeFactFromOtherSources(String showKey, String currentName,
                                                 List<String> sourceNames,
                                                 List<String> targetNames,
                                                 List<List<String>> otherLists) {
@@ -2977,7 +2859,7 @@ public final class EpisodeNameMatcher {
                 continue;
             }
             // 事实成立 → 记下来，并立刻用它重解目标源
-            learnCrossDomainFact(currentName, probeName, sourceNames, other);
+            learnCrossDomainFact(showKey, currentName, probeName, sourceNames, other);
             int again = locate(currentName, si, sourceNames, targetNames);
             if (again >= 0) {
                 return again;
@@ -3101,7 +2983,7 @@ public final class EpisodeNameMatcher {
      * @param matchedName 切源后（新源）命中的集名
      */
     public static void learnCrossDomainFact(String currentName, String matchedName) {
-        learnCrossDomainFact(currentName, matchedName, null, null);
+        learnCrossDomainFact(null, currentName, matchedName, null, null);
     }
 
     /**
@@ -3121,7 +3003,15 @@ public final class EpisodeNameMatcher {
      */
     public static void learnCrossDomainFact(String currentName, String matchedName,
                                             List<String> sourceNames, List<String> targetNames) {
-        if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName)) {
+        learnCrossDomainFact(null, currentName, matchedName, sourceNames, targetNames);
+    }
+
+    /**
+     * 带剧名（showKey）重载（r122）：强证据写入<b>该剧</b>的统一日期表（不再有全局事实表）。
+     */
+    public static void learnCrossDomainFact(String showKey, String currentName, String matchedName,
+                                            List<String> sourceNames, List<String> targetNames) {
+        if (TextUtils.isEmpty(showKey) || TextUtils.isEmpty(currentName) || TextUtils.isEmpty(matchedName)) {
             return;
         }
         int curDate = dateOf(currentName);
@@ -3132,7 +3022,7 @@ public final class EpisodeNameMatcher {
         // 方向一：旧源给日期、新源给期号
         if (curDate > 0 && curOrd <= 0 && tgtOrd > 0 && tgtOrd < 1000) {
             if (rankConsistent(tgtOrd, matchedName, sourceNames, targetNames)) {
-                rememberCrossDomainFact(tgtOrd, curDate, part);
+                tblPut(showKey.trim(), tgtOrd, curDate, part);
             }
             return;
         }
@@ -3140,7 +3030,7 @@ public final class EpisodeNameMatcher {
         // 守卫要在**目标列表**里查命中项的序，故传 matchedName（不是 currentName）
         if (curOrd > 0 && curOrd < 1000 && curDate <= 0 && tgtDate > 0) {
             if (rankConsistent(curOrd, matchedName, sourceNames, targetNames)) {
-                rememberCrossDomainFact(curOrd, tgtDate, part);
+                tblPut(showKey.trim(), curOrd, tgtDate, part);
             }
             return;
         }
@@ -3178,19 +3068,19 @@ public final class EpisodeNameMatcher {
      *
      * @return 目标列表下标；无记录或目标列表里找不到该日期时返回 -1
      */
-    private static int alignByRememberedFact(String currentName, int curOrdinal,
+    private static int alignByRememberedFact(String showKey, String currentName, int curOrdinal,
                                              boolean curHasDate, int curDate,
                                              int wantPart0, List<String> targetNames) {
         int wantDate = -1;
         int wantOrdinal = -1;
         if (curHasDate) {
-            wantOrdinal = recallOrdinalOfDate(curDate, wantPart0);
+            wantOrdinal = lookupOrdinalOfDate(showKey, curDate, wantPart0);
             if (wantOrdinal <= 0) {
-                wantOrdinal = recallOrdinalOfDate(curDate, PART_NONE);
+                wantOrdinal = lookupOrdinalOfDate(showKey, curDate, PART_NONE);
             }
             if (wantOrdinal <= 0) {
                 // 表里没有这一天 → 用已有锚点外推它的期号
-                wantOrdinal = ordinalOfDateByFacts(curDate, wantPart0);
+                wantOrdinal = ordinalOfDateByFacts(showKey, curDate, wantPart0);
             }
             if (wantOrdinal > 0) {
                 // 有期号 → 按期号在目标里找。
@@ -3205,9 +3095,9 @@ public final class EpisodeNameMatcher {
             return -1;
         }
         if (curOrdinal > 0) {
-            wantDate = recallDateOfOrdinal(curOrdinal, wantPart0);
+            wantDate = lookupDateOfOrdinal(showKey, curOrdinal, wantPart0);
             if (wantDate <= 0) {
-                wantDate = recallDateOfOrdinal(curOrdinal, PART_NONE);
+                wantDate = lookupDateOfOrdinal(showKey, curOrdinal, PART_NONE);
             }
             if (wantDate > 0) {
                 int byDate = findIndexByDate(String.valueOf(wantDate), targetNames, currentName);
@@ -3216,7 +3106,7 @@ public final class EpisodeNameMatcher {
                 }
             }
             // 查表没有这一期 → 用已有锚点拟合周更节奏外推（见 alignByFactExtrapolation）
-            return alignByFactExtrapolation(curOrdinal, wantPart0, currentName, targetNames);
+            return alignByFactExtrapolation(showKey, curOrdinal, wantPart0, currentName, targetNames);
         }
         return -1;
     }
@@ -3240,9 +3130,13 @@ public final class EpisodeNameMatcher {
      *
      * @return 目标列表下标；锚点不足或落位失败返回 -1
      */
-    private static int alignByFactExtrapolation(int curOrdinal, int wantPart0,
+    private static int alignByFactExtrapolation(String showKey, int curOrdinal, int wantPart0,
                                                  String currentName, List<String> targetNames) {
         if (curOrdinal <= 0 || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        Map<String, Integer> om = showKey == null ? null : TBL_ORD_TO_DATE.get(showKey.trim());
+        if (om == null || om.isEmpty()) {
             return -1;
         }
         int p = normalizePart(wantPart0);
@@ -3251,7 +3145,7 @@ public final class EpisodeNameMatcher {
         long baseDay = 0;
         int baseOrd = 0;
         int anchors = 0;
-        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+        for (Map.Entry<String, Integer> e : om.entrySet()) {
             String key = e.getKey();
             int bar = key.lastIndexOf('|');
             if (bar <= 0) {
@@ -3285,7 +3179,7 @@ public final class EpisodeNameMatcher {
         int ordGap = maxOrd - minOrd;
         long daySpan = 0;
         int baseDate = 0;
-        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+        for (Map.Entry<String, Integer> e : om.entrySet()) {
             String key = e.getKey();
             int bar = key.lastIndexOf('|');
             if (bar <= 0 || parseIntSafe(key.substring(bar + 1), -1) != p) {
@@ -3301,7 +3195,7 @@ public final class EpisodeNameMatcher {
             return -1;
         }
         int maxDate = 0;
-        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+        for (Map.Entry<String, Integer> e : om.entrySet()) {
             String key = e.getKey();
             int bar = key.lastIndexOf('|');
             if (bar <= 0 || parseIntSafe(key.substring(bar + 1), -1) != p) {
@@ -3385,22 +3279,26 @@ public final class EpisodeNameMatcher {
      *
      * @return 期号；无法确定时返回 -1
      */
-    private static int ordinalOfDateByFacts(int date, int part) {
+    private static int ordinalOfDateByFacts(String showKey, int date, int part) {
         if (date <= 0) {
             return -1;
         }
         int p = normalizePart(part);
-        int exact = recallOrdinalOfDate(date, p);
+        int exact = lookupOrdinalOfDate(showKey, date, p);
         if (exact > 0) {
             return exact;
         }
-        exact = recallOrdinalOfDate(date, PART_NONE);
+        exact = lookupOrdinalOfDate(showKey, date, PART_NONE);
         if (exact > 0) {
             return exact;
+        }
+        Map<String, Integer> om = showKey == null ? null : TBL_ORD_TO_DATE.get(showKey.trim());
+        if (om == null || om.isEmpty()) {
+            return -1;
         }
         // 收集本分段下所有锚点：期号 → 日期
         List<int[]> anchors = new ArrayList<>();   // {ordinal, date}
-        for (Map.Entry<String, Integer> e : FACT_ORDINAL_TO_DATE.entrySet()) {
+        for (Map.Entry<String, Integer> e : om.entrySet()) {
             String key = e.getKey();
             int bar = key.lastIndexOf('|');
             if (bar <= 0) {
