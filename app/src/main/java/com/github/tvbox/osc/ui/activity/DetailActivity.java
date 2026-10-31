@@ -13,6 +13,7 @@ import android.os.Bundle;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
@@ -5810,17 +5811,69 @@ public class DetailActivity extends BaseActivity {
      *
      * @return 目标源下标；无法可靠匹配返回 -1
      */
+    /** ★ r125 诊断开关：定位 L1.6 日期表为何未生效（定稿后可关）。 */
+    private static final boolean DBG_DATE = true;
+    private static final String DBG_TAG = "TVBox-DBG";
+    private static final java.util.HashSet<String> DBG_DUMPED_SHOWS = new java.util.HashSet<>();
+
     /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
     private void ensureDateTablesBuilt() {
         try {
             if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.size() < 2) return;
             java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
-            for (java.util.List<VodInfo.VodSeries> l : vodInfo.seriesMap.values()) {
+            java.util.List<String> srcKeys = new java.util.ArrayList<>();
+            for (java.util.Map.Entry<String, java.util.List<VodInfo.VodSeries>> en : vodInfo.seriesMap.entrySet()) {
+                java.util.List<VodInfo.VodSeries> l = en.getValue();
                 if (l == null) continue;
                 all.add(seriesNames(l));
+                srcKeys.add(en.getKey());
             }
             String showKey = TextUtils.isEmpty(detailFallbackAnchorTitle) ? vod_name : detailFallbackAnchorTitle;
             EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+            // ★ r125 诊断：每部剧仅首帧 dump 一次，输出各线路完整集名 + 建表后 o0..o8 映射，
+            //   用于定位「表空/配对错位」与补齐日志被 logcat 截断的完整列表。
+            if (DBG_DATE && DBG_DUMPED_SHOWS.add(showKey)) {
+                Log.i(DBG_TAG, "[DBG-BUILD] r125-diag show=" + showKey + " lists=" + all.size());
+                dbgDumpDateState(showKey, all, srcKeys);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** ★ r125 诊断：把每条线路的完整集名按 <1800 字符分块打点，并按 o0..o8 打印日期表映射。 */
+    private void dbgDumpDateState(String showKey, java.util.List<java.util.List<String>> all, java.util.List<String> srcKeys) {
+        if (!DBG_DATE) return;
+        try {
+            if (all != null) {
+                for (int li = 0; li < all.size(); li++) {
+                    java.util.List<String> l = all.get(li);
+                    if (l == null) continue;
+                    String srcKey = (srcKeys != null && li < srcKeys.size()) ? srcKeys.get(li) : ("#" + li);
+                    StringBuilder sb = new StringBuilder();
+                    int ci = 0;
+                    for (int i = 0; i < l.size(); i++) {
+                        String e = l.get(i);
+                        if (e == null) e = "";
+                        String tok = i + ":" + e + "|";
+                        if (sb.length() + tok.length() > 1800) {
+                            Log.i(DBG_TAG, "[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
+                            sb.setLength(0);
+                        }
+                        sb.append(tok);
+                    }
+                    if (sb.length() > 0) {
+                        Log.i(DBG_TAG, "[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
+                    }
+                }
+            }
+            StringBuilder tb = new StringBuilder();
+            for (int ord = 0; ord <= 8; ord++) {
+                tb.append("o").append(ord)
+                        .append("|U=").append(EpisodeNameMatcher.lookupDateOfOrdinal(showKey, ord, EpisodeNameMatcher.PART_UP))
+                        .append("|D=").append(EpisodeNameMatcher.lookupDateOfOrdinal(showKey, ord, EpisodeNameMatcher.PART_DOWN))
+                        .append("; ");
+            }
+            Log.i(DBG_TAG, "[DBG-TBLMAP] show=" + showKey + " " + tb);
         } catch (Throwable ignored) {
         }
     }
@@ -6155,6 +6208,18 @@ public class DetailActivity extends BaseActivity {
                     ? vod_name : detailFallbackAnchorTitle;
             int byTable = EpisodeNameMatcher.matchByDateTable(
                     tblShow, currentName, seriesNames(playList), targetNames);
+            if (DBG_DATE) {
+                // ★ r125 诊断：L1.6 每次尝试都留痕，看清 playList 是哪条源、目标是否期号式、查表结果。
+                Log.i(DBG_TAG, "[DBG-L16] show=" + tblShow
+                        + " cur=" + currentName
+                        + " playIdx=" + playIndex
+                        + " playSize=" + (playList == null ? -1 : playList.size())
+                        + " play0=" + (playList == null || playList.isEmpty() ? "" : playList.get(0).name)
+                        + " tgtSize=" + (targetNames == null ? -1 : targetNames.size())
+                        + " tgt0=" + (targetNames == null || targetNames.isEmpty() ? "" : targetNames.get(0))
+                        + " cross=" + EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)
+                        + " byTable=" + byTable);
+            }
             if (byTable >= 0) {
                 LOG.sw("[FB] dateTableAnchor ep=" + currentName + " -> idx=" + byTable
                         + " tgt=" + targetNames.get(byTable));
