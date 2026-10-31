@@ -2147,7 +2147,11 @@ public class DetailActivity extends BaseActivity {
         long total = switchStartedAt == 0L ? 0L : (now - switchStartedAt);
         LOG.sw("[FB] phase " + currentSwitchPhase + " -> " + p
                 + " costMs=" + cost + " totalMs=" + total
-                + (total > SWITCH_TOTAL_BUDGET_MS ? " (OVER_BUDGET)" : ""));
+                // ★ r130：手动切源不计入预算——否则"人工连点测匹配"会在日志里刷满 OVER_BUDGET，
+                //   把正常的测试节奏误读成"自动兜底卡死"。manual 轮次只标 (manual)，不做超预算告警。
+                + (detailFallbackManualSwap
+                        ? " (manual)"
+                        : (total > SWITCH_TOTAL_BUDGET_MS ? " (OVER_BUDGET)" : "")));
         currentSwitchPhase = p;
         switchPhaseStartedAt = now;
     }
@@ -6873,9 +6877,19 @@ public class DetailActivity extends BaseActivity {
                     + "/" + newIndex + "/" + newSeriesName + " => " + oldTime);
             // 新源该集已有记忆（整片搬移时可能已搬到）⇒ 以新源为准，不覆盖
             long nowVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            boolean wrote = false;
             if (nowVal <= 0) {
                 PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+                wrote = true;
             }
+            // ★ r130：迁移结果可观测——此前只有 oldTime/newVal(=迁移前新源的旧值，通常 0)，
+            //   无法判断"这条进度到底写没写进新源"。配合 PlayFragment 的 [FB] progressRead
+            //   即可验证"写进去了 / 起播读到了"，把"切源后进度丢失"变成可量化的指标。
+            LOG.sw("[FB] migrateResult oldTime=" + oldTime
+                    + " existed=" + nowVal
+                    + " wrote=" + (wrote ? oldTime : 0)
+                    + " keep=" + (wrote ? "new" : "existing")
+                    + " ep=" + newSeriesName);
             // ★ v99-r75：旧源这一条已复制到新源 ⇒ 删掉，避免同一部片在多个源各留一份。
             //   （打墓碑 + markDirty ⇒ 同步侧能正确知道"这条被迁走了"）
             PlayProgressManager.delete(oldRecord.sourceKey, oldRecord.id,
