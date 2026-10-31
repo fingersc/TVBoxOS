@@ -214,6 +214,10 @@ public final class EpisodeNameMatcher {
             //   「20260915陈瑶慢直播」「歌手后花园」「第20260829期人物篇」——
             //   它们都带期号，旧词表判不出衍生 ⇒ 与正片同分竞争，findIndex 平手取先到就切错。
             + "|企划|大放送|看片会|慢直播|后花园|人物篇"
+            // ★ r123：真机《我家那闺女2026》里有「20260821闺女面对面第2期」(先导子节目) 与
+            //   「闺女生活盲盒大放送第2期」等衍生，二者都带第N期编号、与正片「第2期上」撞号，
+            //   而旧词表缺「面对面 / 盲盒」⇒ 被当正片 → 错切到「面对面第2期 / 0903盲盒」。
+            + "|面对面|盲盒"
             // ★ r38：真实综艺样本（9881 条去重集名，抓自 5 个源站）里出现频次高、
             //   语义明确为衍生的词根：超前363 / 会员169 / 番外62 / 精编43 /
             //   未播36 / 手记36 / vlog23 / 发布会14 / 彩排6。
@@ -650,7 +654,10 @@ public final class EpisodeNameMatcher {
             boolean cn = isNonMainFeature(currentName);
             boolean tn = isNonMainFeature(targetName);
             if (cn != tn) {
-                return NON_MAIN_PENALTY;       // 一正一副：降权但仍保留为候选（沿用旧口径）
+                // ★ r123 统一门槛：正片 ↔ 衍生 属不同系列，一律不配（不再 30 分弱匹配）。
+                //   否则「第2期上」(正片) 在目标源只余「闺女面对面第2期/盲盒第2期」(衍生) 时
+                //   会被 30 分接受 → 错切到衍生条目。用户口径：有衍生词的集不与无衍生词的集匹配。
+                return 0;
             }
             if (cn) {
                 // ★ r117：非正片 vs 非正片、规范系列不同 → 0（理由同轴 1）。
@@ -2388,6 +2395,10 @@ public final class EpisodeNameMatcher {
     private static final Map<String, Map<String, Integer>> TBL_DATE_TO_ORD =
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final int TBL_LIMIT_PER_SHOW = 600;
+    // ★ r123：日期表持久化格式版本。旧版（r121/r122）落盘的条目可能含现已判定为错误的映射
+    //   （如 第2期上→0903盲盒），载入时版本不符则整表丢弃重建 —— 让错误条目能"自愈"，
+    //   不再被永久化。修改表语义/词表时须同步 bump 此版本号。
+    private static final int TBL_PERSIST_VERSION = 2;
     // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
     private static final java.util.Set<String> TBL_CONFLICT =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
@@ -2420,6 +2431,21 @@ public final class EpisodeNameMatcher {
         try {
             r = new java.io.BufferedReader(new java.io.InputStreamReader(
                     new java.io.FileInputStream(dateTableFile), "UTF-8"));
+            // 首行版本头自愈：旧格式(无版本头)或版本不符 → 丢弃旧表重建，避免错误映射永久化
+            String head = r.readLine();
+            int ver = -1;
+            if (head != null && head.startsWith("#TBL")) {
+                int tb = head.indexOf('\t');
+                if (tb >= 0) {
+                    try { ver = Integer.parseInt(head.substring(tb + 1).trim()); } catch (Exception ex) { ver = -1; }
+                }
+            }
+            if (ver != TBL_PERSIST_VERSION) {
+                TBL_ORD_TO_DATE.clear();
+                TBL_DATE_TO_ORD.clear();
+                TBL_CONFLICT.clear();
+                return;
+            }
             String line;
             while ((line = r.readLine()) != null) {
                 String[] p = line.split("\t");
@@ -2450,6 +2476,7 @@ public final class EpisodeNameMatcher {
         try {
             w = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
                     new java.io.FileOutputStream(dateTableFile), "UTF-8"));
+            w.write("#TBL\t" + TBL_PERSIST_VERSION + "\n");
             for (Map.Entry<String, Map<String, Integer>> e : TBL_ORD_TO_DATE.entrySet()) {
                 for (Map.Entry<String, Integer> kv : e.getValue().entrySet()) {
                     w.write(e.getKey());
@@ -2479,8 +2506,10 @@ public final class EpisodeNameMatcher {
 
     private static boolean tblIsDeriv(String name) {
         if (TextUtils.isEmpty(name)) return true;
-        for (String w : TBL_DERIV) if (name.contains(w)) return true;
-        return false;
+        // ★ r123 统一词表：与 isNonMainFeature 同源判定衍生，杜绝"两套衍生词表不一致"
+        //   （旧 TBL_DERIV 缺 人物篇/看片会/慢直播/后花园/会员/番外/精编/未播/vlog/发布会/彩排，
+        //    且旧 NON_MAIN_FEATURE 缺 面对面/盲盒）导致建表把衍生/先导当正片、序列错位。
+        return isNonMainFeature(name);
     }
 
     /**
@@ -2499,6 +2528,7 @@ public final class EpisodeNameMatcher {
             if (lst == null) continue;
             for (String n : lst) {
                 if (TextUtils.isEmpty(n)) continue;
+                if (tblIsDeriv(n)) continue;      // ★ r123：混合名入表也要过滤衍生（面对面/盲盒/人物篇…）
                 String of = hybridOrdinalForm(n);
                 if (TextUtils.isEmpty(of)) continue;
                 int o = tblOrdinalOf(of);
@@ -4356,11 +4386,11 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
                 continue;
             }
 
-            // 当前是非正片：优先同词
+            // 当前是非正片：仅接受同一规范衍生系列（不同衍生系列不配，避免跨系列错切）
             if (nonMain && curToken != null && curToken.equals(nonMainFeatureToken(name))) {
                 return i;
             }
-            if (sameTokenFallback < 0) {
+            if (sameTokenFallback < 0 && sameNonMainSeries(currentName, name)) {
                 sameTokenFallback = i;
             }
         }
