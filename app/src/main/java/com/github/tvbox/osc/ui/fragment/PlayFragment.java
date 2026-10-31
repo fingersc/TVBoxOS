@@ -2659,8 +2659,18 @@ public class PlayFragment extends BaseLazyFragment {
         // 与 DetailActivity L1.6 同源同序（改一处必须改另一处）。表由 buildDateTableForVod 提前建好。
         {
             String tblShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            // ★ r126：建表/查表用的「源」必须是【包含 currentName 的线路】（通常旧源=期号式）；
+            //   切源途中 getPlayingSeriesList() 可能已指向目标日期源 → 拿到「日期×日期」无法建表。
+            List<String> tblSourceNames = seriesNames(playList);
+            if ((tblSourceNames == null || !tblSourceNames.contains(currentName))
+                    && mVodInfo != null && mVodInfo.seriesMap != null) {
+                for (List<VodInfo.VodSeries> l : mVodInfo.seriesMap.values()) {
+                    List<String> cand = seriesNames(l);
+                    if (cand != null && cand.contains(currentName)) { tblSourceNames = cand; break; }
+                }
+            }
             int byTable = EpisodeNameMatcher.matchByDateTable(
-                    tblShow, currentName, seriesNames(playList), targetNames);
+                    tblShow, currentName, tblSourceNames, targetNames);
             if (byTable >= 0) {
                 return byTable;
             }

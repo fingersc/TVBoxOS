@@ -5815,6 +5815,30 @@ public class DetailActivity extends BaseActivity {
     private static final boolean DBG_DATE = true;
     private static final String DBG_TAG = "TVBox-DBG";
     private static final java.util.HashSet<String> DBG_DUMPED_SHOWS = new java.util.HashSet<>();
+    private static final java.util.HashSet<String> DBG_DUMPED_SRC = new java.util.HashSet<>();
+
+    /** ★ r125/r126 诊断：把 L1.6 实际使用的「源」列表完整集名按 <1800 字符分块打点，每剧一次。 */
+    private void dbgDumpSourceOnce(String showKey, java.util.List<String> src) {
+        if (!DBG_DATE || src == null) return;
+        if (!DBG_DUMPED_SRC.add(showKey)) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            int ci = 0;
+            for (int i = 0; i < src.size(); i++) {
+                String e = src.get(i) == null ? "" : src.get(i);
+                String tok = i + ":" + e + "|";
+                if (sb.length() + tok.length() > 1800) {
+                    Log.i(DBG_TAG, "[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci++) + " " + sb);
+                    sb.setLength(0);
+                }
+                sb.append(tok);
+            }
+            if (sb.length() > 0) {
+                Log.i(DBG_TAG, "[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci) + " " + sb);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
 
     /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
     private void ensureDateTablesBuilt() {
@@ -6206,19 +6230,25 @@ public class DetailActivity extends BaseActivity {
         {
             String tblShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
                     ? vod_name : detailFallbackAnchorTitle;
+            // ★ r126：建表/查表用的「源」必须是【包含 currentName 的那条线路】（通常是旧源=期号式），
+            //   而不是 getPlayingSeriesList()——切源途中它可能已指向目标日期源，导致拿到「日期×日期」
+            //   无法建表（这正是 r121~r125 L1.6 恒 -1、落到 L2 簇秩猜成 20260913上 的真因）。
+            //   getRankSourceList 会优先返回旧源快照 detailFallbackSourceNames（当它含 currentName 时）。
+            List<String> tblSourceNames = getRankSourceList(currentName);
             int byTable = EpisodeNameMatcher.matchByDateTable(
-                    tblShow, currentName, seriesNames(playList), targetNames);
+                    tblShow, currentName, tblSourceNames, targetNames);
             if (DBG_DATE) {
-                // ★ r125 诊断：L1.6 每次尝试都留痕，看清 playList 是哪条源、目标是否期号式、查表结果。
+                // ★ r125/r126 诊断：L1.6 每次尝试留痕——看清「源」是哪条、它是否含 currentName、查表结果。
                 Log.i(DBG_TAG, "[DBG-L16] show=" + tblShow
                         + " cur=" + currentName
-                        + " playIdx=" + playIndex
-                        + " playSize=" + (playList == null ? -1 : playList.size())
-                        + " play0=" + (playList == null || playList.isEmpty() ? "" : playList.get(0).name)
+                        + " srcSize=" + (tblSourceNames == null ? -1 : tblSourceNames.size())
+                        + " src0=" + (tblSourceNames == null || tblSourceNames.isEmpty() ? "" : tblSourceNames.get(0))
+                        + " srcHas=" + (tblSourceNames != null && tblSourceNames.contains(currentName))
                         + " tgtSize=" + (targetNames == null ? -1 : targetNames.size())
                         + " tgt0=" + (targetNames == null || targetNames.isEmpty() ? "" : targetNames.get(0))
                         + " cross=" + EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)
                         + " byTable=" + byTable);
+                dbgDumpSourceOnce(tblShow, tblSourceNames);
             }
             if (byTable >= 0) {
                 LOG.sw("[FB] dateTableAnchor ep=" + currentName + " -> idx=" + byTable

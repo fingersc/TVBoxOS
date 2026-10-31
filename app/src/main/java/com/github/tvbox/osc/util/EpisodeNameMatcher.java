@@ -2398,7 +2398,8 @@ public final class EpisodeNameMatcher {
     // ★ r123：日期表持久化格式版本。旧版（r121/r122）落盘的条目可能含现已判定为错误的映射
     //   （如 第2期上→0903盲盒），载入时版本不符则整表丢弃重建 —— 让错误条目能"自愈"，
     //   不再被永久化。修改表语义/词表时须同步 bump 此版本号。
-    private static final int TBL_PERSIST_VERSION = 2;
+    //   r126：日期表口径修正(L1.6 改用旧源/期号式源建表) + 丢弃历史错误表，故 bump 到 3。
+    private static final int TBL_PERSIST_VERSION = 3;
     // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
     private static final java.util.Set<String> TBL_CONFLICT =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
