@@ -2503,6 +2503,25 @@ public class PlayFragment extends BaseLazyFragment {
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
         // ★ r124：切源前保险——确保「期号↔日期」表已按整部剧所有线路建好（幂等，含历史跳播场景）
         ensureDateTablesBuilt();
+        // ---------- 第-1.5层 r131（方案B）：区间合集条目「第1-20集」——只认完全同名 ----------
+        // 与 DetailActivity.findMatchingEpisodeIndex 同一套规则，两个入口必须一致：
+        //   区间条目（第A-B集）解析不到任何域、会被判成「非正片」从而被 nonMainSafe 恒 -1 拦死，
+        //   上层误判成「目标源没有这一集」→ 逐源轮转。这里只做"完全同名"定位，找不到就 -1。
+        if (currentSeries != null && targetList != null && !targetList.isEmpty()
+                && EpisodeNameMatcher.isEpisodeRangeLabel(currentSeries.name)) {
+            int byExact = -1;
+            for (int i = 0; i < targetList.size(); i++) {
+                VodInfo.VodSeries s = targetList.get(i);
+                if (s != null && TextUtils.equals(currentSeries.name, s.name)) {
+                    byExact = i;
+                    break;
+                }
+            }
+            LOG.sw("[FB] rangeExact ep=" + currentSeries.name
+                    + (byExact >= 0 ? " -> idx=" + byExact + " tgt=" + targetList.get(byExact).name
+                                    : " miss -> -1 (区间条目无同名，放弃该源)"));
+            return byExact;
+        }
         int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)
                 || targetList == null || targetList.isEmpty()) {

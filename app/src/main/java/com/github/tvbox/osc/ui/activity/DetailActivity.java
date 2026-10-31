@@ -1638,6 +1638,13 @@ public class DetailActivity extends BaseActivity {
     private String  vod_picture="";
     private String  vod_name="";
     private void initData() {
+        // r133：补拉候选详情的独立出口（刻意不用 detailResult，避免污染切源判定）。
+        sourceViewModel.prefetchDetailResult.observe(this, new Observer<AbsXml>() {
+            @Override
+            public void onChanged(AbsXml xml) {
+                onPrefetchDetailArrived(xml);
+            }
+        });
         Intent intent = getIntent();
         if (intent != null && intent.getExtras() != null) {
             Bundle bundle = intent.getExtras();
@@ -1974,6 +1981,11 @@ public class DetailActivity extends BaseActivity {
         LOG.sw("[FB] switchStart manual=" + (manual ? 1 : 0)
                 + " from=" + sourceKey + " cycleNo=" + detailFallbackCycleCount);
         detailFallbackDenyMsg = "";
+        // r133：每次切源前，把「此刻已知的候选源」扫一遍补充建表素材（每个片名只扫一次）。
+        try {
+            sweepPoolCandidatesForTables();
+        } catch (Throwable ignored) {
+        }
         if (isFinishing()) {
             return false;
         }
@@ -2743,6 +2755,142 @@ public class DetailActivity extends BaseActivity {
      * <p>用锚 key 读池（与轮转/择优同一口径）。只有 1 条时说明没得选，
      * 集数校验不启动（避免把唯一候选记死后无源可切）。</p>
      */
+    /**
+     * r133：把候选源自带的集列表（若有）并入该剧日期表的建表素材。
+     *
+     * <p>攒池阶段本来就在全网搜索（ac=detail），部分源回包会把播放列表解析进 {@code video.urlBean}，
+     * 这类源无需再发一次详情请求，就地收集即可。同一站点组只取第一份：
+     * {@link #stationGroupOf(String)} 去掉「1-」「2-」这类序号前缀后比较，
+     * 使 1-非凡 / 2-非凡 / 3-非凡 这种本质同站的候选只贡献一次。
+     */
+    private void harvestCandidateSeries(Movie.Video video) {
+        if (video == null) return;
+        String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
+        if (TextUtils.isEmpty(show)) return;
+        String station = stationGroupOf(video.sourceKey);
+        if (TextUtils.isEmpty(station)) return;
+        java.util.List<String> names = seriesNamesOf(video);
+        if (names == null || names.size() < 2) {
+            // 回包没带集列表 → 排进「补拉详情」队列（同站点组只排第一个）。
+            enqueuePrefetch(video, show.trim(), station);
+            return;
+        }
+        commitHarvest(show.trim(), station, names, video.sourceKey);
+    }
+
+    /** r133：把一份集列表并入该剧日期表素材（同站只取第一份）。 */
+    private void commitHarvest(String show, String station, java.util.List<String> names, String sourceKey) {
+        if (names == null || names.size() < 2 || TextUtils.isEmpty(show)) return;
+        if (!detailTableStationSeen.add(show + "|" + station)) return;
+        java.util.List<java.util.List<String>> batch = new java.util.ArrayList<>(1);
+        batch.add(names);
+        EpisodeNameMatcher.buildDateTableForVod(show, batch);
+        LOG.sw("[FB] harvestSeries show=" + show + " station=" + station
+                + " src=" + sourceKey + " n=" + names.size());
+    }
+
+    /** r133：候选没带集列表时补拉详情；同站点组只排一次，队列串行。 */
+    private void enqueuePrefetch(Movie.Video video, String show, String station) {
+        if (video == null || TextUtils.isEmpty(video.sourceKey) || TextUtils.isEmpty(video.id)) return;
+        if (!detailTableStationSeen.add("q|" + show + "|" + station)) return;
+        if (!prefetchQueuedKeys.add(video.sourceKey + "|" + video.id)) return;
+        prefetchQueue.add(video.sourceKey + "|" + video.id + '\u0001' + show + '\u0001' + station);
+        pumpPrefetch();
+    }
+
+    /** r133：切源前扫一遍当前候选池，把还没进过表的源补上（每个片名只扫一次）。 */
+    private void sweepPoolCandidatesForTables() {
+        String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? "" : detailFallbackAnchorTitle.trim();
+        if (TextUtils.isEmpty(show)) return;
+        if (!prefetchSweptShows.add(show)) return;
+        List<Movie.Video> pool = poolOf(show);
+        if (pool == null || pool.isEmpty()) return;
+        for (Movie.Video v : pool) {
+            try {
+                harvestCandidateSeries(v);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void pumpPrefetch() {
+        if (prefetchBusy || prefetchQueue.isEmpty()) return;
+        String item = prefetchQueue.poll();
+        String[] parts = item.split("\u0001", 3);
+        String key = parts[0];
+        prefetchInFlightKey = key;
+        prefetchInFlightShow = parts.length > 1 ? parts[1] : "";
+        prefetchInFlightStation = parts.length > 2 ? parts[2] : "";
+        int bar = key.indexOf('|');
+        String sourceKey = bar < 0 ? key : key.substring(0, bar);
+        String id = bar < 0 ? "" : key.substring(bar + 1);
+        if (TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(id)) {
+            prefetchInFlightKey = null;
+            pumpPrefetch();
+            return;
+        }
+        prefetchBusy = true;
+        try {
+            sourceViewModel.prefetchDetail(sourceKey, id);
+        } catch (Throwable t) {
+            prefetchBusy = false;
+            prefetchInFlightKey = null;
+        }
+    }
+
+    /** r133：补拉详情回来 → 收集集列表并入日期表素材，然后放行下一个。 */
+    private void onPrefetchDetailArrived(AbsXml xml) {
+        String show = TextUtils.isEmpty(prefetchInFlightShow) ? detailFallbackAnchorTitle : prefetchInFlightShow;
+        String station = prefetchInFlightStation;
+        String key = prefetchInFlightKey;
+        try {
+            if (xml != null && xml.movie != null && xml.movie.videoList != null) {
+                for (Movie.Video v : xml.movie.videoList) {
+                    if (v == null) continue;
+                    java.util.List<String> names = seriesNamesOf(v);
+                    if (names != null) {
+                        commitHarvest(TextUtils.isEmpty(show) ? (v.name == null ? "" : v.name.trim()) : show,
+                                station, names, key);
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        prefetchBusy = false;
+        prefetchInFlightKey = null;
+        prefetchInFlightShow = null;
+        prefetchInFlightStation = null;
+        pumpPrefetch();
+    }
+
+    /** r133：从候选的 urlBean 里取第一条有内容的线路的集名；没有则返回 null。 */
+    private static java.util.List<String> seriesNamesOf(Movie.Video video) {
+        if (video == null || video.urlBean == null || video.urlBean.infoList == null) return null;
+        for (Movie.Video.UrlBean.UrlInfo info : video.urlBean.infoList) {
+            if (info == null || info.beanList == null || info.beanList.isEmpty()) continue;
+            java.util.List<String> one = new java.util.ArrayList<>(info.beanList.size());
+            for (Movie.Video.UrlBean.UrlInfo.InfoBean bean : info.beanList) {
+                if (bean != null && !TextUtils.isEmpty(bean.name)) one.add(bean.name);
+            }
+            if (!one.isEmpty()) return one;
+        }
+        return null;
+    }
+
+    /** r133：站点分组键 —— 去掉「1-」「2_」这类序号前缀，便于识别本质同站的多个源。 */
+    private static String stationGroupOf(String sourceKey) {
+        if (TextUtils.isEmpty(sourceKey)) return "";
+        String s = sourceKey.trim();
+        int i = 0;
+        while (i < s.length() && Character.isDigit(s.charAt(i))) i++;
+        if (i > 0 && i < s.length()) {
+            char c = s.charAt(i);
+            if (c == '-' || c == '_' || c == '.' || c == ' ') s = s.substring(i + 1);
+        }
+        return s.trim().toLowerCase();
+    }
+
     private int countSameStationCandidates(String sourceKey) {
         if (TextUtils.isEmpty(sourceKey)) {
             return 0;
@@ -3484,6 +3632,11 @@ public class DetailActivity extends BaseActivity {
                 // 只要片名精确命中就全部纳入（含当前正在播放的源，使一圈能真正闭合）。
                 cacheDetailFallbackCandidate(video);
                 cachedAny = true;
+                // r133：攒池回包若自带集列表，就地并入该剧日期表素材（同站只取第一份）。
+                try {
+                    harvestCandidateSeries(video);
+                } catch (Throwable ignored) {
+                }
             }
         }
         // ★ 提前消费：一旦本批结果里出现了可用候选，就安排一次「不再死等搜索收尾」的放片。
@@ -5025,6 +5178,21 @@ public class DetailActivity extends BaseActivity {
     private final List<String> quickSearchWord = new ArrayList<>();
     private ExecutorService searchExecutorService = null;
     private ExecutorService detailFallbackSearchExecutor;
+    /**
+     * r133：攒池阶段「顺带拉详情」的去重标记 —— key = 剧名 + '|' + 站点组。
+     * 同一站点组（如 1-非凡 / 2-非凡 / 3-非凡）只取第一份集列表，避免同一份列表被反复并入日期表。
+     */
+    private final Set<String> detailTableStationSeen = new HashSet<>();
+    /** r133：「补拉候选详情」队列（一次只放一个在飞，等回包再发下一个）。 */
+    private final java.util.ArrayDeque<String> prefetchQueue = new java.util.ArrayDeque<>();
+    private final Set<String> prefetchQueuedKeys = new HashSet<>();
+    /** r133：已经扫过候选池的片名（每个片名只扫一次，避免反复排补拉）。 */
+    private final Set<String> prefetchSweptShows = new HashSet<>();
+    private boolean prefetchBusy;
+    private String prefetchInFlightKey;
+    private String prefetchInFlightShow;
+    private String prefetchInFlightStation;
+
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     /**
      * 候选池（内存层），按归一化片名索引。
@@ -5942,6 +6110,29 @@ public class DetailActivity extends BaseActivity {
     private int findMatchingEpisodeIndex(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
         // ★ r124：切源前保险——确保「期号↔日期」表已按整部剧所有线路建好（幂等，含历史跳播场景）
         ensureDateTablesBuilt();
+        // ---------- 第-1.5层 r131（方案B）：区间合集条目「第1-20集」——只认完全同名 ----------
+        // 实测《人世间 2024》jinyingyun / xlyun / subyun 等源：整部剧只有 4 条
+        //   「第1-20集 / 第21-40集 / 第41-60集 / 第61-82集完结」，每条指向一个"整段播放页"。
+        //   这类名字没有 8 位日期、也不是规范「第N集」，parse 不到任何域 ⇒ 被判「非正片（衍生）」
+        //   ⇒ 下面的 nonMainSafe 按"同规范系列"比，恒 -1 ⇒ 上层误判成「目标源没有这一集」。
+        //   真机后果：一次手动切源触发 36 次 loadDetail、36 次 alignNoEpisode、5 轮 newCycle 的自动连跳。
+        //   ★ 方案B：不改 isMainFeatureEntry 的分类语义，只在切源入口按「完全同名」定位；
+        //     找不到就 -1（宁不切、不错切），绝不进入任何位置/簇秩猜测层。
+        if (currentSeries != null && targetList != null && !targetList.isEmpty()
+                && EpisodeNameMatcher.isEpisodeRangeLabel(currentSeries.name)) {
+            int byExact = -1;
+            for (int i = 0; i < targetList.size(); i++) {
+                VodInfo.VodSeries s = targetList.get(i);
+                if (s != null && TextUtils.equals(currentSeries.name, s.name)) {
+                    byExact = i;
+                    break;
+                }
+            }
+            LOG.sw("[FB] rangeExact ep=" + currentSeries.name
+                    + (byExact >= 0 ? " -> idx=" + byExact + " tgt=" + targetList.get(byExact).name
+                                    : " miss -> -1 (区间条目无同名，放弃该源)"));
+            return byExact;
+        }
         // ---------- 第-1层 r117：非正片（衍生集）安全入口 ----------
         // 当前在播的是非正片时，切源锚（URL日期锚/混合锚/正片簇秩）全对它关门，只能落到
         //   按位置/簇秩/裸下标猜的层 —— 实测「第20260511期彩蛋」被猜成「20260511特别加更」错切。

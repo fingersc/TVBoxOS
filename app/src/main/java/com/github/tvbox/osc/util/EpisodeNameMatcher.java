@@ -924,6 +924,27 @@ public final class EpisodeNameMatcher {
      * 备战篇/全纪录/小考/宿舍日记/“聚”乐部…），黑名单永远列不全；列不全的后果是
      * "正片簇序"整体偏移，跨域切源就会系统性错一期。</p>
      */
+    /**
+     * ★ r131：区间合集条目（{@code 第1-20集} / {@code 第21-40集} / {@code 第61-82集完结}）。
+     *
+     * <p>实测（人世间 2024，jinyingyun / xlyun / subyun 等源）整部剧只有 4 条：
+     * {@code 第1-20集}、{@code 第21-40集}、{@code 第41-60集}、{@code 第61-82集完结}，
+     * 每条指向一个"整段"播放页。这类名字既没有 8 位日期、也不是规范的「第N集」，
+     * 以前 parse 不到任何域 ⇒ 落到 {@code isMainFeatureEntry} 末尾 {@code return false}，
+     * 被判成「非正片（衍生）」。</p>
+     *
+     * <p>后果：切源时被第-1层 nonMainSafe 拦截、按"同规范系列"比对 ⇒ 恒 -1，
+     * 上层把它当成"目标源没有这一集"⇒ 一个源一个源地继续切 ⇒ 一次手动切源
+     * 触发 30 源 × 多轮自动连跳（真机日志：36 次 loadDetail / 36 次 alignNoEpisode / 5 轮 newCycle）。</p>
+     */
+    private static final java.util.regex.Pattern EP_RANGE_LABEL =
+            java.util.regex.Pattern.compile("第?\\s*\\d{1,4}\\s*[-~～—至]\\s*\\d{1,4}\\s*[集期]");
+
+    /** ★ r131：是不是「第A-B集/期」区间合集条目（整段正片，不是单集）。 */
+    public static boolean isEpisodeRangeLabel(String name) {
+        return name != null && EP_RANGE_LABEL.matcher(name).find();
+    }
+
     public static boolean isMainFeatureEntry(String name) {
         if (TextUtils.isEmpty(name)) {
             return false;
@@ -2563,6 +2584,52 @@ public final class EpisodeNameMatcher {
     private static final Map<String, String> TBL_BUILT_SIG =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    // ★ r132：按剧名累积「已知集列表」池（保序去重 + 限量），建表素材不再局限于已打开过的线路。
+    private static final java.util.Map<String, java.util.List<List<String>>> KNOWN_LISTS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int KNOWN_LISTS_PER_SHOW = 24;
+    private static final int KNOWN_SHOWS_MAX = 48;
+
+    private static java.util.List<List<String>> mergeKnownLists(String key,
+                                                               java.util.Collection<List<String>> incoming) {
+        java.util.List<List<String>> acc = KNOWN_LISTS.get(key);
+        if (acc == null) {
+            if (KNOWN_LISTS.size() >= KNOWN_SHOWS_MAX) {
+                java.util.Iterator<String> it = KNOWN_LISTS.keySet().iterator();
+                if (it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+            acc = new java.util.ArrayList<>();
+            KNOWN_LISTS.put(key, acc);
+        }
+        synchronized (acc) {
+            for (List<String> l : incoming) {
+                if (l == null || l.isEmpty() || acc.size() >= KNOWN_LISTS_PER_SHOW) continue;
+                if (!containsSameNames(acc, l)) acc.add(new java.util.ArrayList<>(l));
+            }
+            return new java.util.ArrayList<>(acc);
+        }
+    }
+
+    private static boolean containsSameNames(java.util.List<List<String>> acc, List<String> probe) {
+        for (List<String> one : acc) {
+            if (one.size() != probe.size()) continue;
+            boolean same = true;
+            for (int i = 0; i < one.size(); i++) {
+                String a = one.get(i);
+                String b = probe.get(i);
+                if (a == null ? b != null : !a.equals(b)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return true;
+        }
+        return false;
+    }
+
     /**
      * ★ r124 建表可靠化：传入本剧【所有线路】的集名列表，两两配对建「期号↔日期」表。
      * 与"切源时拿新源列表懒建"解耦——拿到整部剧 seriesMap 时一次按「期号源×日期源」正确姿势建好，
@@ -2572,11 +2639,12 @@ public final class EpisodeNameMatcher {
         if (TextUtils.isEmpty(showKey) || allLists == null) return;
         final String key = showKey.trim();
         if (key.isEmpty()) return;
-        java.util.List<List<String>> lists = new java.util.ArrayList<>();
+        // ★ r132：建表素材按剧名【累积】，不再局限于本次传入的这批线路。
+        //   切源过程中每加载一个源都会并入它的集列表 —— 即「该影片此刻现有的所有已知集列表」，
+        //   只要其中某条列表含有强依据（日期+期号混合名），就会被收进表里。
+        java.util.List<List<String>> lists = mergeKnownLists(key, allLists);
         StringBuilder sig = new StringBuilder();
-        for (List<String> l : allLists) {
-            if (l == null || l.isEmpty()) continue;
-            lists.add(l);
+        for (List<String> l : lists) {
             sig.append(l.size()).append(':');
             String f = l.get(0);
             String last = l.get(l.size() - 1);
@@ -2735,6 +2803,7 @@ public final class EpisodeNameMatcher {
         TBL_ORD_TO_DATE.remove(showKey.trim());
         TBL_DATE_TO_ORD.remove(showKey.trim());
         TBL_BUILT_SIG.remove(showKey.trim());
+        KNOWN_LISTS.remove(showKey.trim());
         clearGradeForShow(showKey.trim());
         persistDateTables();
     }
@@ -2745,6 +2814,7 @@ public final class EpisodeNameMatcher {
         TBL_DATE_TO_ORD.clear();
         TBL_CONFLICT.clear();
         TBL_BUILT_SIG.clear();
+        KNOWN_LISTS.clear();
         TBL_GRADE.clear();
         persistDateTables();
     }

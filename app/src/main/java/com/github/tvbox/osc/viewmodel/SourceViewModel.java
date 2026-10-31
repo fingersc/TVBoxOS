@@ -103,6 +103,13 @@ public class SourceViewModel extends ViewModel {
     public MutableLiveData<AbsXml> quickSearchResult;
     public MutableLiveData<AbsXml> detailFallbackSearchResult;
     public MutableLiveData<AbsXml> detailResult;
+    /**
+     * r133：攒池阶段「补拉候选源详情」的独立出口。
+     *
+     * <p>刻意不复用 {@link #detailResult}：详情页观察 detailResult 时会把它当作「当前播放源详情」，
+     * 补拉一个候选会污染 settled/fallbackResult 判定，把正常切源流程带偏。</p>
+     */
+    public MutableLiveData<AbsXml> prefetchDetailResult;
     public MutableLiveData<JSONObject> actionResult;
     public MutableLiveData<JSONObject> playResult;
     public Gson gson;
@@ -126,6 +133,7 @@ public class SourceViewModel extends ViewModel {
         quickSearchResult = new MutableLiveData<>();
         detailFallbackSearchResult = new MutableLiveData<>();
         detailResult = new MutableLiveData<>();
+        prefetchDetailResult = new MutableLiveData<>();
         actionResult = new MutableLiveData<>();
         playResult = new MutableLiveData<>();
         gson=new Gson();
