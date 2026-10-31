@@ -1143,6 +1143,7 @@ public class DetailActivity extends BaseActivity {
                         llLayout.removeCallbacks(detailFallbackDetailTimeout);
                     }
                     if (fallbackResult) {
+                        setSwitchPhase(SwitchPhase.MATCHING);
                         SourceBean fallbackSource = ApiConfig.get().getSource(sourceKey);
                         String fallbackName = fallbackSource == null ? sourceKey : fallbackSource.getName();
                         Toast.makeText(DetailActivity.this, "站点切换至" + fallbackName, Toast.LENGTH_SHORT).show();
@@ -2123,7 +2124,32 @@ public class DetailActivity extends BaseActivity {
      *
      * @return true 表示已经发起 loadDetail（或已转入全网搜索流程）
      */
+    // ================= r129(P2)：切源「显式阶段」+ 统一时钟（观测用，行为零变化）=================
+    // 背景：切源编排此前由上百个 detailFallback* 布尔字段拼出隐式状态，非法组合难以排查。
+    // 本版先落「单一阶段枚举 + 一轮切源总时钟」，只做记录/日志，不参与任何分支判定，
+    // 保证行为零变化；后续 P2 第二步再把各布尔收敛到该枚举上。
+    enum SwitchPhase { IDLE, SNAPSHOT, POOL, PICKING, LOADING_DETAIL, MATCHING, MIGRATING, PLAYING }
+    private volatile SwitchPhase currentSwitchPhase = SwitchPhase.IDLE;
+    private volatile long switchPhaseStartedAt = 0L;
+    private volatile long switchStartedAt = 0L;
+    private static final long SWITCH_TOTAL_BUDGET_MS = 90_000L; // 一轮切源总预算（观测基线，暂不强制）
+
+    private void setSwitchPhase(SwitchPhase p) {
+        if (p == null) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (p == currentSwitchPhase) { switchPhaseStartedAt = now; return; }
+        long cost = switchPhaseStartedAt == 0L ? 0L : (now - switchPhaseStartedAt);
+        if (currentSwitchPhase == SwitchPhase.IDLE || p == SwitchPhase.SNAPSHOT) switchStartedAt = now;
+        long total = switchStartedAt == 0L ? 0L : (now - switchStartedAt);
+        LOG.sw("[FB] phase " + currentSwitchPhase + " -> " + p
+                + " costMs=" + cost + " totalMs=" + total
+                + (total > SWITCH_TOTAL_BUDGET_MS ? " (OVER_BUDGET)" : ""));
+        currentSwitchPhase = p;
+        switchPhaseStartedAt = now;
+    }
+
     private boolean loadNextDetailFallbackFromCache() {
+        setSwitchPhase(SwitchPhase.PICKING);
         if (!detailFallbackCacheEntryUsable()) {
             // 缓存为空 → 只有这种情况才真正发起一次全网搜索
             if (!detailFallbackSearchCollecting) {
@@ -2180,6 +2206,7 @@ public class DetailActivity extends BaseActivity {
         showDetailFallbackIndicators(nextSource, video);
         markDetailFallbackInflight(nextSource, nextId);
         markSwitchFrom();
+        setSwitchPhase(SwitchPhase.LOADING_DETAIL);
         loadDetail(nextId, nextSource, true);
         return true;
     }
@@ -4795,6 +4822,7 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void resetDetailFallback() {
+        setSwitchPhase(SwitchPhase.IDLE);
         resetDetailFallback(false);
     }
 
@@ -6205,25 +6233,7 @@ public class DetailActivity extends BaseActivity {
             }
         }
 
-        // ---------- 第1.5层：同日期多段的组内位置对齐 ----------
-        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
-        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
-        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
-        // 必须在跨域联网之前做：这是纯本地、零延迟、且确定性的判断。
-        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
-        int playIndex = indexOfSeries(playList, currentSeries);
-        if (playIndex < 0 && vodInfo != null && vodInfo.playIndex >= 0 && vodInfo.playIndex < playList.size()) {
-            playIndex = vodInfo.playIndex;
-        }
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
-                    currentName, playIndex, seriesNames(playList), targetNames);
-            if (byGroup >= 0) {
-                return byGroup;
-            }
-        }
-
-        // ---------- 第1.6层：日期表（期号↔日期；情形1混合名 + 情形4组序对齐）→ 查表按形态选条（r121）----------
+        // ---------- 第1.6层（Tier A · 强证据）：日期表（期号↔日期；r128 起只由混合名等强证据建立）→ 查表按形态选条（r121）----------
         // 优先于跨域簇秩猜：用两侧真实列表建/查「期号↔日期」表，期号式当前集名查得日期后按日期落位，
         // 命中即返回；查不到（表未覆盖/该剧无配对源/不可信）原样放行给第2层旧链路（零回归）。
         // 修《我家那闺女2026》「第2期上」被簇秩猜成「20260913上」（应 20260906上）。
@@ -6289,19 +6299,33 @@ public class DetailActivity extends BaseActivity {
             }
         }
 
-        // ---------- 第3层：本地按序兜底（猜测，仅在列表构成一致时成立）----------
-        List<VodInfo.VodSeries> sourceList = getPlayingSeriesList();
-        int sourceIndex = indexOfSeries(sourceList, currentSeries);
-        if (sourceIndex < 0 && vodInfo != null && vodInfo.playIndex >= 0 && vodInfo.playIndex < sourceList.size()) {
-            sourceIndex = vodInfo.playIndex;
+        // ---------- 第1.5层（Tier B · 兜底）：同日期多段的组内位置对齐 ----------
+        // 从"日期表/簇秩/联网"之前移到末尾：组内位置是纯位置猜测，只在所有强证据层全落空时使用。
+        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
+        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
+        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
+        // ★ r129(P1)：删除原「第3层 alignByOrder 同下标兜底」——纯猜测、跨域无依据，违反"宁不切不错切"。
+        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        int playIndex = indexOfSeries(playList, currentSeries);
+        if (playIndex < 0 && vodInfo != null && vodInfo.playIndex >= 0 && vodInfo.playIndex < playList.size()) {
+            playIndex = vodInfo.playIndex;
         }
-        if (sourceIndex >= 0 && !sourceList.isEmpty()) {
-            // 跨域时按序对齐的"同下标"没有依据（源里可能混入预告/花絮/特别篇），
-            // 此处仅允许同域兜底，跨域交给上面的直连层。
-            int aligned = EpisodeNameMatcher.alignByOrder(
-                    sourceIndex, seriesNames(sourceList), targetNames, false);
-            if (aligned >= 0) {
-                return aligned;
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
+                    currentName, playIndex, seriesNames(playList), targetNames);
+            if (byGroup >= 0) {
+                return byGroup;
+            }
+        }
+        // ---------- 同域纯下标兜底（仅同域；跨域一律 -1）----------
+        // ★ r129 补充：前序版本把这一层连同跨域猜测一起删掉了，但本层入参 allowCrossDomain=false，
+        //   本身只服务「同域且两侧可识别条目数相等」的场景，属确定性保守选择，不是跨域瞎猜。
+        //   同站不同源命名/语言不一致导致前序全落空时，它仍是最后一张安全网。
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byOrder = EpisodeNameMatcher.alignByOrder(
+                    playIndex, seriesNames(playList), targetNames, false);
+            if (byOrder >= 0) {
+                return byOrder;
             }
         }
         return matchedIndex;

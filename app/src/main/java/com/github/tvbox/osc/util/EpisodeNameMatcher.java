@@ -2399,10 +2399,18 @@ public final class EpisodeNameMatcher {
     //   （如 第2期上→0903盲盒），载入时版本不符则整表丢弃重建 —— 让错误条目能"自愈"，
     //   不再被永久化。修改表语义/词表时须同步 bump 此版本号。
     //   r126：日期表口径修正(L1.6 改用旧源/期号式源建表) + 丢弃历史错误表，故 bump 到 3。
-    private static final int TBL_PERSIST_VERSION = 3;
+    //   r127：删除「>=3 衍生标记」门槛(会误杀干净日期源致整对不建表)；并丢弃该门槛下可能错建的旧表，故 bump 到 4。
+    private static final int TBL_PERSIST_VERSION = 5;   // r128(P0)：删纯期号×纯日期推断建表，旧表(≤4)一律作废重建
     // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
     private static final java.util.Set<String> TBL_CONFLICT =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+    // r128：证据级别（**仅内存、不落盘**）。STRONG=名字自证（混合名/锚点/learn+rankConsistent）；
+    //   WEAK=按正片序逐条对齐的推断。键 = showKey + "#" + (o…|d…)。
+    //   规则：STRONG 可覆盖 WEAK/旧记录；WEAK 永不覆盖既有、也不作废；同级(STRONG-STRONG 或 WEAK-WEAK)矛盾双向作废。
+    private static final Map<String, String> TBL_GRADE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final String GRADE_STRONG = "S";
+    private static final String GRADE_WEAK = "W";
     private static final java.util.regex.Pattern TBL_ORD_RE =
             java.util.regex.Pattern.compile("第(\\d{1,4})期");
     private static final String[] TBL_DERIV = {
@@ -2463,7 +2471,7 @@ public final class EpisodeNameMatcher {
                 } catch (Exception ex) {
                     continue;
                 }
-                tblPut(show, ord, date, part);
+                tblPut(show, ord, date, part, false);
             }
         } catch (Throwable ignored) {
         } finally {
@@ -2534,23 +2542,15 @@ public final class EpisodeNameMatcher {
                 if (TextUtils.isEmpty(of)) continue;
                 int o = tblOrdinalOf(of);
                 int d = dateOf(n);
-                if (o > 0 && d > 0) tblPut(key, o, d, extractPart(n));
+                if (o > 0 && d > 0) tblPut(key, o, d, extractPart(n), true);
             }
         }
-        // 2) 情形4：判定哪侧是纯期号源、哪侧是纯日期源
-        if (a == null || b == null) return;
-        int aOrd = 0, aDate = 0, bOrd = 0, bDate = 0;
-        for (String n : a) { if (tblIsDeriv(n)) continue; if (dateOf(n) > 0) aDate++; else if (tblOrdinalOf(n) >= 0) aOrd++; }
-        for (String n : b) { if (tblIsDeriv(n)) continue; if (dateOf(n) > 0) bDate++; else if (tblOrdinalOf(n) >= 0) bOrd++; }
-        List<String> periodNames, dateNames;
-        if (aOrd >= aDate && bDate >= bOrd) { periodNames = a; dateNames = b; }
-        else if (bOrd >= bDate && aDate >= aOrd) { periodNames = b; dateNames = a; }
-        else return;
-        // 日期源可信度：需 >=3 类衍生标记，否则(全名日期式)不可信
-        java.util.Set<String> rich = new java.util.HashSet<>();
-        for (String n : dateNames) for (String w : TBL_DERIV) if (n != null && n.contains(w)) rich.add(w);
-        if (rich.size() < 3) return;
-        alignGroupSequence(key, periodNames, dateNames);
+        // ★ r128(P0)：删除「纯期号源 × 纯日期源 组序对齐」建表(原 alignGroupSequence 调用)。
+        //   该路径用"逐条位置对齐"【推断】期号↔日期，属原则1 明令禁止的"推算/猜测建表"：
+        //   日期源若含先导/衍生日且无内容词(如 第YYYYMMDD期)会整体偏移、生成错表并被持久化。
+        //   现日期表【只由强证据写入】：①混合名(日期+真期号，见上 step1)；②learnCrossDomainFact(带序关系守卫)。
+        //   纯期号×纯日期一律不建表(宁空表不写垃圾)；这类跨域对齐改由匹配层兜底推断，且【不回写表】。
+        //   （保留上方 step1 混合名入表逻辑；a/b 参数仍被 step1 使用。）
     }
 
     /** 一对源建表并立即落盘（对外保持 r121 原语义：建完即持久化）。 */
@@ -2630,38 +2630,77 @@ public final class EpisodeNameMatcher {
             if (p[1] != d[1]) break;                 // 分段形态不一致 → 停止
             if (d[0] < lastDate) break;              // 日期必须单调不降（上/下同日，允许相等）
             lastDate = d[0];
-            tblPut(showKey, p[0], d[0], p[1]);
+            tblPut(showKey, p[0], d[0], p[1], false);
         }
     }
 
-    private static void tblPut(String showKey, int ord, int date, int part) {
+    private static void tblPut(String showKey, int ord, int date, int part, boolean strong) {
         int p = normalizePart(part);
         String ok = tblOrdKey(ord, p);
         String dk = tblDateKey(date, p);
-        if (TBL_CONFLICT.contains(showKey + "#" + ok)
-                || TBL_CONFLICT.contains(showKey + "#" + dk)) {
+        String gkOrd = showKey + "#" + ok;
+        String gkDate = showKey + "#" + dk;
+        if (TBL_CONFLICT.contains(gkOrd) || TBL_CONFLICT.contains(gkDate)) {
             return;
         }
         Map<String, Integer> om = TBL_ORD_TO_DATE.get(showKey);
         if (om == null) { om = new java.util.concurrent.ConcurrentHashMap<>(); TBL_ORD_TO_DATE.put(showKey, om); }
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey);
         if (dm == null) { dm = new java.util.concurrent.ConcurrentHashMap<>(); TBL_DATE_TO_ORD.put(showKey, dm); }
-        Integer expD = om.get(ok);
-        if (expD != null && expD != date) {
-            // 同一期号被映射到多个日期（如正片与"加更/会员版"同标第N期）：保留首个，不覆盖也不作废。
-            //   对"日期→期号"查询无危害（每个日期仍唯一），故不触发墓碑，避免误伤真实的多日期同号情况。
-            return;
-        }
-        Integer expO = dm.get(dk);
-        if (expO != null && expO != ord) {
-            // 同一日期被映射到不同期号 → 矛盾,整组作废
-            dm.remove(dk);
-            om.remove(tblOrdKey(expO, p));
-            TBL_CONFLICT.add(showKey + "#" + dk);
-            return;
+        Integer expD = om.get(ok);          // 该期号已映射到的日期
+        Integer expO = dm.get(dk);          // 该日期已映射到的期号
+        boolean have = (expD != null) || (expO != null);
+        boolean existingStrong = GRADE_STRONG.equals(TBL_GRADE.get(gkOrd))
+                || GRADE_STRONG.equals(TBL_GRADE.get(gkDate));
+        if (have) {
+            boolean consistent = (expD == null || expD == date) && (expO == null || expO == ord);
+            if (!consistent) {
+                // 弱证据永不覆盖、也不作废既有（Q2）
+                if (!strong) return;
+                if (existingStrong) {
+                    // 强 vs 强 同级矛盾 → 双向作废
+                    if (expD != null) { om.remove(ok); TBL_GRADE.remove(gkOrd); }
+                    if (expO != null) {
+                        dm.remove(dk);
+                        String okO = tblOrdKey(expO, p);
+                        om.remove(okO);
+                        TBL_GRADE.remove(showKey + "#" + okO);
+                    }
+                    TBL_CONFLICT.add(gkOrd);
+                    TBL_CONFLICT.add(gkDate);
+                    TBL_GRADE.remove(gkOrd); TBL_GRADE.remove(gkDate);
+                    return;
+                }
+                // 强证据覆盖弱/旧记录：先清掉旧的反向映射，再写新值
+                if (expD != null && expD != date) {
+                    String dkD = tblDateKey(expD, p);
+                    dm.remove(dkD); TBL_GRADE.remove(showKey + "#" + dkD);
+                }
+                if (expO != null && expO != ord) {
+                    String okO = tblOrdKey(expO, p);
+                    om.remove(okO); TBL_GRADE.remove(showKey + "#" + okO);
+                }
+            }
         }
         if (!om.containsKey(ok) && om.size() < TBL_LIMIT_PER_SHOW) om.put(ok, date);
         if (!dm.containsKey(dk) && dm.size() < TBL_LIMIT_PER_SHOW) dm.put(dk, ord);
+        if (strong) {
+            TBL_GRADE.put(gkOrd, GRADE_STRONG);
+            TBL_GRADE.put(gkDate, GRADE_STRONG);
+        } else {
+            if (TBL_GRADE.get(gkOrd) == null) TBL_GRADE.put(gkOrd, GRADE_WEAK);
+            if (TBL_GRADE.get(gkDate) == null) TBL_GRADE.put(gkDate, GRADE_WEAK);
+        }
+    }
+
+    /** r128：清掉某剧的全部证据级别标注（内存）。 */
+    private static void clearGradeForShow(String showKey) {
+        if (TextUtils.isEmpty(showKey)) return;
+        String pre = showKey + "#";
+        java.util.Iterator<String> it = TBL_GRADE.keySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().startsWith(pre)) it.remove();
+        }
     }
 
     /** 查该剧「期号→日期」；part 未命中再回落无分段/上。未命中 -1。 */
@@ -2696,6 +2735,7 @@ public final class EpisodeNameMatcher {
         TBL_ORD_TO_DATE.remove(showKey.trim());
         TBL_DATE_TO_ORD.remove(showKey.trim());
         TBL_BUILT_SIG.remove(showKey.trim());
+        clearGradeForShow(showKey.trim());
         persistDateTables();
     }
 
@@ -2705,6 +2745,7 @@ public final class EpisodeNameMatcher {
         TBL_DATE_TO_ORD.clear();
         TBL_CONFLICT.clear();
         TBL_BUILT_SIG.clear();
+        TBL_GRADE.clear();
         persistDateTables();
     }
 
@@ -2796,7 +2837,7 @@ public final class EpisodeNameMatcher {
                     continue;
                 }
                 // r122：写入统一日期表（按剧名隔离、冲突墓碑、持久化），不再建独立 ANCHOR 表
-                tblPut(k, o, d, extractPart(name));
+                tblPut(k, o, d, extractPart(name), true);
                 any = true;
             }
         }
@@ -3096,7 +3137,7 @@ public final class EpisodeNameMatcher {
         // 方向一：旧源给日期、新源给期号
         if (curDate > 0 && curOrd <= 0 && tgtOrd > 0 && tgtOrd < 1000) {
             if (rankConsistent(tgtOrd, matchedName, sourceNames, targetNames)) {
-                tblPut(showKey.trim(), tgtOrd, curDate, part);
+                tblPut(showKey.trim(), tgtOrd, curDate, part, true);
             }
             return;
         }
@@ -3104,7 +3145,7 @@ public final class EpisodeNameMatcher {
         // 守卫要在**目标列表**里查命中项的序，故传 matchedName（不是 currentName）
         if (curOrd > 0 && curOrd < 1000 && curDate <= 0 && tgtDate > 0) {
             if (rankConsistent(curOrd, matchedName, sourceNames, targetNames)) {
-                tblPut(showKey.trim(), curOrd, tgtDate, part);
+                tblPut(showKey.trim(), curOrd, tgtDate, part, true);
             }
             return;
         }

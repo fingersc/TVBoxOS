@@ -2637,22 +2637,13 @@ public class PlayFragment extends BaseLazyFragment {
             }
         }
 
-        // ---------- 第1.5层：同日期多段的组内位置对齐 ----------
-        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
-        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
-        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
-        // 必须在跨域联网之前做：这是纯本地、零延迟、且确定性的判断。
+        // 组内位置对齐所需的「当前源列表 + 下标」在此提前算好：第2层 2-b 簇秩要用它。
+        // ★ r129(P1)：alignByGroupPosition 本身是 Tier B 兜底，已下移到方法末尾，
+        //   只在该剧所有强证据层(日期表/簇秩/联网/完全同名)全落空时才使用。
         List<VodInfo.VodSeries> playList = getPlayingSeriesList();
         int playIndex = indexOfSeries(playList, currentSeries);
         if (playIndex < 0 && mVodInfo != null && mVodInfo.playIndex >= 0 && mVodInfo.playIndex < playList.size()) {
             playIndex = mVodInfo.playIndex;
-        }
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
-                    currentName, playIndex, seriesNames(playList), targetNames);
-            if (byGroup >= 0) {
-                return byGroup;
-            }
         }
 
         // ---------- 第1.6层 r124：日期表（期号↔日期）→ 查表按形态选条 ----------
@@ -2705,17 +2696,27 @@ public class PlayFragment extends BaseLazyFragment {
             }
         }
 
-        // ---------- 第3层：本地按序兜底（仅同域，跨域不猜）----------
-        List<VodInfo.VodSeries> sourceList = getPlayingSeriesList();
-        int sourceIndex = indexOfSeries(sourceList, currentSeries);
-        if (sourceIndex < 0 && mVodInfo != null && mVodInfo.playIndex >= 0 && mVodInfo.playIndex < sourceList.size()) {
-            sourceIndex = mVodInfo.playIndex;
+        // ---------- 第1.5层（Tier B · 兜底）：同日期多段的组内位置对齐（下移到最后）----------
+        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
+        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
+        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
+        // ★ r129(P1)：仅在日期表/簇秩/联网/完全同名等强证据层全落空后才走到这里。
+        //   原「第3层 alignByOrder 同下标兜底」已删除——纯猜测、跨域无依据，违反"宁不切不错切"。
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
+                    currentName, playIndex, seriesNames(playList), targetNames);
+            if (byGroup >= 0) {
+                return byGroup;
+            }
         }
-        if (sourceIndex >= 0 && !sourceList.isEmpty()) {
-            int aligned = EpisodeNameMatcher.alignByOrder(
-                    sourceIndex, seriesNames(sourceList), targetNames, false);
-            if (aligned >= 0) {
-                return aligned;
+        // ---------- 同域纯下标兜底（仅同域；跨域一律 -1）----------
+        // ★ r129 补充：本层 allowCrossDomain=false，只服务「同域且两侧可识别条目数相等」，
+        //   是确定性保守选择；同站源命名不一致导致前序全落空时用它兜底。
+        if (playIndex >= 0 && !playList.isEmpty()) {
+            int byOrder = EpisodeNameMatcher.alignByOrder(
+                    playIndex, seriesNames(playList), targetNames, false);
+            if (byOrder >= 0) {
+                return byOrder;
             }
         }
         return matchedIndex;
