@@ -2224,6 +2224,119 @@ public final class EpisodeNameMatcher {
     }
 
     /**
+     * ★ r151：跨源「同日内容标签」共识。
+     *
+     * <p>真实源里同一天的非正片/特辑经常只有部分线路写了内容词：</p>
+     * <pre>
+     *   dytt:  20260820选歌组队下
+     *   ukzy:  第20260820期一公选歌组队下
+     *   目标:  一公选歌组队（下）      ← 目标列表可能没有日期
+     * </pre>
+     * <p>当前源「第20260820期下」没有内容词时，日期簇秩会把 8/20 算成第1期下。
+     * 官方节目表（Baidu Baike 67924554）第1期 8/15-16、第2期 8/21-22；8/20 不在正期表内，
+     * 是一公选歌组队特辑，因此目标侧应落「一公选歌组队（上/下）」。
+     * 这里从本剧已累积的所有线路（KNOWN_LISTS）+ 当前源里收集同一天、非衍生的内容词，
+     * 再去目标列表找同内容词 + 同分段的唯一候选；找不到或出现多个候选一律返回 -1，
+     * 保持「宁可不切，不可切错」。</p>
+     */
+    private static int alignByDateContentConsensus(String showKey, String currentName,
+                                                   List<String> sourceNames, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        EpisodeKey cur = parse(currentName);
+        if (cur.domain != DOMAIN_DATE || cur.ordinal <= 0) {
+            return -1;
+        }
+        final int curDay = cur.ordinal;
+        final int curPart = normalizePart(extractPart(currentName));
+        java.util.LinkedHashSet<String> tokens = new java.util.LinkedHashSet<>();
+        addDateContentToken(tokens, currentName, curDay);
+        if (sourceNames != null) {
+            for (String n : sourceNames) {
+                addDateContentToken(tokens, n, curDay);
+            }
+        }
+        if (!TextUtils.isEmpty(showKey)) {
+            List<List<String>> known = KNOWN_LISTS.get(showKey.trim());
+            if (known != null) {
+                synchronized (known) {
+                    for (List<String> list : known) {
+                        if (list == null) continue;
+                        for (String n : list) {
+                            addDateContentToken(tokens, n, curDay);
+                        }
+                    }
+                }
+            }
+        }
+        if (tokens.isEmpty()) {
+            return -1;
+        }
+        int exact = -1;
+        int exactCount = 0;
+        int loose = -1;
+        int looseCount = 0;
+        for (int i = 0; i < targetNames.size(); i++) {
+            String tn = targetNames.get(i);
+            if (TextUtils.isEmpty(tn) || isNonMainFeature(tn)) {
+                continue;
+            }
+            int tp = normalizePart(extractPart(tn));
+            if (curPart != PART_NONE && tp != PART_NONE && tp != curPart) {
+                continue;
+            }
+            String tl = featureLabelOf(tn);
+            if (TextUtils.isEmpty(tl)) {
+                continue;
+            }
+            for (String tok : tokens) {
+                if (tok.equals(tl)) {
+                    if (exact != i) {
+                        exact = i;
+                        exactCount++;
+                    }
+                    break;
+                }
+                if (tok.length() >= 2 && tl.length() >= 2
+                        && (tok.contains(tl) || tl.contains(tok))) {
+                    if (loose != i) {
+                        loose = i;
+                        looseCount++;
+                    }
+                    break;
+                }
+            }
+        }
+        if (exactCount == 1) {
+            return exact;
+        }
+        if (exactCount > 1) {
+            return -1;
+        }
+        return looseCount == 1 ? loose : -1;
+    }
+
+    /** 收集同一天、非衍生条目的内容词（供 {@link #alignByDateContentConsensus} 使用）。 */
+    private static void addDateContentToken(java.util.Set<String> tokens, String name, int day) {
+        if (tokens == null || TextUtils.isEmpty(name) || day <= 0) {
+            return;
+        }
+        if (dateOf(name) != day || isNonMainFeature(name)) {
+            return;
+        }
+        String label = featureLabelOf(name);
+        if (TextUtils.isEmpty(label)) {
+            return;
+        }
+        label = label.trim();
+        if (label.length() < 2 || !HAS_CJK.matcher(label).find()) {
+            return;
+        }
+        tokens.add(label);
+    }
+
+    /**
      * 带剧名（showKey）的重载（r122）：日期表按剧名隔离，事实/外推均读写该剧的日期表。
      * showKey 为空时退化为"无表"（等价旧版无事实的冷启动），不抛异常。
      */
@@ -2245,6 +2358,15 @@ public final class EpisodeNameMatcher {
         // 这里用"结构化正片判定"，覆盖关键词表列不全的衍生命名。
         if (isNonMainEntry(currentName, labels)) {
             return -1;
+        }
+
+        // ★ r151：跨源「同日内容标签」共识（必须先于第0层的条数相等/前缀映射）。
+        //   典型：dytt「20260820选歌组队下」+ ukzy「第20260820期一公选歌组队下」
+        //   → 目标 Clun「一公选歌组队（下）」；当前源「第20260820期下」本身没有内容词。
+        //   只认同日、同分段且唯一命中的内容词，命中不了就继续走原有各层。
+        int byDateContent = alignByDateContentConsensus(showKey, currentName, sourceNames, targetNames);
+        if (byDateContent >= 0) {
+            return byDateContent;
         }
 
         // ================= 第 0 层：正片序列位置映射（最强、最通用）=================
@@ -2492,6 +2614,16 @@ public final class EpisodeNameMatcher {
             //   有 36 天（节拍 7 的 5 倍多）——那是预告，真正第1期是 `20260527`。
             //   判据要求"孤立"（与下一条正片距离 ≥ 4×节拍），隔周更新/停播三周都不触发。
             firstDate = skipLeadingIsolatedAnchor(sourceNames, labels, firstDate, srcPeriod);
+            // ★ r151：日期源 byRank 的安全闸。簇秩必须与当前日期落在同一节拍上：
+            //   若当前日期离「首播日 + srcPeriod×rank」超过半个节拍，说明 byRank 只是
+            //   按第1期硬套（实测 20260820 被套成第1期下），直接弃用。
+            if (byRank >= 0 && rank >= 0 && firstDate > 0 && curDay > 0) {
+                long expectedDay = dayNumberOf(firstDate) + (long) srcPeriod * rank;
+                long tol = Math.max(2L, srcPeriod / 2L);
+                if (Math.abs(curDay - expectedDay) > tol) {
+                    byRank = -1;
+                }
+            }
             if (firstDate > 0 && curDay > 0) {
                 long diff = curDay - dayNumberOf(firstDate);
                 if (diff >= 0) {
