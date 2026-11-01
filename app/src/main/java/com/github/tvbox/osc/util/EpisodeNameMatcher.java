@@ -5477,7 +5477,68 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
                 matchedPartExact = partExact;
             }
         }
+        // ★ r152：内容词兜底——当前集是「内容词+分段」写法（如「一公挑战赛（下）」），
+        //   目标源却是「日期+第N期+内容词+分段」（如「第20260822期第02期一公挑战赛下」）时，
+        //   两边没有共同的日期/期号锚，前面的 score 会给 0，旧逻辑直接返回 -1。
+        //   这类同内容、同分段且目标唯一时要能互相认领；多义（同内容同分段多条）仍返回 -1。
+        if (matched < 0) {
+            int byContent = findIndexByContentLabel(currentName, targetNames);
+            if (byContent >= 0) {
+                return byContent;
+            }
+        }
         return matched;
+    }
+
+    /**
+     * 纯内容词匹配：仅用于「当前集没有日期/期号、只有内容词+分段」的名字。
+     *
+     * <p>目标条目的内容词由 {@link #featureLabelOf(String)} 归一化，要求
+     * 内容词相等或互相包含、分段相等（当前集显式带分段时），且候选唯一。</p>
+     *
+     * <p>只允许没有日期/期号的当前集进入，避免抢走已有日期锚/期号锚的精确路径。</p>
+     */
+    private static int findIndexByContentLabel(String currentName, List<String> targetNames) {
+        if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
+            return -1;
+        }
+        if (dateOf(currentName) > 0 || extractOrdinal(currentName) > 0) {
+            return -1;
+        }
+        // 非正片（直拍/预热/纯享等）走 findIndexForNonMain 的规范系列路径，不能按内容词
+        // 认领到正片条目，否则「一公直拍机位（下）」可能被当成「一公挑战赛（下）」。
+        if (isNonMainEntryName(currentName)) {
+            return -1;
+        }
+        String curLabel = featureLabelOf(currentName);
+        if (TextUtils.isEmpty(curLabel) || curLabel.length() < 2) {
+            return -1;
+        }
+        int curPart = extractPart(currentName);
+        int hit = -1;
+        for (int i = 0; i < targetNames.size(); i++) {
+            String targetName = targetNames.get(i);
+            if (TextUtils.isEmpty(targetName) || isNonMainEntryName(targetName)) {
+                continue;
+            }
+            String targetLabel = featureLabelOf(targetName);
+            if (TextUtils.isEmpty(targetLabel) || targetLabel.length() < 2) {
+                continue;
+            }
+            boolean labelMatch = targetLabel.equals(curLabel)
+                    || targetLabel.contains(curLabel) || curLabel.contains(targetLabel);
+            if (!labelMatch) {
+                continue;
+            }
+            if (curPart != 0 && extractPart(targetName) != curPart) {
+                continue;
+            }
+            if (hit >= 0) {
+                return -1; // 同内容同分段多条：无法唯一确定，绝不猜
+            }
+            hit = i;
+        }
+        return hit;
     }
 
     /**

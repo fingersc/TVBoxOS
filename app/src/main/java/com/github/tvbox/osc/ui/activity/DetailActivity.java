@@ -1457,8 +1457,20 @@ public class DetailActivity extends BaseActivity {
                         //   两者的 extractEpisodeNumber 量纲不同（2 vs 20260411），直接比数值恒不相等，
                         //   会把本来正确的"跨域定位"误判为错位 → 整条时间迁移被跳过 → 用户看到"切对了集但时间归零"。
                         //   改用 EpisodeNameMatcher.positionTrustedAcrossDomain：跨域一律放行，同域才严格比序号。
-                        String expectedName = sameNameRestored && vodInfoRecord != null ? vodInfoRecord.playNote
-                                : (fallbackFromValid ? fallbackFromName : "");
+                        String expectedName = sameNameRestored && vodInfoRecord != null ? vodInfoRecord.playNote : "";
+                        // ★ r152：历史记录存在但 playNote 为空时，若本次 restore 是「无内容匹配」
+                        //   落到 0 号位，仍要退回切源前实际播放快照，让 alignNoEpisode 拒绝该源；
+                        //   不能因为同名记录的空字段把期望集名清空，否则 0 号位会被直接迁移。
+                        //   注意：只有 restore 失败才启用，正常内容级 restore（如 r151 的
+                        //   第20260820期下→一公选歌组队下）不能被名字级守卫误拦。
+                        //   读后即清：本标记只服务这一次迁移守卫，不能让「上一轮无匹配」
+                        //   外溢到后续线路切换/下一轮切源，把正常源误判成错源。
+                        if (detailFallbackRestoreNoContentMatch) {
+                            if (TextUtils.isEmpty(expectedName) && fallbackFromValid) {
+                                expectedName = fallbackFromName;
+                            }
+                            detailFallbackRestoreNoContentMatch = false;
+                        }
                         boolean positionTrusted = EpisodeNameMatcher.positionTrustedAcrossDomain(
                                 expectedName, currentEpisode.name);
 
@@ -3519,6 +3531,10 @@ public class DetailActivity extends BaseActivity {
     private void captureDetailFallbackEpisode() {
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
+        // ★ r152：每次切源开始都重新采集旧源列表；不能沿用上一轮的列表，
+        //   否则本轮在「旧源名不在新列表」时会拿到陈旧的秩源，导致跨源定位串源。
+        detailFallbackSourceNames = null;
+        detailFallbackRestoreNoContentMatch = false;
         // 预览模式下实际播放对象是 previewVodInfo，详情页 vodInfo.playIndex 可能已过期
         VodInfo playing = showPreview && previewVodInfo != null ? previewVodInfo : vodInfo;
         if (playing == null || playing.seriesMap == null || TextUtils.isEmpty(playing.playFlag)) {
@@ -3551,6 +3567,7 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void restoreDetailFallbackEpisode() {
+        detailFallbackRestoreNoContentMatch = false;
         VodInfo.VodSeries fallback = detailFallbackEpisode;
         int fallbackIndex = detailFallbackEpisodeIndex;
         if (fallback == null && fallbackFromValid) {
@@ -3610,6 +3627,7 @@ public class DetailActivity extends BaseActivity {
                         seriesNames(preferredList));
             } else {
                 vodInfo.playIndex = 0;
+                detailFallbackRestoreNoContentMatch = true;
                 LOG.sw("[FB] restoreNoContentMatch target=" + (fallback == null ? "" : fallback.name)
                         + " oldIndex=" + fallbackIndex + " list=" + preferredList.size()
                         + " => 不按原下标兜底");
@@ -5107,7 +5125,19 @@ public class DetailActivity extends BaseActivity {
         // 新圈由 pollNextCycledSource() 在本圈转尽时统一开启（它会自己清这两个集合）。
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
-        detailFallbackSourceNames = null;
+        // ★ r152：只有彻底复位（换片/退出页面）才清「本次 restore 无内容匹配」标记。
+        //   keepCache=true 是同一轮切源成功收尾，紧随其后的迁移守卫（expectedName）
+        //   还要靠这个标记拦住落到 0 号位的错源，清掉会让 r152 的守卫失效。
+        if (!keepCache) {
+            detailFallbackRestoreNoContentMatch = false;
+        }
+        // ★ r152：keepCache=true 表示同一轮切源还在继续（候选源失败后换下一个），
+        //   旧源列表是下一次 restoreDetailFallbackEpisode 的唯一秩源，必须保留到本轮结束；
+        //   否则第二次候选的 findMatchingEpisodeIndex 会把「新源」当成源列表（srcHas=false），
+        //   再把无内容匹配的第 0 条当成落点。只有彻底复位/下次切源重新 capture 时才清。
+        if (!keepCache) {
+            detailFallbackSourceNames = null;
+        }
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
@@ -5349,6 +5379,8 @@ public class DetailActivity extends BaseActivity {
     private boolean detailFallbackNewCycle = true;
     private VodInfo.VodSeries detailFallbackEpisode;
     private int detailFallbackEpisodeIndex = -1;
+    /** r152：restoreDetailFallbackEpisode 是否因所有线路都无内容匹配而落到 0 号位。 */
+    private boolean detailFallbackRestoreNoContentMatch = false;
     /** 切源前捕获的旧源剧集名列表（供离线秩对齐用，见 captureDetailFallbackEpisode）。 */
     private List<String> detailFallbackSourceNames = null;
     
