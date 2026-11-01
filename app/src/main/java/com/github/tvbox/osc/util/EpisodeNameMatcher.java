@@ -2837,6 +2837,38 @@ public final class EpisodeNameMatcher {
         }
     }
 
+    /** ★ r147：清掉某剧的派生状态（表、分级、冲突墓碑），供列表集合变化后重建，避免旧冲突把新证据永久挡死。 */
+    private static void clearShowTableState(String showKey) {
+        if (TextUtils.isEmpty(showKey)) return;
+        String key = showKey.trim();
+        TBL_ORD_TO_DATE.remove(key);
+        TBL_DATE_TO_ORD.remove(key);
+        String prefix = key + "#";
+        java.util.Iterator<String> it = TBL_CONFLICT.iterator();
+        while (it.hasNext()) {
+            String one = it.next();
+            if (one != null && one.startsWith(prefix)) TBL_CONFLICT.remove(one);
+        }
+        java.util.Iterator<String> gt = TBL_GRADE.keySet().iterator();
+        while (gt.hasNext()) {
+            String one = gt.next();
+            if (one != null && one.startsWith(prefix)) TBL_GRADE.remove(one);
+        }
+    }
+
+    /** ★ r147：按全部集名做内容签名（不能只用条数+首尾，否则不同列表可能撞签名）。 */
+    private static String buildListsSignature(java.util.List<List<String>> lists) {
+        StringBuilder sig = new StringBuilder();
+        for (List<String> l : lists) {
+            sig.append(l.size()).append(':');
+            for (String n : l) {
+                sig.append(n == null ? 0 : n.hashCode()).append(',');
+            }
+            sig.append(';');
+        }
+        return sig.toString();
+    }
+
     private static boolean containsSameNames(java.util.List<List<String>> acc, List<String> probe) {
         for (List<String> one : acc) {
             if (one.size() != probe.size()) continue;
@@ -2867,17 +2899,13 @@ public final class EpisodeNameMatcher {
         //   切源过程中每加载一个源都会并入它的集列表 —— 即「该影片此刻现有的所有已知集列表」，
         //   只要其中某条列表含有强依据（日期+期号混合名），就会被收进表里。
         java.util.List<List<String>> lists = mergeKnownLists(key, allLists);
-        StringBuilder sig = new StringBuilder();
-        for (List<String> l : lists) {
-            sig.append(l.size()).append(':');
-            String f = l.get(0);
-            String last = l.get(l.size() - 1);
-            sig.append(f == null ? 0 : f.hashCode()).append('/')
-               .append(last == null ? 0 : last.hashCode()).append(';');
-        }
+        String s = buildListsSignature(lists);
         if (lists.size() < 2) return;
-        String s = sig.toString();
         if (s.equals(TBL_BUILT_SIG.get(key))) return;
+        // ★ r147：列表集合变化后必须从零重建。旧实现只换签名、不清理旧表/冲突，
+        //   早期小列表建表留下的 TBL_CONFLICT 会把新列表的 o1/o2 永久挡死
+        //   （2040 日志 DBG-BUILD lists=11 但 o0/o1/o2 全 -1 的根因）。
+        clearShowTableState(key);
         TBL_BUILT_SIG.put(key, s);
         for (int i = 0; i < lists.size(); i++) {
             for (int j = i + 1; j < lists.size(); j++) {
@@ -3119,11 +3147,11 @@ public final class EpisodeNameMatcher {
     /** 清空某剧日期表（历史记录删除时调用）。 */
     public static void clearDateTable(String showKey) {
         if (TextUtils.isEmpty(showKey)) return;
-        TBL_ORD_TO_DATE.remove(showKey.trim());
-        TBL_DATE_TO_ORD.remove(showKey.trim());
-        TBL_BUILT_SIG.remove(showKey.trim());
-        KNOWN_LISTS.remove(showKey.trim());
-        clearGradeForShow(showKey.trim());
+        String key = showKey.trim();
+        clearShowTableState(key);
+        TBL_BUILT_SIG.remove(key);
+        KNOWN_LISTS.remove(key);
+        clearGradeForShow(key);
         persistDateTables();
     }
 
@@ -5044,6 +5072,16 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         }
         final int k = idxs.size();
 
+        // ★ r147：组内只有「上/中/下」分段、没有任何期号信息时，这组只是同一期的分段，
+        //   不能把 `第2期` 的 2 当成组内位置（否则会落到 `中`，把第2期切成第1期中段）。
+        boolean groupOnlyParts = true;
+        for (int idx : idxs) {
+            if (rawSeqOf(names.get(idx)) > 0 || extractPart(names.get(idx)) == PART_NONE) {
+                groupOnlyParts = false;
+                break;
+            }
+        }
+
         // 组内是否全部为同一期号（用于「无分段 ≡ 上」与错期保护）
         int groupOrd = -1;
         boolean allSameOrd = true;
@@ -5093,7 +5131,9 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             want = (k >= 3 ? 3 : 2);
         } else {
             int curSeq = rawSeqOf(currentName);
-            if (distinctSeq && curSeq >= minSeq && curSeq <= maxSeq) {
+            if (groupOnlyParts && !curIsDateSeq && curSeq > 1) {
+                want = 0;                        // ★ r147：单期分段组没有第2期，宁可不切
+            } else if (distinctSeq && curSeq >= minSeq && curSeq <= maxSeq) {
                 want = curSeq - minSeq + 1;      // 组内不同期：第 N 期 → 组内第 (N-min+1) 条
             } else if (!curIsDateSeq && allSameOrd && curOrd == groupOrd) {
                 want = 1;                        // 组内同期、当前无分段 → 无分段 ≡ 上
