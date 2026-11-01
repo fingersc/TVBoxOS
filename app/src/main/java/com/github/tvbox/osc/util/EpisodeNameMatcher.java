@@ -1105,9 +1105,16 @@ public final class EpisodeNameMatcher {
             return isLeadingOrdinal(name);
         }
         if (key.domain == DOMAIN_DATE && key.ordinal > 0) {
-            // ★ r140：`20261022-01` 整体按「纯日期域」处理——stripMainResidue 已把
-            //   「日期 + -NN」整段剥掉，因此这里只需判残余是否为空（不再用白名单绕开）。
-            return stripMainResidue(name).isEmpty();
+            // ★ r148：日期就是编号；其余内容词（如「20260820选歌组队上」）属于正片
+            //   的场次/分段描述，不应因 stripMainResidue 残留而判成非正片。
+            //   真正的衍生词已在方法开头由 NON_MAIN_FEATURE 一票否决。
+            return true;
+        }
+        // ★ r148：无日期/期号、但带明确上/中/下分段的名称（如「一公挑战赛（下）」）
+        //   是正片的分段条目，不是衍生栏目；此前统一 return false 导致
+        //   isNonMainEntryName 误判并让 nonMainSafe 恒 -1。
+        if (key.domain == DOMAIN_UNKNOWN && extractPart(name) != PART_NONE) {
+            return true;
         }
         // ★ r119 方案B：电影身份不再在此纯名字函数里判（它无"线路/集数"上下文）。
         //   改由 DetailActivity 调 isMovieMain(name, countSeriesEpisodes(vodInfo)) 按「集数≤N 且 格式词」判定。
@@ -5349,6 +5356,13 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
     public static int findIndexForNonMain(String currentName, List<String> targetNames, String showKey) {
         if (TextUtils.isEmpty(currentName) || targetNames == null || targetNames.isEmpty()) {
             return -1;
+        }
+        // ★ r148：完全同名直接命中。调用方可能把正片名误送进来（历史分类口径），
+        //   这里先按字符串完全相同兜底，避免被下面的衍生词过滤误杀。
+        for (int i = 0; i < targetNames.size(); i++) {
+            if (TextUtils.equals(currentName, targetNames.get(i))) {
+                return i;
+            }
         }
         final String curSeries = canonicalNonMainSeries(currentName);
         if (curSeries == null) {

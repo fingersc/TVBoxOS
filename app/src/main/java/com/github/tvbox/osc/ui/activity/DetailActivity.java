@@ -3597,16 +3597,23 @@ public class DetailActivity extends BaseActivity {
             }
         }
         if (preferredList != null && !preferredList.isEmpty()) {
-            // 保守落地：所有线路都没匹配上该集时，宁可保持原下标（仍在合法范围内），
-            // 也不做"就近猜测"把可能错位的下标写成正式结果。
-            // 注意这里传入的是"已钳位过的原下标"，属于合法值，safeLand 会正常写入，
-            // 但绝不接受 findMatchingEpisodeIndex 返回的 -1。
-            // ★ 正片保护：原下标若恰好落在特辑/花絮等非正片条目上（实测
-            //   「第5期上」兜底到「20260508泳池特辑」），就近回退到正片条目。
-            vodInfo.playIndex = EpisodeNameMatcher.sanitizeMainFeatureFallback(
-                    fallback == null ? null : fallback.name,
-                    nearestEpisodeIndex(fallback, fallbackIndex, preferredList),
-                    seriesNames(preferredList));
+            // ★ r149（D）：所有线路都没有内容级匹配时，不再按旧源下标兜底。
+            //   旧实现 nearestEpisodeIndex 最后会退回 clamped(fallbackIndex)，跨源列表构成
+            //   不同时这个源下标本身没有意义（实测 21:24 Clun：第20260820期上 被写成
+            //   「第1期：初舞台（下）」）。现在 nearestEpisodeIndex 无锚即返 -1：保持 index 0，
+            //   让紧随其后的 alignNoEpisode 按“没有这一集”拒绝该源，宁可不切也不猜。
+            int nearest = nearestEpisodeIndex(fallback, fallbackIndex, preferredList);
+            if (nearest >= 0) {
+                vodInfo.playIndex = EpisodeNameMatcher.sanitizeMainFeatureFallback(
+                        fallback == null ? null : fallback.name,
+                        nearest,
+                        seriesNames(preferredList));
+            } else {
+                vodInfo.playIndex = 0;
+                LOG.sw("[FB] restoreNoContentMatch target=" + (fallback == null ? "" : fallback.name)
+                        + " oldIndex=" + fallbackIndex + " list=" + preferredList.size()
+                        + " => 不按原下标兜底");
+            }
         }
     }
 
@@ -6201,7 +6208,7 @@ public class DetailActivity extends BaseActivity {
                 currentSeries == null ? null : currentSeries.name, countSeriesEpisodes(vodInfo));
         if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
                 && targetList != null && targetList.size() > 1
-                && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)
+                && EpisodeNameMatcher.isNonMainFeature(currentSeries.name)
                 && !currentIsMovie) {
             String anchorShowName = TextUtils.isEmpty(detailFallbackAnchorTitle)
                     ? vod_name : detailFallbackAnchorTitle;
@@ -6732,7 +6739,7 @@ public class DetailActivity extends BaseActivity {
     /**
      * 重定位最终兜底：能提取集数号时，取"集数号最接近"的条目（差值相同取靠前的），
      * 避免列表前部有"特别篇"等额外条目导致整体后移时，裸下标指向错误的集；
-     * 无法提取集数号时才退回钳位后的原始下标。
+     * 无法提取集数号时返回 -1（r149 起），不再按原下标兜底。
      */
     /**
      * ★ v99-r43：就近落点 —— 重写为「日期锚优先，无锚不猜」。
@@ -6750,18 +6757,18 @@ public class DetailActivity extends BaseActivity {
      *
      * <p><b>新口径</b>（用户口径：{@code 20260808} ≡ {@code 第20260808期} ≡ {@code 20260808期}，
      * 日期即真值）：目标名带日期时，只在<b>候选也带日期</b>的集合里按日期差取唯一最近；
-     * 一天多条（平手）或候选都没有日期（纯期号列表）时<b>不做任何猜测</b>，保持原下标，
+     * 一天多条（平手）或候选都没有日期（纯期号列表）时<b>不做任何猜测</b>，返回 -1，
      * 由上层 {@code sanitizeMainFeatureFallback} 矫正正片属性。宁可不切，不可切错。</p>
      *
      * <p><b>★ v99-r45：纯期号目标列表的兜底</b>。目标名不带日期（{@code 第2期}）而候选也全是
      * 期号式时，按「同期号 + 同分段 + 正片」找一条 —— 这正是真机日志里
      * 「{@code 第2期} 落到 {@code 第2期下}」的缺口：日期锚用不上，旧实现直接退回
-     * {@code clamped(源下标)}，而源下标跨源没有意义。仍找不到就保持原位。</p>
+     * {@code clamped(源下标)}，而源下标跨源没有意义。仍找不到就返回 -1（r149 起），
+     * 由调用方拒绝该源，不再按原下标猜。</p>
      */
     private int nearestEpisodeIndex(VodInfo.VodSeries target, int fallbackIndex, List<VodInfo.VodSeries> list) {
-        if (list == null || list.isEmpty()) return Math.max(0, fallbackIndex);
-        int clamped = Math.max(0, Math.min(fallbackIndex, list.size() - 1));
-        if (target == null || TextUtils.isEmpty(target.name)) return clamped;
+        if (list == null || list.isEmpty()) return -1;
+        if (target == null || TextUtils.isEmpty(target.name)) return -1;
         int targetDate = EpisodeNameMatcher.dateOf(target.name);
         if (targetDate > 0) {
             // ★ v99-r45：先按「同日期 + 同分段 + 正片」精确命中。
@@ -6792,8 +6799,8 @@ public class DetailActivity extends BaseActivity {
                     tie++;
                 }
             }
-            // 只有"唯一最近"才采纳；同一天多条并列 ⇒ 锚不足以定案，保持原位
-            return (bestIndex >= 0 && tie == 1) ? bestIndex : clamped;
+            // 只有"唯一最近"才采纳；同一天多条并列 ⇒ 锚不足以定案，返回 -1
+            return (bestIndex >= 0 && tie == 1) ? bestIndex : -1;
         }
         // 目标名没有日期（纯期号式）：按「同期号 + 同分段 + 正片」找一条
         int targetOrd = EpisodeNameMatcher.extractOrdinal(target.name);
@@ -6816,8 +6823,8 @@ public class DetailActivity extends BaseActivity {
             // 同期号只有一条正片（目标源没拆分段）也认
             if (anyPart >= 0 && countMainOfOrdinal(list, targetOrd) == 1) return anyPart;
         }
-        // 没有任何可用锚：保持原位
-        return clamped;
+        // 没有任何可用锚：返回 -1，交给调用方拒绝该源
+        return -1;
     }
 
     /** 统计列表里指定期号的【正片】条目数（nearestEpisodeIndex 的唯一性判据）。 */
