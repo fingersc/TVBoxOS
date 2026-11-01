@@ -3110,6 +3110,29 @@ public final class EpisodeNameMatcher {
         return uniq.size() == 1 ? uniq.iterator().next().intValue() : -1;
     }
 
+    /**
+     * ★ r150：查「日期+期号」对应的精确分段（只认 {@code d<date>|UP/MIDDLE/DOWN} 强证据键）。
+     *
+     * <p>不能改用 {@link #lookupDateOfOrdinal} 反推：该方法带多级 fallback
+     * （请求分段→NONE→UP→DOWN→MIDDLE），当表里只有一条 DOWN 记录时，查 UP/MIDDLE 也会
+     * 返回同一个日期，导致「第1期：初舞台（上/下）」无法区分。</p>
+     *
+     * @return 唯一匹配的 {@link #PART_UP}/{@link #PART_MIDDLE}/{@link #PART_DOWN}；无记录或多义返回 {@link #PART_NONE}
+     */
+    public static int lookupPartOfDateOrdinal(String showKey, int date, int ord) {
+        if (TextUtils.isEmpty(showKey) || date <= 0 || ord <= 0) return PART_NONE;
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+        if (dm == null) return PART_NONE;
+        int found = PART_NONE;
+        for (int p = PART_UP; p <= PART_DOWN; p++) {
+            Integer v = dm.get(tblDateKey(date, p));
+            if (v == null || v.intValue() != ord) continue;
+            if (found != PART_NONE && found != p) return PART_NONE;
+            found = p;
+        }
+        return found;
+    }
+
     /** ★ r140：反查某期号在对应日期的「同日位置」（第2期 → 2），供纯期号→日期式目标定位用。 */
     public static int lookupPosOfOrdinal(String showKey, int ord, int date) {
         if (TextUtils.isEmpty(showKey) || ord <= 0 || date <= 0) return -1;
@@ -3208,6 +3231,9 @@ public final class EpisodeNameMatcher {
             if (o > 0) {
                 // 同日多集且是同一期的 上/中/下 时，按位置推出分段，避免「-2」落到「上」
                 int wantPart = partFromPos(showKey, curDate, pos);
+                // ★ r150：跨日 上/下（20260815 上、20260816 下）不是同日 POS 键，partFromPos 返回 -1；
+                //   改查「日期+期号」的精确分段，避免目标列表第一条「第1期：初舞台（上）」抢走 20260816。
+                if (wantPart <= 0) wantPart = lookupPartOfDateOrdinal(showKey, curDate, o);
                 int idx = findIndexByEpisode(currentName, o, targetNames, wantPart);
                 if (idx >= 0) return idx;
             }

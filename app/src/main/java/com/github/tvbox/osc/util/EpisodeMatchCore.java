@@ -61,9 +61,18 @@ public final class EpisodeMatchCore {
 
         // ---------- 第1.05层：当前集名自带播出日期 → 混合锚点 → 目标纯期号落位（r114）----------
         if (!anchors.nonMain && !TextUtils.isEmpty(anchors.nameDate) && anchors.nameAnchorOrd > 0) {
-            int byAnchorDate = EpisodeNameMatcher.findIndexByEpisode(currentName, anchors.nameAnchorOrd, targetNames);
+            String anchorShow = TextUtils.isEmpty(anchorTitle) ? showName : anchorTitle;
+            // 当前名自带分段时以当前名为准；只有纯日期名才用日期表补分段，避免表与名冲突时反向覆盖。
+            int anchorPart = EpisodeNameMatcher.PART_NONE;
+            if (EpisodeNameMatcher.extractPart(currentName) == EpisodeNameMatcher.PART_NONE) {
+                anchorPart = EpisodeNameMatcher.lookupPartOfDateOrdinal(
+                        anchorShow, EpisodeNameMatcher.dateOf(anchors.nameDate), anchors.nameAnchorOrd);
+            }
+            int byAnchorDate = EpisodeNameMatcher.findIndexByEpisode(
+                    currentName, anchors.nameAnchorOrd, targetNames, anchorPart);
             if (byAnchorDate >= 0) {
                 LOG.sw("[FB] nameDateAnchor date=" + anchors.nameDate + " ord=" + anchors.nameAnchorOrd
+                        + " part=" + anchorPart
                         + " ep=" + currentName + " -> idx=" + byAnchorDate
                         + " tgt=" + targetNames.get(byAnchorDate));
                 return byAnchorDate;
