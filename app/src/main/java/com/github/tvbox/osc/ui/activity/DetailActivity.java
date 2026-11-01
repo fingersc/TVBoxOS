@@ -1496,8 +1496,12 @@ public class DetailActivity extends BaseActivity {
                                     java.util.Collections.singletonList(currentEpisode.name),
                                     guardShow) == 0;
                         } else {
-                            sameEpisodeConfirmed = EpisodeNameMatcher.isSameEpisodeStrict(
-                                    expectedName, currentEpisode.name);
+                            // ★ r141：同集确认升级为「列表级」。
+                            //   原名级 isSameEpisodeStrict 只比日期/期号/显式分段，认不出
+                            //   同日多分段写法（20261022-02 ≡ 第20261022期下、20261022第2期 ≡ 20261022中），
+                            //   实测一次手动切源 6 个候选源全被误判 alignNoEpisode、一个都没切过去。
+                            sameEpisodeConfirmed = confirmSameEpisodeInList(
+                                    expectedName, currentEpisode.name, playingSeriesList);
                         }
                         if (!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
@@ -2735,6 +2739,38 @@ public class DetailActivity extends BaseActivity {
             }
         }
         return best;
+    }
+
+    /**
+     * ★ r141：同集确认的「列表级」判据。
+     *
+     * <p>原名级 {@link EpisodeNameMatcher#isSameEpisodeStrict} 只比日期/期号/显式分段，
+     * 认不出「同日多分段」写法：{@code 20261022-02} ≡ {@code 第20261022期下}、
+     * {@code 20261022第2期} ≡ {@code 20261022中}。真机日志实测一次手动切源，
+     * 6 个候选源全被判 alignNoEpisode、一个都没切过去（Toast「没有其他源包含这一集」）。</p>
+     *
+     * <p>补充判据：用切源选集的同一套定位器 {@link EpisodeNameMatcher#findIndex}
+     * 在同一份目标列表上求最佳下标，若它指向的条目就是当前条目（名字一致），
+     * 即视为同一集。定位器能给出结果时以它为准（它比纯名字面量更贴近实际选集语义）；
+     * 定位器给不出结果（如纯期号 × 纯日期、无日期表）才退回名字级严格判定。</p>
+     */
+    private static boolean confirmSameEpisodeInList(String expectedName, String currentName,
+                                                    List<VodInfo.VodSeries> list) {
+        if (TextUtils.isEmpty(expectedName)) {
+            return false;
+        }
+        if (list == null || list.isEmpty()) {
+            return EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentName);
+        }
+        List<String> names = new java.util.ArrayList<>(list.size());
+        for (VodInfo.VodSeries s : list) {
+            names.add(s == null || s.name == null ? "" : s.name);
+        }
+        int idx = EpisodeNameMatcher.findIndex(expectedName, names);
+        if (idx >= 0 && idx < names.size()) {
+            return TextUtils.equals(names.get(idx), currentName);
+        }
+        return EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentName);
     }
 
     /**
