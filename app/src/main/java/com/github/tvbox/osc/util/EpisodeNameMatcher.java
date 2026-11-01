@@ -68,6 +68,17 @@ public final class EpisodeNameMatcher {
     private static final Pattern DATE_THEN_ORD =
             Pattern.compile("(?:19|20)\\d{6}\\D{0,8}第\\s*(\\d{1,3})\\s*[期集话]");
 
+    /**
+     * ★ r137：日期被"包进期号壳"的正片混合名——{@code 第20260821期第02期公挑战赛上} /
+     * {@code 20260821第2期上}。日期标记与「第N期」之间不允许出现汉字内容词
+     * （{@code 20260809超前企划第1期}、{@code 20260817备战篇第1期} 仍然不算正片）。
+     *
+     * <p>为什么单独一条：原 {@link #isLeadingOrdinal} 走 {@code DATE_THEN_ORD} 分支时，
+     * 匹配起点在 8 位数字处，左侧前缀是「第」⇒ 被判"含中文内容词"⇒ 非正片。
+     * 但「第YYYYMMDD期」本身是日期编号的写法，不是内容词。</p>
+     */
+    private static final Pattern DATE_ORD_HYBRID_MAIN =
+            Pattern.compile("^\\s*第?\\s*(?:19|20)\\d{6}\\s*期?\\s*[^\\p{IsHan}]*\\s*第\\d{1,3}\\s*[期集话]");
     /** ★ r36：反过来——「第N期」在前、日期在后（{@code 第1期20260815上}），语义与上者相同。 */
     private static final Pattern ORD_THEN_DATE =
             Pattern.compile("第\\s*(\\d{1,3})\\s*[期集话]\\D{0,8}(?:19|20)\\d{6}");
@@ -951,6 +962,17 @@ public final class EpisodeNameMatcher {
         }
         if (NON_MAIN_FEATURE.matcher(name).find()) {
             return false;
+        }
+        // ★ r137：日期被"包进期号壳"的混合名（{@code 第20260821期第02期公挑战赛上}）
+        //   —— 这是"日期 + 第N期 + 内容词"的正常写法，日期（第YYYYMMDD期 / YYYYMMDD）
+        //   应视为【编号】而非内容词。原逻辑走 DATE_THEN_ORD 时，期号左侧前缀是"第"字
+        //   ⇒ leadingPrefixOk 判含中文 ⇒ 非正片 ⇒ isNonMainEntryName=true
+        //   ⇒ DetailActivity 第-1层 nonMainSafe 抢先拦截 ⇒ findIndexForNonMain 恒 -1
+        //   ⇒ alignNoEpisode「该源没有这一集」，而实际 score=80、findIndex=0 本可命中
+        //   （真机 2026-11-01《披荆斩棘2026》：19 次误判，其中 17 次目标源确有该集）。
+        //   仅当"日期标记与第N期之间没有内容词"时放行；衍生词已在上面一票否决。
+        if (DATE_ORD_HYBRID_MAIN.matcher(name).find()) {
+            return true;
         }
         EpisodeKey key = parse(name);
         if (key.domain == DOMAIN_ORDINAL && key.ordinal > 0) {
