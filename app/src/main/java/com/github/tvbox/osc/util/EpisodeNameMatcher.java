@@ -214,6 +214,32 @@ public final class EpisodeNameMatcher {
     private static final Pattern DATE_INDEX_TAIL =
             Pattern.compile("\\d{8}\\s*[-–]\\s*\\d{1,2}(?![\\d])");
 
+    /**
+     * ★ r139：「YYYYMMDD-NN」= <b>同日第 NN 集</b>。
+     *
+     * <p>真机《后会友期》(2026-11-01) 两个源的列表逐条同位：
+     * {@code 20261022-01 / 20261022-02 / 20261022沉浸版 …} 对应
+     * {@code 第20261022期第01期 / 第20261022期第02期 / 第20261022期沉浸版 …}。
+     * 即 {@code -01}/{@code -02} 是当天播出的第 1、2 集，<b>不是上/下分段</b>。</p>
+     *
+     * <p>旧逻辑把这种名字当成"日期-序号不可靠对应"，在 {@link #score} 里整条排除出日期轴，
+     * 于是只能去比 {@code epOrdinal}（20261022 vs 1）⇒ 恒 0 ⇒ findIndex=-1 ⇒ 判"该源没有这一集"。
+     * 组 1 = 序号。</p>
+     */
+    private static final Pattern DATE_INDEX_SEQ =
+            Pattern.compile("(?:19|20)\\d{6}\\s*[-_]\\s*0*(\\d{1,2})(?![\\d])");
+
+    /**
+     * ★ r139：日期被包在期号壳里、再挂一个"同日第几集"标签的写法：
+     * {@code 第20261022期第02期}。
+     *
+     * <p>必须<b>连着日期壳</b>才算同日序号——{@code 20260906第2期上} 里的 {@code 第2期}
+     * 是"本季第 2 期"，不是"当天第 2 集"，不能进同日序号（否则它与 {@code 20260906上}
+     * 会被判成不同集，破坏《我家那闺女》已修好的日期锚对齐）。</p>
+     */
+    private static final Pattern DAY_ORDINAL_TAG =
+            Pattern.compile("第\\s*(?:19|20)\\d{6}\\s*期\\s*第\\s*0*(\\d{1,2})\\s*[期集](?![\\d])");
+
     private static final Pattern NON_MAIN_FEATURE = Pattern.compile(
             "重温|回顾|往期|经典|花絮|预告|特辑|幕后|彩蛋|先导片|加更|纯享"
             // —— 综艺常见衍生栏目（用户 2026-10 确认）——
@@ -236,7 +262,10 @@ public final class EpisodeNameMatcher {
             + "|超前|番外|精编|未播|手记|[vV]log|发布会|彩排|会员"
             // ★ r116：真机「直拍REACTION第N期」是衍生（直拍机位/直拍/reaction 均非正片正片）。
             //   旧表只有「直拍机位」，漏了「直拍REACTION」⇒ 与正片「第N期」同序号并列 80 分抢位。
-            + "|直拍|[Rr][Ee][Aa][Cc][Tt][Ii][Oo][Nn]");
+            + "|直拍|[Rr][Ee][Aa][Cc][Tt][Ii][Oo][Nn]"
+            // ★ r139：真机《后会友期》里「20261022沉浸版 / 第20261023期沉浸版」是正片的
+            //   另一版剪辑（同列表里与正片并列），旧词表缺「沉浸」⇒ 与正片同分抢位。
+            + "|沉浸");
 
     /**
      * ★ r119：电影单片（单文件）条目的「画质/语言/版本」标签词表。
@@ -556,6 +585,9 @@ public final class EpisodeNameMatcher {
             ep = k.ordinal;                   // 期号域：ordinal 本就是期序
         } else {
             ep = periodOrdinalFromRaw(name);
+            // ★ r140：`20261022-01` 的尾部数字是「同日位置」，不是全局期号，故不再写入 epOrdinal。
+            //   写进去会把 `20261029-3` 当成「第3期」错配到 `第3期上`（实测 r139 返回 0）。
+            //   同日位置由 daySeqOf 与 findIndexByDate 的「同日组结构」处理。
         }
         return new EpisodeKey(k.ordinal, k.domain, k.part, k.raw, date, ep);
     }
@@ -615,6 +647,64 @@ public final class EpisodeNameMatcher {
      * 经 {@link #normalizePart} 后同为 {@code PART_MIDDLE}，已足以确定是同一集，
      * 再区分写法只会引入没有实际收益的复杂度。</p>
      */
+    /**
+     * ★ r139：把「同一天里的第几集」归一成一个序号。
+     *
+     * <p>同一个播出日，不同源有三种写法，本方法让它们可比：</p>
+     * <ul>
+     *   <li>{@code 第20261022期第02期} → 2（显式期号标签，优先）</li>
+     *   <li>{@code 20261022-02} → 2（日期尾部序号）</li>
+     *   <li>{@code 20261022上} / {@code 20261022下} → 1 / 2（上/下就是当天第 1、2 集）</li>
+     * </ul>
+     *
+     * <p>没有日期、或三种标记都没有时返回 0（无法判定，交由调用方按原逻辑处理）。</p>
+     */
+    private static int daySeqOf(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        EpisodeKey key = parse(name);
+        if (key.date <= 0) {
+            return 0;
+        }
+        int seq = 0;
+        Matcher m = DAY_ORDINAL_TAG.matcher(name);
+        while (m.find()) {
+            int v = -1;
+            try {
+                v = Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {
+                // 数字过长时 parseInt 会抛异常，按"取不到"处理
+            }
+            if (v > 0 && v <= 99) {
+                seq = v;                     // 取最后一个标签（`第20261022期第02期` → 2）
+            }
+        }
+        if (seq > 0) {
+            return seq;
+        }
+        m = DATE_INDEX_SEQ.matcher(name);
+        if (m.find()) {
+            int v = -1;
+            try {
+                v = Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {
+                // 同上
+            }
+            if (v > 0) {
+                return v;
+            }
+        }
+        int part = extractPart(name);
+        if (part == PART_UP) {
+            return 1;
+        }
+        if (part == PART_DOWN) {
+            return 2;
+        }
+        return 0;
+    }
+
     public static int score(String currentName, String targetName) {
         if (TextUtils.isEmpty(currentName) || TextUtils.isEmpty(targetName)) {
             return 0;
@@ -628,19 +718,42 @@ public final class EpisodeNameMatcher {
         //     1) 两侧都有日期 ⇒ 日期为准（日期不同即不同集，再比分段/正片口径）；
         //     2) 否则两侧都有期号 ⇒ 比期号（覆盖“日期(第N期)”这类混合名 ↔ 纯期号）；
         //     3) 两侧都无可识别轴 ⇒ 退回包含式模糊（旧行为）。
-        boolean curIndexTail = DATE_INDEX_TAIL.matcher(currentName).find();
-        boolean tgtIndexTail = DATE_INDEX_TAIL.matcher(targetName).find();
         EpisodeKey cur = parse(currentName);
         EpisodeKey tgt = parse(targetName);
         final boolean curHasDate = cur.date > 0;
         final boolean tgtHasDate = tgt.date > 0;
 
         // ── 轴 1：日期轴（两侧都有可用播出日期）──
-        if (curHasDate && tgtHasDate && !curIndexTail && !tgtIndexTail) {
+        if (curHasDate && tgtHasDate) {
             if (cur.date != tgt.date) {
                 return 0;
             }
-            if (normalizePart(extractPart(currentName)) != normalizePart(extractPart(targetName))) {
+            // ★ r139：同一天可能播多集（`20261022-01` / `20261022-02`，
+            //   对应 `第20261022期第01期` / `第20261022期第02期`）。
+            //   两侧都能判出"当天第几集"且不一致 ⇒ 不是同一集。
+            //   旧逻辑对 `日期-序号` 名字整条跳过日期轴（视为不可靠对应），
+            //   结果落到期号轴比 epOrdinal(20261022 vs 1) ⇒ 恒 0 ⇒ 永远判"没有这一集"。
+            int curDaySeq = daySeqOf(currentName);
+            int tgtDaySeq = daySeqOf(targetName);
+            final boolean bothDaySeq = curDaySeq > 0 && tgtDaySeq > 0;
+            // ★ r139 安全阀：一侧能判出"当天第 N 集"、另一侧算不出（0=裸日期/无序号）时，
+            //   只有 N==1 才允许对到那条"整集/当天唯一一条"。N>=2 说明当天前面还有第 1 集，
+            //   裸日期不能顶替，否则会把「当天第 2 集」误配成「当天整集」。
+            if (!bothDaySeq) {
+                if (curDaySeq > 1 && tgtDaySeq == 0) {
+                    return 0;
+                }
+                if (tgtDaySeq > 1 && curDaySeq == 0) {
+                    return 0;
+                }
+            }
+            if (bothDaySeq && curDaySeq != tgtDaySeq) {
+                return 0;
+            }
+            // 能判出"同日第几集"时，序号本身已包含 上/下 语义（上=1、下=2），
+            // 不再重复比 part —— 否则 `20261022-02`(part=NONE) 对 `…期下`(part=DOWN) 会被判不同集。
+            if (!bothDaySeq
+                    && normalizePart(extractPart(currentName)) != normalizePart(extractPart(targetName))) {
                 return 0;
             }
             if (isNonMainFeature(currentName) != isNonMainFeature(targetName)) {
@@ -979,6 +1092,8 @@ public final class EpisodeNameMatcher {
             return isLeadingOrdinal(name);
         }
         if (key.domain == DOMAIN_DATE && key.ordinal > 0) {
+            // ★ r140：`20261022-01` 整体按「纯日期域」处理——stripMainResidue 已把
+            //   「日期 + -NN」整段剥掉，因此这里只需判残余是否为空（不再用白名单绕开）。
             return stripMainResidue(name).isEmpty();
         }
         // ★ r119 方案B：电影身份不再在此纯名字函数里判（它无"线路/集数"上下文）。
@@ -1546,6 +1661,9 @@ public final class EpisodeNameMatcher {
             return "";
         }
         String work = BRACKET_CONTENT.matcher(name).replaceAll("");
+        // ★ r140：`20261022-01` 整体当作「纯日期域」——先把「日期-序号」整段剥掉。
+        //   否则残余的 "01" 会让它被判成非正片（真机《后会友期》因此 nonMainSafe 恒 -1）。
+        work = DATE_INDEX_SEQ.matcher(work).replaceAll("");
         work = DATE_COMPACT.matcher(work).replaceAll("");
         work = DATE_SEPARATED.matcher(work).replaceAll("");
         work = EIGHT_DIGITS.matcher(work).replaceAll("");
@@ -2451,7 +2569,8 @@ public final class EpisodeNameMatcher {
     //   不再被永久化。修改表语义/词表时须同步 bump 此版本号。
     //   r126：日期表口径修正(L1.6 改用旧源/期号式源建表) + 丢弃历史错误表，故 bump 到 3。
     //   r127：删除「>=3 衍生标记」门槛(会误杀干净日期源致整对不建表)；并丢弃该门槛下可能错建的旧表，故 bump 到 4。
-    private static final int TBL_PERSIST_VERSION = 5;   // r128(P0)：删纯期号×纯日期推断建表，旧表(≤4)一律作废重建
+    //   r140：日期表新增「同日位置」维度（一天多集：20261022-01/-02、第3期上/下），键空间变化，旧表作废，故 bump 到 6。
+    private static final int TBL_PERSIST_VERSION = 6;
     // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
     private static final java.util.Set<String> TBL_CONFLICT =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
@@ -2471,6 +2590,9 @@ public final class EpisodeNameMatcher {
 
     private static String tblOrdKey(int ord, int part) { return "o" + ord + "|" + part; }
     private static String tblDateKey(int date, int part) { return "d" + date + "|" + part; }
+    // ★ r140：日期→期号表支持「同一天多集」。分段键(0..3)之外，用 1000+同日位置 作独立键空间：
+    //   20261022 的第 1/2 集分别为 d20261022|1001、d20261022|1002，互不冲突，也不会与 上/下 分段键混淆。
+    private static final int POS_BASE = 1000;
 
     // ---- r121 持久化：把日期表落到磁盘，关闭 TVBox 重开复用；历史删除时经 clearDateTable 清理 ----
     private static java.io.File dateTableFile;
@@ -2586,14 +2708,32 @@ public final class EpisodeNameMatcher {
         pair.add(b);
         for (List<String> lst : pair) {
             if (lst == null) continue;
-            for (String n : lst) {
+            // ★ r140：同一播出日可能有多集（如 20261022 的双集 20261022-01/02）。
+            //   先按日期分组并给组内条目编「同日位置」，否则 tblPut 会把同日期不同期号判成矛盾并整日作废。
+            java.util.Map<Integer, java.util.List<Integer>> byDate = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < lst.size(); i++) {
+                String n = lst.get(i);
                 if (TextUtils.isEmpty(n)) continue;
                 if (tblIsDeriv(n)) continue;      // ★ r123：混合名入表也要过滤衍生（面对面/盲盒/人物篇…）
                 String of = hybridOrdinalForm(n);
                 if (TextUtils.isEmpty(of)) continue;
                 int o = tblOrdinalOf(of);
                 int d = dateOf(n);
-                if (o > 0 && d > 0) tblPut(key, o, d, extractPart(n), true);
+                if (o > 0 && d > 0) {
+                    java.util.List<Integer> g = byDate.get(d);
+                    if (g == null) { g = new java.util.ArrayList<>(); byDate.put(d, g); }
+                    g.add(i);
+                }
+            }
+            for (java.util.Map.Entry<Integer, java.util.List<Integer>> e : byDate.entrySet()) {
+                java.util.List<Integer> g = e.getValue();
+                int pos = g.size() > 1 ? 1 : 0;
+                for (int idx : g) {
+                    String n = lst.get(idx);
+                    int o = tblOrdinalOf(hybridOrdinalForm(n));
+                    tblPut(key, o, e.getKey(), extractPart(n), true, pos);
+                    if (pos > 0) pos++;
+                }
             }
         }
         // ★ r128(P0)：删除「纯期号源 × 纯日期源 组序对齐」建表(原 alignGroupSequence 调用)。
@@ -2733,9 +2873,14 @@ public final class EpisodeNameMatcher {
     }
 
     private static void tblPut(String showKey, int ord, int date, int part, boolean strong) {
+        tblPut(showKey, ord, date, part, strong, 0);
+    }
+
+    /** ★ r140：pos>0 表示该日期有多集时的「同日位置」，日期→期号写入独立键空间，避免同日不同期被判矛盾。 */
+    private static void tblPut(String showKey, int ord, int date, int part, boolean strong, int pos) {
         int p = normalizePart(part);
         String ok = tblOrdKey(ord, p);
-        String dk = tblDateKey(date, p);
+        String dk = pos > 0 ? tblDateKey(date, POS_BASE + pos) : tblDateKey(date, p);
         String gkOrd = showKey + "#" + ok;
         String gkDate = showKey + "#" + dk;
         if (TBL_CONFLICT.contains(gkOrd) || TBL_CONFLICT.contains(gkDate)) {
@@ -2811,6 +2956,24 @@ public final class EpisodeNameMatcher {
         if (v == null) v = om.get(tblOrdKey(ord, PART_UP));
         if (v == null) v = om.get(tblOrdKey(ord, PART_DOWN));
         if (v == null) v = om.get(tblOrdKey(ord, PART_MIDDLE));
+        if (v == null) {
+            // ★ r140：同日多集只写 POS 键，普通键空缺 → 从 POS 键反查唯一日期
+            Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+            if (dm != null) {
+                for (Map.Entry<String, Integer> e : dm.entrySet()) {
+                    if (e.getValue() == null || e.getValue().intValue() != ord) continue;
+                    int bar = e.getKey().lastIndexOf('|');
+                    int pp;
+                    try { pp = Integer.parseInt(e.getKey().substring(bar + 1)); } catch (Exception ex) { continue; }
+                    if (pp < POS_BASE) continue;
+                    int bar1 = e.getKey().indexOf('|');
+                    int dd;
+                    try { dd = Integer.parseInt(e.getKey().substring(1, bar1)); } catch (Exception ex) { continue; }
+                    if (v != null && v.intValue() != dd) return -1;
+                    v = dd;
+                }
+            }
+        }
         return v == null ? -1 : v;
     }
 
@@ -2824,7 +2987,79 @@ public final class EpisodeNameMatcher {
         if (v == null) v = dm.get(tblDateKey(date, PART_UP));
         if (v == null) v = dm.get(tblDateKey(date, PART_DOWN));
         if (v == null) v = dm.get(tblDateKey(date, PART_MIDDLE));
+        if (v == null) {
+            // ★ r140：同日多集只写 POS 键 → 组内期号唯一时可直接返回
+            java.util.Set<Integer> uniq = new java.util.HashSet<>();
+            for (Map.Entry<String, Integer> e : dm.entrySet()) {
+                if (!e.getKey().startsWith("d" + date + "|")) continue;
+                int bar = e.getKey().lastIndexOf('|');
+                int pp;
+                try { pp = Integer.parseInt(e.getKey().substring(bar + 1)); } catch (Exception ex) { continue; }
+                if (pp >= POS_BASE && e.getValue() != null) uniq.add(e.getValue());
+            }
+            if (uniq.size() == 1) v = uniq.iterator().next();
+        }
         return v == null ? -1 : v;
+    }
+
+    /** ★ r140：查「日期 + 同日位置」对应的期号（一天多集：20261022-01 → 第1期）。 */
+    public static int lookupOrdinalOfDatePos(String showKey, int date, int pos) {
+        if (TextUtils.isEmpty(showKey) || date <= 0 || pos <= 0) return -1;
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+        if (dm == null) return -1;
+        Integer v = dm.get(tblDateKey(date, POS_BASE + pos));
+        if (v != null) return v;
+        // 退化：该日期所有当日位置指向同一期号（第3期上/中/下）→ 期号唯一，可直接用
+        java.util.Set<Integer> uniq = new java.util.HashSet<>();
+        for (Map.Entry<String, Integer> e : dm.entrySet()) {
+            if (!e.getKey().startsWith("d" + date + "|")) continue;
+            int bar = e.getKey().lastIndexOf('|');
+            int pp;
+            try { pp = Integer.parseInt(e.getKey().substring(bar + 1)); } catch (Exception ex) { continue; }
+            if (pp >= POS_BASE) uniq.add(e.getValue());
+        }
+        return uniq.size() == 1 ? uniq.iterator().next().intValue() : -1;
+    }
+
+    /** ★ r140：反查某期号在对应日期的「同日位置」（第2期 → 2），供纯期号→日期式目标定位用。 */
+    public static int lookupPosOfOrdinal(String showKey, int ord, int date) {
+        if (TextUtils.isEmpty(showKey) || ord <= 0 || date <= 0) return -1;
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+        if (dm == null) return -1;
+        for (Map.Entry<String, Integer> e : dm.entrySet()) {
+            if (!e.getKey().startsWith("d" + date + "|")) continue;
+            if (e.getValue() == null || e.getValue().intValue() != ord) continue;
+            int bar = e.getKey().lastIndexOf('|');
+            int pp;
+            try { pp = Integer.parseInt(e.getKey().substring(bar + 1)); } catch (Exception ex) { continue; }
+            if (pp >= POS_BASE) return pp - POS_BASE;
+        }
+        return -1;
+    }
+
+    /**
+     * ★ r140：同日多集若是「同一期的 上/中/下」，按同日位置推出分段；不同期则返回 -1（不参与分段推断）。
+     */
+    private static int partFromPos(String showKey, int date, int pos) {
+        if (TextUtils.isEmpty(showKey) || date <= 0 || pos <= 0) return -1;
+        Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
+        if (dm == null) return -1;
+        java.util.Set<Integer> ords = new java.util.HashSet<>();
+        int maxPos = 0;
+        for (Map.Entry<String, Integer> e : dm.entrySet()) {
+            if (!e.getKey().startsWith("d" + date + "|")) continue;
+            int bar = e.getKey().lastIndexOf('|');
+            int pp;
+            try { pp = Integer.parseInt(e.getKey().substring(bar + 1)); } catch (Exception ex) { continue; }
+            if (pp < POS_BASE) continue;
+            ords.add(e.getValue());
+            maxPos = Math.max(maxPos, pp - POS_BASE);
+        }
+        if (ords.size() != 1 || maxPos < 2) return -1;   // 组内不同期 → 不是分段关系
+        if (pos == 1) return PART_UP;
+        if (pos == 2) return maxPos >= 3 ? PART_MIDDLE : PART_DOWN;
+        if (pos == 3) return PART_DOWN;
+        return -1;
     }
 
     /** 清空某剧日期表（历史记录删除时调用）。 */
@@ -2865,15 +3100,26 @@ public final class EpisodeNameMatcher {
         if (curDate <= 0 && curOrd >= 0) {
             int d = lookupDateOfOrdinal(showKey, curOrd, curPart);
             if (d > 0) {
-                int idx = findIndexByDate(String.valueOf(d), targetNames, currentName);
+                // ★ r140：同日多集时用「同日位置」合成定位名，避免 findIndexByDate 永远取第一条
+                int pos = curPart != PART_NONE ? dayPositionOf(currentName, 0)
+                        : lookupPosOfOrdinal(showKey, curOrd, d);
+                String locator = pos > 0
+                        ? (d + "-" + (pos < 10 ? "0" + pos : String.valueOf(pos)))
+                        : currentName;
+                int idx = findIndexByDate(String.valueOf(d), targetNames, locator);
                 if (idx >= 0) return idx;
             }
             return -1;
         }
         if (curDate > 0 && curOrd < 0) {
-            int o = lookupOrdinalOfDate(showKey, curDate, curPart);
+            // ★ r140：`20261022-01` 这类「日期-同日序号」，先按位置查同日第几集，再回落到分段键
+            int pos = dayPositionOf(currentName, 0);
+            int o = pos > 0 ? lookupOrdinalOfDatePos(showKey, curDate, pos) : -1;
+            if (o <= 0) o = lookupOrdinalOfDate(showKey, curDate, curPart);
             if (o > 0) {
-                int idx = findIndexByEpisode(currentName, o, targetNames);
+                // 同日多集且是同一期的 上/中/下 时，按位置推出分段，避免「-2」落到「上」
+                int wantPart = partFromPos(showKey, curDate, pos);
+                int idx = findIndexByEpisode(currentName, o, targetNames, wantPart);
                 if (idx >= 0) return idx;
             }
         }
@@ -4545,8 +4791,9 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
 
         int nonMainFallback = -1;      // 口径未知时的兜底
         int sameTokenFallback = -1;    // 非正片的"同词"命中
-        int mainFirst = -1;            // ★r110：同日期首个正片（无显式分段时的旧兜底）
-        int mainPartMatch = -1;        // ★r110：同日期中分段与当前【显式】分段一致的正片
+        // ★ r140：同日期正片可能有多条（`20261022-01` / `20261022-02`，或 上/中/下），
+        //   先全部收齐，再按「同日组结构」定位，绝不能直接取第一条（第2期会落到第1期）。
+        java.util.List<Integer> mainIdxs = new java.util.ArrayList<>();
         for (int i = 0; i < names.size(); i++) {
             String name = names.get(i);
             if (TextUtils.isEmpty(name)) {
@@ -4570,15 +4817,9 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             }
 
             if (!curIsNonMain) {
-                // 当前是正片：只认正片；按分段挑（同分段优先，见方法末尾落位规则）
+                // 当前是正片：只认正片，先收集全部候选
                 if (!nonMain) {
-                    if (mainFirst < 0) {
-                        mainFirst = i;
-                    }
-                    if (mainPartMatch < 0
-                            && normalizePart(extractPart(name)) == normalizePart(extractPart(currentName))) {
-                        mainPartMatch = i;
-                    }
+                    mainIdxs.add(i);
                 }
                 continue;
             }
@@ -4595,14 +4836,157 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             return nonMainFallback;
         }
         if (!curIsNonMain) {
-            // ★r110：当前是正片时按显式分段落位，而非永远取第一条
-            if (extractPart(currentName) != PART_NONE) {
-                return mainPartMatch;   // >=0 命中同分段；-1 表示该日期无对应分段 → 跳过该源
-            }
-            return mainFirst;           // 当前无显式分段：沿用旧行为（同日期首个正片）
+            // ★ r140：同日多条时按「同日位置」精确定位；单条时直接命中。
+            return pickSameDateMainIndex(mainIdxs, names, currentName);
         }
         // 当前是非正片：同词优先，找不到才降级到该日期的任意条目
         return sameTokenFallback;
+    }
+
+    /**
+     * ★ r140：同日多条正片时，按「同日位置」精确落位。
+     *
+     * <p>同一个播出日可能有多集，各源写法不同，尾部数字的语义要由<b>该日期组的结构</b>决定：</p>
+     * <ul>
+     *   <li>组内是同一期的 上/中/下（{@code 第3期上/中/下}）→ 位置 = 分段位置（1/2/3）；</li>
+     *   <li>组内是不同期（{@code 第1期/第2期}）→ 位置 = 期号（第 p 个）；</li>
+     *   <li>组内是 {@code 20261022-01/-02} → 位置 = 尾部序号；</li>
+     *   <li>结构混合、位置越界、多条同位置 → -1（宁可不切，不猜）。</li>
+     * </ul>
+     */
+    private static int pickSameDateMainIndex(java.util.List<Integer> idxs, java.util.List<String> names,
+                                             String currentName) {
+        if (idxs == null || idxs.isEmpty()) {
+            return -1;
+        }
+        if (idxs.size() == 1) {
+            return idxs.get(0);
+        }
+        // 完全同名优先（例如当前就是裸日期 `20260906`，组内有 `20260906上/下`）
+        for (int idx : idxs) {
+            if (names.get(idx).equalsIgnoreCase(currentName)) {
+                return idx;
+            }
+        }
+        final int k = idxs.size();
+
+        // 组内是否全部为同一期号（用于「无分段 ≡ 上」与错期保护）
+        int groupOrd = -1;
+        boolean allSameOrd = true;
+        for (int idx : idxs) {
+            int o = rawSeqOf(names.get(idx));
+            if (o <= 0) {
+                allSameOrd = false;
+                break;
+            }
+            if (groupOrd < 0) {
+                groupOrd = o;
+            } else if (groupOrd != o) {
+                allSameOrd = false;
+                break;
+            }
+        }
+        int curOrd = rawSeqOf(currentName);
+        boolean curIsDateSeq = DATE_INDEX_SEQ.matcher(currentName).find();
+        // date-NN 的 NN 是「同日位置」而非期号（20261029-2 = 第3期中），不能拿它跟组内期号比。
+        if (!curIsDateSeq && allSameOrd && groupOrd > 0 && curOrd > 0 && curOrd != groupOrd) {
+            return -1;                       // 日期对上了但期号不同 → 不是同一集
+        }
+
+        // ★ r140：组内「序号」——date-NN 的 NN 或 第N期；全为正且连续时用绝对序号映射到组内位置。
+        //   例：组 [20261016第8期, 20261016第9期, 20261016第10期] 的序号是 8/9/10，
+        //   位置是 1/2/3 —— 不能把绝对序号直接当位置（否则第9期永远对不上）。
+        int minSeq = Integer.MAX_VALUE;
+        int maxSeq = Integer.MIN_VALUE;
+        java.util.Set<Integer> seqSet = new java.util.HashSet<>();
+        boolean allSeq = true;
+        for (int idx : idxs) {
+            int sq = rawSeqOf(names.get(idx));
+            if (sq <= 0) { allSeq = false; break; }
+            seqSet.add(sq);
+            minSeq = Math.min(minSeq, sq);
+            maxSeq = Math.max(maxSeq, sq);
+        }
+        boolean distinctSeq = allSeq && seqSet.size() == k && (maxSeq - minSeq + 1 == k);
+
+        int curPart = extractPart(currentName);   // ★ 用原始分段：PART_NONE 不能归一成"上"
+        int want;
+        if (curPart == PART_UP) {
+            want = 1;
+        } else if (curPart == PART_MIDDLE) {
+            want = 2;
+        } else if (curPart == PART_DOWN) {
+            want = (k >= 3 ? 3 : 2);
+        } else {
+            int curSeq = rawSeqOf(currentName);
+            if (distinctSeq && curSeq >= minSeq && curSeq <= maxSeq) {
+                want = curSeq - minSeq + 1;      // 组内不同期：第 N 期 → 组内第 (N-min+1) 条
+            } else if (!curIsDateSeq && allSameOrd && curOrd == groupOrd) {
+                want = 1;                        // 组内同期、当前无分段 → 无分段 ≡ 上
+            } else if (curSeq > 0 && curSeq <= k) {
+                want = curSeq;                   // 组内序号本身从 1 起（20261022-01/02）
+            } else {
+                want = 0;
+            }
+        }
+        if (want <= 0) {
+            return -1;
+        }
+        int hit = -1;
+        for (int idx : idxs) {
+            int sq = rawSeqOf(names.get(idx));
+            int part = extractPart(names.get(idx));   // ★ 原始分段
+            int pos;
+            if (part == PART_UP) {
+                pos = 1;
+            } else if (part == PART_MIDDLE) {
+                pos = 2;
+            } else if (part == PART_DOWN) {
+                pos = (k >= 3 ? 3 : 2);
+            } else if (distinctSeq) {
+                pos = sq - minSeq + 1;
+            } else {
+                pos = 0;
+            }
+            if (pos == want) {
+                if (hit >= 0) {
+                    return -1;               // 多条同位置 → 多义，不猜
+                }
+                hit = idx;
+            }
+        }
+        return hit;
+    }
+
+    /** ★ r140：条目自身的「组内序号」——date-NN 的 NN，或 第N期 的 N；无则 0。 */
+    private static int rawSeqOf(String name) {
+        Matcher m = DATE_INDEX_SEQ.matcher(name);
+        if (m.find()) {
+            int v = parseIntSafe(m.group(1));
+            if (v > 0) return v;
+        }
+        return parse(name).epOrdinal;
+    }
+
+    /** ★ r140：条目在「同一日期组」里的位置（1 起）。0 表示无法判定。 */
+    private static int dayPositionOf(String name, int groupSize) {
+        int part = extractPart(name);             // ★ 用原始分段：不要 normalizePart（NONE→UP）
+        if (part == PART_UP) {
+            return 1;
+        }
+        if (part == PART_MIDDLE) {
+            return 2;
+        }
+        if (part == PART_DOWN) {
+            return groupSize >= 3 ? 3 : 2;
+        }
+        Matcher m = DATE_INDEX_SEQ.matcher(name);
+        if (m.find()) {
+            int v = parseIntSafe(m.group(1));
+            return v > 0 ? v : 0;
+        }
+        int ord = parse(name).epOrdinal;
+        return ord > 0 ? ord : 0;
     }
 
     /**
@@ -4622,6 +5006,57 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         }
         if (TextUtils.isEmpty(currentName)) {
             return -1;
+        }
+        // ★ r140：当前集带日期、且目标源同一日期有 ≥2 条正片时，先在「同日期组」内定位。
+        //   score() 只有两条名字、看不到列表，无法判断"该日期是否只有一条"；而 `20261022第2期`
+        //   这类写法（日期+第N期，无「第…期」壳）的 daySeq 在单条比较里恒为 0，会被同日第 1 条
+        //   以 80 分抢走。列表级有上下文，交给 findIndexByDate 按组内位置精确判定。
+        int curDateForSeq = dateOf(currentName);
+        if (curDateForSeq > 0) {
+            int sameDateMainCount = 0;
+            for (String n : targetNames) {
+                if (dateOf(n) == curDateForSeq && isMainFeatureEntry(n)) {
+                    sameDateMainCount++;
+                }
+            }
+            if (DATE_INDEX_SEQ.matcher(currentName).find() || sameDateMainCount >= 2) {
+                int byDate = findIndexByDate(String.valueOf(curDateForSeq), targetNames, currentName);
+                if (byDate >= 0) {
+                    return byDate;
+                }
+                for (String n : targetNames) {
+                    if (dateOf(n) == curDateForSeq) {
+                        return -1;           // 同日组存在但无法唯一定位 → 不猜
+                    }
+                }
+            }
+        }
+        // ★ r140：序号对位兜底——当前带「序号」（date-NN 或 第N期）、目标源是纯期号列表时，
+        //   按序号唯一命中（列表里没有日期，findIndexByDate 无从下手）。
+        int curSeq = rawSeqOf(currentName);
+        if (curSeq > 0) {
+            boolean anyDate = false;
+            for (String n : targetNames) {
+                if (dateOf(n) > 0) {
+                    anyDate = true;
+                    break;
+                }
+            }
+            if (!anyDate) {
+                int seqHit = -1;
+                for (int i = 0; i < targetNames.size(); i++) {
+                    if (rawSeqOf(targetNames.get(i)) == curSeq) {
+                        if (seqHit >= 0) {
+                            seqHit = -2;
+                            break;
+                        }
+                        seqHit = i;
+                    }
+                }
+                if (seqHit >= 0) {
+                    return seqHit;
+                }
+            }
         }
         // 第一轮：同域精确匹配
         int matched = -1;
@@ -4841,7 +5276,7 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
      *
      * @param wantPartOverride 调用方推断出的分段；传 {@code -1} 表示按 {@code currentName} 自身推断
      */
-    private static int findIndexByEpisode(String currentName, int episode, List<String> targetNames,
+    public static int findIndexByEpisode(String currentName, int episode, List<String> targetNames,
                                           int wantPartOverride) {
         return findIndexByEpisode(currentName, episode, targetNames, wantPartOverride, null);
     }
@@ -4883,7 +5318,13 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
             EpisodeKey key = parse(name);
             // ★ r116 双维轴：用 epOrdinal（期号轴）判定，兼容「20260612(第4期)」这类
             //   日期+期号混合名（legacy domain=DATE，但 epOrdinal=4 仍应命中）。
-            if (key.epOrdinal <= 0 || key.epOrdinal != episode) {
+            // ★ r140：`第20261022期第01期` 这类伪期号 parse 不出 epOrdinal，回退用混合名里的真期号。
+            int tgtOrd = key.epOrdinal;
+            if (tgtOrd <= 0) {
+                String hof = hybridOrdinalForm(name);
+                if (!TextUtils.isEmpty(hof)) tgtOrd = tblOrdinalOf(hof);
+            }
+            if (tgtOrd <= 0 || tgtOrd != episode) {
                 continue;
             }
             if (curIsNonMain) {
