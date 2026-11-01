@@ -78,7 +78,7 @@ public final class EpisodeNameMatcher {
      * 但「第YYYYMMDD期」本身是日期编号的写法，不是内容词。</p>
      */
     private static final Pattern DATE_ORD_HYBRID_MAIN =
-            Pattern.compile("^\\s*第?\\s*(?:19|20)\\d{6}\\s*期?\\s*[^\\p{IsHan}]*\\s*第\\d{1,3}\\s*[期集话]");
+            Pattern.compile("^\\s*第?\\s*(?:19|20)\\d{6}\\s*期?\\s*[^\\u4e00-\\u9fa5]*\\s*第\\d{1,3}\\s*[期集话]");
     /** ★ r36：反过来——「第N期」在前、日期在后（{@code 第1期20260815上}），语义与上者相同。 */
     private static final Pattern ORD_THEN_DATE =
             Pattern.compile("第\\s*(\\d{1,3})\\s*[期集话]\\D{0,8}(?:19|20)\\d{6}");
