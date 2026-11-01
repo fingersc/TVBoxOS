@@ -468,8 +468,21 @@ public final class EpisodeNameMatcher {
      * 解析名称，返回可比较的 EpisodeKey。
      * 解析顺序：日期 → 期数(阿拉伯) → 期数(中文) → 纯序号兜底(≤4位)。
      */
+    /** ★ r144：名称解析缓存。parse 是纯函数，跨线路/跨切源重复解析同一批集名，缓存可显著降 CPU。 */
+    private static final java.util.concurrent.ConcurrentHashMap<String, EpisodeKey> PARSE_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int PARSE_CACHE_MAX = 4096;
+
     public static EpisodeKey parse(String name) {
-        return enrichDualAxis(parseLegacy(name), name);
+        if (TextUtils.isEmpty(name)) {
+            return enrichDualAxis(parseLegacy(name), name);
+        }
+        EpisodeKey cached = PARSE_CACHE.get(name);
+        if (cached != null) return cached;
+        EpisodeKey key = enrichDualAxis(parseLegacy(name), name);
+        if (PARSE_CACHE.size() >= PARSE_CACHE_MAX) PARSE_CACHE.clear();
+        PARSE_CACHE.put(name, key);
+        return key;
     }
 
     /**
@@ -2308,6 +2321,30 @@ public final class EpisodeNameMatcher {
             final int wantPart = wantPart0;
             // ① 簇法：期号即秩（第N期 = 目标列表第 N-1 个正片簇）
             List<List<Integer>> clusters = buildMainFeatureClusters(targetNames, labels);
+            // ★ r142：同日多期（一天播两期）时，上面的日期差切簇会把同一天的两期并成一簇，
+            //   于是「第2期」的 rank=1 落到下一周的簇（实测 1639 日志：第2期 → 20261029上）。
+            //   这类列表里每一条都带显式的「同日第几期」（20261022-01/02、第20261022期第01/02期、
+            //   20261022第1/2期），期号本身就是绝对期序，直接按它落位，不能再走周更外推。
+            List<List<Integer>> periodClusters = expandSameDatePeriodClusters(clusters, targetNames);
+            if (periodClusters != clusters) {
+                int exactCluster = -1;
+                for (int ci = 0; ci < periodClusters.size(); ci++) {
+                    if (groupPeriodSeq(periodClusters.get(ci), targetNames) == curOrdinal) {
+                        exactCluster = ci;
+                        break;
+                    }
+                }
+                int pickCluster = exactCluster >= 0 ? exactCluster
+                        : (rank < periodClusters.size() ? rank : -1);
+                if (pickCluster >= 0) {
+                    int picked = pickMainFeatureEntry(targetNames, periodClusters.get(pickCluster),
+                            wantPart, -1L);
+                    if (picked >= 0) {
+                        return picked;
+                    }
+                }
+                return -1;
+            }
             // ★ v99-r43：期号秩的【起算簇校准】—— 用户口径「日期与期号同义」的落地。
             //
             //   旧实现直接拿 `rank = 期号-1` 当目标簇下标，隐含假设「目标列表第 0 簇就是第 1 期」。
@@ -2570,7 +2607,7 @@ public final class EpisodeNameMatcher {
     //   r126：日期表口径修正(L1.6 改用旧源/期号式源建表) + 丢弃历史错误表，故 bump 到 3。
     //   r127：删除「>=3 衍生标记」门槛(会误杀干净日期源致整对不建表)；并丢弃该门槛下可能错建的旧表，故 bump 到 4。
     //   r140：日期表新增「同日位置」维度（一天多集：20261022-01/-02、第3期上/下），键空间变化，旧表作废，故 bump 到 6。
-    private static final int TBL_PERSIST_VERSION = 6;
+    private static final int TBL_PERSIST_VERSION = 7;   // ★ r143：同日多期按序建表修复后，旧表(6)作废重建
     // 冲突墓碑：不同源给出矛盾映射时,该键一律作废(宁缺毋滥),避免持久化后被错误引导
     private static final java.util.Set<String> TBL_CONFLICT =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
@@ -2727,6 +2764,23 @@ public final class EpisodeNameMatcher {
             }
             for (java.util.Map.Entry<Integer, java.util.List<Integer>> e : byDate.entrySet()) {
                 java.util.List<Integer> g = e.getValue();
+                // ★ r143：同日多期的「同日位置」必须按期号排序后编号，不能按线路里的原始顺序。
+                //   各源对同一天的排序可能不同（如 HD 为 第1期/第2期，闪电为 第2期/第1期），
+                //   按原序编号会把同一条目在不同线路写成不同 pos，触发 tblPut 的强证据互相作废，
+                //   导致整日 o1/o2 丢失（1639 日志 o1/o2 全 -1 的根因）。
+                java.util.Collections.sort(g, new java.util.Comparator<Integer>() {
+                    @Override
+                    public int compare(Integer i1, Integer i2) {
+                        int o1 = tblOrdinalOf(hybridOrdinalForm(lst.get(i1)));
+                        int o2 = tblOrdinalOf(hybridOrdinalForm(lst.get(i2)));
+                        if (o1 != o2) return o1 < o2 ? -1 : 1;
+                        // 同一期的 上/中/下 也按固定顺序排，避免线路把「下」写在「上」前面时 pos 错位。
+                        int p1 = extractPart(lst.get(i1));
+                        int p2 = extractPart(lst.get(i2));
+                        if (p1 != p2) return p1 < p2 ? -1 : 1;
+                        return i1 < i2 ? -1 : (i1.intValue() == i2.intValue() ? 0 : 1);
+                    }
+                });
                 int pos = g.size() > 1 ? 1 : 0;
                 for (int idx : g) {
                     String n = lst.get(idx);
@@ -4428,6 +4482,126 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
         }
         // ★ v99-r44：剔除「日更衍生簇」——见 dropDailyRefreshClusters。
         return dropDailyRefreshClusters(clusters, names);
+    }
+
+    /**
+     * ★ r142：取「同一天里的第几期」的显式序号。
+     *
+     * <p>只认三种写法里带序号的部分：{@code 20261022-02}、{@code 第20261022期第02期}、
+     * {@code 20261022第2期}。上/中/下分段<b>不算</b>期序——同一天的上/下是同一期的三段，
+     * 不能当成两期。</p>
+     */
+    private static int explicitPeriodSeqOf(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        Matcher m = DAY_ORDINAL_TAG.matcher(name);
+        if (m.find()) {
+            int v = parseIntSafe(m.group(1));
+            if (v > 0) {
+                return v;
+            }
+        }
+        m = DATE_INDEX_SEQ.matcher(name);
+        if (m.find()) {
+            int v = parseIntSafe(m.group(1));
+            if (v > 0) {
+                return v;
+            }
+        }
+        // 「20261022第2期」：日期 + 不带壳的本季期号（分段不算同日序号）
+        EpisodeKey key = parse(name);
+        if (key.date > 0 && key.epOrdinal > 0 && key.part == PART_NONE) {
+            return key.epOrdinal;
+        }
+        return 0;
+    }
+
+    /**
+     * ★ r142：把「同一天多期」的簇拆成一期一簇。
+     *
+     * <p>日期差切簇（{@link #CLUSTER_GAP_DAYS}）只认日期，同一天播两期时会把两期并成一簇，
+     * 使后续期号的簇秩整体偏一期。这里仅在<b>簇内所有条目同一天、且都带显式同日序号、
+     * 且序号不止一个</b>时拆分——条件不满足就原样返回，绝不猜。</p>
+     *
+     * @return 拆分后的簇；没有可拆的簇时返回原对象（调用方可用引用比较判断是否发生拆分）
+     */
+    private static List<List<Integer>> expandSameDatePeriodClusters(List<List<Integer>> clusters,
+                                                                   List<String> names) {
+        if (clusters == null || clusters.isEmpty() || names == null) {
+            return clusters;
+        }
+        List<List<Integer>> out = new ArrayList<>();
+        boolean expanded = false;
+        for (List<Integer> cluster : clusters) {
+            if (cluster == null || cluster.size() < 2) {
+                out.add(cluster);
+                continue;
+            }
+            Set<Integer> dates = new HashSet<>();
+            Map<Integer, List<Integer>> bySeq = new HashMap<>();
+            boolean allExplicit = true;
+            for (int idx : cluster) {
+                if (idx < 0 || idx >= names.size()) {
+                    allExplicit = false;
+                    break;
+                }
+                String n = names.get(idx);
+                int d = dateOf(n);
+                if (d <= 0) {
+                    allExplicit = false;
+                    break;
+                }
+                dates.add(d);
+                int seq = explicitPeriodSeqOf(n);
+                if (seq <= 0) {
+                    allExplicit = false;
+                    break;
+                }
+                List<Integer> list = bySeq.get(seq);
+                if (list == null) {
+                    list = new ArrayList<>();
+                    bySeq.put(seq, list);
+                }
+                list.add(idx);
+            }
+            if (!allExplicit || dates.size() != 1 || bySeq.size() < 2) {
+                out.add(cluster);
+                continue;
+            }
+            expanded = true;
+            List<Integer> seqs = new ArrayList<>(bySeq.keySet());
+            java.util.Collections.sort(seqs);
+            for (Integer s : seqs) {
+                out.add(bySeq.get(s));
+            }
+        }
+        return expanded ? out : clusters;
+    }
+
+    /**
+     * ★ r142：簇的显式期序号；簇内条目的序号不一致或缺失时返回 0。
+     */
+    private static int groupPeriodSeq(List<Integer> cluster, List<String> names) {
+        if (cluster == null || cluster.isEmpty() || names == null) {
+            return 0;
+        }
+        int seq = 0;
+        for (int idx : cluster) {
+            if (idx < 0 || idx >= names.size()) {
+                return 0;
+            }
+            int s = explicitPeriodSeqOf(names.get(idx));
+            if (s <= 0) {
+                return 0;
+            }
+            if (seq == 0) {
+                seq = s;
+            } else if (seq != s) {
+                return 0;
+            }
+        }
+        return seq;
     }
 
     /**

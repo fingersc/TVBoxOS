@@ -53,6 +53,7 @@ import com.github.tvbox.osc.ui.dialog.QuickSearchDialog;
 import com.github.tvbox.osc.ui.fragment.PlayFragment;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.EpisodeDict;
+import com.github.tvbox.osc.util.EpisodeMatchCore;
 import com.github.tvbox.osc.util.EpisodeNameMatcher;
 import com.github.tvbox.osc.util.EpisodeOnlineResolver;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
@@ -66,6 +67,7 @@ import com.github.tvbox.osc.util.FilmIdentity;
 import com.github.tvbox.osc.util.ShowTitleKey;
 import com.github.tvbox.osc.util.SourceQualityStore;
 import com.github.tvbox.osc.util.SubtitleHelper;
+import com.github.tvbox.osc.util.SwitchBudget;
 import com.github.tvbox.osc.viewmodel.SearchSession;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
@@ -151,7 +153,7 @@ public class DetailActivity extends BaseActivity {
      * 已经跑通过的并发量，不引入新的带宽风险；变快的部分全部来自「不再等最慢的源」。</p>
      */
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
-    private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000L;
+    private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = SwitchBudget.SEARCH_TIMEOUT_MS;
     /**
      * ★ v99-r57：正在加载候选详情（{@code detailFallbackLoadingCandidate}）时的补位并发上限。
      *
@@ -178,7 +180,7 @@ public class DetailActivity extends BaseActivity {
      * <p>保证「没问过的源最终一定会被问到」—— 补位不再依赖"结果回调恰好落在空闲时刻"
      * 这种运气（第二次能发 65 个只是碰巧，不是设计）。</p>
      */
-    private static final long DETAIL_FALLBACK_BUSY_REFILL_DELAY_MS = 300L;
+    private static final long DETAIL_FALLBACK_BUSY_REFILL_DELAY_MS = SwitchBudget.BUSY_REFILL_DELAY_MS;
     /**
      * ★ v99-r58：攒池引擎的<b>后台并发档</b>（取代原 {@code DETAIL_FALLBACK_PREHEAT_MAX_SEARCH}）。
      *
@@ -194,7 +196,7 @@ public class DetailActivity extends BaseActivity {
      * 窗口，此刻扎进去会拖慢首帧。等首帧出来、播放进入稳态再慢慢补，
      * 用户点切源时池子通常已经攒了一部分。</p>
      */
-    private static final long DETAIL_FALLBACK_PREHEAT_DELAY_MS = 1500L;
+    private static final long DETAIL_FALLBACK_PREHEAT_DELAY_MS = SwitchBudget.PREHEAT_DELAY_MS;
     /**
      * ★ v99-r58：攒池任务的<b>兜底硬闸</b>（取代原 {@code DETAIL_FALLBACK_PREHEAT_TIMEOUT_MS}）。
      *
@@ -206,7 +208,7 @@ public class DetailActivity extends BaseActivity {
      * 走完 101 个源需要 {@code 101 ÷ 5 × 3.6 ≈ 73s}。取 120s 是为了覆盖更差的网络，
      * 正常情况下由队列跑空自然收尾，硬闸只是异常慢网的保险。</p>
      */
-    private static final long DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS = 120000L;
+    private static final long DETAIL_FALLBACK_POOL_FILL_TIMEOUT_MS = SwitchBudget.POOL_FILL_TIMEOUT_MS;
     /**
      * ★ v99-r58：单部影片候选池的<b>条数软上限</b>（用户拍板 40）。
      *
@@ -235,13 +237,13 @@ public class DetailActivity extends BaseActivity {
      * 便于 {@code pollNextCycledSource()} 按质量挑，而不是闭眼拿第一个回来的），
      * 就提前放起来。搜索阶段在后台继续跑，照样把整圈缓存补满 —— 两者互不冲突。</p>
      */
-    private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = 1200L;
-    private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = 6000L;
+    private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = SwitchBudget.FIRST_CONSUME_DELAY_MS;
+    private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = SwitchBudget.DETAIL_TIMEOUT_MS;
     // ===== 方案A：探路请求 =====
     private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
-    private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = 2500L;
+    private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = SwitchBudget.PROBE_TIMEOUT_MS;
     // ===== 方案B：按源超时（替代 8s 全局超时）=====
-    private static final long DETAIL_FALLBACK_SOURCE_TIMEOUT_MS = 3500L;
+    private static final long DETAIL_FALLBACK_SOURCE_TIMEOUT_MS = SwitchBudget.SOURCE_TIMEOUT_MS;
 
     /**
      * 一次切源里，因「候选不可用」而<b>自动续切</b>的次数上限。
@@ -253,7 +255,7 @@ public class DetailActivity extends BaseActivity {
      * <p>达到上限即停止并保留当前画面，由用户决定是否再点一次——
      * 连跳十几个站对用户毫无价值，只会让人以为应用失控。</p>
      */
-    private static final int DETAIL_FALLBACK_MAX_FAILOVER = 3;
+    private static final int DETAIL_FALLBACK_MAX_FAILOVER = SwitchBudget.MAX_FAILOVER;
     // ===== 方案D：缓存持久化 =====
     // 抽出去是为了让 RoomDataManger（删除历史连带清池）能直接依赖仓储层，
     // 而不是反向依赖 UI 层的 Activity。
@@ -1150,7 +1152,7 @@ public class DetailActivity extends BaseActivity {
                         llLayout.removeCallbacks(detailFallbackDetailTimeout);
                     }
                     if (fallbackResult) {
-                        setSwitchPhase(SwitchPhase.MATCHING);
+                        setSwitchPhase(SwitchSession.Phase.MATCHING);
                         SourceBean fallbackSource = ApiConfig.get().getSource(sourceKey);
                         String fallbackName = fallbackSource == null ? sourceKey : fallbackSource.getName();
                         Toast.makeText(DetailActivity.this, "站点切换至" + fallbackName, Toast.LENGTH_SHORT).show();
@@ -1507,7 +1509,7 @@ public class DetailActivity extends BaseActivity {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
                                     + " expected=" + expectedName + " actual=" + currentEpisode.name
                                     + " userPicked=" + (fallbackResult ? 0 : 1)
-                                    + " alignFailover=" + detailFallbackAlignFailover);
+                                    + " alignFailover=" + switchSession.alignFailover());
                             detailFallbackLoadingCandidate = false;
                             llLayout.removeCallbacks(detailFallbackDetailTimeout);
                             if (!fallbackResult) {
@@ -1516,11 +1518,9 @@ public class DetailActivity extends BaseActivity {
                                         "该源没有当前这一集", Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            boolean alignBudgetExhausted =
-                                    detailFallbackAlignFailover >= DETAIL_FALLBACK_MAX_ALIGN_FAILOVER
-                                    || (detailFallbackRoundStartMs > 0
-                                        && System.currentTimeMillis() - detailFallbackRoundStartMs
-                                            >= DETAIL_FALLBACK_ALIGN_MAX_MS);
+                            boolean alignBudgetExhausted = !switchSession.canAlignFailover(
+                                    DETAIL_FALLBACK_MAX_ALIGN_FAILOVER,
+                                    DETAIL_FALLBACK_ALIGN_MAX_MS);
                             if (alignBudgetExhausted) {
                                 Toast.makeText(DetailActivity.this,
                                         detailFallbackHadEpisodePlaybackFail
@@ -1530,7 +1530,7 @@ public class DetailActivity extends BaseActivity {
                                 finishDetailFallbackWithoutResult();
                                 return;
                             }
-                            detailFallbackAlignFailover++;
+                            switchSession.noteAlignFailover();
                             detailFallbackSoftTriedKeys.add(sourceKey);
                             loadNextDetailFallbackSource();
                             return;
@@ -2112,9 +2112,8 @@ public class DetailActivity extends BaseActivity {
 
         detailFallbackActive = true;
         // 手动发起切源 → 重置失败续切预算。自动续切不清零，那正是要限制的连跳。
-        detailFallbackFailoverCount = 0;
-        // ★ r105：本轮切源墙钟起点（供「该源没有该集」续切的时间封顶用）。
-        detailFallbackRoundStartMs = System.currentTimeMillis();
+        // ★ r146(P2)：预算计数与轮次起点统一由 SwitchSession 管理。
+        switchSession.beginRound();
         // ★ 每次切源前，把搜索会话候选池的「最新增量」并入本地缓存。
         //   搜索是边跑边补的（单一真相源在 SearchSession），而本地 detailFallbackCache
         //   是进页面那一刻的副本；不重新拉取的话，切源能在几个站之间轮转，
@@ -2154,36 +2153,15 @@ public class DetailActivity extends BaseActivity {
      *
      * @return true 表示已经发起 loadDetail（或已转入全网搜索流程）
      */
-    // ================= r129(P2)：切源「显式阶段」+ 统一时钟（观测用，行为零变化）=================
-    // 背景：切源编排此前由上百个 detailFallback* 布尔字段拼出隐式状态，非法组合难以排查。
-    // 本版先落「单一阶段枚举 + 一轮切源总时钟」，只做记录/日志，不参与任何分支判定，
-    // 保证行为零变化；后续 P2 第二步再把各布尔收敛到该枚举上。
-    enum SwitchPhase { IDLE, SNAPSHOT, POOL, PICKING, LOADING_DETAIL, MATCHING, MIGRATING, PLAYING }
-    private volatile SwitchPhase currentSwitchPhase = SwitchPhase.IDLE;
-    private volatile long switchPhaseStartedAt = 0L;
-    private volatile long switchStartedAt = 0L;
-    private static final long SWITCH_TOTAL_BUDGET_MS = 90_000L; // 一轮切源总预算（观测基线，暂不强制）
+    // ================= r146(P2)：切源「显式阶段」+ SwitchSession（行为零变化）=================
+    private final SwitchSession switchSession = new SwitchSession();
 
-    private void setSwitchPhase(SwitchPhase p) {
-        if (p == null) return;
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (p == currentSwitchPhase) { switchPhaseStartedAt = now; return; }
-        long cost = switchPhaseStartedAt == 0L ? 0L : (now - switchPhaseStartedAt);
-        if (currentSwitchPhase == SwitchPhase.IDLE || p == SwitchPhase.SNAPSHOT) switchStartedAt = now;
-        long total = switchStartedAt == 0L ? 0L : (now - switchStartedAt);
-        LOG.sw("[FB] phase " + currentSwitchPhase + " -> " + p
-                + " costMs=" + cost + " totalMs=" + total
-                // ★ r130：手动切源不计入预算——否则"人工连点测匹配"会在日志里刷满 OVER_BUDGET，
-                //   把正常的测试节奏误读成"自动兜底卡死"。manual 轮次只标 (manual)，不做超预算告警。
-                + (detailFallbackManualSwap
-                        ? " (manual)"
-                        : (total > SWITCH_TOTAL_BUDGET_MS ? " (OVER_BUDGET)" : "")));
-        currentSwitchPhase = p;
-        switchPhaseStartedAt = now;
+    private void setSwitchPhase(SwitchSession.Phase p) {
+        switchSession.enter(p, detailFallbackManualSwap);
     }
 
     private boolean loadNextDetailFallbackFromCache() {
-        setSwitchPhase(SwitchPhase.PICKING);
+        setSwitchPhase(SwitchSession.Phase.PICKING);
         if (!detailFallbackCacheEntryUsable()) {
             // 缓存为空 → 只有这种情况才真正发起一次全网搜索
             if (!detailFallbackSearchCollecting) {
@@ -2241,7 +2219,7 @@ public class DetailActivity extends BaseActivity {
         showDetailFallbackIndicators(nextSource, video);
         markDetailFallbackInflight(nextSource, nextId);
         markSwitchFrom();
-        setSwitchPhase(SwitchPhase.LOADING_DETAIL);
+        setSwitchPhase(SwitchSession.Phase.LOADING_DETAIL);
         loadDetail(nextId, nextSource, true);
         return true;
     }
@@ -4251,9 +4229,9 @@ public class DetailActivity extends BaseActivity {
      * @return true 表示允许继续续切；false 表示已达上限、调用方应直接返回
      */
     private boolean consumeFailoverBudget(String reason) {
-        if (detailFallbackFailoverCount >= DETAIL_FALLBACK_MAX_FAILOVER) {
+        if (!switchSession.canFailover(DETAIL_FALLBACK_MAX_FAILOVER)) {
             LOG.sw("[FB] failover LIMIT reached reason=" + reason
-                    + " count=" + detailFallbackFailoverCount
+                    + " count=" + switchSession.failoverCount()
                     + " dead=" + detailFallbackDeadKeys.size()
                     + " soft=" + detailFallbackSoftTriedKeys.size());
             Toast.makeText(this,
@@ -4264,8 +4242,8 @@ public class DetailActivity extends BaseActivity {
             finishDetailFallbackWithoutResult();
             return false;
         }
-        detailFallbackFailoverCount++;
-        LOG.sw("[FB] failover #" + detailFallbackFailoverCount + " reason=" + reason
+        switchSession.noteFailover();
+        LOG.sw("[FB] failover #" + switchSession.failoverCount() + " reason=" + reason
                 + " from=" + sourceKey
                 + " dead=" + detailFallbackDeadKeys.size()
                 + " soft=" + detailFallbackSoftTriedKeys.size());
@@ -4292,7 +4270,7 @@ public class DetailActivity extends BaseActivity {
                 showDetailFallbackIndicators(nextSource, video);
                 markDetailFallbackInflight(nextSource, videoId);
                 LOG.sw("[FB] loadDetail -> " + nextSource + " id=" + videoId
-                        + " failover=" + detailFallbackFailoverCount);
+                        + " failover=" + switchSession.failoverCount());
                 markSwitchFrom();
                 loadDetail(videoId, nextSource, true);
                 return;
@@ -5040,7 +5018,7 @@ public class DetailActivity extends BaseActivity {
     }
 
     private void resetDetailFallback() {
-        setSwitchPhase(SwitchPhase.IDLE);
+        setSwitchPhase(SwitchSession.Phase.IDLE);
         resetDetailFallback(false);
     }
 
@@ -5058,13 +5036,8 @@ public class DetailActivity extends BaseActivity {
      *                  false = 彻底复位（退出页面 / 换片 / 出错）
      */
     private void resetDetailFallback(boolean keepCache) {
-        detailFallbackFailoverCount = 0;
-        // ★ r105：「该源没有该集」预算必须按轮计、跨轮不累加。
-        //   此前这里从不清 detailFallbackAlignFailover（全文件只有声明处 =0），
-        //   于是第一次切源烧到 6 后，之后每轮起点就 ≥6、一进门直接放弃 —— 与注释
-        //   「独立预算 6 次（每轮）」不符，是「切一次不成就永远切不动」的元凶之一。
-        detailFallbackAlignFailover = 0;
-        detailFallbackRoundStartMs = 0L;
+        // ★ r146(P2)：两类续切预算与轮次起点统一由 SwitchSession 收尾。
+        switchSession.endRound();
         // ★ r103：只有「换片/全新一轮」的彻底复位才清「有集但播放失败」标记；
         //   keepCache=true 是同一轮内的成功重新定位，标记要保留到本轮真正收尾，
         //   否则会漏掉此前「有集却超时」的事实（详见字段注释）。
@@ -5336,12 +5309,6 @@ public class DetailActivity extends BaseActivity {
     private boolean detailFallbackEarlyConsumeScheduled;
 
     /**
-     * 本轮切源已发生的「失败续切」次数，达到 {@link #DETAIL_FALLBACK_MAX_FAILOVER} 即停止。
-     * 每次<b>手动</b>发起切源时清零；自动续切不清零，正是为了限制连跳。
-     */
-    private int detailFallbackFailoverCount;
-
-    /**
      * 提前消费：候选池里已经有可用候选时，不再等搜索阶段收尾就直接放起来。
      *
      * <p>只做一次判断，真正的选源/加载交给 {@link #loadNextDetailFallbackSource()}，
@@ -5451,12 +5418,9 @@ public class DetailActivity extends BaseActivity {
      */
     private String detailFallbackDenyMsg = "";
     /**
-     * ★ v99-r76：因「该源没有当前这一集」而续切的次数（<b>独立预算</b>，不占用通用 failover 预算 ——
-     * 「找有对应集的源」比「起播失败重试」需要更多次，用户定稿为 6 次）。
+     * ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（r105：6→12，配合上游去重与时间封顶）。
      */
-    private int detailFallbackAlignFailover = 0;
-    /** ★ v99-r76：因「该源没有当前这一集」而续切的最大次数（r105：6→12，配合上游去重与时间封顶）。 */
-    private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = 12;
+    private static final int DETAIL_FALLBACK_MAX_ALIGN_FAILOVER = SwitchBudget.MAX_ALIGN_FAILOVER;
     /**
      * ★ r105：本轮切源「该源没有该集」续切的总墙钟上限（毫秒）。
      *
@@ -5464,9 +5428,7 @@ public class DetailActivity extends BaseActivity {
      * 用时间封顶既能穿过一大串「没该集」的源走到池子后段真正含该集的源（如非凡系），
      * 又能兜住网络差时「连跳十几个站、页面不停变化无法中断」的老问题。</p>
      */
-    private static final long DETAIL_FALLBACK_ALIGN_MAX_MS = 20000L;
-    /** ★ r105：本轮切源开始时刻（用于上面的墙钟封顶）；0 表示未开始 / 不限。 */
-    private long detailFallbackRoundStartMs = 0L;
+    private static final long DETAIL_FALLBACK_ALIGN_MAX_MS = SwitchBudget.ALIGN_MAX_MS;
     /**
      * ★ r105：本圈已尝试过的「上游影片 id」集合。
      *
@@ -5511,6 +5473,10 @@ public class DetailActivity extends BaseActivity {
      * 但一切「池/搜索/持久化」语义都改锚不动。</p>
      */
     private String detailFallbackAnchorTitle = "";
+    /** ★ r144：日期表缓存守卫——同一部剧/同一套线路只建一次，避免每次定位重建全部列表。 */
+    private VodInfo dateTableBuiltVod;
+    private String dateTableBuiltShow = "";
+    private int dateTableBuiltSignature = 0;
     /** 当前 CycleKeys / TriedKeys 归属的片名；片名一变说明换剧了，圈记录必须重置。 */
     private String detailFallbackCycleTitle = "";
     // ===== 方案A：探路状态 =====
@@ -6083,14 +6049,14 @@ public class DetailActivity extends BaseActivity {
      * @return 目标源下标；无法可靠匹配返回 -1
      */
     /** ★ r125 诊断开关：定位 L1.6 日期表为何未生效（定稿后可关）。 */
-    private static final boolean DBG_DATE = true;
+    // ★ r144：日期表诊断统一受「调试模式」开关（LOG.isDebugEnabled）控制，不再常开。
     private static final String DBG_TAG = "TVBox-DBG";
     private static final java.util.HashSet<String> DBG_DUMPED_SHOWS = new java.util.HashSet<>();
     private static final java.util.HashSet<String> DBG_DUMPED_SRC = new java.util.HashSet<>();
 
     /** ★ r125/r126 诊断：把 L1.6 实际使用的「源」列表完整集名按 <1800 字符分块打点，每剧一次。 */
     private void dbgDumpSourceOnce(String showKey, java.util.List<String> src) {
-        if (!DBG_DATE || src == null) return;
+        if (!LOG.isDebugEnabled() || src == null) return;
         if (!DBG_DUMPED_SRC.add(showKey)) return;
         try {
             StringBuilder sb = new StringBuilder();
@@ -6099,22 +6065,47 @@ public class DetailActivity extends BaseActivity {
                 String e = src.get(i) == null ? "" : src.get(i);
                 String tok = i + ":" + e + "|";
                 if (sb.length() + tok.length() > 1800) {
-                    Log.i(DBG_TAG, "[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci++) + " " + sb);
+                    LOG.dbg("[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci++) + " " + sb);
                     sb.setLength(0);
                 }
                 sb.append(tok);
             }
             if (sb.length() > 0) {
-                Log.i(DBG_TAG, "[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci) + " " + sb);
+                LOG.dbg("[DBG-SRC] show=" + showKey + " n=" + src.size() + " chunk=" + (ci) + " " + sb);
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    /** ★ r144：当前剧集所有线路的轻量指纹（线路列表身份 + 条数），用于判断日期表是否需要重建。 */
+    private int dateTableSignature() {
+        if (vodInfo == null || vodInfo.seriesMap == null) return 0;
+        int sig = 17;
+        for (java.util.Map.Entry<String, java.util.List<VodInfo.VodSeries>> en : vodInfo.seriesMap.entrySet()) {
+            java.util.List<VodInfo.VodSeries> l = en.getValue();
+            sig = sig * 31 + System.identityHashCode(l);
+            sig = sig * 31 + (l == null ? 0 : l.size());
+        }
+        return sig;
+    }
+
+    private void markDateTablesBuilt(String showKey) {
+        dateTableBuiltVod = vodInfo;
+        dateTableBuiltShow = showKey == null ? "" : showKey;
+        dateTableBuiltSignature = dateTableSignature();
     }
 
     /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
     private void ensureDateTablesBuilt() {
         try {
             if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.size() < 2) return;
+            String showKey = TextUtils.isEmpty(detailFallbackAnchorTitle) ? vod_name : detailFallbackAnchorTitle;
+            int sig = dateTableSignature();
+            // ★ r144：同一部剧、同一套线路已建过表就直接复用，避免每次 findMatchingEpisodeIndex 都复制全量集名。
+            if (vodInfo == dateTableBuiltVod && sig == dateTableBuiltSignature
+                    && TextUtils.equals(showKey, dateTableBuiltShow)) {
+                return;
+            }
             java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
             java.util.List<String> srcKeys = new java.util.ArrayList<>();
             for (java.util.Map.Entry<String, java.util.List<VodInfo.VodSeries>> en : vodInfo.seriesMap.entrySet()) {
@@ -6123,12 +6114,12 @@ public class DetailActivity extends BaseActivity {
                 all.add(seriesNames(l));
                 srcKeys.add(en.getKey());
             }
-            String showKey = TextUtils.isEmpty(detailFallbackAnchorTitle) ? vod_name : detailFallbackAnchorTitle;
             EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+            markDateTablesBuilt(showKey);
             // ★ r125 诊断：每部剧仅首帧 dump 一次，输出各线路完整集名 + 建表后 o0..o8 映射，
             //   用于定位「表空/配对错位」与补齐日志被 logcat 截断的完整列表。
-            if (DBG_DATE && DBG_DUMPED_SHOWS.add(showKey)) {
-                Log.i(DBG_TAG, "[DBG-BUILD] r125-diag show=" + showKey + " lists=" + all.size());
+            if (LOG.isDebugEnabled() && DBG_DUMPED_SHOWS.add(showKey)) {
+                LOG.dbg("[DBG-BUILD] r125-diag show=" + showKey + " lists=" + all.size());
                 dbgDumpDateState(showKey, all, srcKeys);
             }
         } catch (Throwable ignored) {
@@ -6137,7 +6128,7 @@ public class DetailActivity extends BaseActivity {
 
     /** ★ r125 诊断：把每条线路的完整集名按 <1800 字符分块打点，并按 o0..o8 打印日期表映射。 */
     private void dbgDumpDateState(String showKey, java.util.List<java.util.List<String>> all, java.util.List<String> srcKeys) {
-        if (!DBG_DATE) return;
+        if (!LOG.isDebugEnabled()) return;
         try {
             if (all != null) {
                 for (int li = 0; li < all.size(); li++) {
@@ -6151,13 +6142,13 @@ public class DetailActivity extends BaseActivity {
                         if (e == null) e = "";
                         String tok = i + ":" + e + "|";
                         if (sb.length() + tok.length() > 1800) {
-                            Log.i(DBG_TAG, "[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
+                            LOG.dbg("[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
                             sb.setLength(0);
                         }
                         sb.append(tok);
                     }
                     if (sb.length() > 0) {
-                        Log.i(DBG_TAG, "[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
+                        LOG.dbg("[DBG-LIST] show=" + showKey + " src=" + srcKey + " n=" + l.size() + " chunk=" + (ci++) + " " + sb);
                     }
                 }
             }
@@ -6168,7 +6159,7 @@ public class DetailActivity extends BaseActivity {
                         .append("|D=").append(EpisodeNameMatcher.lookupDateOfOrdinal(showKey, ord, EpisodeNameMatcher.PART_DOWN))
                         .append("; ");
             }
-            Log.i(DBG_TAG, "[DBG-TBLMAP] show=" + showKey + " " + tb);
+            LOG.dbg("[DBG-TBLMAP] show=" + showKey + " " + tb);
         } catch (Throwable ignored) {
         }
     }
@@ -6361,240 +6352,27 @@ public class DetailActivity extends BaseActivity {
     }
 
     private int findMatchingEpisodeIndexRaw(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
-        if (targetList == null || targetList.isEmpty()) {
-            return -1;
-        }
-        if (targetList.size() == 1) {
-            return 0;
-        }
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
             return -1;
         }
         final List<String> targetNames = seriesNames(targetList);
-        final String currentName = currentSeries.name;
-
-        // ---------- 第0层：播放流日期锚 + 混合锚点 → 规范期号（r112，必须先于同域匹配）----------
-        // 同一「第N期」在不同源可能指向不同播出日期：172116 把 0410 标「第4期」，jisu 把 0403 标「第4期」。
-        // 若先做同域匹配，「第4期上」会直接命中 jisu「第4期上」(实为 0403) —— 这正是错切。
-        // 因此当①当前集名无日期、②播放流 URL 里带真实播出日期、③混合锚点给出的规范期号（该日期对应的真期号）
-        // 与当前名自身期号**不同**（即当前源期号标签偏了）时，以规范期号为准重新定位。
-        // 只在三者同时成立时介入；其余情况完全放行旧链路（零回归）。
-        if (TextUtils.isEmpty(extractDateFromName(currentName))
-                && !EpisodeNameMatcher.isNonMainEntryName(currentName)
-                && currentSeries.url != null && !currentSeries.url.isEmpty()) {
-            String curUrlDate = extractDateFromName(currentSeries.url);
-            if (!TextUtils.isEmpty(curUrlDate)) {
-                String anchorShow0 = TextUtils.isEmpty(detailFallbackAnchorTitle)
-                        ? vod_name : detailFallbackAnchorTitle;
-                int anchorOrd0 = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShow0, curUrlDate);
-                int selfOrd0 = EpisodeNameMatcher.extractOrdinal(currentName);
-                if (anchorOrd0 > 0 && selfOrd0 > 0 && selfOrd0 != anchorOrd0) {
-                    int byAnchor0 = EpisodeNameMatcher.findIndexByEpisode(currentName, anchorOrd0, targetNames);
-                    if (byAnchor0 >= 0) {
-                        LOG.sw("[FB] urlDateAnchorOrdPre url=" + curUrlDate + " self=" + selfOrd0
-                                + " ord=" + anchorOrd0 + " ep=" + currentName
-                                + " -> idx=" + byAnchor0 + " tgt=" + targetNames.get(byAnchor0));
-                        return byAnchor0;
-                    }
-                }
-            }
-        }
-
-        // ---------- 第1层：本地同域精确匹配 ----------
-        // 含"前导零 / 多字少字"等同域变体，全部在此解决，不联网。
-        int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
-        if (matchedIndex >= 0) {
-            return matchedIndex;
-        }
-
-        // ---------- 第1.05层：当前集名自带播出日期 → 混合锚点(日期↔规范期号) → 目标纯期号落位（r114）----------
-        // 场景：切源时传入的「当前集名」(detailFallbackEpisode) 本身带真实播出日期，如「20260403下」或
-        //   「20260403(第4期下)」；而目标源用纯「第N期」命名（无日期）。此时上面的 L1 同域精确匹配在跨域时
-        //   必然落空；主线程下 tryResolveCrossDomainNow 被主动跳过(crossDomainSyncSkipped)，而 alignByMainFeatureRank
-        //   按「正片位置秩」对其又会漏算非正片条目导致少算秩（实测魔力歌先生：0403下被错落成 第3期下=0327，早一周）。
-        //   这里直接用「当前名自带的播出日期」查 r112/r113 收割的『日期→规范期号』混合锚表，得到该日期的规范期号后
-        //   按规范期号在目标源定位——既不需要目标源本身带日期，也不依赖易被非正片打乱的位置秩。
-        // 门控(零回归)：①当前名带 8 位播出日期且为在播正片口径；②规范期号必须由锚表精确给出(缺失/歧义不放行)；
-        //   ③ findIndexByEpisode 命中才采纳，否则原样放行给后续旧链路。
-        {
-            final String curNameDate = extractDateFromName(currentName);
-            if (!TextUtils.isEmpty(curNameDate) && !EpisodeNameMatcher.isNonMainEntryName(currentName)) {
-                String anchorShowName = TextUtils.isEmpty(detailFallbackAnchorTitle)
-                        ? vod_name : detailFallbackAnchorTitle;
-                int curAnchorOrd = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShowName, curNameDate);
-                if (curAnchorOrd > 0) {
-                    int byAnchorDate = EpisodeNameMatcher.findIndexByEpisode(currentName, curAnchorOrd, targetNames);
-                    if (byAnchorDate >= 0) {
-                        LOG.sw("[FB] nameDateAnchor date=" + curNameDate + " ord=" + curAnchorOrd
-                                + " ep=" + currentName + " -> idx=" + byAnchorDate
-                                + " tgt=" + targetNames.get(byAnchorDate));
-                        return byAnchorDate;
-                    }
-                }
-            }
-        }
-
-        // ---------- 第1.1层：当前播放流 URL 内含播出日期 → 权威日期锚（r111）----------
-        // 场景：老源用「第N期」命名（当前集名本身没有日期），但它的播放地址里带着这一集的
-        //   真实播出日期（如 https://c.baisiweiting.com:18443/hls/942/20260906/4417434/plist32.ts）。
-        //   此时 URL 里的日期是「用户此刻到底在看哪一期」的直接物证，比按老源列表做
-        //   位置/簇秩/联网猜测都可靠。
-        //   实测（10-30 11:23，我家那闺女2026）：老源 Clun/156428「第2期下」的播放流在
-        //   /20260906/，目标 153252 里 20260906下 在 index16，但旧的秩对齐把「第2期下」
-        //   当成第3期落到 20260913下(index22)，整整晚一期；用 URL 日期锚直接落 16。
-        // 门控（零回归）：
-        //   ① 仅当前集名自身没有日期时才启用（名字自带日期时以名字为准，保持旧链路）；
-        //   ② 仅当前集对象带 url 且能解出 8 位播出日期时；
-        //   ③ 只有目标列表确实存在该日期（findIndexByDate>=0）才采纳，否则原样放行。
-        if (TextUtils.isEmpty(extractDateFromName(currentName))
-                && !EpisodeNameMatcher.isNonMainEntryName(currentName)
-                && currentSeries.url != null && !currentSeries.url.isEmpty()) {
-            String urlDate = extractDateFromName(currentSeries.url);
-            if (!TextUtils.isEmpty(urlDate)) {
-                int byUrlDate = EpisodeNameMatcher.findIndexByDate(urlDate, targetNames, currentName);
-                if (byUrlDate >= 0) {
-                    LOG.sw("[FB] urlDateAnchor url=" + urlDate + " ep=" + currentName
-                            + " -> idx=" + byUrlDate + " tgt=" + targetNames.get(byUrlDate));
-                    return byUrlDate;
-                }
-                // ★ r112：目标源只有期号、没有日期（如 jisu「第N期上」）时，findIndexByDate 落空。
-                //   此时用「当前播放流 URL 里的播出日期」查『日期↔真期号』混合锚点得到**规范期号**
-                //   （不信当前源自己的期号标签——正是修 172116 第4期(实为0410=第5期)→jisu 第4期 的关键），
-                //   再按规范期号在目标源定位。锚点缺失/不可信则原样放行给旧链路（宁可不切不切错）。
-                String anchorShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
-                        ? vod_name : detailFallbackAnchorTitle;
-                int anchorOrd = EpisodeNameMatcher.ordinalOfDateFromAnchor(anchorShow, urlDate);
-                if (anchorOrd > 0) {
-                    int byAnchor = EpisodeNameMatcher.findIndexByEpisode(currentName, anchorOrd, targetNames);
-                    if (byAnchor >= 0) {
-                        LOG.sw("[FB] urlDateAnchorOrd url=" + urlDate + " ord=" + anchorOrd
-                                + " ep=" + currentName + " -> idx=" + byAnchor
-                                + " tgt=" + targetNames.get(byAnchor));
-                        return byAnchor;
-                    }
-                }
-            }
-        }
-
-        // ---------- 第1.2层：日期+期号混合式名的"期数式"直配 ----------
-        // 采集源普遍有 `20260906第2期上`（日期打头 + 期号 + 分段）这种写法，
-        // 最大资源整库如此。parse 是日期优先 ⇒ 整名被判成日期域 ⇒ 上面第1层的
-        // 同域匹配直接被 gating 掉（实测 score 全 0、findIndex 返回 -1），
-        // 只能退化到跨域换算或裸下标兜底 —— 曾实测切到「加更版第2期」。
-        // 但名字里本来就带着与目标源**完全同形**的 `第2期上` —— 确定性证据，必须先试。
-        //
-        // ★ 只做确定性命中，这一层排在很前面，必须零误判：
-        //   ① 提取出的形态必须带**显式分段**（上/中/下）—— 分段是唯一能把
-        //      「第2期上 / 第2期下 / 加更版第2期」区分开的判据（三者期号都是 2）；
-        //   ② 目标列表里必须存在与之**完全同名**的一条 —— 不用模糊打分，
-        //      因为实测 `企划第2期` 会被模糊匹配到诱饵 `第2期`、
-        //      `大放送第1期` 会被匹配到 `第1期`、`第4期` 会撞上孤立诱饵 `第4期`。
-        //   两条同时满足才采纳；否则原样放行给下面的层处理（零回归风险）。
-        String ordinalForm = EpisodeNameMatcher.hybridOrdinalForm(currentName);
-        if (!TextUtils.isEmpty(ordinalForm)
-                && EpisodeNameMatcher.extractPart(ordinalForm) != EpisodeNameMatcher.PART_NONE) {
-            int exactForm = targetNames.indexOf(ordinalForm);
-            if (exactForm >= 0) {
-                return exactForm;
-            }
-        }
-
-        // ---------- 第1.6层（Tier A · 强证据）：日期表（期号↔日期；r128 起只由混合名等强证据建立）→ 查表按形态选条（r121）----------
-        // 优先于跨域簇秩猜：用两侧真实列表建/查「期号↔日期」表，期号式当前集名查得日期后按日期落位，
-        // 命中即返回；查不到（表未覆盖/该剧无配对源/不可信）原样放行给第2层旧链路（零回归）。
-        // 修《我家那闺女2026》「第2期上」被簇秩猜成「20260913上」（应 20260906上）。
-        {
-            String tblShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
-                    ? vod_name : detailFallbackAnchorTitle;
-            // ★ r126：建表/查表用的「源」必须是【包含 currentName 的那条线路】（通常是旧源=期号式），
-            //   而不是 getPlayingSeriesList()——切源途中它可能已指向目标日期源，导致拿到「日期×日期」
-            //   无法建表（这正是 r121~r125 L1.6 恒 -1、落到 L2 簇秩猜成 20260913上 的真因）。
-            //   getRankSourceList 会优先返回旧源快照 detailFallbackSourceNames（当它含 currentName 时）。
-            List<String> tblSourceNames = getRankSourceList(currentName);
-            int byTable = EpisodeNameMatcher.matchByDateTable(
-                    tblShow, currentName, tblSourceNames, targetNames);
-            if (DBG_DATE) {
-                // ★ r125/r126 诊断：L1.6 每次尝试留痕——看清「源」是哪条、它是否含 currentName、查表结果。
-                Log.i(DBG_TAG, "[DBG-L16] show=" + tblShow
-                        + " cur=" + currentName
-                        + " srcSize=" + (tblSourceNames == null ? -1 : tblSourceNames.size())
-                        + " src0=" + (tblSourceNames == null || tblSourceNames.isEmpty() ? "" : tblSourceNames.get(0))
-                        + " srcHas=" + (tblSourceNames != null && tblSourceNames.contains(currentName))
-                        + " tgtSize=" + (targetNames == null ? -1 : targetNames.size())
-                        + " tgt0=" + (targetNames == null || targetNames.isEmpty() ? "" : targetNames.get(0))
-                        + " cross=" + EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)
-                        + " byTable=" + byTable);
-                dbgDumpSourceOnce(tblShow, tblSourceNames);
-            }
-            if (byTable >= 0) {
-                LOG.sw("[FB] dateTableAnchor ep=" + currentName + " -> idx=" + byTable
-                        + " tgt=" + targetNames.get(byTable));
-                return byTable;
-            }
-        }
-
-        // ---------- 第2层：跨域 → 权威换算 ----------
-        // 严格门控：只有真正跨域（日期 ↔ 期数）才走这一步；同域失败属正常无对应，不联网。
-        if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
-            // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
-            int dictIndex = resolveByOfflineDict(currentName, targetNames);
-            if (dictIndex >= 0) {
-                return dictIndex;
-            }
-            // 2-b 离线正片秩对齐（★ 切到特辑 bug 的主修复，现为首选）：
-            //     用"正片簇序"在本地把期数与日期两种命名域对齐——零延迟、零外部依赖，
-            //     不受直连站点波动影响。此前的顺序是"联网优先、离线兜底"，实测
-            //     直连站点（zyshow.net）波动大（约半数首请求超时/重置），导致每次
-            //     跨域切源都要先白等联网预算才落到离线层；且站点完全不可达时
-            //     裸下标兜底会把「第5期上」静默切到「20260508泳池特辑」这类错位条目。
-            //     簇序对齐自带周更快照校验（±3 天）与伪正片过滤，不确定时返回 -1，
-            //     此时才轮到下面的联网权威换算。
-            List<String> rankSourceNames = getRankSourceList(currentName);
-            int rankSourceIndex = rankSourceNames.indexOf(currentName);
-            String rankShow = TextUtils.isEmpty(detailFallbackAnchorTitle)
-                    ? vod_name : detailFallbackAnchorTitle;
-            int byRank = EpisodeNameMatcher.alignByMainFeatureRank(rankShow,
-                    currentName, rankSourceIndex, rankSourceNames, targetNames);
-            if (byRank >= 0) {
-                return byRank;
-            }
-            // 2-c 直连站点：离线对齐失败时的权威修正（缓存命中 0ms，未命中约 800ms）
-            int online = tryResolveCrossDomainNow(currentName, targetNames);
-            if (online >= 0) {
-                return online;
-            }
-        }
-
-        // ---------- 第1.5层（Tier B · 兜底）：同日期多段的组内位置对齐 ----------
-        // 从"日期表/簇秩/联网"之前移到末尾：组内位置是纯位置猜测，只在所有强证据层全落空时使用。
-        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
-        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
-        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
-        // ★ r129(P1)：删除原「第3层 alignByOrder 同下标兜底」——纯猜测、跨域无依据，违反"宁不切不错切"。
-        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        final List<VodInfo.VodSeries> playList = getPlayingSeriesList();
         int playIndex = indexOfSeries(playList, currentSeries);
         if (playIndex < 0 && vodInfo != null && vodInfo.playIndex >= 0 && vodInfo.playIndex < playList.size()) {
             playIndex = vodInfo.playIndex;
         }
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
-                    currentName, playIndex, seriesNames(playList), targetNames);
-            if (byGroup >= 0) {
-                return byGroup;
-            }
-        }
-        // ---------- 同域纯下标兜底（仅同域；跨域一律 -1）----------
-        // ★ r129 补充：前序版本把这一层连同跨域猜测一起删掉了，但本层入参 allowCrossDomain=false，
-        //   本身只服务「同域且两侧可识别条目数相等」的场景，属确定性保守选择，不是跨域瞎猜。
-        //   同站不同源命名/语言不一致导致前序全落空时，它仍是最后一张安全网。
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byOrder = EpisodeNameMatcher.alignByOrder(
-                    playIndex, seriesNames(playList), targetNames, false);
-            if (byOrder >= 0) {
-                return byOrder;
-            }
-        }
-        return matchedIndex;
+        // ★ r145：原始层栈唯一实现，DA/PF 共用；本方法只负责提供环境参数。
+        return EpisodeMatchCore.resolveRaw(
+                vod_name,
+                detailFallbackAnchorTitle,
+                currentSeries.name,
+                currentSeries.url,
+                playIndex,
+                seriesNames(playList),
+                getRankSourceList(currentSeries.name),
+                targetNames,
+                this::resolveByOfflineDict,
+                this::tryResolveCrossDomainNow);
     }
 
     /**

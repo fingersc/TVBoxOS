@@ -93,6 +93,15 @@ public class LOG {
     }
 
     /**
+     * ★ r144：日期表建表诊断通道。历史上这里用裸 {@code Log.i("TVBox-DBG", ...)} 常开，
+     * 关调试模式也照打；统一收口到本方法后与其它通道一样受调试模式开关控制。
+     */
+    public static void dbg(String msg) {
+        if (!debug) return;
+        Log.i("TVBox-DBG", "" + msg);
+    }
+
+    /**
      * 直播播放链路专用诊断通道，同样<b>受调试模式开关控制</b>。
      *
      * <p>直播排障最想知道的是「这次到底用的哪个播放器、走的是硬解还是软解」，

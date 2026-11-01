@@ -77,6 +77,7 @@ import com.github.tvbox.osc.ui.dialog.SubtitleDialog;
 import com.github.tvbox.osc.util.AdBlocker;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.EpisodeDict;
+import com.github.tvbox.osc.util.EpisodeMatchCore;
 import com.github.tvbox.osc.util.EpisodeNameMatcher;
 import com.github.tvbox.osc.util.EpisodeOnlineResolver;
 import com.github.tvbox.osc.util.EpisodeResolveInitializer;
@@ -2071,6 +2072,10 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     private VodInfo mVodInfo;
+    /** ★ r144：日期表缓存守卫——同一部剧/同一套线路只建一次。 */
+    private VodInfo dateTableBuiltVod;
+    private String dateTableBuiltShow = "";
+    private int dateTableBuiltSignature = 0;
     private JSONObject mVodPlayerCfg;
     private String sourceKey;
     private SourceBean sourceBean;
@@ -2485,17 +2490,38 @@ public class PlayFragment extends BaseLazyFragment {
      *
      * @return 目标源下标；无法可靠匹配返回 -1
      */
+    /** ★ r144：当前剧集所有线路的轻量指纹（线路列表身份 + 条数）。 */
+    private int dateTableSignature() {
+        if (mVodInfo == null || mVodInfo.seriesMap == null) return 0;
+        int sig = 17;
+        for (java.util.Map.Entry<String, java.util.List<VodInfo.VodSeries>> en : mVodInfo.seriesMap.entrySet()) {
+            java.util.List<VodInfo.VodSeries> l = en.getValue();
+            sig = sig * 31 + System.identityHashCode(l);
+            sig = sig * 31 + (l == null ? 0 : l.size());
+        }
+        return sig;
+    }
+
     /** ★ r124 建表可靠化：切源前用整部剧所有线路列表建「期号↔日期」表（幂等）。 */
     private void ensureDateTablesBuilt() {
         try {
             if (mVodInfo == null || mVodInfo.seriesMap == null || mVodInfo.seriesMap.size() < 2) return;
+            String showKey = mVodInfo.name == null ? "" : mVodInfo.name.trim();
+            int sig = dateTableSignature();
+            // ★ r144：同一部剧、同一套线路已建过表就直接复用。
+            if (mVodInfo == dateTableBuiltVod && sig == dateTableBuiltSignature
+                    && TextUtils.equals(showKey, dateTableBuiltShow)) {
+                return;
+            }
             java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
             for (java.util.List<VodInfo.VodSeries> l : mVodInfo.seriesMap.values()) {
                 if (l == null) continue;
                 all.add(seriesNames(l));
             }
-            String showKey = mVodInfo.name == null ? "" : mVodInfo.name.trim();
             EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+            dateTableBuiltVod = mVodInfo;
+            dateTableBuiltShow = showKey;
+            dateTableBuiltSignature = sig;
         } catch (Throwable ignored) {
         }
     }
@@ -2521,6 +2547,45 @@ public class PlayFragment extends BaseLazyFragment {
                     + (byExact >= 0 ? " -> idx=" + byExact + " tgt=" + targetList.get(byExact).name
                                     : " miss -> -1 (区间条目无同名，放弃该源)"));
             return byExact;
+        }
+        // ---------- 第-1层 r117：非正片（衍生集）安全入口（r145 与 DA 对齐）----------
+        int totalEp = 0;
+        if (mVodInfo != null && mVodInfo.seriesMap != null) {
+            for (List<VodInfo.VodSeries> l : mVodInfo.seriesMap.values()) {
+                if (l != null && l.size() > totalEp) totalEp = l.size();
+            }
+        }
+        boolean currentIsMovie = EpisodeNameMatcher.isMovieMain(
+                currentSeries == null ? null : currentSeries.name, totalEp);
+        if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
+                && targetList != null && targetList.size() > 1
+                && EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)
+                && !currentIsMovie) {
+            String anchorShowName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name;
+            int byNonMain = EpisodeNameMatcher.findIndexForNonMain(
+                    currentSeries.name, seriesNames(targetList), anchorShowName);
+            LOG.sw("[FB] nonMainSafe ep=" + currentSeries.name + (byNonMain >= 0
+                    ? " -> idx=" + byNonMain + " tgt=" + targetList.get(byNonMain).name
+                    : " miss -> -1"));
+            return byNonMain;
+        }
+        // ---------- 第0.95层 r115：纯期号正片 → 目标「日期(第N期)」同期正片（r145 与 DA 对齐）----------
+        try {
+            if (currentSeries != null && !TextUtils.isEmpty(currentSeries.name)
+                    && targetList != null && targetList.size() > 1) {
+                int curOrdR = EpisodeNameMatcher.extractOrdinal(currentSeries.name);
+                if (curOrdR > 0 && EpisodeNameMatcher.dateOf(currentSeries.name) <= 0
+                        && !EpisodeNameMatcher.isNonMainEntryName(currentSeries.name)) {
+                    int byPeriod = EpisodeNameMatcher.findDatePeriodMain(curOrdR,
+                            EpisodeNameMatcher.extractPart(currentSeries.name), seriesNames(targetList));
+                    if (byPeriod >= 0 && byPeriod < targetList.size()) {
+                        LOG.sw("[FB] datePeriodAnchor ep=" + currentSeries.name + " ord=" + curOrdR
+                                + " -> idx=" + byPeriod + " tgt=" + targetList.get(byPeriod).name);
+                        return byPeriod;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
         }
         int resolved = findMatchingEpisodeIndexRaw(currentSeries, targetList);
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)
@@ -2622,123 +2687,28 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     private int findMatchingEpisodeIndexRaw(VodInfo.VodSeries currentSeries, List<VodInfo.VodSeries> targetList) {
-        if (targetList == null || targetList.isEmpty()) {
-            return -1;
-        }
-        if (targetList.size() == 1) {
-            return 0;
-        }
         if (currentSeries == null || TextUtils.isEmpty(currentSeries.name)) {
             return -1;
         }
         final List<String> targetNames = seriesNames(targetList);
-        final String currentName = currentSeries.name;
-
-        // ---------- 第1层：本地同域精确匹配（含前导零 / 多字少字变体）----------
-        int matchedIndex = EpisodeNameMatcher.findIndex(currentName, targetNames);
-        if (matchedIndex >= 0) {
-            return matchedIndex;
-        }
-
-        // ---------- 第1.2层：日期+期号混合式名的"期数式"直配 ----------
-        // 与 DetailActivity 侧同源同序（改一处必须改另一处）。
-        // `20260906第2期上` 这类"日期打头 + 期号 + 分段"的名字，parse 日期优先会
-        // 把整名判成日期域，上面的同域匹配被 gating 掉；但名字里本就带着与目标源
-        // 完全同形的 `第2期上` —— 确定性证据，必须先试（纯本地、零延迟）。
-        // 只做确定性命中：①形态带显式分段 ②目标列表存在完全同名的一条。
-        // 见 DetailActivity 同层的详细说明（模糊匹配会撞诱饵，不可用）。
-        String ordinalForm = EpisodeNameMatcher.hybridOrdinalForm(currentName);
-        if (!TextUtils.isEmpty(ordinalForm)
-                && EpisodeNameMatcher.extractPart(ordinalForm) != EpisodeNameMatcher.PART_NONE) {
-            int exactForm = targetNames.indexOf(ordinalForm);
-            if (exactForm >= 0) {
-                return exactForm;
-            }
-        }
-
-        // 组内位置对齐所需的「当前源列表 + 下标」在此提前算好：第2层 2-b 簇秩要用它。
-        // ★ r129(P1)：alignByGroupPosition 本身是 Tier B 兜底，已下移到方法末尾，
-        //   只在该剧所有强证据层(日期表/簇秩/联网/完全同名)全落空时才使用。
-        List<VodInfo.VodSeries> playList = getPlayingSeriesList();
+        final List<VodInfo.VodSeries> playList = getPlayingSeriesList();
         int playIndex = indexOfSeries(playList, currentSeries);
         if (playIndex < 0 && mVodInfo != null && mVodInfo.playIndex >= 0 && mVodInfo.playIndex < playList.size()) {
             playIndex = mVodInfo.playIndex;
         }
-
-        // ---------- 第1.6层 r124：日期表（期号↔日期）→ 查表按形态选条 ----------
-        // 与 DetailActivity L1.6 同源同序（改一处必须改另一处）。表由 buildDateTableForVod 提前建好。
-        {
-            String tblShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
-            // ★ r126：建表/查表用的「源」必须是【包含 currentName 的线路】（通常旧源=期号式）；
-            //   切源途中 getPlayingSeriesList() 可能已指向目标日期源 → 拿到「日期×日期」无法建表。
-            List<String> tblSourceNames = seriesNames(playList);
-            if ((tblSourceNames == null || !tblSourceNames.contains(currentName))
-                    && mVodInfo != null && mVodInfo.seriesMap != null) {
-                for (List<VodInfo.VodSeries> l : mVodInfo.seriesMap.values()) {
-                    List<String> cand = seriesNames(l);
-                    if (cand != null && cand.contains(currentName)) { tblSourceNames = cand; break; }
-                }
-            }
-            int byTable = EpisodeNameMatcher.matchByDateTable(
-                    tblShow, currentName, tblSourceNames, targetNames);
-            if (byTable >= 0) {
-                return byTable;
-            }
-        }
-
-        // ---------- 第2层：跨域 → 权威换算 ----------
-        if (EpisodeNameMatcher.needsCrossDomainResolve(currentName, targetNames)) {
-            // 2-a 离线字典：仅在"长期无网"部署下打开时抢占（零延迟、无需联网）
-            int dictIndex = resolveByOfflineDict(currentName, targetNames);
-            if (dictIndex >= 0) {
-                return dictIndex;
-            }
-            // 2-b 离线正片秩对齐（★ 切到特辑 bug 的主修复，现为首选）：
-            //     用"正片簇序"在本地把期数与日期两种命名域对齐——零延迟、零外部
-            //     依赖，不受直连站点波动影响（实测 zyshow.net 约半数首请求超时/重置，
-            //     旧的"联网优先"顺序会让每次跨域切源先白等联网预算）。簇序对齐
-            //     自带周更快照校验（±3 天）与伪正片过滤，不确定时返回 -1，
-            //     此时才轮到下面的联网权威换算。此前这里落空后由裸下标兜底，
-            //     会把「第5期上」静默切到「20260508泳池特辑」这类错位条目上。
-            if (playIndex >= 0 && !playList.isEmpty()) {
-                String rankShow = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name.trim();
-                int byRank = EpisodeNameMatcher.alignByMainFeatureRank(rankShow,
-                        currentName, playIndex, seriesNames(playList), targetNames);
-                if (byRank >= 0) {
-                    return byRank;
-                }
-            }
-            // 2-c 直连站点：离线对齐失败时的权威修正（缓存命中 0ms，未命中约 800ms）
-            int online = tryResolveCrossDomainNow(currentName, targetNames);
-            if (online >= 0) {
-                return online;
-            }
-        }
-
-        // ---------- 第1.5层（Tier B · 兜底）：同日期多段的组内位置对齐（下移到最后）----------
-        // 场景：旧源把某天切成"上/中/下"，新源写成"上/无后缀/下"。无后缀≡上，
-        // 于是新源的同日组语义变成[上,上,下]，"中"用名字匹配会落空。
-        // 两侧同日组条数相同时，按组内位置（第 N 段对第 N 段）定位即可。
-        // ★ r129(P1)：仅在日期表/簇秩/联网/完全同名等强证据层全落空后才走到这里。
-        //   原「第3层 alignByOrder 同下标兜底」已删除——纯猜测、跨域无依据，违反"宁不切不错切"。
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byGroup = EpisodeNameMatcher.alignByGroupPosition(
-                    currentName, playIndex, seriesNames(playList), targetNames);
-            if (byGroup >= 0) {
-                return byGroup;
-            }
-        }
-        // ---------- 同域纯下标兜底（仅同域；跨域一律 -1）----------
-        // ★ r129 补充：本层 allowCrossDomain=false，只服务「同域且两侧可识别条目数相等」，
-        //   是确定性保守选择；同站源命名不一致导致前序全落空时用它兜底。
-        if (playIndex >= 0 && !playList.isEmpty()) {
-            int byOrder = EpisodeNameMatcher.alignByOrder(
-                    playIndex, seriesNames(playList), targetNames, false);
-            if (byOrder >= 0) {
-                return byOrder;
-            }
-        }
-        return matchedIndex;
+        String showName = mVodInfo == null || mVodInfo.name == null ? "" : mVodInfo.name;
+        // ★ r145：与 DetailActivity 共用唯一原始层栈，禁止再在本文件复制匹配规则。
+        return EpisodeMatchCore.resolveRaw(
+                showName,
+                showName,
+                currentSeries.name,
+                currentSeries.url,
+                playIndex,
+                seriesNames(playList),
+                seriesNames(playList),
+                targetNames,
+                this::resolveByOfflineDict,
+                this::tryResolveCrossDomainNow);
     }
 
     /**
