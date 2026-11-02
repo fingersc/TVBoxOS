@@ -178,7 +178,7 @@ public final class SyncEngine {
                     remote = HistorySyncManager.emptyLocal(owner, deviceId, now);
                     repaired = true;
                 } else {
-                    throw new IOException("账号密钥与云端不匹配（账号可能被管理员重置，"
+                    throw new IOException("账号密码与云端不匹配（账号可能被管理员重置，"
                             + "或用了不同密码登录同名目录）");
                 }
             }

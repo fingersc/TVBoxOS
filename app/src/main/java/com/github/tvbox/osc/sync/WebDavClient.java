@@ -66,7 +66,7 @@ public final class WebDavClient {
     public WebDavClient(String url, String user, String password) {
         HttpUrl parsed = url == null ? null : HttpUrl.parse(url.trim());
         if (parsed == null) {
-            throw new IllegalArgumentException("WebDAV 地址无效");
+            throw new IllegalArgumentException("WebDAV 服务器地址无效，请检查");
         }
         this.base = parsed;
         this.auth = Credentials.basic(user == null ? "" : user, password == null ? "" : password);
@@ -314,7 +314,7 @@ public final class WebDavClient {
 
     private void checkAuth(Response resp) throws AuthException {
         if (resp.code() == 401 || resp.code() == 403) {
-            throw new AuthException("认证失败（请检查账号与「应用密码」）");
+            throw new AuthException("认证失败，请检查「WebDAV 存储」配置");
         }
     }
 }

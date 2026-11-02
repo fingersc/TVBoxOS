@@ -161,7 +161,7 @@
                         android:layout_weight="1"
                         android:background="@drawable/input_account_field"
                         android:gravity="center_vertical"
-                        android:hint="用户名"
+                        android:hint="账号"
                         android:imeOptions="actionNext|flagNoExtractUi"
                         android:includeFontPadding="false"
                         android:inputType="text"

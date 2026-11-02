@@ -235,8 +235,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             confirmActivate();
             return;
         }
-        if (!HistorySyncManager.hasConfig()) {
-            toast("WebDAV 未配置，请先在下方“WebDAV 存储”填写地址、账号、密码并点“保存配置”后再登录");
+        String davUrl = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");
+        String davUser = Hawk.get(HawkConfig.SYNC_WEBDAV_USER, "");
+        String davPass = Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, "");
+        if (TextUtils.isEmpty(davUrl) || TextUtils.isEmpty(davUser) || TextUtils.isEmpty(davPass)) {
+            toast("WebDAV 未配置，请先在下方“WebDAV 存储”填写地址、网盘账号、应用密码并点“保存配置”后再登录");
             tvSyncStatus.setText("登录失败：WebDAV 未配置");
             return;
         }
@@ -259,8 +262,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             @Override
             public void run() {
                 try {
-                    // 密钥派生 20 万轮，老盒子上约 1 秒，先给一句「正在计算密钥」
-                    postStage("正在计算密钥…");
+                    // 密钥派生 20 万轮，老盒子上约 1 秒，先给一句「正在处理密码」
+                    postStage("正在处理密码…");
                     final byte[] key = Crypto.deriveKey(user, pass);
                     postStage("正在验证账号…");
                     final AccountService.Result result = AccountService.check(dav(), user, key);
@@ -276,7 +279,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                         public void run() {
                             setBusy(false, null);
                             tvSyncStatus.setText("验证失败：" + t.getMessage());
-                            toast("登录失败：" + t.getMessage());
+                            if (t instanceof WebDavClient.AuthException) {
+                                toast(t.getMessage());
+                            } else {
+                                toast("登录失败：" + t.getMessage());
+                            }
                         }
                     });
                 }
@@ -346,7 +353,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                         public void run() {
                             setBusy(false, null);
                             tvSyncStatus.setText("激活失败：" + t.getMessage());
-                            toast("激活失败：" + t.getMessage());
+                            if (t instanceof WebDavClient.AuthException) {
+                                toast(t.getMessage());
+                            } else {
+                                toast("激活失败：" + t.getMessage());
+                            }
                         }
                     });
                 }
@@ -702,7 +713,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                     new WebDavClient(url, user, pass).test();
                     result = "连接成功";
                 } catch (Throwable t) {
-                    result = "连接失败：" + t.getMessage();
+                    result = (t instanceof WebDavClient.AuthException)
+                            ? t.getMessage() : "连接失败：" + t.getMessage();
                 }
                 final String msg = result;
                 main.post(new Runnable() {
