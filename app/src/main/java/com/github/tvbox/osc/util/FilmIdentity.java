@@ -74,6 +74,48 @@ public class FilmIdentity {
         return true;
     }
 
+    /**
+     * ★ r156：切源用的严格影片身份判据。
+     *
+     * <p>与 {@link #isSameFilm(int, String, int, String)} 的区别：本方法在「信息不足」时
+     * 返回 {@code false}，即宁可不自动切，也不把同名翻拍/未知影片当同片。用于电影单片
+     * 切源确证（`九门` 这类 title-only 的电影，用户已明确：年份/导演都未知时不允许自动切）。</p>
+     *
+     * <ul>
+     *   <li>双方年份都已知：必须相等；</li>
+     *   <li>否则双方导演都已知：必须 {@link #metaRelated(String, String)}；</li>
+     *   <li>其余（身份不足）：false。</li>
+     * </ul>
+     */
+    public static boolean isSameFilmStrict(int yearA, String directorA,
+                                           int yearB, String directorB) {
+        if (isSameFilmConflict(yearA, directorA, yearB, directorB)) {
+            return false;
+        }
+        if (yearA > 0 && yearB > 0) {
+            return true;                     // 已由 conflict 排除不相等
+        }
+        if (!isEmpty(directorA) && !isEmpty(directorB)) {
+            return true;                     // 已由 conflict 排除交叉不上
+        }
+        return false;                        // 身份不足：不自动切
+    }
+
+    /**
+     * ★ r156：是否存在**硬冲突**（明确不是同一部片）。
+     * 只有硬冲突才应把候选源拉黑；身份信息不足只是「不自动切」，不应永久拉黑。
+     */
+    public static boolean isSameFilmConflict(int yearA, String directorA,
+                                             int yearB, String directorB) {
+        if (yearA > 0 && yearB > 0 && yearA != yearB) {
+            return true;
+        }
+        if (!isEmpty(directorA) && !isEmpty(directorB) && !metaRelated(directorA, directorB)) {
+            return true;
+        }
+        return false;
+    }
+
     private static boolean isEmpty(String s) {
         return s == null || s.trim().isEmpty();
     }

@@ -326,6 +326,14 @@ public final class EpisodeNameMatcher {
     /** 画质 / 编码噪声词，与集名语义无关。同样提为常量避免重复编译。 */
     private static final Pattern QUALITY_JUNK = Pattern.compile("2160p|1080p|720p|480p|4k|h26[45]|x26[45]|mp4");
 
+    /**
+     * ★ r156：独立数字段。纯序号兜底只能用「前后都不是字母/数字」的数字，
+     * 避免把 {@code HDTC中字v2} 的版本号 {@code v2} 当成第 2 集。
+     * 例：{@code 第2集} → 命中 {@code 2}；{@code HDTC中字v2} / {@code TC2} / {@code 20260809} → 不命中。
+     */
+    private static final Pattern BARE_NUMBER =
+            Pattern.compile("(?<![A-Za-z0-9])([0-9]{1,4})(?![0-9])");
+
     /** 非正片降权分值：使非正片得分显著低于正片的 80，但又高于 0（保留兜底可匹配性）。 */
     public static final int NON_MAIN_PENALTY = 30;
 
@@ -560,11 +568,12 @@ public final class EpisodeNameMatcher {
             }
         }
 
-        // 5. 纯序号兜底：仅当去掉非数字后长度 ≤ 4 才采纳，
-        //    避免把残留的 20260809 这类长串当成集数号（这是原 bug 的直接来源）
-        String number = work.replaceAll("\\D+", "");
-        if (!TextUtils.isEmpty(number) && number.length() <= 4) {
-            return new EpisodeKey(parseIntSafe(number), DOMAIN_ORDINAL, part, raw);
+        // 5. 纯序号兜底：只接受「独立数字段」（前后不是字母/数字），长度 ≤ 4。
+        //    ★ r156：旧实现 `work.replaceAll("\\D+","")` 会把 HDTC中字v2 的版本号 v2
+        //    抠成 "2" 误判成第 2 集，进而让 isMovieFormatName=false、score 轴2/轴3 全失效。
+        Matcher bare = BARE_NUMBER.matcher(work);
+        if (bare.find()) {
+            return new EpisodeKey(parseIntSafe(bare.group(1)), DOMAIN_ORDINAL, part, raw);
         }
 
         return new EpisodeKey(-1, DOMAIN_UNKNOWN, part, raw);
@@ -1154,6 +1163,40 @@ public final class EpisodeNameMatcher {
             return false;
         }
         return isMovieFormatName(name);
+    }
+
+    /**
+     * ★ r156：整条线路的条目是否**全部**是电影格式标签（正片/TC/TC中字/HD中字/HD国语版…）。
+     * <p>用于电影单片切源：只有目标线路的每一条都是「版本/画质/语言标签」时，才允许把
+     * 「当前集名 vs 目标单条」按同一部电影处理；含 `上部/下部/第01集` 的线路一律不满足。</p>
+     */
+    public static boolean isAllMovieFormatLabels(List<String> names) {
+        if (names == null || names.isEmpty()) {
+            return false;
+        }
+        for (String name : names) {
+            if (!isMovieFormatName(name)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * ★ r156：是否为「纯片名」——无日期/期号/分段，且不是电影格式标签。
+     * <p>典型：电影源把播放条目直接写成片名 `九门`。这类名字本身不能定位集，
+     * 只能在「目标源确证是同一部电影」时按单片放行。</p>
+     */
+    public static boolean isTitleOnlyName(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return false;
+        }
+        EpisodeKey key = parse(name);
+        return key.domain == DOMAIN_UNKNOWN
+                && key.date <= 0
+                && key.ordinal <= 0
+                && extractPart(name) == PART_NONE
+                && !isMovieFormatName(name);
     }
 
     /** {@link #isMainFeatureEntry} 的取反，语义读起来更顺：该条目不是正片。 */

@@ -112,6 +112,9 @@ import java.util.Comparator;
 
 public class DetailActivity extends BaseActivity {
     private static final String STATE_FULL_WINDOWS = "detail_full_windows";
+    /** r156：片名尾部年份后缀（九门(2023) / 九门（2023） / 九门2023），仅用于电影片名比较前剥离。 */
+    private static final java.util.regex.Pattern YEAR_SUFFIX =
+            java.util.regex.Pattern.compile("[（(]?(?:19|20)[0-9]{2}[)）]?$");
     private static final String DETAIL_FALLBACK_SEARCH_TAG = "detail_fallback_search";
     /**
      * ★ v99-r57：后台（静默预热 / 主搜索超时移交的剩余源）专用请求 tag。
@@ -1510,12 +1513,26 @@ public class DetailActivity extends BaseActivity {
                                     java.util.Collections.singletonList(currentEpisode.name),
                                     guardShow) == 0;
                         } else {
-                            // ★ r141：同集确认升级为「列表级」。
-                            //   原名级 isSameEpisodeStrict 只比日期/期号/显式分段，认不出
-                            //   同日多分段写法（20261022-02 ≡ 第20261022期下、20261022第2期 ≡ 20261022中），
-                            //   实测一次手动切源 6 个候选源全被误判 alignNoEpisode、一个都没切过去。
-                            sameEpisodeConfirmed = confirmSameEpisodeInList(
-                                    expectedName, currentEpisode.name, playingSeriesList);
+                            // ★ r156：电影单片切源——目标线路每条都是画质/语言/版本标签
+                            //   （正片 / TC / TC中字 / HD中字 / HD国语版…），且当前集名是
+                            //   电影格式名（HDTC中字v2）或纯片名（九门）时，按「同一部电影」
+                            //   确证，不再把单条目标退化成「expectedName == currentName」字面比较。
+                            //   身份判据用 FilmIdentity.isSameFilmStrict：年份/导演都未知时
+                            //   不自动切（用户 m02771 拍板），同名翻拍用硬冲突拉黑。
+                            boolean movieSingleCase = isMovieSingleCase(
+                                    expectedName, currentEpisode.name, playingSeriesList, vodInfo);
+                            if (movieSingleCase) {
+                                sameEpisodeConfirmed = confirmMovieSingleIdentity(
+                                        expectedName, currentEpisode.name,
+                                        sourceKey, vodId, vodInfo);
+                            } else {
+                                // ★ r141：同集确认升级为「列表级」。
+                                //   原名级 isSameEpisodeStrict 只比日期/期号/显式分段，认不出
+                                //   同日多分段写法（20261022-02 ≡ 第20261022期下、20261022第2期 ≡ 20261022中），
+                                //   实测一次手动切源 6 个候选源全被误判 alignNoEpisode、一个都没切过去。
+                                sameEpisodeConfirmed = confirmSameEpisodeInList(
+                                        expectedName, currentEpisode.name, playingSeriesList);
+                            }
                         }
                         if (!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
@@ -2761,6 +2778,105 @@ public class DetailActivity extends BaseActivity {
             return TextUtils.equals(names.get(idx), currentName);
         }
         return EpisodeNameMatcher.isSameEpisodeStrict(expectedName, currentName);
+    }
+
+    /**
+     * ★ r156：是不是「电影单片切源」场景。
+     *
+     * <p>条件：目标线路每条都是电影格式标签（正片/TC/TC中字/HD中字/HD国语版…），
+     * 目标集数 ≤ {@link EpisodeNameMatcher#MOVIE_LINE_MAX_EPISODES}，目标片名与锚点同一部片，
+     * 当前集名是电影格式名（HDTC中字v2）或纯片名（九门）。</p>
+     *
+     * <p>注意：`上部/下部`、`第01集` 不是电影格式标签，不会命中本分支；
+     * 目标多集（>4）也不会命中，避免把电影错配到剧集。</p>
+     */
+    private boolean isMovieSingleCase(String expectedName, String currentName,
+                                      List<VodInfo.VodSeries> list, VodInfo vodInfo) {
+        if (TextUtils.isEmpty(expectedName) || vodInfo == null) {
+            return false;
+        }
+        if (!EpisodeNameMatcher.isMovieFormatName(currentName)
+                && !EpisodeNameMatcher.isTitleOnlyName(currentName)) {
+            return false;
+        }
+        int count = countSeriesEpisodes(vodInfo);
+        if (count <= 0 || count > EpisodeNameMatcher.MOVIE_LINE_MAX_EPISODES) {
+            return false;
+        }
+        if (!isMovieLikeSeries(list)) {
+            return false;
+        }
+        if (!isSameMovieTitle(detailFallbackAnchorTitle, vodInfo.name)) {
+            return false;
+        }
+        return EpisodeNameMatcher.isMovieFormatName(expectedName)
+                || EpisodeNameMatcher.isTitleOnlyName(expectedName);
+    }
+
+    /** 目标线路每条是否都是「电影单片形态」：画质/语言/版本标签，或纯片名（九门）。 */
+    private boolean isMovieLikeSeries(List<VodInfo.VodSeries> list) {
+        if (list == null || list.isEmpty()) {
+            return false;
+        }
+        for (VodInfo.VodSeries s : list) {
+            if (s == null || (!EpisodeNameMatcher.isMovieFormatName(s.name)
+                    && !EpisodeNameMatcher.isTitleOnlyName(s.name))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 电影片名比较：允许片名尾部带年份（九门 vs 九门(2023)），真正是否同片交给 FilmIdentity。 */
+    private boolean isSameMovieTitle(String a, String b) {
+        if (isSameFallbackTitle(a, b)) {
+            return true;
+        }
+        return isSameFallbackTitle(stripYearSuffix(a), stripYearSuffix(b));
+    }
+
+    private String stripYearSuffix(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return "";
+        }
+        return YEAR_SUFFIX.matcher(s.trim()).replaceFirst("").trim();
+    }
+
+    /**
+     * ★ r156：电影单片同片确认。
+     * <p>用 {@link FilmIdentity#isSameFilmStrict}：年份/导演都未知 → 不自动切（用户拍板）；
+     * 明确不是同一部片（年份不同/导演交叉不上）→ 记 mismatch 并拉黑该候选源。</p>
+     */
+    private boolean confirmMovieSingleIdentity(String expectedName, String currentName,
+                                               String sourceKey, String vodId, VodInfo vodInfo) {
+        int refYear = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
+        String refDirector = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.director;
+        int tgtYear = vodInfo == null ? 0 : vodInfo.year;
+        String tgtDirector = vodInfo == null ? "" : vodInfo.director;
+
+        if (!FilmIdentity.isSameFilmStrict(refYear, refDirector, tgtYear, tgtDirector)) {
+            boolean conflict = FilmIdentity.isSameFilmConflict(
+                    refYear, refDirector, tgtYear, tgtDirector);
+            String refId = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.id;
+            String tag = conflict ? "movieIdentityMismatch" : "movieIdentityUnknown";
+            LOG.sw("[FB] " + tag
+                    + " source=" + sourceKey + " id=" + vodId
+                    + " expected=" + expectedName + " actual=" + currentName
+                    + " ref=" + refId + "/y" + refYear
+                    + " tgt=" + vodInfo.id + "/y" + tgtYear
+                    + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector);
+            if (conflict) {
+                detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
+            }
+            return false;
+        }
+
+        LOG.sw("[FB] movieSingleConfirm"
+                + " source=" + sourceKey + " id=" + vodId
+                + " expected=" + expectedName + " actual=" + currentName
+                + " refY=" + refYear + " tgtY=" + tgtYear
+                + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector);
+        return true;
     }
 
     /**
