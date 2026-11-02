@@ -1490,6 +1490,18 @@ public class DetailActivity extends BaseActivity {
                         //   （实测《呼啸山庄》id=11807 expected=HD中字 actual=HD中字 仍被判"该源没有该集"，全程 firstFrame=0）。
                         boolean expectedIsMovie = EpisodeNameMatcher.isMovieMain(
                                 expectedName, countSeriesEpisodes(vodInfo));
+                        // ★ r157：先判「电影单片同集」再走分支。
+                        //   原因：纯片名（如「九门」）在 isMainFeatureEntry 里是 false，
+                        //   isNonMainEntryName(expectedName)=true，而 isMovieMain 又因
+                        //   isMovieFormatName("九门")=false 导致 expectedIsMovie=false。
+                        //   若先走非正片分支，会被 findIndexForNonMain 恒 -1 拦死，
+                        //   r156 的电影单片分支永远到不了 —— 真机 1712 日志：手动切
+                        //   2021《九门》各格式名都 movieSingleConfirm，但自动续切时
+                        //   expected 变成纯片名「九门」，10 个同片源全 alignNoEpisode。
+                        //   movieSingleCase 自带「目标单条/每条电影格式/同片名」约束，
+                        //   非电影场景不会误命中，故可安全用它旁路非正片分支。
+                        boolean movieSingleCase = isMovieSingleCase(
+                                expectedName, currentEpisode.name, playingSeriesList, vodInfo);
                         if (!TextUtils.isEmpty(expectedName)
                                 && EpisodeNameMatcher.isEpisodeRangeLabel(expectedName)) {
                             // ★ r135：区间合集条目（第1-20集 / 第61-82集完结）不是"一集"，
@@ -1500,7 +1512,8 @@ public class DetailActivity extends BaseActivity {
                             sameEpisodeConfirmed = TextUtils.equals(expectedName, currentEpisode.name);
                             LOG.sw("[FB] rangeConfirm expected=" + expectedName
                                     + " actual=" + currentEpisode.name + " -> " + sameEpisodeConfirmed);
-                        } else if (!TextUtils.isEmpty(expectedName)
+                        } else if (!movieSingleCase
+                                && !TextUtils.isEmpty(expectedName)
                                 && EpisodeNameMatcher.isNonMainEntryName(expectedName)
                                 && !expectedIsMovie) {
                             // ★ r118：非正片按「规范系列 + 同日期/同期号(锚表互译)」确证同一集。
@@ -1519,8 +1532,6 @@ public class DetailActivity extends BaseActivity {
                             //   确证，不再把单条目标退化成「expectedName == currentName」字面比较。
                             //   身份判据用 FilmIdentity.isSameFilmStrict：年份/导演都未知时
                             //   不自动切（用户 m02771 拍板），同名翻拍用硬冲突拉黑。
-                            boolean movieSingleCase = isMovieSingleCase(
-                                    expectedName, currentEpisode.name, playingSeriesList, vodInfo);
                             if (movieSingleCase) {
                                 sameEpisodeConfirmed = confirmMovieSingleIdentity(
                                         expectedName, currentEpisode.name,
