@@ -4,6 +4,7 @@ import static com.google.android.exoplayer2.upstream.HttpUtil.buildRangeRequestH
 import static java.lang.Math.min;
 
 import android.net.Uri;
+import android.os.SystemClock;
 
 import androidx.annotation.Nullable;
 
@@ -114,6 +115,9 @@ public final class OkHttpDataSource extends BaseDataSource implements HttpDataSo
     private boolean opened;
     private long bytesToRead;
     private long bytesRead;
+    // r156：真实分片下载记账（open→close）所需的请求起始时刻与一次性标记
+    private long reqStartMs;
+    private boolean segReported;
 
     public OkHttpDataSource(Call.Factory callFactory) {
         this(callFactory, null);
@@ -178,6 +182,8 @@ public final class OkHttpDataSource extends BaseDataSource implements HttpDataSo
     @Override
     public long open(DataSpec dataSpec) throws HttpDataSourceException {
         this.dataSpec = dataSpec;
+        reqStartMs = SystemClock.elapsedRealtime();
+        segReported = false;
         bytesRead = 0;
         bytesToRead = 0;
         transferInitializing(dataSpec);
@@ -259,8 +265,41 @@ public final class OkHttpDataSource extends BaseDataSource implements HttpDataSo
         if (opened) {
             opened = false;
             transferEnded();
+            recordSegIfMedia();
             closeConnectionQuietly();
         }
+    }
+
+    /** 请求结束时把「本次真实字节 / 真实耗时」记入 {@link HttpSegStats}（仅媒体分片，只观测）。 */
+    private void recordSegIfMedia() {
+        if (segReported) {
+            return;
+        }
+        segReported = true;
+        if (dataSpec == null || dataSpec.uri == null) {
+            return;
+        }
+        String u = dataSpec.uri.toString();
+        if (!isMediaUrl(u)) {
+            return;
+        }
+        long elapsed = SystemClock.elapsedRealtime() - reqStartMs;
+        long b = bytesRead;
+        if (elapsed <= 0 || b <= 0) {
+            return;
+        }
+        HttpSegStats.record(b, elapsed);
+    }
+
+    private static boolean isMediaUrl(String u) {
+        if (u == null) {
+            return false;
+        }
+        int q = u.indexOf('?');
+        String p = q >= 0 ? u.substring(0, q) : u;
+        return p.endsWith(".ts") || p.endsWith(".m4s") || p.endsWith(".mp4")
+                || p.endsWith(".m4v") || p.endsWith(".flv")
+                || p.endsWith(".aac") || p.endsWith(".mp3") || p.endsWith(".m4a");
     }
 
     private Request makeRequest(DataSpec dataSpec) throws HttpDataSourceException {

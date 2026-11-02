@@ -2330,6 +2330,16 @@ public class PlayFragment extends BaseLazyFragment {
         List<String> lineFlags = getLineFlagsInDisplayOrder();
         int currentLineIndex = findLineFlagIndex(lineFlags, currentFlag);
         int startLineIndex = currentLineIndex >= 0 ? currentLineIndex + 1 : 0;
+        // r156：按播放 URL 去重 —— 有些线路（如 hnyun / hnm3u8）会解析到同一个地址，
+        // 换过去等于没换。这里把「当前集 URL」和「已解析出的当前播放 URL」都收集起来，
+        // 候选线路若指向同一 URL 直接跳过，避免白切一次。
+        java.util.Set<String> triedUrls = new java.util.HashSet<>();
+        if (currentSeries != null && !TextUtils.isEmpty(currentSeries.url)) {
+            triedUrls.add(currentSeries.url.trim());
+        }
+        if (!TextUtils.isEmpty(webPlayUrl)) {
+            triedUrls.add(webPlayUrl.trim());
+        }
         // 查找下一条未尝试过、且**确实含有当前集**的线路。
         // 关键：匹配不上（返回 -1）时跳过该线路，继续往后找，
         // 绝不退回 findSameEpisodeIndex 的"按下标兜底"——那会静默切到不相干的集。
@@ -2354,6 +2364,14 @@ public class PlayFragment extends BaseLazyFragment {
                     // 该线路没有这一集：标记为已尝试并跳过
                     triedLineFlags.add(flag);
                     LOG.i("echo-autoRetry skip line(no such episode): " + flag);
+                    continue;
+                }
+                // r156：候选线路解析到的集 URL 与当前相同 → 换过去也是同一地址，跳过
+                VodInfo.VodSeries candSeries = seriesList.get(located);
+                String candUrl = candSeries == null ? null : candSeries.url;
+                if (!TextUtils.isEmpty(candUrl) && triedUrls.contains(candUrl.trim())) {
+                    triedLineFlags.add(flag);
+                    LOG.i("echo-autoRetry skip line(same url): " + flag);
                     continue;
                 }
                 nextFlag = flag;

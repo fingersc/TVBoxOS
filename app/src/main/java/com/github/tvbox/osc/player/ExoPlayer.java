@@ -207,6 +207,9 @@ public class ExoPlayer extends ExoMediaPlayer {
 
     private void recordSegment(long durMs, long bytes, long mediaMs) {
         if (durMs < 0) return;
+        // 只统计媒体分片：manifest/init 不计入窗口，否则会让 [seg] 的 n 与真实分片数错位、
+        // 也会污染“每 10 片一行”的节拍。
+        if (segLoadType != C.DATA_TYPE_MEDIA) return;
         segWinCount++;
         segWinSumMs += durMs;
         if (bytes > 0) segWinBytes += bytes;
@@ -218,37 +221,57 @@ public class ExoPlayer extends ExoMediaPlayer {
 
     /** 会话结束/切源前把不足一个窗口的尾巴也打出来（预览等短会话只有几片，否则永远看不到 [seg]）。 */
     private void flushSegments() {
-        if (segWinCount > 0) emitSegLine(true);
+        if (segWinCount > 0 || xyz.doikki.videoplayer.exo.HttpSegStats.peekCount() > 0) emitSegLine(true);
     }
 
     private void emitSegLine(boolean partial) {
         int n = segWinCount;
-        long avg = n > 0 ? segWinSumMs / n : 0;
-        // actKbps：纯下载吞吐（bytes*8/纯下载耗时）
-        long actKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
-        // segKbps：内容码率（bytes*8/覆盖的媒体时长）。拿不到媒体时长时退回声明码率。
+        // r156：吞吐改用 OkHttpDataSource 记账的「真实 HTTP 字节/耗时」（open→close），
+        // 不再用 Exo 的 loadDurationMs —— 后者会把装载空闲算进去，把 250ms 的分片量成 1400ms，
+        // 导致 actKbps 偏低、cls=jitter 假阳性。
+        long[] dl = xyz.doikki.videoplayer.exo.HttpSegStats.consume();
+        int dlN = (int) dl[0];
+        long dlBytes = dl[1];
+        long dlMs = dl[2];
+        long dlMax = dl[3];
+        int dlSlow2 = (int) dl[4];
+        long avg;
+        long max;
+        int slow2;
+        long dlKbps;
+        if (dlN > 0) {
+            avg = dlMs / dlN;
+            max = dlMax;
+            slow2 = dlSlow2;
+            dlKbps = (dlMs > 0 && dlBytes > 0) ? dlBytes * 8 / dlMs : -1;
+        } else {
+            // 兜底（非本 OkHttpDataSource 路径）：退回 Exo 口径，cls 会标 unknown
+            avg = n > 0 ? segWinSumMs / n : 0;
+            max = segWinMaxMs;
+            slow2 = segWinSlow2s;
+            dlKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
+        }
+        // segKbps：内容码率（bytes*8/覆盖的媒体时长），拿不到按声明码率
         long contentKbps = (segWinMediaMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinMediaMs
                 : (segDeclaredBitrate > 0 ? segDeclaredBitrate / 1000 : -1);
-        // 分类（供 P1-5 / P3 决策）：
-        //   slow   = 实际下载吞吐撑不住内容码率 → 带宽不足（调水位没用，只能切源/提速）
-        //   jitter = 吞吐够但存在单段 >2s 的停顿 → 抖动型（并行预取/降恢复水位才有效）
-        //   good   = 吞吐够且无长停顿
+        // 分类：slow=真实吞吐撑不住内容码率；jitter=吞吐够但有单段>2s停顿；good=都好
         String cls;
-        if (contentKbps <= 0 || actKbps <= 0) {
+        if (dlN <= 0 || contentKbps <= 0 || dlKbps <= 0) {
             cls = "unknown";
-        } else if (actKbps * 100 < contentKbps * 85) {
+        } else if (dlKbps * 100 < contentKbps * 90) {
             cls = "slow";
-        } else if (segWinSlow2s > 0) {
+        } else if (max >= 2000) {
             cls = "jitter";
         } else {
             cls = "good";
         }
         LOG.i("[seg]" + (partial ? " part" : "")
-                + " n=" + n + " type=" + segTypeName(segLoadType)
+                + " n=" + (dlN > 0 ? dlN : n) + " segs=" + n
+                + " type=" + segTypeName(segLoadType)
                 + " cls=" + cls
-                + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
+                + " avg=" + avg + "ms max=" + max + "ms slow2s=" + slow2
                 + " segKbps=" + contentKbps
-                + " actKbps=" + actKbps
+                + " dlKbps=" + dlKbps
                 + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
         segWinCount = 0;
         segWinSumMs = 0;
@@ -405,6 +428,7 @@ public class ExoPlayer extends ExoMediaPlayer {
         segWinMaxMs = 0;
         segWinBytes = 0;
         segWinSlow2s = 0;
+        xyz.doikki.videoplayer.exo.HttpSegStats.reset();
         segLastBwEstimate = -1L;
         segLastFmtBitrate = -1;
         segLastFmtW = -1;
