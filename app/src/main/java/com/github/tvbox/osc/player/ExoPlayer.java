@@ -30,7 +30,6 @@ import com.google.android.exoplayer2.trackselection.MappingTrackSelector;
 import com.google.android.exoplayer2.upstream.DefaultAllocator;
 import com.google.android.exoplayer2.analytics.AnalyticsListener;
 import com.google.android.exoplayer2.source.MediaLoadData;
-import com.google.android.exoplayer2.util.EventTime;
 import com.google.android.exoplayer2.util.MimeTypes;
 
 import java.io.IOException;
@@ -128,7 +127,7 @@ public class ExoPlayer extends ExoMediaPlayer {
 
     private final AnalyticsListener segAnalyticsListener = new AnalyticsListener() {
         @Override
-        public void onLoadStarted(EventTime eventTime, MediaLoadData mediaLoadData) {
+        public void onLoadStarted(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData) {
             segLoadStartMs = eventTime.realtimeMs;
             segLoadType = mediaLoadData == null ? -1 : mediaLoadData.dataType;
             segLoadBitrate = (mediaLoadData != null && mediaLoadData.trackFormat != null)
@@ -136,12 +135,12 @@ public class ExoPlayer extends ExoMediaPlayer {
         }
 
         @Override
-        public void onLoadCompleted(EventTime eventTime, MediaLoadData mediaLoadData) {
+        public void onLoadCompleted(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData) {
             recordSegment(eventTime.realtimeMs - segLoadStartMs);
         }
 
         @Override
-        public void onLoadError(EventTime eventTime, MediaLoadData mediaLoadData,
+        public void onLoadError(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData,
                                 IOException error, boolean wasCanceled) {
             LOG.i("[seg] err type=" + segTypeName(segLoadType)
                     + " canceled=" + wasCanceled
@@ -149,7 +148,7 @@ public class ExoPlayer extends ExoMediaPlayer {
         }
 
         @Override
-        public void onBandwidthEstimate(EventTime eventTime, int totalLoadTimeMs,
+        public void onBandwidthEstimate(AnalyticsListener.EventTime eventTime, int totalLoadTimeMs,
                                         long totalBytesLoaded, long bitrateEstimate) {
             segLastBwEstimate = bitrateEstimate;
         }
