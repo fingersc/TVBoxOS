@@ -31,8 +31,12 @@ import java.io.IOException;
  */
 public class HlsErrorHandlingPolicy extends DefaultLoadErrorHandlingPolicy {
 
-    private static final int MAX_RETRIES = 3;  // 最多重试3次
-    private static final long RETRY_DELAY_MS = 500;  // 重试延迟500毫秒
+    // P1-2（r153）：分片失败快速放弃，把等待时间让给「重试另一个分片 / 自动切源」。
+    //   原来 3 次 × 500ms：单个卡死分片最坏要拖 ~30s 才跳过（配合 30s readTimeout 更久）。
+    //   改成 2 次 × 300ms：坏分片更快被判死并跳过，整段卡顿明显缩短。
+    //   注意：这里只收紧「次数/间隔」，不改 manifest 4xx 不重试的既有规则（见 getRetryDelayMsFor）。
+    private static final int MAX_RETRIES = 2;  // 最多重试2次
+    private static final long RETRY_DELAY_MS = 300;  // 重试延迟300毫秒
 
     public HlsErrorHandlingPolicy() {
         super();

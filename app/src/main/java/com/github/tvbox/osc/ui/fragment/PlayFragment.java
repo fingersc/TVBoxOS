@@ -151,6 +151,8 @@ public class PlayFragment extends BaseLazyFragment {
     private static final int MSG_SWITCH_LINE_PLAY_TIMEOUT = 102;
     /** 解析停滞检查：页面加载完仍探不到视频地址时，提前兜底换线路/换源。 */
     private static final int MSG_PARSE_STALL_CHECK = 103;
+    /** P2（r153）：单次长卡顿（≥15s）即时检查 —— 不等恢复，卡满阈值就直接换源。 */
+    private static final int MSG_STALL_SWITCH_CHECK = 104;
     private static final long RESOLVE_PLAY_URL_TIMEOUT_MS = 15 * 1000L;
     private static final long SWITCH_LINE_PLAY_TIMEOUT_MS = 20 * 1000L;
     /**
@@ -494,6 +496,9 @@ public class PlayFragment extends BaseLazyFragment {
                         break;
                     case MSG_PARSE_STALL_CHECK:
                         handleParseStallCheck();
+                        break;
+                    case MSG_STALL_SWITCH_CHECK:
+                        handleLongStallCheck();
                         break;
                 }
                 return false;
@@ -1899,6 +1904,8 @@ public class PlayFragment extends BaseLazyFragment {
         //   「电视上看的进度，手机上要等下次打开播放页才看得到」。
         //   位置没变时节流会直接跳过，所以瞬时抖动依然不会触发同步。
         saveProgressOnInterrupt(true);
+        // P2：离开前台就不再因卡顿触发切源（回到前台会自动恢复）
+        stallSwitchAllowed = false;
         // ★ 不立即暂停，改成「延迟确认」。
         //
         //   播放过程中 Activity 会被系统短暂抢走焦点（覆盖层闪现 / 其它应用短暂前台 /
@@ -1944,6 +1951,8 @@ public class PlayFragment extends BaseLazyFragment {
         // 把被 HomeActivity.onStop 取消掉的自适应轮询链条重新接上。
         HistorySyncManager.onForeground();
         exitingPreview = false;
+        // P2：回到前台，恢复「卡顿自动切源」能力
+        stallSwitchAllowed = true;
         // ★ 关键闸门：用户主动暂停过 → 回到前台也不恢复播放，保持暂停画面。
         // 之前这里无条件 resume()，导致「暂停 → 回桌面 → 切回来自动播放」。
         if (mVideoView != null && !userPaused) {
@@ -2035,6 +2044,9 @@ public class PlayFragment extends BaseLazyFragment {
         cancelDeferredPause();
         audioPlayback = false;
         switchingPlayback = false;
+        stallSwitchAllowed = false;
+        stallHistories.clear();
+        recentlyStallSwitchedFlags.clear();
         MusicPlaybackService.stop(getContext(), this);
         if (sourceViewModel != null && playResultObserver != null) {
             sourceViewModel.playResult.removeObserver(playResultObserver);
@@ -2174,6 +2186,50 @@ public class PlayFragment extends BaseLazyFragment {
 
     /** ★ v64：卡顿开始那一刻的源 key —— 卡顿期间可能已经切源，结账要对真实源头记账。 */
     private String stallSourceKey = null;
+    /** P2（r153）：卡顿开始那一刻的「站点|线路」账 key（与 stallSourceKey 不同，后者只给质量分用）。 */
+    private String stallAccountKey = null;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // P2（r153）：慢源自动切源
+    //
+    // 触发口径（用户拍板）：
+    //   · 10 分钟滚动窗口内 ≥3 次卡顿（每次 ≥1s），或累计 ≥15s；
+    //   · 单次 ≥15s 直接切（不等它恢复，走 MSG_STALL_SWITCH_CHECK）；
+    //   · 首播 5s 内就卡 → 该源明显不行，累计 2 次即切。
+    //
+    // 保护口径（用户明确否决了「每切后 3 分钟冷却 / 每集最多 3 次」）：
+    //   · 不设全局冷却、不设每集次数上限；
+    //   · 每个新源独立窗口（切过去后重新累计，不继承上一个源）；
+    //   · 60s 内不切回「刚因卡顿离开」的线路（防乒乓），但允许连续切到其他线路；
+    //   · 线路轮完 → 走既有站点兜底换源；全轮完仍卡 → 停并提示；
+    //   · seek 后 2s 内的 buffering 不计（见 STALL_SEEK_GRACE_MS），不做改动。
+    // ═══════════════════════════════════════════════════════════════════════
+    private static final long STALL_WINDOW_MS = 10 * 60 * 1000L;
+    private static final long STALL_COUNT_MIN_MS = 1000L;
+    private static final int STALL_COUNT_THRESHOLD = 3;
+    private static final long STALL_TOTAL_MS_THRESHOLD = 15_000L;
+    private static final long STALL_SINGLE_SWITCH_MS = 15_000L;
+    private static final long STALL_QUICK_FAIL_WINDOW_MS = 5_000L;
+    private static final int STALL_QUICK_FAIL_COUNT = 2;
+    private static final long STALL_SWITCH_BACK_BLOCK_MS = 60_000L;
+
+    /** 每个「站点|线路」的卡顿账（滚动窗口内 count / 累计时长 / 首播快卡次数）。 */
+    private static final class StallHistory {
+        long windowStartMs;
+        int count;
+        long totalMs;
+        int quickCount;
+    }
+
+    private final java.util.Map<String, StallHistory> stallHistories = new java.util.HashMap<>();
+    /** 线路 flag → 上次因卡顿切走的 elapsedRealtime（60s 内不切回）。 */
+    private final java.util.Map<String, Long> recentlyStallSwitchedFlags = new java.util.HashMap<>();
+    /** 卡顿触发的切源是否正在执行（防重入）。 */
+    private boolean stallSwitchInFlight = false;
+    /** 页面在前台且允许因卡顿自动切源。 */
+    private boolean stallSwitchAllowed = true;
+    /** 本次起播的首帧时刻（elapsedRealtime），0=尚未出首帧。 */
+    private long firstFrameAtMs = 0L;
 
     private long playTimeoutBasePosition = 0;
     private java.util.Set<String> triedLineFlags = new java.util.HashSet<>();  // 记录已尝试过的线路
@@ -2279,22 +2335,31 @@ public class PlayFragment extends BaseLazyFragment {
         // 绝不退回 findSameEpisodeIndex 的"按下标兜底"——那会静默切到不相干的集。
         String nextFlag = null;
         int nextIndex = 0;
-        for (int i = startLineIndex; i < lineFlags.size(); i++) {
-            String flag = lineFlags.get(i);
-            List<VodInfo.VodSeries> seriesList = mVodInfo.seriesMap.get(flag);
-            if (triedLineFlags.contains(flag) || seriesList == null || seriesList.isEmpty()) {
-                continue;
+        // P2：第一遍跳过「60s 内刚因卡顿离开」的线路（防乒乓）；若那样会导致无路可走，
+        // 第二遍忽略这个屏蔽再找 —— 保证不会因为屏蔽而提前走向站点兜底。
+        for (int pass = 0; pass < 2 && nextFlag == null; pass++) {
+            boolean ignoreStallBlock = (pass == 1);
+            for (int i = startLineIndex; i < lineFlags.size(); i++) {
+                String flag = lineFlags.get(i);
+                List<VodInfo.VodSeries> seriesList = mVodInfo.seriesMap.get(flag);
+                if (triedLineFlags.contains(flag) || seriesList == null || seriesList.isEmpty()) {
+                    continue;
+                }
+                if (!ignoreStallBlock && isRecentlyStallSwitched(flag)) {
+                    LOG.i("echo-autoRetry skip recently-stall line: " + flag);
+                    continue;
+                }
+                int located = locateEpisodeOnFlag(currentSeries, seriesList);
+                if (located < 0) {
+                    // 该线路没有这一集：标记为已尝试并跳过
+                    triedLineFlags.add(flag);
+                    LOG.i("echo-autoRetry skip line(no such episode): " + flag);
+                    continue;
+                }
+                nextFlag = flag;
+                nextIndex = located;
+                break;
             }
-            int located = locateEpisodeOnFlag(currentSeries, seriesList);
-            if (located < 0) {
-                // 该线路没有这一集：标记为已尝试并跳过
-                triedLineFlags.add(flag);
-                LOG.i("echo-autoRetry skip line(no such episode): " + flag);
-                continue;
-            }
-            nextFlag = flag;
-            nextIndex = located;
-            break;
         }
         if (nextFlag == null) {
             // 所有线路都已尝试过
@@ -3038,9 +3103,12 @@ public class PlayFragment extends BaseLazyFragment {
         stopParse();
         // ★ v64：新一轮开始前先把上一轮没结算的卡顿记账 ——
         //   用户往往正是因为卡了才切源/换线路走的，这种样本恰恰最值得记。
-        settlePendingStall();
+        //   allowSwitch=false：这是「换新一轮」的收尾，不允许据此再触发一次切源（防递归）。
+        settlePendingStall(false);
         playbackStarted = false;
         stallGateOpen = false;
+        firstFrameAtMs = 0L;
+        stallSwitchAllowed = true;
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3338,10 +3406,13 @@ public class PlayFragment extends BaseLazyFragment {
         // 进而让切源选站和搜索排序依据的数据越用越不准。
         // 未结算的计时直接作废即可（不写任何统计）。
         discardPlayQualityTimer();
-        settlePendingStall();
+        // P2：页面切走属于正常中断，不允许据此触发自动切源
+        stallSwitchAllowed = false;
+        settlePendingStall(false);
         stopParse();
         playbackStarted = false;
         stallGateOpen = false;
+        firstFrameAtMs = 0L;
         if (mVideoView != null) {
             // 页面切走前先落盘：下面紧接着就要 release()，那次保存用的是缓存位置
             saveCurrentProgressNow();
@@ -3556,9 +3627,13 @@ public class PlayFragment extends BaseLazyFragment {
                     vodFirstFrameLogged = true;
                     LOG.i("[vod] first frame");
                 }
+                // 记录首帧时刻（用于「首播 5s 内快卡」判定）——只在真正出画面那一刻记一次
+                if (!stallGateOpen) {
+                    firstFrameAtMs = SystemClock.elapsedRealtime();
+                }
                 // 开始渲染 = 出画面了。此后才允许统计卡顿。
                 stallGateOpen = true;
-                settlePendingStall();          // 保险：能播就说明卡顿已经结束
+                settlePendingStall(true);          // 保险：能播就说明卡顿已经结束
                 return;
             }
             if (playState == VideoView.STATE_ERROR || playState == VideoView.STATE_IDLE) {
@@ -3567,7 +3642,7 @@ public class PlayFragment extends BaseLazyFragment {
                 }
                 // 卡到报错 / 播放器释放：把没结算的那次补记上
                 // （用户往往正是因为卡了才退出的，这种样本最该被记录）
-                settlePendingStall();
+                settlePendingStall(false);
                 stallGateOpen = false;
                 return;
             }
@@ -3585,16 +3660,19 @@ public class PlayFragment extends BaseLazyFragment {
                 }
                 stallStartAtMs = SystemClock.elapsedRealtime();
                 stallSourceKey = sourceKey;
+                stallAccountKey = currentStallAccountKey();
+                // P2：卡满 15s 仍没恢复就立刻切（不等它恢复再算账）
+                scheduleLongStallCheck();
             } else if (playState == VideoView.STATE_BUFFERED) {
-                settlePendingStall();
+                settlePendingStall(true);
             }
         } catch (Throwable th) {
             LOG.e("[PQ] trackPlayStall fail: " + th);
         }
     }
 
-    /** 结算一次已完成的卡顿（当前没在卡顿则什么都不做）。 */
-    private void settlePendingStall() {
+    /** 结算一次已完成的卡顿（当前没在卡顿则什么都不做）。allowSwitch=是否允许据此触发自动切源。 */
+    private void settlePendingStall(boolean allowSwitch) {
         if (stallStartAtMs < 0) {
             return;
         }
@@ -3602,12 +3680,143 @@ public class PlayFragment extends BaseLazyFragment {
         stallStartAtMs = -1L;
         String key = stallSourceKey;
         stallSourceKey = null;
+        String acc = stallAccountKey;
+        stallAccountKey = null;
+        cancelLongStallCheck();
         if (TextUtils.isEmpty(key) || ms <= 0) {
             return;
         }
         // 单次封顶在 recordStall 内部做（避免「挂后台半天回来还在转」的畸高样本）
         SourceQualityStore.recordStall(key, ms);
         LOG.i("[PQ] stall " + key + " " + ms + "ms");
+        if (allowSwitch) {
+            onStallSettledForSwitch(acc, ms);
+        }
+    }
+
+    /** 「站点|线路」复合 key —— 切源以线路为单位，卡顿账也按线路独立累计。 */
+    private String currentStallAccountKey() {
+        String flag = mVodInfo == null ? "" : mVodInfo.playFlag;
+        return (sourceKey == null ? "" : sourceKey) + "|" + (flag == null ? "" : flag);
+    }
+
+    private void scheduleLongStallCheck() {
+        if (mHandler == null) return;
+        mHandler.removeMessages(MSG_STALL_SWITCH_CHECK);
+        mHandler.sendEmptyMessageDelayed(MSG_STALL_SWITCH_CHECK, STALL_SINGLE_SWITCH_MS);
+    }
+
+    private void cancelLongStallCheck() {
+        if (mHandler != null) mHandler.removeMessages(MSG_STALL_SWITCH_CHECK);
+    }
+
+    /** 单次长卡顿兜底：卡满 15s 仍未恢复 → 立即切（在 BUFFERING 中就切，不等恢复）。 */
+    private void handleLongStallCheck() {
+        if (!stallSwitchAllowed || switchingPlayback || mVideoView == null) return;
+        if (stallStartAtMs < 0) return;
+        long ms = SystemClock.elapsedRealtime() - stallStartAtMs;
+        if (ms < STALL_SINGLE_SWITCH_MS) return;
+        LOG.i("[PS] long stall " + ms + "ms, switch now");
+        triggerStallSwitch(stallAccountKey, "longStall=" + ms + "ms");
+    }
+
+    /** 一次卡顿结算后更新该线路的账，够阈值就切源。 */
+    private void onStallSettledForSwitch(String accountKey, long ms) {
+        try {
+            if (!stallSwitchAllowed || switchingPlayback || mVideoView == null) return;
+            if (TextUtils.isEmpty(accountKey)) return;
+            long now = SystemClock.elapsedRealtime();
+            StallHistory h = stallHistories.get(accountKey);
+            if (h == null) {
+                h = new StallHistory();
+                h.windowStartMs = now;
+                stallHistories.put(accountKey, h);
+            }
+            if (now - h.windowStartMs > STALL_WINDOW_MS) {
+                h.windowStartMs = now;
+                h.count = 0;
+                h.totalMs = 0;
+                h.quickCount = 0;
+            }
+            if (ms >= STALL_COUNT_MIN_MS) h.count++;
+            h.totalMs += ms;
+            // 「首播 5s 内就卡」按卡顿【开始】时刻判定（now-ms），而不是按结算时刻
+            long stallStartMs = now - ms;
+            if (firstFrameAtMs > 0 && stallStartMs >= firstFrameAtMs
+                    && stallStartMs - firstFrameAtMs <= STALL_QUICK_FAIL_WINDOW_MS) {
+                h.quickCount++;
+            }
+            LOG.i("[PS] stall-acc " + accountKey + " n=" + h.count
+                    + " sum=" + h.totalMs + "ms quick=" + h.quickCount);
+            boolean hit = h.count >= STALL_COUNT_THRESHOLD
+                    || h.totalMs >= STALL_TOTAL_MS_THRESHOLD
+                    || ms >= STALL_SINGLE_SWITCH_MS
+                    || h.quickCount >= STALL_QUICK_FAIL_COUNT;
+            if (hit) {
+                String reason = "n=" + h.count + " sum=" + h.totalMs
+                        + "ms single=" + ms + "ms quick=" + h.quickCount;
+                // 清账，避免切走后在新源上又因旧账立刻触发
+                h.count = 0;
+                h.totalMs = 0;
+                h.quickCount = 0;
+                h.windowStartMs = now;
+                // ★ 不要在本方法内同步切源：本方法经 trackPlayStall 在
+                //   onPlayStateChanged 回调里执行，同步 play()/release() 会在播放器
+                //   自己的回调栈里重建播放器，易触发竞态。post 到主线程队列再切。
+                final String acc2 = accountKey;
+                final String reason2 = reason;
+                if (mHandler != null) {
+                    mHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            triggerStallSwitch(acc2, reason2);
+                        }
+                    });
+                } else {
+                    triggerStallSwitch(accountKey, reason);
+                }
+            }
+        } catch (Throwable th) {
+            LOG.e("[PS] stall-acc fail: " + th);
+        }
+    }
+
+    /**
+     * 因卡顿触发一次自动切源。
+     *
+     * <p>直接复用既有的换线路/换源链路（{@link #tryNextLineIfEnabled()} → {@link #tryNextLine()}）：
+     * 它已处理「同集对齐、进度继承、线路轮完转站点兜底」。这里只额外把「刚离开的线路」
+     * 记进 60s 黑名单（防乒乓），并在没有下一条线路时给出明确提示，而不是无声停住。</p>
+     */
+    private void triggerStallSwitch(String accountKey, String reason) {
+        if (stallSwitchInFlight) return;
+        if (!stallSwitchAllowed || switchingPlayback || mVideoView == null) return;
+        if (!allowAutoSwitchLine || !Hawk.get(HawkConfig.AUTO_SWITCH_LINE, true)) {
+            LOG.i("[PS] stall-switch disabled");
+            return;
+        }
+        stallSwitchInFlight = true;
+        try {
+            String flag = mVodInfo == null ? null : mVodInfo.playFlag;
+            LOG.i("[PS] stall-switch from=" + accountKey + " flag=" + flag + " reason=" + reason);
+            if (!TextUtils.isEmpty(flag)) {
+                recentlyStallSwitchedFlags.put(flag, SystemClock.elapsedRealtime());
+            }
+            boolean ok = tryNextLineIfEnabled();
+            if (!ok) {
+                setTip("已尝试全部可用线路，仍较慢", false, true);
+            }
+        } catch (Throwable th) {
+            LOG.e("[PS] stall-switch fail: " + th);
+        } finally {
+            stallSwitchInFlight = false;
+        }
+    }
+
+    private boolean isRecentlyStallSwitched(String flag) {
+        if (TextUtils.isEmpty(flag)) return false;
+        Long at = recentlyStallSwitchedFlags.get(flag);
+        return at != null && SystemClock.elapsedRealtime() - at < STALL_SWITCH_BACK_BLOCK_MS;
     }
 
     /** 超过这个耗时就认为不是正常的起播等待（例如应用被切到后台），不计入统计。 */

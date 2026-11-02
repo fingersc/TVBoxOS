@@ -2018,22 +2018,103 @@ public class VodController extends BaseController {
                 });
     }
 
+    /**
+     * 从 master playlist 里选一个要播放的变体。
+     *
+     * <p><b>P1-1（r153）画质优先：</b>旧实现只取<b>第一条</b> {@code EXT-X-STREAM-INF}，
+     * 而第一条未必是最高画质（很多源的排列顺序是随机的，甚至是低清在前）。用户明确
+     * 要求「画质优先、不为流畅降码率」，所以这里改成：</p>
+     * <ol>
+     *   <li>在 {@link #MAX_VARIANT_HEIGHT}（1080p）以内的变体里，按<b>分辨率面积</b>
+     *       从大到小选，面积相同再比 {@code BANDWIDTH}；</li>
+     *   <li>若所有变体都超过 1080p（如只有 4K），取其中<b>最低</b>的一档作为兜底 ——
+     *       避免白白选个 4K 让机顶盒解不动/狂缓冲；</li>
+     *   <li>没有任何分辨率信息时，退化为按 {@code BANDWIDTH} 取最高。</li>
+     * </ol>
+     *
+     * <p>只做「选哪条变体」，不做任何降码率/限码率 —— 非去广告路径的 Exo 原生 ABR
+     * 保持不动（用户已确认「ABR 先不动」）。</p>
+     */
+    private static final int MAX_VARIANT_HEIGHT = 1080;
+
     private String extractForwardUrl(String baseUrl, String content) {
-        String[] lines = content.split("\\r?\\n",50);
+        String[] lines = content.split("\\r?\\n", 200);
+        String bestInCap = null;      // 1080p 以内，面积最大（同面积比带宽）
+        long bestInCapArea = -1L, bestInCapBandwidth = -1L;
+        String lowestOverCap = null;  // 超过 1080p，面积最小
+        long lowestOverCapArea = Long.MAX_VALUE;
+        String bestByBandwidth = null; // 无分辨率信息时，带宽最高
+        long bestBandwidth = -1L;
+
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i].trim();
-            if (line.startsWith("#EXT-X-STREAM-INF")) {
-                // 只需要找接下来的几行
-                for (int j = i + 1; j < lines.length; j++) {
-                    String targetLine = lines[j].trim();
-                    if (targetLine.isEmpty()) continue;
-                    if (isValidM3u8Line(targetLine)) {
-                        return resolveForwardUrl(baseUrl, targetLine);
+            if (!line.startsWith("#EXT-X-STREAM-INF")) continue;
+            int height = parseResolutionHeight(line);
+            long bandwidth = parseStreamInfLong(line, "BANDWIDTH");
+            // 该 STREAM-INF 下面第一条非注释行就是变体 URI
+            String uri = null;
+            for (int j = i + 1; j < lines.length; j++) {
+                String targetLine = lines[j].trim();
+                if (targetLine.isEmpty() || targetLine.startsWith("#")) continue;
+                if (isValidM3u8Line(targetLine)) uri = targetLine;
+                break;
+            }
+            if (uri == null) continue;
+            long area = (long) height * (long) height;   // 用短边平方近似面积（无需宽）
+            if (height > 0) {
+                if (height <= MAX_VARIANT_HEIGHT) {
+                    if (area > bestInCapArea
+                            || (area == bestInCapArea && bandwidth > bestInCapBandwidth)) {
+                        bestInCapArea = area;
+                        bestInCapBandwidth = bandwidth;
+                        bestInCap = uri;
                     }
+                } else if (area < lowestOverCapArea) {
+                    lowestOverCapArea = area;
+                    lowestOverCap = uri;
                 }
+            } else if (bandwidth > bestBandwidth) {
+                bestBandwidth = bandwidth;
+                bestByBandwidth = uri;
             }
         }
-        return "";
+
+        String chosen = bestInCap != null ? bestInCap
+                : (lowestOverCap != null ? lowestOverCap : bestByBandwidth);
+        if (chosen == null) return "";
+        return resolveForwardUrl(baseUrl, chosen);
+    }
+
+    /** 取 {@code RESOLUTION=1920x1080} 里的高（1080）；取不到返回 -1。 */
+    private int parseResolutionHeight(String line) {
+        try {
+            int idx = line.indexOf("RESOLUTION=");
+            if (idx < 0) return -1;
+            int start = idx + "RESOLUTION=".length();
+            int end = start;
+            while (end < line.length() && line.charAt(end) != ',') end++;
+            String v = line.substring(start, end).trim();
+            int x = v.indexOf('x');
+            if (x < 0) x = v.indexOf('X');
+            if (x <= 0) return -1;
+            return Integer.parseInt(v.substring(x + 1).trim());
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 取 {@code KEY=数字} 的数值；取不到返回 -1。 */
+    private long parseStreamInfLong(String line, String key) {
+        try {
+            int idx = line.indexOf(key + "=");
+            if (idx < 0) return -1L;
+            int start = idx + key.length() + 1;
+            int end = start;
+            while (end < line.length() && line.charAt(end) != ',') end++;
+            return Long.parseLong(line.substring(start, end).trim());
+        } catch (Throwable t) {
+            return -1L;
+        }
     }
 
     private boolean isValidM3u8Line(String line) {

@@ -140,10 +140,9 @@ public class OkGoHelper {
         //     既覆盖分片并发、又不会长期占着文件描述符。
         //
         //   · 超时
-        //     readTimeout 默认 10s 对慢源偏紧：慢源不是"断流"，而是"慢"，
-        //     10 秒内没吐出下一个字节就抛 SocketTimeoutException → Exo 判定
-        //     该分片失败 → 走 HlsErrorHandlingPolicy 重试/跳过 → 观众看到卡顿
-        //     甚至跳片。放宽到 30s 让"慢但有响应"的源有机会把数据送完。
+        //     readTimeout 见下方 r153 说明：由 30s 收紧到 10s。慢源不是"断流"而是
+        //     "慢"，只要还在吐字节就不会触发；真正卡死时 10s 快速失败并及时换线，
+        //     避免把用户晾在一次 30 秒的长黑屏里。
         //     connectTimeout 8s：连不上就快速失败并让上层换线，
         //     拉长只会让用户在"黑屏等起播"上浪费时间。
         //     writeTimeout 对流媒体无实际意义（请求体为空），保留默认即可。
@@ -156,7 +155,12 @@ public class OkGoHelper {
         try {
             builder.connectionPool(new ConnectionPool(12, 5, TimeUnit.MINUTES));
             builder.connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);   // 15s → 8s
-            builder.readTimeout(30, TimeUnit.SECONDS);                            // 30s 保持不动
+            // P1-2（r153）：readTimeout 30s → 10s。
+            //   30s 的语义是「一个分片请求挂 30s 才判失败」——对慢源/死源就是一次
+            //   30 秒的黑屏长卡（用户明确不接受「把短卡并成一次长卡」）。10s 让它
+            //   更快失败，交给 HlsErrorHandlingPolicy 的重试/跳过与上层自动切源处理；
+            //   对「慢但有响应」的源，10s 内仍会持续收到字节，不会误杀。
+            builder.readTimeout(10, TimeUnit.SECONDS);
             Dispatcher dispatcher = new Dispatcher();
             dispatcher.setMaxRequests(64);
             dispatcher.setMaxRequestsPerHost(10);

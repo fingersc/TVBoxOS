@@ -28,7 +28,12 @@ import com.google.android.exoplayer2.trackselection.MappingTrackSelector;
 //    正确路径 = com.google.android.exoplayer2.upstream.DefaultAllocator
 //    （曾误写成根包，CI 报 "cannot find symbol ... class DefaultAllocator"）
 import com.google.android.exoplayer2.upstream.DefaultAllocator;
+import com.google.android.exoplayer2.analytics.AnalyticsListener;
+import com.google.android.exoplayer2.source.MediaLoadData;
+import com.google.android.exoplayer2.util.EventTime;
 import com.google.android.exoplayer2.util.MimeTypes;
+
+import java.io.IOException;
 
 import java.util.ArrayList;
 import java.lang.reflect.InvocationHandler;
@@ -100,6 +105,87 @@ public class ExoPlayer extends ExoMediaPlayer {
     private static final int VOD_TIER_LOW_MAX_MS = 30_000;    // 字节上限80MB ≈ 21.3Mbps
     private static final int VOD_TIER_LOW_TARGET_BYTES = 80 * 1024 * 1024;
     private static final int VOD_TIER_LOW_BACK_BUFFER_MS = 0;
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // P0 播放度量（r153）
+    //
+    // 目的：日志里此前只有「起播/失败」，没有分片级的吞吐与耗时，无法判断一个慢源
+    // 到底是「带宽不足（慢速型）」「带宽够但分段请求抖动（抖动型）」还是「解码跟不上」。
+    // 这里挂一个 AnalyticsListener，按窗口汇总分片加载耗时与带宽估计，每 10 个分片
+    // 打一行 `[seg]`，用于给 P1-5(并行预取) 与 P3(卡后恢复水位) 提供实测依据。
+    //
+    // 说明：只做观测，不改任何播放行为；日志量按窗口聚合，不会像逐分片那样刷屏。
+    // ═══════════════════════════════════════════════════════════════════════
+    private static final int SEG_LOG_EVERY = 10;
+    private long segLoadStartMs = -1L;
+    private int segLoadType = -1;
+    private int segLoadBitrate = -1;
+    private int segWinCount = 0;
+    private long segWinSumMs = 0;
+    private long segWinMaxMs = 0;
+    private int segWinSlow2s = 0;
+    private long segLastBwEstimate = -1L;
+
+    private final AnalyticsListener segAnalyticsListener = new AnalyticsListener() {
+        @Override
+        public void onLoadStarted(EventTime eventTime, MediaLoadData mediaLoadData) {
+            segLoadStartMs = eventTime.realtimeMs;
+            segLoadType = mediaLoadData == null ? -1 : mediaLoadData.dataType;
+            segLoadBitrate = (mediaLoadData != null && mediaLoadData.trackFormat != null)
+                    ? mediaLoadData.trackFormat.bitrate : -1;
+        }
+
+        @Override
+        public void onLoadCompleted(EventTime eventTime, MediaLoadData mediaLoadData) {
+            recordSegment(eventTime.realtimeMs - segLoadStartMs);
+        }
+
+        @Override
+        public void onLoadError(EventTime eventTime, MediaLoadData mediaLoadData,
+                                IOException error, boolean wasCanceled) {
+            LOG.i("[seg] err type=" + segTypeName(segLoadType)
+                    + " canceled=" + wasCanceled
+                    + " err=" + (error == null ? "null" : error.getClass().getSimpleName()));
+        }
+
+        @Override
+        public void onBandwidthEstimate(EventTime eventTime, int totalLoadTimeMs,
+                                        long totalBytesLoaded, long bitrateEstimate) {
+            segLastBwEstimate = bitrateEstimate;
+        }
+    };
+
+    private void recordSegment(long durMs) {
+        if (durMs < 0) return;
+        segWinCount++;
+        segWinSumMs += durMs;
+        if (durMs > segWinMaxMs) segWinMaxMs = durMs;
+        if (segLoadType == C.DATA_TYPE_MEDIA && durMs >= 2000) segWinSlow2s++;
+        if (segWinCount >= SEG_LOG_EVERY) {
+            long avg = segWinSumMs / segWinCount;
+            LOG.i("[seg] n=" + segWinCount + " type=" + segTypeName(segLoadType)
+                    + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
+                    + " segKbps=" + (segLoadBitrate > 0 ? segLoadBitrate / 1000 : -1)
+                    + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
+            segWinCount = 0;
+            segWinSumMs = 0;
+            segWinMaxMs = 0;
+            segWinSlow2s = 0;
+        }
+    }
+
+    private static String segTypeName(int t) {
+        switch (t) {
+            case C.DATA_TYPE_MANIFEST:
+                return "manifest";
+            case C.DATA_TYPE_MEDIA:
+                return "media";
+            case C.DATA_TYPE_MEDIA_INITIALIZATION:
+                return "init";
+            default:
+                return "other";
+        }
+    }
 
     public ExoPlayer(Context context) {
         super(context);
@@ -186,6 +272,14 @@ public class ExoPlayer extends ExoMediaPlayer {
     @Override
     public void initPlayer() {
         super.initPlayer();
+        // P0：分片级吞吐/耗时观测（仅日志，不改播放行为）
+        try {
+            if (mInternalPlayer != null) {
+                mInternalPlayer.addAnalyticsListener(segAnalyticsListener);
+            }
+        } catch (Throwable th) {
+            LOG.i("[seg] addAnalyticsListener skip: " + th.getClass().getSimpleName());
+        }
         mInternalPlayer.addListener(new Player.Listener() {
             @Override
             public void onTracksChanged(Tracks tracks) {
@@ -213,6 +307,15 @@ public class ExoPlayer extends ExoMediaPlayer {
     public void setDataSource(String path, Map<String, String> headers) {
         defaultSubtitleTrackSelected = false;
         defaultSubtitleTrackSelectionClosed = false;
+        // P0：新一轮起播，清空上一个源遗留在窗口里的度量
+        segLoadStartMs = -1L;
+        segLoadType = -1;
+        segLoadBitrate = -1;
+        segWinCount = 0;
+        segWinSumMs = 0;
+        segWinMaxMs = 0;
+        segWinSlow2s = 0;
+        segLastBwEstimate = -1L;
         super.setDataSource(path, headers);
     }
 

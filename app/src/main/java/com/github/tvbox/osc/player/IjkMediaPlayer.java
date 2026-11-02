@@ -105,6 +105,23 @@ public class IjkMediaPlayer extends IjkPlayer {
         mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "dns_cache_timeout", -1);
         mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT,"safe",0);
 
+        // ★ P1-3（r153）：把网络重连选项放到**正确的类目**（FORMAT=ffmpeg 协议选项）。
+        //
+        //   背景：ApiConfig 默认选项里那条 `reconnect=1` 被放在 category 4=PLAYER，
+        //   而 ffmpeg 的 reconnect 属于协议(格式)层选项 ⇒ 那条配置实际从未生效，
+        //   慢源/瞬时断流时不会自动重连，只能整段失败。
+        //
+        //   这里在代码里以 FORMAT 类目显式设一次（覆盖用户配置里的同项），不依赖
+        //   ApiConfig 的默认 JSON：
+        //     · reconnect / reconnect_streamed：分片流/普通流都允许自动重连
+        //     · reconnect_delay_max：两次重连之间的最大退避（秒）
+        //     · multiple_requests：重连后尽量复用同一条 HTTP 连接（少一次握手/TLS）
+        //   注意：这些是 ffmpeg 的 http 协议选项，必须 OPT_CATEGORY_FORMAT。
+        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect", 1);
+        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_streamed", 1);
+        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "reconnect_delay_max", 4);
+        mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "multiple_requests", 1);
+
         if(Hawk.get(HawkConfig.PLAYER_IS_LIVE, false)){
             // ★ 缓存水位（毫秒）：原先 300ms 太贴近临界 —— 缓冲区几乎永远处于
             //   "刚够/不够"的边缘，解复用器每个分片周期都把它顶下去再拉上来，
