@@ -235,6 +235,11 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             confirmActivate();
             return;
         }
+        if (!HistorySyncManager.hasConfig()) {
+            toast("WebDAV 未配置，请先在下方“WebDAV 存储”填写地址、账号、密码并点“保存配置”后再登录");
+            tvSyncStatus.setText("登录失败：WebDAV 未配置");
+            return;
+        }
         final String user = etUser.getText().toString().trim();
         final String pass = etPass.getText().toString();
         if (TextUtils.isEmpty(user) || TextUtils.isEmpty(pass)) {
@@ -271,6 +276,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                         public void run() {
                             setBusy(false, null);
                             tvSyncStatus.setText("验证失败：" + t.getMessage());
+                            toast("登录失败：" + t.getMessage());
                         }
                     });
                 }
@@ -340,6 +346,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                         public void run() {
                             setBusy(false, null);
                             tvSyncStatus.setText("激活失败：" + t.getMessage());
+                            toast("激活失败：" + t.getMessage());
                         }
                     });
                 }
@@ -364,6 +371,9 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                         }
                         refreshAll();
                         tvSyncStatus.setText(message);
+                        if (!ok && message != null) {
+                            toast(message);
+                        }
                     }
                 });
     }
