@@ -120,6 +120,8 @@ public class ExoPlayer extends ExoMediaPlayer {
     private long segLoadStartMs = -1L;
     private int segLoadType = -1;
     private int segLoadBitrate = -1;
+    /** 声明码率（kbps 用 bit/s 存）——HLS 分片的 trackFormat 在 onLoadStarted 常为 null，改由 onDownstreamFormatChanged 取。 */
+    private int segDeclaredBitrate = -1;
     private int segWinCount = 0;
     private long segWinSumMs = 0;
     private long segWinMaxMs = 0;
@@ -135,6 +137,7 @@ public class ExoPlayer extends ExoMediaPlayer {
             segLoadType = mediaLoadData == null ? -1 : mediaLoadData.dataType;
             segLoadBitrate = (mediaLoadData != null && mediaLoadData.trackFormat != null)
                     ? mediaLoadData.trackFormat.bitrate : -1;
+            if (segLoadBitrate > 0) segDeclaredBitrate = segLoadBitrate;
         }
 
         @Override
@@ -151,6 +154,17 @@ public class ExoPlayer extends ExoMediaPlayer {
             LOG.i("[seg] err type=" + segTypeName(segLoadType)
                     + " canceled=" + wasCanceled
                     + " err=" + (error == null ? "null" : error.getClass().getSimpleName()));
+        }
+
+        @Override
+        public void onDownstreamFormatChanged(AnalyticsListener.EventTime eventTime,
+                                              MediaLoadData mediaLoadData) {
+            // HLS 分片的 MediaLoadData.trackFormat 在 onLoadStarted/onLoadCompleted 常为 null，
+            // 真正带码率/分辨率的是 onDownstreamFormatChanged。缺了它 segKbps 会一直是 -1。
+            if (mediaLoadData != null && mediaLoadData.trackFormat != null
+                    && mediaLoadData.trackFormat.bitrate > 0) {
+                segDeclaredBitrate = mediaLoadData.trackFormat.bitrate;
+            }
         }
 
         @Override
@@ -171,9 +185,26 @@ public class ExoPlayer extends ExoMediaPlayer {
             long avg = segWinSumMs / segWinCount;
             // bytes*8/ms = kbit/s（实际吞吐）
             long actKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
+            long declaredKbps = segDeclaredBitrate > 0 ? segDeclaredBitrate / 1000
+                    : (segLoadBitrate > 0 ? segLoadBitrate / 1000 : -1);
+            // 分类（供 P1-5 / P3 决策）：
+            //   slow   = 实际吞吐明显低于声明码率 → 带宽不足（调水位没用，只能切源/提速）
+            //   jitter = 吞吐够但存在单段 >2s 的停顿 → 抖动型（并行预取/降恢复水位才有效）
+            //   good   = 吞吐够且无长停顿
+            String cls;
+            if (declaredKbps <= 0 || actKbps <= 0) {
+                cls = "unknown";
+            } else if (actKbps * 100 < declaredKbps * 85) {
+                cls = "slow";
+            } else if (segWinSlow2s > 0) {
+                cls = "jitter";
+            } else {
+                cls = "good";
+            }
             LOG.i("[seg] n=" + segWinCount + " type=" + segTypeName(segLoadType)
+                    + " cls=" + cls
                     + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
-                    + " segKbps=" + (segLoadBitrate > 0 ? segLoadBitrate / 1000 : -1)
+                    + " segKbps=" + declaredKbps
                     + " actKbps=" + actKbps
                     + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
             segWinCount = 0;
@@ -321,6 +352,7 @@ public class ExoPlayer extends ExoMediaPlayer {
         segLoadStartMs = -1L;
         segLoadType = -1;
         segLoadBitrate = -1;
+        segDeclaredBitrate = -1;
         segWinCount = 0;
         segWinSumMs = 0;
         segWinMaxMs = 0;

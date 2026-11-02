@@ -55,6 +55,13 @@ public class HlsErrorHandlingPolicy extends DefaultLoadErrorHandlingPolicy {
                 return C.TIME_UNSET;
             }
         }
+        // P1-2 补（r154）：清单遇到 TLS/连接被重置（SSLHandshakeException / Connection reset /
+        //   Connection closed by peer 等）说明这条地址基本是死链（境外被 reset / 服务端拒绝），
+        //   重试只会再耗一轮 3~4s 握手、然后照样失败。直接判死不重试，把「翻族重试 / 换线」
+        //   尽早交给上层（实测 play.modujx10.com 单源每次省约 11s）。
+        if (isManifest(loadErrorInfo) && isConnectionReset(loadErrorInfo.exception)) {
+            return C.TIME_UNSET;
+        }
         // 如果是HLS切片错误，使用较短的重试延迟
         if (isChunkError(loadErrorInfo)) {
             return RETRY_DELAY_MS;
@@ -115,6 +122,33 @@ public class HlsErrorHandlingPolicy extends DefaultLoadErrorHandlingPolicy {
             t = cause;
         }
         return 0;
+    }
+
+    /** 异常链里是否有「TLS 握手被拒 / 连接被对端重置或关闭」这类基本不可恢复的错误。 */
+    private boolean isConnectionReset(Throwable error) {
+        Throwable t = error;
+        for (int guard = 0; t != null && guard < 8; guard++) {
+            if (t instanceof javax.net.ssl.SSLException) {
+                return true;
+            }
+            String msg = t.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("connection reset")
+                        || lower.contains("connection closed by peer")
+                        || lower.contains("connection abort")
+                        || lower.contains("broken pipe")
+                        || lower.contains("unexpected end of stream")) {
+                    return true;
+                }
+            }
+            Throwable cause = t.getCause();
+            if (cause == t) {
+                break;
+            }
+            t = cause;
+        }
+        return false;
     }
 
     /**
