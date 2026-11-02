@@ -120,14 +120,20 @@ public class ExoPlayer extends ExoMediaPlayer {
     private long segLoadStartMs = -1L;
     private int segLoadType = -1;
     private int segLoadBitrate = -1;
-    /** 声明码率（kbps 用 bit/s 存）——HLS 分片的 trackFormat 在 onLoadStarted 常为 null，改由 onDownstreamFormatChanged 取。 */
+    /** 声明码率（bit/s）——HLS 分片的 trackFormat 在 onLoadStarted 常为 null，改由 onDownstreamFormatChanged 取。 */
     private int segDeclaredBitrate = -1;
     private int segWinCount = 0;
-    private long segWinSumMs = 0;
+    private long segWinSumMs = 0;      // 纯下载耗时（LoadEventInfo.loadDurationMs）
+    private long segWinMediaMs = 0;    // 这些分片覆盖的媒体时长（mediaEndTimeMs-mediaStartTimeMs）
     private long segWinMaxMs = 0;
     private long segWinBytes = 0;
     private int segWinSlow2s = 0;
     private long segLastBwEstimate = -1L;
+    // 上次下游格式：用于发现分片间的码率/分辨率/编码变化——卡顿常发生在这些切换点
+    private int segLastFmtBitrate = -1;
+    private int segLastFmtW = -1;
+    private int segLastFmtH = -1;
+    private String segLastFmtCodecs = null;
 
     private final AnalyticsListener segAnalyticsListener = new AnalyticsListener() {
         @Override
@@ -144,7 +150,19 @@ public class ExoPlayer extends ExoMediaPlayer {
         public void onLoadCompleted(AnalyticsListener.EventTime eventTime,
                                     LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData) {
             long bytes = loadEventInfo == null ? 0L : loadEventInfo.bytesLoaded;
-            recordSegment(eventTime.realtimeMs - segLoadStartMs, bytes);
+            // 用纯下载耗时，别把“排队等线程/等连接”的时间算进去，否则 actKbps 会被严重低估。
+            long durMs = (loadEventInfo != null && loadEventInfo.loadDurationMs > 0)
+                    ? loadEventInfo.loadDurationMs
+                    : (eventTime.realtimeMs - segLoadStartMs);
+            // 该分片覆盖的媒体时长：bytes 是媒体字节、mediaMs 是媒体秒 ⇒ bytes*8/mediaMs 才是真正的“内容码率”。
+            long mediaMs = 0L;
+            if (mediaLoadData != null
+                    && mediaLoadData.mediaStartTimeMs != C.TIME_UNSET
+                    && mediaLoadData.mediaEndTimeMs != C.TIME_UNSET) {
+                long d = mediaLoadData.mediaEndTimeMs - mediaLoadData.mediaStartTimeMs;
+                if (d > 0) mediaMs = d;
+            }
+            recordSegment(durMs, bytes, mediaMs);
         }
 
         @Override
@@ -160,10 +178,23 @@ public class ExoPlayer extends ExoMediaPlayer {
         public void onDownstreamFormatChanged(AnalyticsListener.EventTime eventTime,
                                               MediaLoadData mediaLoadData) {
             // HLS 分片的 MediaLoadData.trackFormat 在 onLoadStarted/onLoadCompleted 常为 null，
-            // 真正带码率/分辨率的是 onDownstreamFormatChanged。缺了它 segKbps 会一直是 -1。
-            if (mediaLoadData != null && mediaLoadData.trackFormat != null
-                    && mediaLoadData.trackFormat.bitrate > 0) {
-                segDeclaredBitrate = mediaLoadData.trackFormat.bitrate;
+            // 真正带码率/分辨率/编码的是 onDownstreamFormatChanged。
+            Format f = mediaLoadData == null ? null : mediaLoadData.trackFormat;
+            if (f == null) return;
+            if (f.bitrate > 0) segDeclaredBitrate = f.bitrate;
+            // 只有格式确实变化时才打一行（分片间码率/分辨率/编码切换是卡顿高发点）
+            boolean changed = f.bitrate != segLastFmtBitrate || f.width != segLastFmtW
+                    || f.height != segLastFmtH
+                    || (f.codecs != null && !f.codecs.equals(segLastFmtCodecs));
+            if (changed) {
+                segLastFmtBitrate = f.bitrate;
+                segLastFmtW = f.width;
+                segLastFmtH = f.height;
+                segLastFmtCodecs = f.codecs;
+                LOG.i("[seg] fmt type=" + segTypeName(mediaLoadData.dataType)
+                        + " " + f.width + "x" + f.height
+                        + " bitrate=" + (f.bitrate > 0 ? f.bitrate / 1000 : -1) + "kbps"
+                        + " codecs=" + f.codecs);
             }
         }
 
@@ -174,45 +205,57 @@ public class ExoPlayer extends ExoMediaPlayer {
         }
     };
 
-    private void recordSegment(long durMs, long bytes) {
+    private void recordSegment(long durMs, long bytes, long mediaMs) {
         if (durMs < 0) return;
         segWinCount++;
         segWinSumMs += durMs;
         if (bytes > 0) segWinBytes += bytes;
+        if (mediaMs > 0) segWinMediaMs += mediaMs;
         if (durMs > segWinMaxMs) segWinMaxMs = durMs;
         if (segLoadType == C.DATA_TYPE_MEDIA && durMs >= 2000) segWinSlow2s++;
-        if (segWinCount >= SEG_LOG_EVERY) {
-            long avg = segWinSumMs / segWinCount;
-            // bytes*8/ms = kbit/s（实际吞吐）
-            long actKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
-            long declaredKbps = segDeclaredBitrate > 0 ? segDeclaredBitrate / 1000
-                    : (segLoadBitrate > 0 ? segLoadBitrate / 1000 : -1);
-            // 分类（供 P1-5 / P3 决策）：
-            //   slow   = 实际吞吐明显低于声明码率 → 带宽不足（调水位没用，只能切源/提速）
-            //   jitter = 吞吐够但存在单段 >2s 的停顿 → 抖动型（并行预取/降恢复水位才有效）
-            //   good   = 吞吐够且无长停顿
-            String cls;
-            if (declaredKbps <= 0 || actKbps <= 0) {
-                cls = "unknown";
-            } else if (actKbps * 100 < declaredKbps * 85) {
-                cls = "slow";
-            } else if (segWinSlow2s > 0) {
-                cls = "jitter";
-            } else {
-                cls = "good";
-            }
-            LOG.i("[seg] n=" + segWinCount + " type=" + segTypeName(segLoadType)
-                    + " cls=" + cls
-                    + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
-                    + " segKbps=" + declaredKbps
-                    + " actKbps=" + actKbps
-                    + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
-            segWinCount = 0;
-            segWinSumMs = 0;
-            segWinMaxMs = 0;
-            segWinBytes = 0;
-            segWinSlow2s = 0;
+        if (segWinCount >= SEG_LOG_EVERY) emitSegLine(false);
+    }
+
+    /** 会话结束/切源前把不足一个窗口的尾巴也打出来（预览等短会话只有几片，否则永远看不到 [seg]）。 */
+    private void flushSegments() {
+        if (segWinCount > 0) emitSegLine(true);
+    }
+
+    private void emitSegLine(boolean partial) {
+        int n = segWinCount;
+        long avg = n > 0 ? segWinSumMs / n : 0;
+        // actKbps：纯下载吞吐（bytes*8/纯下载耗时）
+        long actKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
+        // segKbps：内容码率（bytes*8/覆盖的媒体时长）。拿不到媒体时长时退回声明码率。
+        long contentKbps = (segWinMediaMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinMediaMs
+                : (segDeclaredBitrate > 0 ? segDeclaredBitrate / 1000 : -1);
+        // 分类（供 P1-5 / P3 决策）：
+        //   slow   = 实际下载吞吐撑不住内容码率 → 带宽不足（调水位没用，只能切源/提速）
+        //   jitter = 吞吐够但存在单段 >2s 的停顿 → 抖动型（并行预取/降恢复水位才有效）
+        //   good   = 吞吐够且无长停顿
+        String cls;
+        if (contentKbps <= 0 || actKbps <= 0) {
+            cls = "unknown";
+        } else if (actKbps * 100 < contentKbps * 85) {
+            cls = "slow";
+        } else if (segWinSlow2s > 0) {
+            cls = "jitter";
+        } else {
+            cls = "good";
         }
+        LOG.i("[seg]" + (partial ? " part" : "")
+                + " n=" + n + " type=" + segTypeName(segLoadType)
+                + " cls=" + cls
+                + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
+                + " segKbps=" + contentKbps
+                + " actKbps=" + actKbps
+                + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
+        segWinCount = 0;
+        segWinSumMs = 0;
+        segWinMediaMs = 0;
+        segWinMaxMs = 0;
+        segWinBytes = 0;
+        segWinSlow2s = 0;
     }
 
     private static String segTypeName(int t) {
@@ -331,6 +374,8 @@ public class ExoPlayer extends ExoMediaPlayer {
             public void onPlaybackStateChanged(int playbackState) {
                 if (playbackState == Player.STATE_READY) {
                     defaultSubtitleTrackSelectionClosed = true;
+                } else if (playbackState == Player.STATE_ENDED) {
+                    flushSegments();
                 }
             }
 
@@ -348,16 +393,23 @@ public class ExoPlayer extends ExoMediaPlayer {
     public void setDataSource(String path, Map<String, String> headers) {
         defaultSubtitleTrackSelected = false;
         defaultSubtitleTrackSelectionClosed = false;
-        // P0：新一轮起播，清空上一个源遗留在窗口里的度量
+        // P0：新一轮起播，先把上一个源不足一个窗口的度量打出来，再清空
+        flushSegments();
         segLoadStartMs = -1L;
         segLoadType = -1;
         segLoadBitrate = -1;
         segDeclaredBitrate = -1;
         segWinCount = 0;
         segWinSumMs = 0;
+        segWinMediaMs = 0;
         segWinMaxMs = 0;
+        segWinBytes = 0;
         segWinSlow2s = 0;
         segLastBwEstimate = -1L;
+        segLastFmtBitrate = -1;
+        segLastFmtW = -1;
+        segLastFmtH = -1;
+        segLastFmtCodecs = null;
         super.setDataSource(path, headers);
     }
 
