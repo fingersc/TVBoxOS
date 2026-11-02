@@ -29,6 +29,7 @@ import com.google.android.exoplayer2.trackselection.MappingTrackSelector;
 //    （曾误写成根包，CI 报 "cannot find symbol ... class DefaultAllocator"）
 import com.google.android.exoplayer2.upstream.DefaultAllocator;
 import com.google.android.exoplayer2.analytics.AnalyticsListener;
+import com.google.android.exoplayer2.source.LoadEventInfo;
 import com.google.android.exoplayer2.source.MediaLoadData;
 import com.google.android.exoplayer2.util.MimeTypes;
 
@@ -122,12 +123,14 @@ public class ExoPlayer extends ExoMediaPlayer {
     private int segWinCount = 0;
     private long segWinSumMs = 0;
     private long segWinMaxMs = 0;
+    private long segWinBytes = 0;
     private int segWinSlow2s = 0;
     private long segLastBwEstimate = -1L;
 
     private final AnalyticsListener segAnalyticsListener = new AnalyticsListener() {
         @Override
-        public void onLoadStarted(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData) {
+        public void onLoadStarted(AnalyticsListener.EventTime eventTime,
+                                  LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData) {
             segLoadStartMs = eventTime.realtimeMs;
             segLoadType = mediaLoadData == null ? -1 : mediaLoadData.dataType;
             segLoadBitrate = (mediaLoadData != null && mediaLoadData.trackFormat != null)
@@ -135,12 +138,15 @@ public class ExoPlayer extends ExoMediaPlayer {
         }
 
         @Override
-        public void onLoadCompleted(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData) {
-            recordSegment(eventTime.realtimeMs - segLoadStartMs);
+        public void onLoadCompleted(AnalyticsListener.EventTime eventTime,
+                                    LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData) {
+            long bytes = loadEventInfo == null ? 0L : loadEventInfo.bytesLoaded;
+            recordSegment(eventTime.realtimeMs - segLoadStartMs, bytes);
         }
 
         @Override
-        public void onLoadError(AnalyticsListener.EventTime eventTime, MediaLoadData mediaLoadData,
+        public void onLoadError(AnalyticsListener.EventTime eventTime,
+                                LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData,
                                 IOException error, boolean wasCanceled) {
             LOG.i("[seg] err type=" + segTypeName(segLoadType)
                     + " canceled=" + wasCanceled
@@ -154,21 +160,26 @@ public class ExoPlayer extends ExoMediaPlayer {
         }
     };
 
-    private void recordSegment(long durMs) {
+    private void recordSegment(long durMs, long bytes) {
         if (durMs < 0) return;
         segWinCount++;
         segWinSumMs += durMs;
+        if (bytes > 0) segWinBytes += bytes;
         if (durMs > segWinMaxMs) segWinMaxMs = durMs;
         if (segLoadType == C.DATA_TYPE_MEDIA && durMs >= 2000) segWinSlow2s++;
         if (segWinCount >= SEG_LOG_EVERY) {
             long avg = segWinSumMs / segWinCount;
+            // bytes*8/ms = kbit/s（实际吞吐）
+            long actKbps = (segWinSumMs > 0 && segWinBytes > 0) ? segWinBytes * 8 / segWinSumMs : -1;
             LOG.i("[seg] n=" + segWinCount + " type=" + segTypeName(segLoadType)
                     + " avg=" + avg + "ms max=" + segWinMaxMs + "ms slow2s=" + segWinSlow2s
                     + " segKbps=" + (segLoadBitrate > 0 ? segLoadBitrate / 1000 : -1)
+                    + " actKbps=" + actKbps
                     + " bwEstKbps=" + (segLastBwEstimate > 0 ? segLastBwEstimate / 1000 : -1));
             segWinCount = 0;
             segWinSumMs = 0;
             segWinMaxMs = 0;
+            segWinBytes = 0;
             segWinSlow2s = 0;
         }
     }
