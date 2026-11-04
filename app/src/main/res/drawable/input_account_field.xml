@@ -19,8 +19,8 @@
             <corners android:radius="@dimen/vs_6" />
             <solid android:color="@color/dialog_input_bg" />
             <stroke
-                android:width="@dimen/vs_1"
-                android:color="@color/account_input_stroke" />
+                android:width="@dimen/vs_2"
+                android:color="#99FFFFFF" />
         </shape>
     </item>
 </selector>
