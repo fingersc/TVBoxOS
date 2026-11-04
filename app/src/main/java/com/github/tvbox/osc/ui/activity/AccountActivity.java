@@ -477,7 +477,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         card.setId(View.generateViewId());
         card.setGravity(android.view.Gravity.CENTER_VERTICAL);
         card.setBackgroundResource(isCurrent ? R.drawable.shape_account_chip_current
-                : ((isAdd || isScan) ? R.drawable.shape_account_chip_add : R.drawable.button_danmu_setting));
+                : ((isAdd || isScan) ? R.drawable.shape_account_chip_add : R.drawable.shape_account_item));
 
         TextView name = new TextView(this);
         name.setText(isCurrent ? "✓ " + text : (isAdd ? "+  " + text : text));
@@ -534,7 +534,7 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
             card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
                 @Override
                 public void onFocusChange(View v, boolean hasFocus) {
-                    card.setBackgroundResource(hasFocus ? R.drawable.button_danmu_setting
+                    card.setBackgroundResource(hasFocus ? R.drawable.shape_account_item
                             : R.drawable.shape_account_chip_current);
                 }
             });

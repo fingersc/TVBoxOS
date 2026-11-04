@@ -65,7 +65,7 @@
                 android:paddingRight="@dimen/vs_5"
                 android:singleLine="true"
                 android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_16" />
+                android:textSize="@dimen/ts_18" />
 
             <TextView
                 android:id="@+id/tvName"
@@ -78,7 +78,7 @@
                 android:padding="@dimen/vs_5"
                 android:text="Title"
                 android:textColor="@android:color/white"
-                android:textSize="@dimen/ts_18" />
+                android:textSize="@dimen/ts_20" />
         </LinearLayout>
         
         <FrameLayout
