@@ -150,6 +150,20 @@ public final class EpisodeNameMatcher {
             Pattern.compile("(?<!\\d)(\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])(?!\\d)");
 
     /**
+     * ★ r164：E 序号前缀 + 日期 的写法——{@code E05.200202} / {@code E714.20240714}。
+     *
+     * <p>部分采集源把每集写成 {@code E{序号}.{日期}}（实测 id=4933 的量子源：
+     * {@code E01.200105$…}、{@code E05.200202$…}）。旧实现里 6 位日期（{@code 200202}）
+     * 只有「紧随 期/集/话」或「整名去非数字后恰为这 6 位」才被采纳为日期，而这种前缀形态
+     * 两者都不满足 ⇒ {@link #dateOf} 返回 -1 ⇒ {@link #isSameEpisodeStrict} 在「一侧有日期、
+     * 另一侧日期不可解析」时放行 ⇒ 切换源时误把 {@code E05.200202}（2020-02-02）当成
+     * 「同一集」而放行，实际播错集。本 Pattern 把 {@code E{序号}.{日期}} 里的日期部分取出，
+     * 6 位按 YYMMDD、8 位按 YYYYMMDD 解析（与 {@link #sixDigitDateOrdinal} 世纪口径一致）。</p>
+     */
+    private static final Pattern EP_PREFIXED_DATE =
+            Pattern.compile("(?i)(?<![A-Za-z0-9])E\\s*\\d{1,4}\\s*[.\\-_/]\\s*(\\d{6,8})(?!\\d)");
+
+    /**
      * 分集段（上/中/下），出现在名称<b>末尾</b>。
      *
      * <p>为什么必须在"去括号"之前提取：站点会把分集写在括号里
@@ -546,6 +560,13 @@ public final class EpisodeNameMatcher {
         if (separated.find()) {
             return new EpisodeKey(buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3)),
                     DOMAIN_DATE, part, raw);
+        }
+
+        // 2.4 ★ r164：E{序号}.{日期} 形态（如 E05.200202 → 2020-02-02），
+        //     必须在 8 位 / 6 位通用兜底之前判定，否则 6 位日期会被当「非日期」而落 UNKNOWN。
+        int epDate = epPrefixedDateOf(work);
+        if (epDate > 0) {
+            return new EpisodeKey(epDate, DOMAIN_DATE, part, raw);
         }
 
         // 2.5 8 位纯数字守卫：{@code 第20260411期 / 第20260411 / 20260411期} 一律按日期语义。
@@ -1913,6 +1934,11 @@ public final class EpisodeNameMatcher {
         Matcher separated = DATE_SEPARATED.matcher(name);
         if (separated.find()) {
             return buildDateOrdinal(separated.group(1), separated.group(2), separated.group(3));
+        }
+        // ★ r164：E{序号}.{日期}（如 E05.200202 → 2020-02-02），与 parseLegacy 同步识别。
+        int epDate = epPrefixedDateOf(name);
+        if (epDate > 0) {
+            return epDate;
         }
         // ★ r103：6 位 YYMMDD（年份只写后两位），与 parse 同步识别。
         int sixDate = sixDigitDateOrdinal(name);
@@ -6951,6 +6977,42 @@ long expected = dayNumberOf(firstDate) + period * (ordinal - 1);
      * 仅当匹配到的 6 位数字<b>紧随 期/集/话</b>，或<b>全名去非数字后恰为这 6 位</b>时
      * 才采纳为日期，降低误判（编号/分辨率等任意 6 位数字）。</p>
      */
+    /**
+     * ★ r164：解析 {@link #EP_PREFIXED_DATE} 命中的 {@code E{序号}.{日期}} 里的日期，返回 YYYYMMDD；无则 -1。
+     * 6 位按 YYMMDD（世纪：YY≤40→20YY，其余 19YY），8 位按 YYYYMMDD；月/日非法则跳过。
+     */
+    private static int epPrefixedDateOf(String s) {
+        if (TextUtils.isEmpty(s)) {
+            return -1;
+        }
+        Matcher m = EP_PREFIXED_DATE.matcher(s);
+        while (m.find()) {
+            String g = m.group(1);
+            int year;
+            int month;
+            int day;
+            if (g.length() == 8) {
+                year = parseIntSafe(g.substring(0, 4));
+                month = parseIntSafe(g.substring(4, 6));
+                day = parseIntSafe(g.substring(6, 8));
+            } else if (g.length() == 6) {
+                int yy = parseIntSafe(g.substring(0, 2));
+                if (yy < 0) {
+                    continue;
+                }
+                year = yy <= 40 ? 2000 + yy : 1900 + yy;
+                month = parseIntSafe(g.substring(2, 4));
+                day = parseIntSafe(g.substring(4, 6));
+            } else {
+                continue;
+            }
+            if (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+                return year * 10000 + month * 100 + day;
+            }
+        }
+        return -1;
+    }
+
     private static int sixDigitDateOrdinal(String s) {
         if (TextUtils.isEmpty(s)) {
             return -1;

@@ -1532,6 +1532,20 @@ public class DetailActivity extends BaseActivity {
                             }
                             detailFallbackRestoreNoContentMatch = false;
                         }
+                        // ★ r164：切源链候选（fallbackResult=true）若同名记录拿不到 playNote（expectedName 为空），
+                        //   必须退回「切源前实际在播的那一集」（backfillFromName，已在 1472 行 reset 前抓取），
+                        //   否则下面 1606 的 alignNoEpisode 守卫会因 expectedName 为空被整体跳过，
+                        //   restoreDetailFallbackEpisode 的就近/裸下标落点（EpisodeMatchCore L1.5/同域 order）
+                        //   会把「集名域对不上」的错源放到错误的集上播放
+                        //   （2026-11-04 日志：17-量子 id=4933 E日期式列表被放行播 E05.200202，而非目标 20100711期）。
+                        //   只补空值，不覆盖同名记录现成的 playNote；fallbackResult=false（首次进入/手动选源）不受影响。
+                        if (fallbackResult && TextUtils.isEmpty(expectedName) && !TextUtils.isEmpty(backfillFromName)) {
+                            expectedName = backfillFromName;
+                            if (LOG.isDebugEnabled()) {
+                                LOG.dbg("[FB] fbExpected snapshotFallback source=" + sourceKey
+                                        + " id=" + vodId + " expected=" + expectedName);
+                            }
+                        }
                         boolean positionTrusted = EpisodeNameMatcher.positionTrustedAcrossDomain(
                                 expectedName, currentEpisode.name);
 
