@@ -1546,6 +1546,23 @@ public class DetailActivity extends BaseActivity {
                                         + " id=" + vodId + " expected=" + expectedName);
                             }
                         }
+                        // ★ r165：治「被污染的同名记录自我确认」。若同名记录现成的 playNote 与
+                        //   「切源前实际在播」的那一集（backfillFromName：快照/旧源集名）日期冲突，
+                        //   说明采信到的记录来自「另一部被错标成同名」的错误合集（如 290 集、E01.200105
+                        //   起的 2020 版），其 playNote 与候选自身落点自洽，会让下方守卫「自我确认」放行。
+                        //   以切源前快照为权威锚覆盖它，逼出 alignNoEpisode 拒绝。
+                        //   仅当两侧日期都可解析且不同才覆盖：跨域/标题式/纯期号（dateOf 无法解析）不受影响；
+                        //   也正因如此，本纠偏只在「纯 方案3（不写历史）」不足以清掉设备上既有脏记录时才起作用。
+                        if (fallbackResult && !TextUtils.isEmpty(expectedName) && !TextUtils.isEmpty(backfillFromName)) {
+                            int expDate = EpisodeNameMatcher.dateOf(expectedName);
+                            int anchorDate = EpisodeNameMatcher.dateOf(backfillFromName);
+                            if (expDate > 0 && anchorDate > 0 && expDate != anchorDate) {
+                                LOG.sw("[FB] fbExpected anchorOverride keep=" + expectedName
+                                        + " -> anchor=" + backfillFromName
+                                        + " source=" + sourceKey + " id=" + vodId);
+                                expectedName = backfillFromName;
+                            }
+                        }
                         boolean positionTrusted = EpisodeNameMatcher.positionTrustedAcrossDomain(
                                 expectedName, currentEpisode.name);
 
@@ -1647,6 +1664,9 @@ public class DetailActivity extends BaseActivity {
                             loadNextDetailFallbackSource();
                             return;
                         }
+                        // ★ r165：本候选已通过同集确认守卫（或被判定无需守卫），允许其后续
+                        //   insertVod 正常写历史/合并同名记录（此时 playNote 才是可信落点）。
+                        detailFallbackConfirmed = true;
 
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
@@ -1859,6 +1879,8 @@ public class DetailActivity extends BaseActivity {
             showLoading();
         }
         if (fallback && detailFallbackActive) {
+            // ★ r165：每次拉取新候选都从「未确认」起步——在其 detailResult 通过同集守卫前不写历史。
+            detailFallbackConfirmed = false;
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
             llLayout.postDelayed(detailFallbackDetailTimeout, DETAIL_FALLBACK_DETAIL_TIMEOUT_MS);
         }
@@ -3522,6 +3544,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackDetailTimedOut = false;
         detailFallbackSearchTimeoutScheduled = false;
         detailFallbackLoadingCandidate = false;
+        detailFallbackConfirmed = false;
         // 清掉上一轮可能残留的「提前消费」预约，避免旧预约抢在本轮前面放片
         detailFallbackEarlyConsumeScheduled = false;
         if (llLayout != null) {
@@ -5340,6 +5363,7 @@ public class DetailActivity extends BaseActivity {
         detailFallbackSearchTimeoutScheduled = false;
         detailFallbackKeepCurrentDetail = false;
         detailFallbackLoadingCandidate = false;
+        detailFallbackConfirmed = false;
         // 方案D：复位前把候选池落盘，供下次进同一部片直接复用
         // 方案A：清理探路状态
         detailFallbackProbePending = false;
@@ -5716,6 +5740,19 @@ public class DetailActivity extends BaseActivity {
      */
     private boolean detailFallbackHadEpisodePlaybackFail = false;
     private boolean detailFallbackLoadingCandidate;
+    /**
+     * ★ r165：本轮切源「当前候选」是否已通过同集确认守卫（{@code alignNoEpisode} 处）。
+     *
+     * <p><b>为什么需要它（1643 日志切错源根因）</b>：被拒候选在 detailResult observer 里已经把
+     * 共享字段 {@code vodInfo} 替换成“错误合集”的分集数据（playIndex 落到 E01.200105）。若在它被拒
+     * <b>之前/之后</b>有任何一次 {@link #insertVod}（典型是旧源拉流超时触发 PlayFragment autoRetry →
+     * {@code RefreshEvent(TYPE_REFRESH, JSONObject)} → refresh 处理器调 insertVod），就会把这个错位落点
+     * 当成 {@code playNote} 写进历史，并经 {@code mergeSameNameVodRecords} 删掉正确源的记录。于是下一个
+     * 候选的 {@code getVodInfoBySameName} 采信到这条被污染的“同名记录”，其 playNote=E01.200105 与
+     * 自身落点自洽 → 自我确认放行 → 切入 290 集错误合集。本标志为 false 时 insertVod 一律不落库，
+     * 待候选真正过守卫（{@code detailFallbackConfirmed = true}）后才允许写历史/合并。</p>
+     */
+    private boolean detailFallbackConfirmed = false;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
     private int detailFallbackNextSourceIndex;
@@ -7358,6 +7395,17 @@ public class DetailActivity extends BaseActivity {
     }
     
     private void insertVod(String sourceKey, VodInfo vodInfo) {
+        // ★ r165：切源候选在通过同集确认守卫之前，一律不写历史、不合并同名记录。
+        //   被拒候选（错误合集的错位落点，如 E01.200105）若此刻落库，会把错集名写成 playNote、
+        //   并经 mergeSameNameVodRecords 删掉正确源记录，使后续候选采信被污染的「同名记录」
+        //   自我确认放行（1643 日志 `histWrite 5d7bbc/4933` 即为该污染写）。确认通过后才允许写。
+        if (detailFallbackActive && !detailFallbackConfirmed) {
+            if (LOG.isDebugEnabled()) {
+                LOG.dbg("[FB] histSkip unconfirmed source=" + sourceKey
+                        + " id=" + (vodInfo != null ? vodInfo.id : "null"));
+            }
+            return;
+        }
         List<VodInfo.VodSeries> list = getPlayingSeriesList();
         if (list.isEmpty()) {
             vodInfo.playNote = "";
