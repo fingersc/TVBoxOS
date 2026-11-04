@@ -2933,6 +2933,13 @@ public final class EpisodeNameMatcher {
         }
     }
 
+    /** ★ r163.1：该剧是否已有可用日期表（用于「有表则异步刷新、无表才同步首建」）。 */
+    public static boolean hasDateTable(String showKey) {
+        if (TextUtils.isEmpty(showKey)) return false;
+        java.util.Map<String, Integer> m = TBL_ORD_TO_DATE.get(showKey.trim());
+        return m != null && !m.isEmpty();
+    }
+
     private static void persistDateTablesNow() {
         if (dateTableFile == null) return;
         synchronized (PERSIST_LOCK) {

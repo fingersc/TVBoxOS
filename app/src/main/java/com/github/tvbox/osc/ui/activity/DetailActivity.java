@@ -1295,7 +1295,7 @@ public class DetailActivity extends BaseActivity {
                             EpisodeNameMatcher.harvestDateOrdinalAnchors(anchorShow, anchorLists);
                             // ★ r124 建表可靠化：整部剧所有线路两两配对建「期号↔日期」表，摆脱"切源时拿新源列表懒建"的空表缺陷
                             com.github.tvbox.osc.util.PerfTrace.begin("detail.buildDateTableForVod");
-                            EpisodeNameMatcher.buildDateTableForVod(anchorShow, anchorLists);
+                            EpisodeNameMatcher.requestBuildDateTable(anchorShow, anchorLists);
                             com.github.tvbox.osc.util.PerfTrace.end("detail.buildDateTableForVod");
                         } catch (Throwable ignored) {
                         }
@@ -6344,7 +6344,12 @@ public class DetailActivity extends BaseActivity {
                 all.add(seriesNames(l));
                 srcKeys.add(en.getKey());
             }
-            EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+            // ★ r163.1：已有表时走异步刷新（主线程零 O(L²) 重建，匹配用现有表即可）；仅「首次无表」才同步首建（此时列表少、成本低）。
+            if (EpisodeNameMatcher.hasDateTable(showKey)) {
+                EpisodeNameMatcher.requestBuildDateTable(showKey, all);
+            } else {
+                EpisodeNameMatcher.buildDateTableForVod(showKey, all);
+            }
             markDateTablesBuilt(showKey);
             com.github.tvbox.osc.util.PerfTrace.end("detail.ensureDateTablesBuilt.build");
             // ★ r125 诊断：每部剧仅首帧 dump 一次，输出各线路完整集名 + 建表后 o0..o8 映射，
