@@ -1313,11 +1313,13 @@ public class DetailActivity extends BaseActivity {
                             int nowEpisodes = countSeriesEpisodes(vodInfo);
                             int sameStation = countSameStationCandidates(sourceKey);
                             if (shouldRejectByEpisodes(nowEpisodes)) {
-                                LOG.sw("[FB] episodeMismatch source=" + sourceKey + " id=" + vodId
-                                        + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
-                                        + " candidates=" + sameStation
-                                        + " " + describeSeriesShape(vodInfo)
-                                        + " => soft + next");
+                                if (LOG.isDebugEnabled()) {
+                                    LOG.sw("[FB] episodeMismatch source=" + sourceKey + " id=" + vodId
+                                            + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
+                                            + " candidates=" + sameStation
+                                            + " " + describeSeriesShape(vodInfo)
+                                            + " => soft + next");
+                                }
                                 // ★★ v99-r67：只记软失败（本圈跳过），**不记死**。
                                 //   集数不符只是「内容可能不完整」（未更新完 / 删减版），
                                 //   与「年份矛盾」这种身份级证据不同；记死会让一个
@@ -1336,12 +1338,14 @@ public class DetailActivity extends BaseActivity {
                             }
                             // ★ v99-r66：集数不等于基准却放行的（loose=1），此前混在 pass 里看不出来 ——
                             //   而那正是「切到了集数不符的片」的唯一记录。
-                            LOG.sw("[FB] episodeCheck source=" + sourceKey + " id=" + vodId
-                                    + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
-                                    + " candidates=" + sameStation
-                                    + (nowEpisodes == detailFallbackRefEpisodes ? "" : " loose=1")
-                                    + " " + describeSeriesShape(vodInfo)
-                                    + " => pass");
+                            if (LOG.isDebugEnabled()) {
+                                LOG.sw("[FB] episodeCheck source=" + sourceKey + " id=" + vodId
+                                        + " now=" + nowEpisodes + " ref=" + detailFallbackRefEpisodes
+                                        + " candidates=" + sameStation
+                                        + (nowEpisodes == detailFallbackRefEpisodes ? "" : " loose=1")
+                                        + " " + describeSeriesShape(vodInfo)
+                                        + " => pass");
+                            }
                         }
                         mGridViewFlag.setVisibility(View.VISIBLE);
                         mGridView.setVisibility(View.VISIBLE);
@@ -2669,6 +2673,9 @@ public class DetailActivity extends BaseActivity {
      * 快照（{@link #detailFallbackCycleOrderSnapshot}），不额外读 Hawk。</p>
      */
     private void logCycleOrder(List<String> orderedSources) {
+        if (!LOG.isDebugEnabled()) {
+            return; // r163.2：调试关闭时不构造 cycleOrder 大字符串（原实现每次都拼 25 项）
+        }
         try {
             if (orderedSources == null || orderedSources.isEmpty()) {
                 return;
@@ -2713,7 +2720,8 @@ public class DetailActivity extends BaseActivity {
         //   全部零分（基准为空或字段都缺）时退回第一条，不会比旧行为差。
         String firstAlive = "";
         int bestScore = 0;
-        StringBuilder pickLog = new StringBuilder();
+        final boolean dbg = LOG.isDebugEnabled();
+        StringBuilder pickLog = dbg ? new StringBuilder() : null;
         for (Movie.Video video : cachedCandidates) {
             if (video == null || !TextUtils.equals(video.sourceKey, sourceKey)
                     || TextUtils.isEmpty(video.id)) {
@@ -2723,10 +2731,12 @@ public class DetailActivity extends BaseActivity {
                 continue;
             }
             int score = referenceMatchScore(detailFallbackRefVideo, video);
-            if (pickLog.length() > 0) {
-                pickLog.append(' ');
+            if (dbg) {
+                if (pickLog.length() > 0) {
+                    pickLog.append(' ');
+                }
+                pickLog.append(video.id).append(':').append(score);
             }
-            pickLog.append(video.id).append(':').append(score);
             if (score < 0) {
                 continue;   // 硬矛盾（年份冲突）：排除
             }
@@ -2748,7 +2758,7 @@ public class DetailActivity extends BaseActivity {
         //   「切到同站另一部同名剧」排障必备：该站有几条同名候选、每条与基准的
         //   得分、最终选了谁、基准是什么。日志里一眼看出是「择优没生效」
         //   （scores 全 0 或 ref=none）还是「元数据贫瘠无从区分」。
-        if (!TextUtils.isEmpty(firstAlive)) {
+        if (dbg && !TextUtils.isEmpty(firstAlive)) {
             LOG.sw("[FB] sameStationPick source=" + sourceKey
                     + " ref=" + describeReference(detailFallbackRefVideo)
                     + " scores=[" + pickLog + "]"
@@ -3007,8 +3017,10 @@ public class DetailActivity extends BaseActivity {
         java.util.List<java.util.List<String>> batch = new java.util.ArrayList<>(1);
         batch.add(names);
         EpisodeNameMatcher.requestBuildDateTable(show, batch);
-        LOG.sw("[FB] harvestSeries show=" + show + " station=" + station
-                + " src=" + sourceKey + " n=" + names.size());
+        if (LOG.isDebugEnabled()) {
+            LOG.sw("[FB] harvestSeries show=" + show + " station=" + station
+                    + " src=" + sourceKey + " n=" + names.size());
+        }
         return true;
     }
 
@@ -3082,7 +3094,9 @@ public class DetailActivity extends BaseActivity {
         prefetchInFlightShow = show == null ? "" : show.trim();
         prefetchInFlightKey = video.sourceKey + "|" + video.id;
         prefetchBusy = true;
-        LOG.sw("[FB] prefetchStart key=" + prefetchInFlightKey + " show=" + prefetchInFlightShow);
+        if (LOG.isDebugEnabled()) {
+            LOG.sw("[FB] prefetchStart key=" + prefetchInFlightKey + " show=" + prefetchInFlightShow);
+        }
         prefetchWatchdog.removeCallbacks(prefetchWatchdogTask);
         prefetchWatchdog.postDelayed(prefetchWatchdogTask, 9000);
         try {
@@ -3108,9 +3122,13 @@ public class DetailActivity extends BaseActivity {
             }
             if (names != null && names.size() >= 2 && !TextUtils.isEmpty(show)) {
                 commitHarvest(show, stationGroupOf(srcKey), names, srcKey);
-                LOG.sw("[FB] prefetchSeries key=" + prefetchInFlightKey + " n=" + names.size());
+                if (LOG.isDebugEnabled()) {
+                    LOG.sw("[FB] prefetchSeries key=" + prefetchInFlightKey + " n=" + names.size());
+                }
             } else {
-                LOG.sw("[FB] prefetchEmpty key=" + prefetchInFlightKey);
+                if (LOG.isDebugEnabled()) {
+                    LOG.sw("[FB] prefetchEmpty key=" + prefetchInFlightKey);
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -3943,7 +3961,7 @@ public class DetailActivity extends BaseActivity {
             //   300ms 重查天然把频率压在 ~3 条/秒，不会刷屏。
             // ★ v99-r62：源已全部派完（next 已到 size、pending 还在飞）时，挡不挡毫无区别，
             //   这种打点纯噪音（真机 16 条里 7 条是 next=101/101）⇒ 只在确实还有源可派时才记。
-            if (detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
+            if (LOG.isDebugEnabled() && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
                 LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
                         + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
                         + " cap=" + detailFallbackPoolConcurrency);
@@ -3986,12 +4004,14 @@ public class DetailActivity extends BaseActivity {
                 if (detailFallbackPoolAskedKeys.size() != before) {
                 }
             }
-            LOG.sw("[FB] poolSuppress reason=liveSearch"
-                    + " task=t" + detailFallbackPoolTaskId
-                    + " asked=" + detailFallbackPoolAskedKeys.size()
-                    + "/" + detailFallbackSourceOrder.size()
-                    + " sessionSearched=" + sessionSearched.size()
-                    + " poolSize=" + detailFallbackUsableCandidateCount());
+            if (LOG.isDebugEnabled()) {
+                LOG.sw("[FB] poolSuppress reason=liveSearch"
+                        + " task=t" + detailFallbackPoolTaskId
+                        + " asked=" + detailFallbackPoolAskedKeys.size()
+                        + "/" + detailFallbackSourceOrder.size()
+                        + " sessionSearched=" + sessionSearched.size()
+                        + " poolSize=" + detailFallbackUsableCandidateCount());
+            }
             // 轮次随时可能结束（全部搜完 / 用户离开搜索页），挂个短重查。
             // 不挂的话没人会再调进来，这条腿就永远不动了。
             scheduleBusyRefill();
@@ -4069,17 +4089,19 @@ public class DetailActivity extends BaseActivity {
             // ★ v99-r58：日志改走 LOG.sw（LOG.i 的 tag 会被真机 logcat 过滤掉），
             //   并把 r57 的 busy=0/1 换成更有信息量的 cap / front —— 合并成单队列后，
             //   「并发档位 + 是否在前台窗口」才是判断行为的关键。
-            LOG.sw("[FB] dispatch task=t" + detailFallbackPoolTaskId
-                    + " n=" + dispatched.size()
-                    + " inflight=" + detailFallbackPendingSources.size()
-                    + " cap=" + cap
-                    + " front=" + (detailFallbackPoolFrontWindowClosed ? 0 : 1)
-                    + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
-                    // ★ v99-r60：skip 保留 r59 的总口径（有没有跳过），另加 skipS
-                    //   专指「因搜索页已搜过而跳过」—— 两种跳过原因必须能分开，
-                    //   否则算不出丙到底省了多少请求。
-                    + " skip=" + (skippedAny ? 1 : 0)
-                    + " skipS=" + (skippedSession ? 1 : 0));
+            if (LOG.isDebugEnabled()) {
+                LOG.sw("[FB] dispatch task=t" + detailFallbackPoolTaskId
+                        + " n=" + dispatched.size()
+                        + " inflight=" + detailFallbackPendingSources.size()
+                        + " cap=" + cap
+                        + " front=" + (detailFallbackPoolFrontWindowClosed ? 0 : 1)
+                        + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                        // ★ v99-r60：skip 保留 r59 的总口径（有没有跳过），另加 skipS
+                        //   专指「因搜索页已搜过而跳过」—— 两种跳过原因必须能分开，
+                        //   否则算不出丙到底省了多少请求。
+                        + " skip=" + (skippedAny ? 1 : 0)
+                        + " skipS=" + (skippedSession ? 1 : 0));
+            }
         } else if (skippedAny) {
             // ★ v99-r59：剩下的源<b>全都问过了</b>，一个请求都没发就扫完了队列表。
             //   必须当场收尾：此时既没有在途请求、也没有结果回调会再调进来，
