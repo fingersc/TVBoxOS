@@ -1634,9 +1634,17 @@ public class DetailActivity extends BaseActivity {
                                         expectedName, currentEpisode.name, playingSeriesList);
                             }
                         }
-                        if (!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) {
+                        // ★ r166：上/下 分P守卫——即使名字级判定误判同集，只要与「切源前实际在播集」
+                        //   的上/下 冲突（如把『一公挑战赛（下）』按位置落成『…（上）』），就判为不同集，
+                        //   拒绝按位置误落（1724 披荆斩棘2026 日志）。空锚/两侧无分P标记时不影响。
+                        boolean partConflict = fallbackResult
+                                && !TextUtils.isEmpty(detailFallbackAnchorEpisode)
+                                && episodePartConflicts(detailFallbackAnchorEpisode, currentEpisode.name);
+                        if ((!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) || partConflict) {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
-                                    + " expected=" + expectedName + " actual=" + currentEpisode.name
+                                    + " expected=" + (TextUtils.isEmpty(expectedName) ? detailFallbackAnchorEpisode : expectedName)
+                                    + " actual=" + currentEpisode.name
+                                    + " partConflict=" + partConflict
                                     + " userPicked=" + (fallbackResult ? 0 : 1)
                                     + " alignFailover=" + switchSession.alignFailover());
                             detailFallbackLoadingCandidate = false;
@@ -3776,6 +3784,7 @@ public class DetailActivity extends BaseActivity {
     private void captureDetailFallbackEpisode() {
         detailFallbackEpisode = null;
         detailFallbackEpisodeIndex = -1;
+        detailFallbackAnchorEpisode = null;
         // ★ r152：每次切源开始都重新采集旧源列表；不能沿用上一轮的列表，
         //   否则本轮在「旧源名不在新列表」时会拿到陈旧的秩源，导致跨源定位串源。
         detailFallbackSourceNames = null;
@@ -3791,9 +3800,235 @@ public class DetailActivity extends BaseActivity {
         }
         detailFallbackEpisodeIndex = Math.max(0, Math.min(playing.playIndex, seriesList.size() - 1));
         detailFallbackEpisode = seriesList.get(detailFallbackEpisodeIndex);
+        // ★ r166：记录切源前实际在播集名，作为本轮 上/下 分P守卫的不可变锚。
+        detailFallbackAnchorEpisode = detailFallbackEpisode == null ? null : detailFallbackEpisode.name;
         // ★ 同时捕获旧源剧集名列表：切源流程加载新源详情后 vodInfo 会被替换，
         //   届时 getPlayingSeriesList() 返回的是新源列表，离线秩对齐必须用旧源口径。
         detailFallbackSourceNames = seriesNames(seriesList);
+    }
+
+    /**
+     * ★ r167：从集名里识别「方向分P」标记。返回 0=无, 1=上, 2=中, 3=下, 4=前, 5=后。
+     *
+     * <p>只认明确写法，避免「上海/马上/集中」这类误判：括号式『（上）/（中）/（下）/（前）/（后）』，
+     * 『上集/上篇/上部/上卷/上幕』等两字组合，以及紧跟在『期/集/话/赛/篇/部/卷/幕/版』或数字后面的
+     * 上/中/下（如『…第02期一公挑战赛下』『20261022中』）。『前/后』仅在紧跟『期/集/话/赛』时认。</p>
+     *
+     * <p>预埋（语料实测几乎为 0 次的未来写法，用独立编码，仅在同写法内部互相比较）：
+     * 罗马数字 Ⅰ~Ⅵ 编码 21~26；中文序号（一）~（五） 编码 31~35；Part数字 编码 41+。</p>
+     */
+    private static int episodePartMarker(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        String s = name;
+        if (s.contains("（上）") || s.contains("(上)") || s.contains("【上】")) return 1;
+        if (s.contains("（中）") || s.contains("(中)") || s.contains("【中】")) return 2;
+        if (s.contains("（下）") || s.contains("(下)") || s.contains("【下】")) return 3;
+        if (s.contains("（前）") || s.contains("(前)") || s.contains("【前】")) return 4;
+        if (s.contains("（后）") || s.contains("(后)") || s.contains("【后】")) return 5;
+        if (s.contains("上集") || s.contains("上篇") || s.contains("上部") || s.contains("上卷") || s.contains("上幕")) return 1;
+        if (s.contains("中集") || s.contains("中篇") || s.contains("中部") || s.contains("中卷") || s.contains("中幕")) return 2;
+        if (s.contains("下集") || s.contains("下篇") || s.contains("下部") || s.contains("下卷") || s.contains("下幕")) return 3;
+        if (s.contains("前篇") || s.contains("前部") || s.contains("前卷") || s.contains("前幕")) return 4;
+        if (s.contains("后篇") || s.contains("后部") || s.contains("后卷") || s.contains("后幕")) return 5;
+        int n = s.length();
+        if (n >= 2) {
+            char last = s.charAt(n - 1);
+            char prev = s.charAt(n - 2);
+            String ctx = "期集话赛篇部卷幕版";
+            boolean prevOk = ctx.indexOf(prev) >= 0 || (prev >= '0' && prev <= '9');
+            if (prevOk) {
+                if (last == '上') return 1;
+                if (last == '中') return 2;
+                if (last == '下') return 3;
+            }
+            if ((last == '前' || last == '后') && "期集话赛".indexOf(prev) >= 0) {
+                return last == '前' ? 4 : 5;
+            }
+        }
+        int roman = romanPartMarker(s);
+        if (roman > 0) return roman;
+        int cn = chinesePartMarker(s);
+        if (cn > 0) return cn;
+        int part = latinPartMarker(s);
+        if (part > 0) return part;
+        return 0;
+    }
+
+    /** 预埋：罗马数字分P Ⅰ~Ⅵ → 21~26（恰出现一个罗马数字才采纳）。 */
+    private static int romanPartMarker(String s) {
+        char[] romans = {'Ⅰ', 'Ⅱ', 'Ⅲ', 'Ⅳ', 'Ⅴ', 'Ⅵ'};
+        int found = 0;
+        int code = 0;
+        for (int i = 0; i < romans.length; i++) {
+            if (s.indexOf(romans[i]) >= 0) {
+                found++;
+                code = 20 + (i + 1);
+            }
+        }
+        return found == 1 ? code : 0;
+    }
+
+    /** 预埋：中文序号（一）~（五） → 31~35。 */
+    private static int chinesePartMarker(String s) {
+        String[] forms = {"（一）", "（二）", "（三）", "（四）", "（五）",
+                "(一)", "(二)", "(三)", "(四)", "(五)"};
+        for (int i = 0; i < 5; i++) {
+            if (s.contains(forms[i]) || s.contains(forms[i + 5])) {
+                return 31 + i;
+            }
+        }
+        return 0;
+    }
+
+    /** 预埋：Part / PART + 数字 → 41+n（无数字记 41）。 */
+    private static int latinPartMarker(String s) {
+        String lower = s.toLowerCase();
+        int idx = lower.indexOf("part");
+        if (idx < 0) {
+            return 0;
+        }
+        int j = idx + 4;
+        while (j < lower.length()) {
+            char c = lower.charAt(j);
+            if (c == ' ' || c == '.' || c == ':' || c == ' ') {
+                j++;
+            } else {
+                break;
+            }
+        }
+        int start = j;
+        while (j < lower.length() && lower.charAt(j) >= '0' && lower.charAt(j) <= '9') {
+            j++;
+        }
+        if (j > start) {
+            int v = parseIntSafe(lower.substring(start, j));
+            return v >= 0 ? 41 + v : 41;
+        }
+        return 41;
+    }
+
+    /** ★ r167：识别「二级序号」分P（同一期内的第02期 / -02）。无则返回 -1。 */
+    private static int episodeSubPart(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return -1;
+        }
+        String s = name;
+        int n = s.length();
+        // 形式一：8 位日期 + '-NN'（如 20261022-02）
+        int i = s.lastIndexOf('-');
+        if (i > 0 && i < n - 1) {
+            String tail = s.substring(i + 1).trim();
+            if (isDigitsRange(tail, 1, 2)) {
+                int j = i - 1;
+                int cnt = 0;
+                while (j >= 0 && s.charAt(j) >= '0' && s.charAt(j) <= '9') {
+                    cnt++;
+                    j--;
+                }
+                if (cnt == 8) {
+                    return parseIntSafe(tail);
+                }
+            }
+        }
+        // 形式二：第YYYYMMDD期 后紧跟 第NN期（双期号）
+        int p1 = s.indexOf('第');
+        while (p1 >= 0) {
+            int q1 = s.indexOf('期', p1 + 1);
+            if (q1 < 0) {
+                break;
+            }
+            String num1 = s.substring(p1 + 1, q1).trim();
+            if (isDigitsRange(num1, 8, 8)) {
+                int p2 = s.indexOf('第', q1 + 1);
+                if (p2 >= 0) {
+                    int q2 = s.indexOf('期', p2 + 1);
+                    if (q2 > p2) {
+                        String num2 = s.substring(p2 + 1, q2).trim();
+                        if (isDigitsRange(num2, 1, 2)) {
+                            return parseIntSafe(num2);
+                        }
+                    }
+                }
+                return -1;
+            }
+            p1 = s.indexOf('第', p1 + 1);
+        }
+        return -1;
+    }
+
+    /** ★ r167：版本变体 0=正片, 1=沉浸版, 2=加更版, 3=抢鲜/抢先版, 4=加更N(加1/加2)。 */
+    private static int episodeVariant(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        String s = name;
+        if (s.contains("沉浸")) return 1;
+        if (s.contains("加更")) return 2;
+        if (s.contains("抢鲜") || s.contains("抢先")) return 3;
+        int n = s.length();
+        for (int i = 0; i + 1 < n; i++) {
+            if (s.charAt(i) == '加' && s.charAt(i + 1) >= '0' && s.charAt(i + 1) <= '9') {
+                return 4;
+            }
+        }
+        return 0;
+    }
+
+    private static boolean isDigitsRange(String s, int min, int max) {
+        if (s == null) {
+            return false;
+        }
+        int len = s.length();
+        if (len < min || len > max) {
+            return false;
+        }
+        for (int i = 0; i < len; i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int parseIntSafe(String s) {
+        try {
+            return Integer.parseInt(s);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /**
+     * ★ r167：两个集名是否在「分P」上冲突——方向(上/中/下/前后)、二级序号(第02期/-02)、版本变体(沉浸/加更/抢鲜/加N)。
+     *
+     * <p>方向与版本：任一侧有标记且两侧不同即冲突（含单侧标记的严格拒绝，符合用户"严格拒绝"要求）。
+     * 二级序号：仅当「两侧都带二级序号且不同」才冲突——因为不同源常把同一集写成
+     * 「第02期」或省略为「下」，单侧比较会把正确的源误拒（1724 现场：锚=一公挑战赛（下），
+     * 正确源=第20260822期第02期一公挑战赛下，二者仅差"第02期"前缀）。普通纯日期/纯期号名两侧全等，不冲突。</p>
+     */
+    private static boolean episodePartConflicts(String a, String b) {
+        if (TextUtils.isEmpty(a) || TextUtils.isEmpty(b)) {
+            return false;
+        }
+        int da = episodePartMarker(a);
+        int db = episodePartMarker(b);
+        if ((da != 0 || db != 0) && da != db) {
+            return true;
+        }
+        int sa = episodeSubPart(a);
+        int sb = episodeSubPart(b);
+        if (sa >= 0 && sb >= 0 && sa != sb) {
+            return true;
+        }
+        int va = episodeVariant(a);
+        int vb = episodeVariant(b);
+        if (va != vb) {
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -5380,6 +5615,8 @@ public class DetailActivity extends BaseActivity {
         //   还要靠这个标记拦住落到 0 号位的错源，清掉会让 r152 的守卫失效。
         if (!keepCache) {
             detailFallbackRestoreNoContentMatch = false;
+            // ★ r166：彻底复位才清「上/下 分P锚」；keepCache（同轮续切）要保留到本轮结束。
+            detailFallbackAnchorEpisode = null;
         }
         // ★ r152：keepCache=true 表示同一轮切源还在继续（候选源失败后换下一个），
         //   旧源列表是下一次 restoreDetailFallbackEpisode 的唯一秩源，必须保留到本轮结束；
@@ -5753,6 +5990,16 @@ public class DetailActivity extends BaseActivity {
      * 待候选真正过守卫（{@code detailFallbackConfirmed = true}）后才允许写历史/合并。</p>
      */
     private boolean detailFallbackConfirmed = false;
+    /**
+     * ★ r166：切源轮「不可变集名锚」——本轮切源开始那一刻实际在播的集名。
+     *
+     * <p>为什么需要它（1724 披荆斩棘2026 日志：目标『一公挑战赛（下）』被切成『…（上）』）：
+     * 切源链某候选若拿不到非空 expectedName，alignNoEpisode 守卫会整段跳过，分集定位退化到
+     * 「按位置/裸下标」落集；当分集列表里同一期存在『（上）/（下）』两条相邻条目时，偏一位就把
+     * 「下」落成「上」。这里固定记住切源前的真实集名，供 上/下 分P冲突守卫兜底，不随每个候选
+     * 的落点漂移（在 {@link #captureDetailFallbackEpisode()} 每次切源轮开始时刷新一次）。</p>
+     */
+    private String detailFallbackAnchorEpisode = null;
     private int detailFallbackRequestIndex;
     private int detailFallbackBatchIndex;
     private int detailFallbackNextSourceIndex;
