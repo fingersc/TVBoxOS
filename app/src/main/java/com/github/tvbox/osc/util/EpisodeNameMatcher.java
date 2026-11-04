@@ -488,9 +488,22 @@ public final class EpisodeNameMatcher {
         EpisodeKey cached = PARSE_CACHE.get(name);
         if (cached != null) return cached;
         EpisodeKey key = enrichDualAxis(parseLegacy(name), name);
-        if (PARSE_CACHE.size() >= PARSE_CACHE_MAX) PARSE_CACHE.clear();
+        if (PARSE_CACHE.size() >= PARSE_CACHE_MAX) evictParseCache();
         PARSE_CACHE.put(name, key);
         return key;
+    }
+
+    /**
+     * ★ r163：原实现在缓存满时 {@code PARSE_CACHE.clear()} 整表清空，大列表（779 集×多源）反复解析时
+     * 会周期性全清 → 命中率塌陷、CPU 抖动。改为淘汰约 1/4（ConcurrentHashMap 弱一致迭代，线程安全）。
+     */
+    private static void evictParseCache() {
+        int target = PARSE_CACHE_MAX - (PARSE_CACHE_MAX / 4);
+        java.util.Iterator<String> it = PARSE_CACHE.keySet().iterator();
+        while (it.hasNext() && PARSE_CACHE.size() > target) {
+            it.next();
+            it.remove();
+        }
     }
 
     /**
@@ -2871,8 +2884,58 @@ public final class EpisodeNameMatcher {
         }
     }
 
+    // ★ r163：落盘改为「后台延迟合并写」。原实现每次建表都把「所有剧」的整张期号↔日期表全量重写磁盘，
+    //   而建表在切源主链路里被每个源触发一次 ⇒ 主线程反复做大文件写（切源卡顿来源之一）。
+    //   现在用单线程调度 + 250ms 合并：突发多次建表只落盘一次，且完全离开主线程。
+    //   表内容语义不变（崩溃丢失 250ms 内的新表可重建，不影响正确性）。
+    private static final java.util.concurrent.ScheduledExecutorService DATE_TABLE_IO =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new java.util.concurrent.ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "date-table-persist");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+    private static final java.util.concurrent.atomic.AtomicBoolean PERSIST_PENDING =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private static void persistDateTables() {
         if (dateTableFile == null) return;
+        if (!PERSIST_PENDING.compareAndSet(false, true)) return;
+        try {
+            DATE_TABLE_IO.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        persistDateTablesNow();
+                    } catch (Throwable ignored) {
+                    } finally {
+                        PERSIST_PENDING.set(false);
+                    }
+                }
+            }, 250, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable t) {
+            PERSIST_PENDING.set(false);
+        }
+    }
+
+    private static final Object PERSIST_LOCK = new Object();
+
+    /** ★ r163：强制把待落盘的日期表立即写出（供退后台或测试等待持久化使用）。 */
+    public static void flushDateTablePersistence() {
+        try {
+            synchronized (PERSIST_LOCK) {
+                persistDateTablesNow();
+            }
+            PERSIST_PENDING.set(false);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void persistDateTablesNow() {
+        if (dateTableFile == null) return;
+        synchronized (PERSIST_LOCK) {
         java.io.BufferedWriter w = null;
         try {
             w = new java.io.BufferedWriter(new java.io.OutputStreamWriter(
@@ -2891,6 +2954,7 @@ public final class EpisodeNameMatcher {
         } catch (Throwable ignored) {
         } finally {
             try { if (w != null) w.close(); } catch (Exception ignore) { }
+        }
         }
     }
 
@@ -3068,6 +3132,76 @@ public final class EpisodeNameMatcher {
         return false;
     }
 
+    // ★ r163：日期表「后台重建 + 突发合并」。
+    //   背景：detailFallback harvest 每加载一个源就触发一次 buildDateTableForVod（r132 起素材按剧累积，
+    //   每次并入新列表都会换签名 ⇒ 触发一次「清表 + 全两两重建 + 落盘」的 O(L²) 重活，主线程被反复占住）。
+    //   现改为：commitHarvest 等高频调用方走 requestBuildDateTable —— 先把集列表并入 KNOWN_LISTS（保证
+    //   切源同步建表能看到最新素材），再把「重建」合并到后台单线程，120ms 内的多次请求只重建一次。
+    //   注意：不在此处做「跨调用增量建表」，因为 r147 明确要求列表变化后从零重建以清掉早期 TBL_CONFLICT，
+    //   增量会重新引入该 bug；后台合并 + 异步已足以消除主线程卡顿（保留表内容口径完全不变）。
+    private static final java.util.concurrent.ScheduledExecutorService DATE_TABLE_BUILD =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new java.util.concurrent.ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "date-table-build");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+    private static final java.util.Set<String> BUILD_SCHEDULED =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
+    private static final java.util.Map<String, Object> TABLE_LOCKS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static Object tableLockFor(String key) {
+        Object o = TABLE_LOCKS.get(key);
+        if (o == null) {
+            Object n = new Object();
+            Object prev = TABLE_LOCKS.putIfAbsent(key, n);
+            o = prev == null ? n : prev;
+        }
+        return o;
+    }
+
+    /**
+     * ★ r163：高频建表入口（切源攒池 harvest / prefetch 收割等）。异步 + 合并，不在调用线程做 O(L²) 重建。
+     * 同步把集列表并入 KNOWN_LISTS，保证随后切源线程的同步建表能用到最新素材。
+     */
+    public static void requestBuildDateTable(String showKey, java.util.Collection<List<String>> allLists) {
+        if (TextUtils.isEmpty(showKey) || allLists == null) return;
+        final String key = showKey.trim();
+        if (key.isEmpty()) return;
+        try {
+            mergeKnownLists(key, allLists);   // 仅累积素材（保序去重），成本远低于建表
+        } catch (Throwable ignored) {
+        }
+        if (!BUILD_SCHEDULED.add(key)) return;   // 已有待执行的重建，合并进来即可
+        try {
+            DATE_TABLE_BUILD.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    BUILD_SCHEDULED.remove(key);
+                    try {
+                        // 在锁内再取最新素材做快照：避免「后台任务先取旧快照、等锁期间切源线程又并入了更全的列表」，
+                        // 导致后台用旧快照 clear+重建把新列表的条目清掉（列表池只增不减，取最新永远更安全）。
+                        synchronized (tableLockFor(key)) {
+                            java.util.List<List<String>> known = KNOWN_LISTS.get(key);
+                            if (known == null) return;
+                            java.util.List<List<String>> snapshot;
+                            synchronized (known) {
+                                snapshot = new java.util.ArrayList<>(known);
+                            }
+                            doBuildDateTableWithLists(key, snapshot);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }, 120, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable t) {
+            BUILD_SCHEDULED.remove(key);
+        }
+    }
+
     /**
      * ★ r124 建表可靠化：传入本剧【所有线路】的集名列表，两两配对建「期号↔日期」表。
      * 与"切源时拿新源列表懒建"解耦——拿到整部剧 seriesMap 时一次按「期号源×日期源」正确姿势建好，
@@ -3081,6 +3215,19 @@ public final class EpisodeNameMatcher {
         //   切源过程中每加载一个源都会并入它的集列表 —— 即「该影片此刻现有的所有已知集列表」，
         //   只要其中某条列表含有强依据（日期+期号混合名），就会被收进表里。
         java.util.List<List<String>> lists = mergeKnownLists(key, allLists);
+        synchronized (tableLockFor(key)) {
+            doBuildDateTableWithLists(key, lists);
+        }
+    }
+
+    /**
+     * ★ r163：把「按已知列表重建该剧日期表」的实体逻辑抽出来，供同步与后台两条路径共用。
+     *   调用方必须已持有 {@link #tableLockFor(String)} 对应的锁。
+     *   ★ 保留 r147 语义：列表集合变化后从零重建（clearShowTableState），避免早期小列表留下的
+     *   TBL_CONFLICT 把新证据永久挡死。r163 只把该重建挪到后台并做突发合并（requestBuildDateTable），
+     *   不改表内容口径。
+     */
+    private static void doBuildDateTableWithLists(String key, java.util.List<List<String>> lists) {
         String s = buildListsSignature(lists);
         if (lists.size() < 2) return;
         if (s.equals(TBL_BUILT_SIG.get(key))) return;

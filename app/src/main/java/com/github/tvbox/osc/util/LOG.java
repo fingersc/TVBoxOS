@@ -93,12 +93,39 @@ public class LOG {
     }
 
     /**
+     * ★ r163：切源诊断的「懒格式化」重载。热路径（每源收割 / 选源打分 / 逐集 dump）上的日志
+     * 过去写成 {@code sw("[FB] ..." + 大拼接)}，字符串在进入方法、判 debug 之前就已求值，
+     * 关闭调试也照付拼接/遍历成本。用本重载传 {@code fmt,args} 后，debug 关闭时连格式化都不做。
+     * 注意：只传单个已拼好的字符串时仍走 {@link #sw(String)}，不会产生歧义。
+     */
+    public static void sw(String fmt, Object... args) {
+        if (!debug) return;
+        Log.i("TVBox-switch", fmt(fmt, args));
+    }
+
+    /**
      * ★ r144：日期表建表诊断通道。历史上这里用裸 {@code Log.i("TVBox-DBG", ...)} 常开，
      * 关调试模式也照打；统一收口到本方法后与其它通道一样受调试模式开关控制。
      */
     public static void dbg(String msg) {
         if (!debug) return;
         Log.i("TVBox-DBG", "" + msg);
+    }
+
+    /** ★ r163：日期表诊断的懒格式化重载，语义同 {@link #sw(String, Object...)}。 */
+    public static void dbg(String fmt, Object... args) {
+        if (!debug) return;
+        Log.i("TVBox-DBG", fmt(fmt, args));
+    }
+
+    private static String fmt(String fmt, Object[] args) {
+        if (fmt == null) return "null";
+        if (args == null || args.length == 0) return fmt;
+        try {
+            return String.format(java.util.Locale.ROOT, fmt, args);
+        } catch (Throwable t) {
+            return fmt;
+        }
     }
 
     /**

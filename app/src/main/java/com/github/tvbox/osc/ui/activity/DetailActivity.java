@@ -357,7 +357,11 @@ public class DetailActivity extends BaseActivity {
         if (savedInstanceState != null) {
             fullWindows = savedInstanceState.getBoolean(STATE_FULL_WINDOWS, false);
         }
+        // ★ r163：super.onCreate 内部会 setContentView(activity_detail)（BaseActivity.onCreate），
+        //   这是"进详情 2.6s"空档的第一嫌疑段；与 init() 分段计时一起定位到底是布局还是初始化。
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.superOnCreate_incl_setContentView");
         super.onCreate(savedInstanceState);
+        com.github.tvbox.osc.util.PerfTrace.end("detail.superOnCreate_incl_setContentView");
     }
 
     @Override
@@ -368,9 +372,15 @@ public class DetailActivity extends BaseActivity {
     @Override
     protected void init() {
         EventBus.getDefault().register(this);
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.initView");
         initView();
+        com.github.tvbox.osc.util.PerfTrace.end("detail.initView");
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.initViewModel");
         initViewModel();
+        com.github.tvbox.osc.util.PerfTrace.end("detail.initViewModel");
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.initData");
         initData();
+        com.github.tvbox.osc.util.PerfTrace.end("detail.initData");
     }
 
     private void initView() {
@@ -464,7 +474,9 @@ public class DetailActivity extends BaseActivity {
         firstReverse = false;
         preFlag = "";
         if (showPreview) {
-            ensurePlayFragment();
+            // ★ r163：不再在 onCreate 内同步创建预览 PlayFragment。ensurePlayFragment() 用的
+            //   commitNowAllowingStateLoss() 会同步执行 Fragment 生命周期、内联 inflate 播放器布局，
+            //   是进详情首帧前的关键阻塞。改为由 jumpToPlay() 按需创建，并在详情页首帧之后再触发。
             tvPlay.setText("全屏");
         }
         llPlayerFragmentContainerBlock.setFocusable(showPreview);
@@ -892,6 +904,7 @@ public class DetailActivity extends BaseActivity {
     private List<Runnable> pauseRunnable = null;
 
     private void jumpToPlay() {
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.jumpToPlay");
         List<VodInfo.VodSeries> jumpList = getPlayingSeriesList();
         if (vodInfo != null && !jumpList.isEmpty()) {
             preFlag = vodInfo.playFlag;
@@ -917,6 +930,24 @@ public class DetailActivity extends BaseActivity {
                 ensurePlayFragment();
                 if (playFragment != null) playFragment.setData(bundle);
                 enterFullPreview();
+            }
+        }
+        com.github.tvbox.osc.util.PerfTrace.end("detail.jumpToPlay");
+    }
+
+    /** ★ r163：把任务投递到当前窗口首帧渲染之后再执行，避免与详情页首帧布局抢主线程（进详情卡顿治理）。 */
+    private void postAfterFirstFrame(final Runnable r) {
+        try {
+            View decor = getWindow() != null ? getWindow().getDecorView() : null;
+            if (decor != null) {
+                decor.post(r);
+            } else {
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(r);
+            }
+        } catch (Throwable t) {
+            try {
+                r.run();
+            } catch (Throwable ignored) {
             }
         }
     }
@@ -963,12 +994,33 @@ public class DetailActivity extends BaseActivity {
 //        pFont.setTypeface(Typeface.DEFAULT );
         Rect rect = new Rect();
 
+        // ★ r163：原实现对整季每条集名做 getTextBounds（O(n) 次 Paint 测量，779 集时有可观耗时）。
+        //   改为采样：前 24 条 + 最长名称，覆盖绝大多数列宽判定场景，视觉结果不变。
         int w = 1;
-        for (int i = 0; i < listSize; ++i) {
+        int sampleCount = Math.min(listSize, 24);
+        for (int i = 0; i < sampleCount; ++i) {
             String name = list.get(i).name;
             pFont.getTextBounds(name, 0, name.length(), rect);
             if (w < rect.width()) {
                 w = rect.width();
+            }
+        }
+        int longestIdx = -1, longestLen = -1;
+        for (int i = 0; i < listSize; ++i) {
+            String nm = list.get(i).name;
+            int len = nm == null ? 0 : nm.length();
+            if (len > longestLen) {
+                longestLen = len;
+                longestIdx = i;
+            }
+        }
+        if (longestIdx >= sampleCount && longestIdx >= 0) {
+            String name = list.get(longestIdx).name;
+            if (name != null) {
+                pFont.getTextBounds(name, 0, name.length(), rect);
+                if (w < rect.width()) {
+                    w = rect.width();
+                }
             }
         }
         w += 32;
@@ -1242,7 +1294,9 @@ public class DetailActivity extends BaseActivity {
                                     ? vod_name : detailFallbackAnchorTitle;
                             EpisodeNameMatcher.harvestDateOrdinalAnchors(anchorShow, anchorLists);
                             // ★ r124 建表可靠化：整部剧所有线路两两配对建「期号↔日期」表，摆脱"切源时拿新源列表懒建"的空表缺陷
+                            com.github.tvbox.osc.util.PerfTrace.begin("detail.buildDateTableForVod");
                             EpisodeNameMatcher.buildDateTableForVod(anchorShow, anchorLists);
+                            com.github.tvbox.osc.util.PerfTrace.end("detail.buildDateTableForVod");
                         } catch (Throwable ignored) {
                         }
                         // ★ v67：首轮记录基准集数（同站多资源择优的兜底信号，见字段注释）
@@ -1607,12 +1661,21 @@ public class DetailActivity extends BaseActivity {
                         seriesFlagAdapter.setNewData(vodInfo.seriesFlags);
                         mGridViewFlag.scrollToPosition(flagScrollTo);
 
+                        com.github.tvbox.osc.util.PerfTrace.begin("detail.refreshList");
                         refreshList();
+                        com.github.tvbox.osc.util.PerfTrace.end("detail.refreshList");
                         if (showPreview) {
-                            jumpToPlay();
                             llPlayerFragmentContainer.setVisibility(View.VISIBLE);
                             llPlayerFragmentContainerBlock.setVisibility(View.VISIBLE);
                             toggleSubtitleTextSize();
+                            // ★ r163：把起播（建预览 PlayFragment + WebView 解析）推迟到详情页首帧之后再执行，
+                            //   让详情先渲染出首帧、再在空闲时加载预览，消除进详情时的一次大卡顿（Davey>1.9s）。
+                            postAfterFirstFrame(new Runnable() {
+                                @Override
+                                public void run() {
+                                    jumpToPlay();
+                                }
+                            });
                         }
                         // ★ v47 异步补位 —— 触发点。
                         //   放在 jumpToPlay() 之后：此刻 playFlag / playIndex 才是最终落点，
@@ -2943,7 +3006,7 @@ public class DetailActivity extends BaseActivity {
         if (!detailTableStationSeen.add(show + "|" + station)) return false;
         java.util.List<java.util.List<String>> batch = new java.util.ArrayList<>(1);
         batch.add(names);
-        EpisodeNameMatcher.buildDateTableForVod(show, batch);
+        EpisodeNameMatcher.requestBuildDateTable(show, batch);
         LOG.sw("[FB] harvestSeries show=" + show + " station=" + station
                 + " src=" + sourceKey + " n=" + names.size());
         return true;
@@ -6272,6 +6335,7 @@ public class DetailActivity extends BaseActivity {
                     && TextUtils.equals(showKey, dateTableBuiltShow)) {
                 return;
             }
+            com.github.tvbox.osc.util.PerfTrace.begin("detail.ensureDateTablesBuilt.build");
             java.util.List<java.util.List<String>> all = new java.util.ArrayList<>();
             java.util.List<String> srcKeys = new java.util.ArrayList<>();
             for (java.util.Map.Entry<String, java.util.List<VodInfo.VodSeries>> en : vodInfo.seriesMap.entrySet()) {
@@ -6282,6 +6346,7 @@ public class DetailActivity extends BaseActivity {
             }
             EpisodeNameMatcher.buildDateTableForVod(showKey, all);
             markDateTablesBuilt(showKey);
+            com.github.tvbox.osc.util.PerfTrace.end("detail.ensureDateTablesBuilt.build");
             // ★ r125 诊断：每部剧仅首帧 dump 一次，输出各线路完整集名 + 建表后 o0..o8 映射，
             //   用于定位「表空/配对错位」与补齐日志被 logcat 截断的完整列表。
             if (LOG.isDebugEnabled() && DBG_DUMPED_SHOWS.add(showKey)) {
@@ -7666,6 +7731,7 @@ public class DetailActivity extends BaseActivity {
 
     void ensurePlayFragment() {
         if (playFragment != null) return;
+        com.github.tvbox.osc.util.PerfTrace.begin("detail.ensurePlayFragment");
         playFragment = new PlayFragment();
         getSupportFragmentManager().beginTransaction().add(R.id.previewPlayer, playFragment).commitNowAllowingStateLoss();
         playFragment.setPreviewMode(!fullWindows);
@@ -7682,6 +7748,7 @@ public class DetailActivity extends BaseActivity {
                 scheduleDetailFallbackSearch();
             }
         });
+        com.github.tvbox.osc.util.PerfTrace.end("detail.ensurePlayFragment");
     }
 
     void releasePlayFragment() {
