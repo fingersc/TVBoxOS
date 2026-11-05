@@ -252,7 +252,9 @@ public final class HistorySyncManager {
             post(cb, false, "登录后才能同步");
             return;
         }
-        long now = System.currentTimeMillis();
+        // r171：20 秒节流只度量“进程内真实流逝”，不能用墙钟——模拟器时钟回拨时
+        //       now - lastPullAt 会长期为负，pullNow 被永久挡住。
+        long now = android.os.SystemClock.elapsedRealtime();
         synchronized (LOCK) {
             if (now - lastPullAt < 20 * 1000L) {
                 return;
@@ -399,7 +401,14 @@ public final class HistorySyncManager {
             long last = lastSyncAt();
             // r18：切后台的补传走更短的最小间隔（见 MIN_GAP_BACKGROUND_MS）。
             long gap = background ? MIN_GAP_BACKGROUND_MS : MIN_GAP_MS;
-            long elapsed = System.currentTimeMillis() - last;
+            // r171：lastAt 由 SyncEngine.finish 写的是 TrustedClock 物理时间（含服务器 Date 偏移），
+            // 这里必须用同一条时间轴比较；否则设备时钟偏慢时 elapsed 为负，会把 min-gap
+            // 误算成“还要等一个时钟偏差那么久”（真机日志曾出现 retryIn≈79 分钟，同步被卡死）。
+            long elapsed = com.github.tvbox.osc.sync.TrustedClock.nowPhysical() - last;
+            if (elapsed < 0) {
+                // 首次学习偏移 / 时钟回拨：保守视为“刚同步过”，只等一个正常 gap，绝不放大。
+                elapsed = 0;
+            }
             if (elapsed < gap) {
                 syncing = false;
                 // ★ v99-r39：按「真实剩余时间」重排，而不是套用 retry-dirty 的固定 60 秒档。
