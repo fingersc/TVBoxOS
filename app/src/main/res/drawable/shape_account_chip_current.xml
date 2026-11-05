@@ -1,11 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 当前账号卡片：统一为「直播选中」样式（半透明蓝底 + 蓝边）；
+<!-- 当前账号卡片：选中=直播选中样式（半透明蓝底 + 蓝边）；聚焦时保留蓝底、叠加白焦点框（边框规格不变）；
      身份仍由「✓ 前缀 + 绿色『当前账号』文字」标识。 -->
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="rectangle">
-    <corners android:radius="@dimen/vs_6" />
-    <solid android:color="#331890FF" />
-    <stroke
-        android:width="1dp"
-        android:color="@color/color_1890FF" />
-</shape>
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape>
+            <corners android:radius="@dimen/vs_6" />
+            <solid android:color="#331890FF" />
+            <stroke android:width="@dimen/vs_2" android:color="@android:color/white" />
+        </shape>
+    </item>
+    <item>
+        <shape>
+            <corners android:radius="@dimen/vs_6" />
+            <solid android:color="#331890FF" />
+            <stroke android:width="1dp" android:color="@color/color_1890FF" />
+        </shape>
+    </item>
+</selector>

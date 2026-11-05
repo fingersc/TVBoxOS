@@ -526,19 +526,6 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 return true;
             }
         });
-        // ★ v99-r20：遥控器聚焦高亮。当前账号卡片用的 shape_account_chip_current 是静态
-        // shape（无 state_focused），聚焦时不像其它卡片（button_danmu_setting 是 selector）那样
-        // 变蓝 —— 盒子端实测反馈。聚焦时临时换用同一个 selector，失焦换回身份底色；
-        // 「✓ 前缀 + 绿色『当前账号』文字」仍保留身份标识，不新增资源。
-        if (isCurrent) {
-            card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-                @Override
-                public void onFocusChange(View v, boolean hasFocus) {
-                    card.setBackgroundResource(hasFocus ? R.drawable.shape_account_item
-                            : R.drawable.shape_account_chip_current);
-                }
-            });
-        }
         llAccounts.addView(card);
     }
 

@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 选中+焦点：保留选中蓝底、叠加聚焦白框（边框规格不变） -->
+    <item android:state_selected="true" android:state_focused="true">
+        <shape>
+            <solid android:color="#331890FF" />
+            <stroke android:width="@dimen/vs_2" android:color="@android:color/white" />
+            <corners android:radius="@dimen/vs_6" />
+        </shape>
+    </item>
     <!-- 焦点：白线框（与首页/设置页一致） -->
     <item android:state_focused="true">
         <shape>

@@ -7,7 +7,6 @@
     <item android:state_focused="true">
         <shape>
             <corners android:radius="@dimen/vs_6" />
-            <solid android:color="@color/color_6632364E" />
             <stroke
                 android:width="@dimen/vs_2"
                 android:color="@android:color/white" />
@@ -17,7 +16,6 @@
     <item>
         <shape>
             <corners android:radius="@dimen/vs_6" />
-            <solid android:color="@color/dialog_input_bg" />
             <stroke
                 android:width="@dimen/vs_2"
                 android:color="#99FFFFFF" />
