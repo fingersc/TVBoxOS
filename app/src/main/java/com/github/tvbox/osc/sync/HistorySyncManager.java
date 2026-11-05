@@ -50,6 +50,8 @@ public final class HistorySyncManager {
     static final Gson GSON = new Gson();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Object LOCK = new Object();
+    /** 退出/手动同步撞上「正在同步」时，挂起等待当前同步收尾的回调（v4.1.2）。 */
+    private static final ArrayList<Callback> WAITERS = new ArrayList<>();
     /** 两次自动同步的最小间隔（手动同步不受此限）。 */
     private static final long MIN_GAP_MS = 60 * 1000L;
 
@@ -440,9 +442,15 @@ public final class HistorySyncManager {
             }
         }
         if (!taken) {
-            // 被占用时必须给回调，否则页面会一直停在「正在同步…」
-            post(cb, false, "正在同步，请稍后再试");
-            SyncScheduler.skipped(owner, "busy");
+            // v4.1.2：不要「立即回调失败」——退出 App 时 syncNow 会撞上在途同步，
+            // 立即回调会让 HomeActivity 误以为同步结束而 killProcess，把在途同步杀在半路。
+            // 把回调挂到当前同步收尾时统一回调（见 drainWaiters）。
+            synchronized (WAITERS) {
+                if (cb != null) {
+                    WAITERS.add(cb);
+                }
+            }
+            SyncScheduler.skipped(owner, "busy-wait");
             return;
         }
         if (!manual) {
@@ -537,6 +545,7 @@ public final class HistorySyncManager {
                         + " skip=" + (notModified ? "304" : (up > 0 ? "no" : "same"))
                         + " state=" + state + " dur=" + (System.currentTimeMillis() - t0) + "ms");
                 post(cb, ok, msg);
+                drainWaiters(ok, msg);
                 if (aborted) {
                     // 账号切换作废：不算一次有效同步，不升降档
                     SyncScheduler.skipped(owner, "aborted");
@@ -557,6 +566,42 @@ public final class HistorySyncManager {
                 cb.onDone(ok, msg);
             }
         });
+    }
+
+    /** 当前同步收尾后，统一回调所有因「忙」而挂起的退出请求。 */
+    private static void drainWaiters(final boolean ok, final String msg) {
+        ArrayList<Callback> waiters;
+        synchronized (WAITERS) {
+            if (WAITERS.isEmpty()) {
+                return;
+            }
+            waiters = new ArrayList<>(WAITERS);
+            WAITERS.clear();
+        }
+        for (Callback waiter : waiters) {
+            post(waiter, ok, msg);
+        }
+    }
+
+    /**
+     * v4.1.2：退出 App 前把最新 SyncState（dirty/etag/pushedHlc/meta）与设置快照同步落盘，
+     * 避免「刚 markDirty 就被 killProcess」导致本次修改下次启动被认为是干净的。
+     */
+    public static void flushState() {
+        String owner = AccountContext.ownerKey();
+        if (owner == null || owner.isEmpty()) {
+            return;
+        }
+        try {
+            SyncState.load(owner).save();
+        } catch (Throwable t) {
+            LOG.e("[sync] flush SyncState failed", t);
+        }
+        try {
+            SettingsProfile.save(owner);
+        } catch (Throwable t) {
+            LOG.e("[sync] flush SettingsProfile failed", t);
+        }
     }
 
     private static String doSync(String owner, byte[] key, boolean manual, int gen) throws Exception {

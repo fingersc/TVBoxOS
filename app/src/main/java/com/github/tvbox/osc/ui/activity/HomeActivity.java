@@ -766,30 +766,74 @@ public class HomeActivity extends BaseActivity {
         }
         exiting = true;
         if (!HistorySyncManager.needsSyncBeforeExit()) {
+            HistorySyncManager.flushState();
             killNow();
             return;
         }
         Toast.makeText(mContext, "正在同步观看记录…", Toast.LENGTH_SHORT).show();
         final boolean[] done = {false};
         final Handler handler = new Handler(Looper.getMainLooper());
+        // 硬上限：正常情况下 2.5s 内完成；若此时仍有一轮同步在途，最多再等 2.5s，
+        // 绝不因为「忙/超时」把在途同步直接杀在半路。
+        final long hardDeadline = System.currentTimeMillis() + 5000L;
+        final Runnable[] waitKill = new Runnable[1];
+        waitKill[0] = new Runnable() {
+            @Override
+            public void run() {
+                if (done[0]) {
+                    return;
+                }
+                if (!HistorySyncManager.isSyncing() || System.currentTimeMillis() >= hardDeadline) {
+                    done[0] = true;
+                    handler.removeCallbacks(waitKill[0]);
+                    HistorySyncManager.flushState();
+                    killNow();
+                    return;
+                }
+                handler.postDelayed(waitKill[0], 100L);
+            }
+        };
         final Runnable timeout = new Runnable() {
             @Override
             public void run() {
-                if (!done[0]) {
-                    done[0] = true;
-                    killNow();
+                if (done[0]) {
+                    return;
                 }
+                if (HistorySyncManager.isSyncing() && System.currentTimeMillis() < hardDeadline) {
+                    handler.postDelayed(waitKill[0], 100L);
+                    return;
+                }
+                done[0] = true;
+                handler.removeCallbacks(waitKill[0]);
+                HistorySyncManager.flushState();
+                killNow();
             }
         };
-        handler.postDelayed(timeout, 2500);
+        handler.postDelayed(timeout, 2500L);
         HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
             @Override
             public void onDone(boolean ok, String message) {
-                handler.removeCallbacks(timeout);
-                if (!done[0]) {
-                    done[0] = true;
-                    killNow();
+                if (done[0]) {
+                    return;
                 }
+                if (ok) {
+                    done[0] = true;
+                    handler.removeCallbacks(waitKill[0]);
+                    handler.removeCallbacks(timeout);
+                    HistorySyncManager.flushState();
+                    killNow();
+                    return;
+                }
+                // 失败/忙：只要还有同步在跑，就等它收尾再退出；不要立即 killProcess。
+                if (HistorySyncManager.isSyncing()) {
+                    handler.postDelayed(waitKill[0], 100L);
+                    return;
+                }
+                done[0] = true;
+                handler.removeCallbacks(waitKill[0]);
+                handler.removeCallbacks(timeout);
+                HistorySyncManager.flushState();
+                killNow();
             }
         });
     }
