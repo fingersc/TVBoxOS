@@ -66,6 +66,8 @@ public class PlayProgressManager {
             PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
             if (position <= 0) {
                 dao.delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+                // ★ 协议 v4：显式清零也要写墓碑，否则云端旧进度会在下次同步被合并回来。
+                SyncTombstones.addProgress(sourceKey, vodId, flag, playIndex, epName);
                 // 删除必须标脏：否则别的设备永远不知道这一集被清除了
                 HistorySyncManager.markDirty(SyncScope.PROGRESS);
                 return;
@@ -77,7 +79,12 @@ public class PlayProgressManager {
             p.playIndex = playIndex;
             p.epName = s(epName);
             p.position = position;
-            p.updateTime = System.currentTimeMillis();
+            // ★ 协议 v4：用 HLC 代替墙钟；updateTime 仅保留给本机展示
+            com.github.tvbox.osc.sync.Hlc h = com.github.tvbox.osc.sync.HlcClock.next();
+            p.updateTime = h.physical;
+            p.hlcPhysical = h.physical;
+            p.hlcCounter = h.counter;
+            p.dev = HistorySyncManager.deviceId();
             dao.save(p);
             // ★ v99-r10/r11：每部片只保留最近 KEEP_PROGRESS_EPISODES 条进度记录（不分线路）。
             //   原来是一集一行、永不上限：50 集 × 20 部 = 1000 行（同集换线路还会再翻倍），
@@ -151,6 +158,10 @@ public class PlayProgressManager {
         return s(flag) + "\u0001" + playIndex + "\u0001" + s(epName);
     }
 
+    private static com.github.tvbox.osc.sync.Hlc hlcOf(PlayProgress r) {
+        return com.github.tvbox.osc.sync.Hlc.of(r.hlcPhysical, r.hlcCounter, r.dev, r.updateTime);
+    }
+
     private static SyncPayload.ProgressItem toItem(PlayProgress r) {
         SyncPayload.ProgressItem it = new SyncPayload.ProgressItem();
         it.sourceKey = r.sourceKey;
@@ -160,6 +171,9 @@ public class PlayProgressManager {
         it.epName = r.epName;
         it.position = r.position;
         it.updateTime = r.updateTime;
+        it.hlcPhysical = r.hlcPhysical > 0 ? r.hlcPhysical : r.updateTime;
+        it.hlcCounter = r.hlcCounter;
+        it.dev = r.dev == null ? "" : r.dev;
         return it;
     }
 
@@ -218,10 +232,7 @@ public class PlayProgressManager {
             Collections.sort(cand, new java.util.Comparator<PlayProgress>() {
                 @Override
                 public int compare(PlayProgress a, PlayProgress b) {
-                    if (a.updateTime == b.updateTime) {
-                        return 0;
-                    }
-                    return a.updateTime > b.updateTime ? -1 : 1;
+                    return hlcOf(b).compareTo(hlcOf(a));
                 }
             });
             if (cand.size() > keep) {
@@ -239,9 +250,7 @@ public class PlayProgressManager {
                     }
                 }
             }
-            final long now = System.currentTimeMillis();
             int moved = 0;
-            int ordinal = 0;
             for (PlayProgress row : cand) {
                 // 3.1 目标集（序号 + 名称）：优先完全一致，其次跨写法对齐
                 int idx = toIdx.containsKey(row.epName) ? toIdx.get(row.epName) : -1;
@@ -259,7 +268,7 @@ public class PlayProgressManager {
                         }
                     }
                 }
-                // 3.3 写入新线路（updateTime 用当前时间 ⇒ 本地/云端 LWW 都以迁移结果为准）
+                // 3.3 写入新线路（HLC 用当前时钟 ⇒ 本地/云端都稳定以迁移结果为准）
                 PlayProgress np = new PlayProgress();
                 np.sourceKey = sk;
                 np.vodId = vid;
@@ -267,9 +276,12 @@ public class PlayProgressManager {
                 np.playIndex = targetIndex;
                 np.epName = targetEp;
                 np.position = row.position;
-                np.updateTime = now + ordinal;
+                com.github.tvbox.osc.sync.Hlc nh = com.github.tvbox.osc.sync.HlcClock.next();
+                np.updateTime = nh.physical;
+                np.hlcPhysical = nh.physical;
+                np.hlcCounter = nh.counter;
+                np.dev = HistorySyncManager.deviceId();
                 dao.save(np);
-                ordinal++;
                 moved++;
             }
             // 4) 旧线路整体抛弃 + 登记墓碑（防止云端那份被 LWW 合并复活）

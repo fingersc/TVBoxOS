@@ -37,8 +37,14 @@ public interface PlayProgressDao {
     java.util.List<PlayProgress> getByVod(String sourceKey, String vodId);
 
     /** 全量导出（同步用）。 */
-    @Query("select * from play_progress")
+    @Query("select * from play_progress order by hlcPhysical desc, hlcCounter desc")
     java.util.List<PlayProgress> getAllRows();
+
+    @Query("select hlcPhysical from play_progress order by hlcPhysical desc, hlcCounter desc limit 1")
+    Long maxHlcPhysical();
+
+    @Query("select hlcCounter from play_progress order by hlcPhysical desc, hlcCounter desc limit 1")
+    Integer maxHlcCounter();
 
     /**
      * 清理"孤儿"进度行：所属影片已不在观看历史（vodRecord）中。

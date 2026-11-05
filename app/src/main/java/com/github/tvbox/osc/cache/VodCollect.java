@@ -20,6 +20,15 @@ public class VodCollect implements Serializable {
     public String name;
     @ColumnInfo(name = "pic")
     public String pic;
+    /** HLC 物理分量（毫秒）；0 表示旧数据，读取时回落到 updateTime。 */
+    @ColumnInfo(name = "hlcPhysical", defaultValue = "0")
+    public long hlcPhysical;
+    /** HLC 逻辑计数。 */
+    @ColumnInfo(name = "hlcCounter", defaultValue = "0")
+    public int hlcCounter;
+    /** 最后写入该条目的设备 id（HLC 平局裁决）。 */
+    @ColumnInfo(name = "dev")
+    public String dev;
 
     public int getId() {
         return id;

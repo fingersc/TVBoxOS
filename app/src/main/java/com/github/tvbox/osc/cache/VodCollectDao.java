@@ -18,8 +18,14 @@ public interface VodCollectDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     long insert(VodCollect record);
 
-    @Query("select * from vodCollect  order by updateTime desc")
+    @Query("select * from vodCollect  order by hlcPhysical desc, hlcCounter desc, id desc")
     List<VodCollect> getAll();
+
+    @Query("select hlcPhysical from vodCollect order by hlcPhysical desc, hlcCounter desc limit 1")
+    Long maxHlcPhysical();
+
+    @Query("select hlcCounter from vodCollect order by hlcPhysical desc, hlcCounter desc limit 1")
+    Integer maxHlcCounter();
 
     @Query("select * from vodCollect where `id`=:id")
     VodCollect getVodCollect(int id);

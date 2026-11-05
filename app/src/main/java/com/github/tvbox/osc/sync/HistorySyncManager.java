@@ -111,7 +111,7 @@ public final class HistorySyncManager {
      * v98 P2：同步状态统一读 {@link SyncState}（每账号一份），
      * 只有「还没迁过」时才回退到旧的散键（start() 与 AccountSwitcher 都会迁）。
      */
-    private static String owner() {
+    public static String owner() {
         return AccountContext.ownerKey();
     }
 
@@ -633,9 +633,10 @@ public final class HistorySyncManager {
         AppDataManager.get();
         if (scopes.history) {
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-            // v77：同步只带当前档位的条数（本机 DB 也已按档位裁剪，这里再兜一层）
-            int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
-            List<VodRecord> rows = dao.getAll(keep > 0 ? keep : Integer.MAX_VALUE);
+            // ★ 协议 v4 / P0-3：上传全部本机行，不再按本机档位预截。
+            //   裁剪只在合并后按"账号级 HISTORY_NUM"统一执行；否则本机多出的行永远传不上去，
+            //   且新设备默认档位(15)会把云端(50)首轮裁掉。
+            List<VodRecord> rows = dao.getAll(Integer.MAX_VALUE);
             if (rows != null) {
                 for (VodRecord r : rows) {
                     SyncPayload.RecordItem it = new SyncPayload.RecordItem();
@@ -644,7 +645,9 @@ public final class HistorySyncManager {
                     // S2：同步包只带 10 个必需字段（本地库仍是完整 VodInfo）
                     it.dataJson = HistorySyncJson.slim(r.dataJson);
                     it.updateTime = r.updateTime;
-                    it.dev = deviceId;
+                    it.hlcPhysical = r.hlcPhysical > 0 ? r.hlcPhysical : r.updateTime;
+                    it.hlcCounter = r.hlcCounter;
+                    it.dev = notEmpty(r.dev) ? r.dev : deviceId;
                     p.records.add(it);
                 }
             }
@@ -662,7 +665,9 @@ public final class HistorySyncManager {
                     it.epName = pr.epName;
                     it.position = pr.position;
                     it.updateTime = pr.updateTime;
-                    it.dev = deviceId;
+                    it.hlcPhysical = pr.hlcPhysical > 0 ? pr.hlcPhysical : pr.updateTime;
+                    it.hlcCounter = pr.hlcCounter;
+                    it.dev = notEmpty(pr.dev) ? pr.dev : deviceId;
                     p.progress.add(it);
                 }
             }
@@ -678,7 +683,9 @@ public final class HistorySyncManager {
                     it.name = c.name;
                     it.pic = c.pic;
                     it.updateTime = c.updateTime;
-                    it.dev = deviceId;
+                    it.hlcPhysical = c.hlcPhysical > 0 ? c.hlcPhysical : c.updateTime;
+                    it.hlcCounter = c.hlcCounter;
+                    it.dev = notEmpty(c.dev) ? c.dev : deviceId;
                     p.collects.add(it);
                 }
             }
@@ -691,11 +698,27 @@ public final class HistorySyncManager {
                 // 首次加入本机的账号：只看云端，不拿默认值覆盖对方设置
                 for (SyncPayload.SettingValue sv : settingMap.values()) {
                     sv.t = 0;
+                    sv.hlcPhysical = 0;
+                    sv.hlcCounter = 0;
                 }
             }
             p.setSettingsMap(settingMap);
         }
         SyncTombstones.fill(p);
+        // ★ 协议 v4：只带「本次启用 scope」的墓碑。否则 history 包里混进 progress/collect
+        //   墓碑 → contentEquals 永远不相等 → 每轮重复整包上传（白烧配额）。
+        if (!scopes.history) {
+            p.deleted.records.clear();
+        }
+        if (!scopes.progress) {
+            p.deleted.progress.clear();
+        }
+        if (!scopes.collect) {
+            p.deleted.collects.clear();
+        }
+        if (!scopes.settings) {
+            p.deleted.settings.clear();
+        }
         return p;
     }
 
@@ -713,16 +736,36 @@ public final class HistorySyncManager {
             long bt = b.updatedAt;
             String ad = a.dev;
             String bd = b.dev;
+            long ahp = a.hlcMaxPhysical;
+            int ahc = a.hlcMaxCounter;
+            long bhp = b.hlcMaxPhysical;
+            int bhc = b.hlcMaxCounter;
+            String asc = a.scope;
+            String bsc = b.scope;
+            // ★ 协议 v4：scope 与 hlcMax 都是「本机生成」的元数据，不代表内容差异，
+            //   不归一化会导致每轮都判定为「不同」→ 每轮都整包 PUT（白烧配额）。
             a.updatedAt = 0L;
             b.updatedAt = 0L;
             a.dev = "";
             b.dev = "";
+            a.hlcMaxPhysical = 0L;
+            b.hlcMaxPhysical = 0L;
+            a.hlcMaxCounter = 0;
+            b.hlcMaxCounter = 0;
+            a.scope = null;
+            b.scope = null;
             String ja = GSON.toJson(a);
             String jb = GSON.toJson(b);
             a.updatedAt = at;
-            a.dev = ad;
             b.updatedAt = bt;
+            a.dev = ad;
             b.dev = bd;
+            a.hlcMaxPhysical = ahp;
+            a.hlcMaxCounter = ahc;
+            b.hlcMaxPhysical = bhp;
+            b.hlcMaxCounter = bhc;
+            a.scope = asc;
+            b.scope = bsc;
             return ja.equals(jb);
         } catch (Throwable t) {
             return false;
@@ -730,43 +773,72 @@ public final class HistorySyncManager {
     }
 
     /**
-     * v77：云端包也按本机档位裁剪——只保留最新 N 条历史，并丢弃已不在列表里的进度行。
-     * 直接丢弃、不写墓碑：否则会把"裁剪"当成用户删除同步到别的设备。
+     * ★ 协议 v4（P0-3）：把云端合并结果裁到「账号级历史上限」。
+     *
+     * <p>v77 的老实现有两个根因问题：</p>
+     * <ol>
+     *   <li>用<b>本机当前</b> {@code HISTORY_NUM} 裁「共享云端文件」。新设备首次加入账号时
+     *       {@code SettingsProfile.resetDefaults()} 会把档位重置成默认 15，而账号实际是 50；
+     *       而 {@link SyncScope} 遍历顺序里 HISTORY 在 SETTINGS 之前 ⇒ 首轮就拿 15 裁掉了云端
+     *       的 50 条，之后才学到「其实账号是 50」。裁掉的数据是<b>物理删除</b>，无法恢复。</li>
+     *   <li>排序键是墙钟 {@code updateTime}：时钟滞后的设备（模拟器常见）刚写入的新记录会排到
+     *       后面被裁掉。</li>
+     * </ol>
+     *
+     * <p>现在的规则：</p>
+     * <ul>
+     *   <li>只按 <b>HLC</b> 降序裁剪，不再看墙钟；</li>
+     *   <li>档位未知（设置尚未同步下来 / 本机处于「只拉不推」的 pendingPull 阶段 / 设置同步被
+     *       关闭）时<b>一律不裁</b>——宁可云端多留一轮，也不能拿错的档位物理删除别人数据；</li>
+     *   <li><b>不再顺带丢弃进度行</b>：进度与历史解耦（P1-4），历史裁剪不应连带删除播放进度。</li>
+     * </ul>
      */
     static void truncateMergedHistory(SyncPayload merged, SyncScopes scopes) {
-        if (!scopes.history || merged.records == null) {
+        if (merged == null || !scopes.history || merged.records == null) {
             return;
         }
-        int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
-        if (keep > 0 && merged.records.size() > keep) {
-            List<SyncPayload.RecordItem> sorted = new ArrayList<>(merged.records);
-            Collections.sort(sorted, new Comparator<SyncPayload.RecordItem>() {
-                @Override
-                public int compare(SyncPayload.RecordItem a, SyncPayload.RecordItem b) {
-                    if (a.updateTime != b.updateTime) {
-                        return a.updateTime > b.updateTime ? -1 : 1;
-                    }
-                    String da = a.dev == null ? "" : a.dev;
-                    String db = b.dev == null ? "" : b.dev;
-                    return da.compareTo(db);
-                }
-            });
-            merged.records = new ArrayList<>(sorted.subList(0, keep));
+        int keep = accountHistoryKeep(merged.owner, scopes);
+        if (keep <= 0 || merged.records.size() <= keep) {
+            return;
         }
-        if (scopes.progress && merged.progress != null) {
-            Set<String> alive = new HashSet<>();
-            for (SyncPayload.RecordItem r : merged.records) {
-                alive.add((r.sourceKey == null ? "" : r.sourceKey) + "\u0001" + (r.vodId == null ? "" : r.vodId));
-            }
-            List<SyncPayload.ProgressItem> kept = new ArrayList<>();
-            for (SyncPayload.ProgressItem p : merged.progress) {
-                String k = (p.sourceKey == null ? "" : p.sourceKey) + "\u0001" + (p.vodId == null ? "" : p.vodId);
-                if (alive.contains(k)) {
-                    kept.add(p);
+        List<SyncPayload.RecordItem> sorted = new ArrayList<>(merged.records);
+        Collections.sort(sorted, new Comparator<SyncPayload.RecordItem>() {
+            @Override
+            public int compare(SyncPayload.RecordItem a, SyncPayload.RecordItem b) {
+                int c = b.hlc().compareTo(a.hlc());
+                if (c != 0) {
+                    return c;
                 }
+                return SyncMerge.recordKey(a.sourceKey, a.vodId)
+                        .compareTo(SyncMerge.recordKey(b.sourceKey, b.vodId));
             }
-            merged.progress = kept;
+        });
+        merged.records = new ArrayList<>(sorted.subList(0, keep));
+    }
+
+    /**
+     * 账号级历史上限。返回 0 表示「档位未知，不要裁」。
+     *
+     * <p>判定顺序：设置同步被关闭 → 未知；本机仍在 pendingPull（还没把账号设置拉下来）
+     * → 未知；否则用本机档位（稳态下同账号各设备的 {@code HISTORY_NUM} 会收敛一致）。</p>
+     */
+    private static int accountHistoryKeep(String owner, SyncScopes scopes) {
+        // 注意：逐 scope 同步时传入的是 SyncScopes.only(sc)（只启用当前 scope），
+        // 不能用它的 settings 标志判断「设置同步是否开启」，否则永远返回 0、历史永不裁剪。
+        // 这里必须读全局开关。
+        SyncScopes global = SyncScopes.load();
+        if (global == null || !global.settings) {
+            return 0;
         }
+        try {
+            if (SettingsProfile.isPendingPull(owner)) {
+                return 0;
+            }
+        } catch (Throwable ignore) {
+        }
+        int idx = Hawk.get(HawkConfig.HISTORY_NUM, 0);
+        int keep = HistoryHelper.getHisNum(idx);
+        return keep > 0 ? keep : 0;
     }
 
     /**
@@ -798,134 +870,191 @@ public final class HistorySyncManager {
     }
 
     static boolean applyLocal(SyncPayload merged, SyncScopes scopes) {
-        boolean changed = false;
+        return applyLocal(merged, scopes, false);
+    }
+
+    /**
+     * @param reset true 表示本轮是「云端 epoch 变化后的整库重置」：此时事务内**不能**
+     *              再用本机旧表重新 merge（否则旧数据会被重新并回、重置失效），
+     *              必须以空本地视图落库。
+     */
+    static boolean applyLocal(SyncPayload merged, SyncScopes scopes, boolean reset) {
+        final boolean[] changed = {false};
         SyncTombstones.suppress(true);
         try {
             AppDataManager.get();
-            // ★ v99-r7 P0-1：merged 里的 dataJson 是「同步包精简格式」（HistorySyncJson.slim，只留 10 个字段）。
-            //   原先这里 deleteAll 后把精简版原样写回 ⇒ **同步一次就把本机完整 VodInfo 降级成 10 字段**，
-            //   与 HistorySyncJson 头部承诺的「本机数据库仍保存完整 VodInfo」相反，而且不可逆
-            //   （后续上传的也是精简版，云端与所有设备一起降级）。
-            //   修法：落库前先按 (sourceKey|vodId) 把本机现有的完整 dataJson 读出来，
-            //        命中则保留本机完整版，其余字段（updateTime 等）仍用合并结果。
-            final Map<String, String> localFullJson = new java.util.HashMap<>();
-            if (scopes.history) {
-                List<VodRecord> olds = AppDataManager.get().getVodRecordDao().getAll(Integer.MAX_VALUE);
-                Map<String, String> oldSig = new java.util.HashMap<>();
-                if (olds != null) {
-                    for (VodRecord r : olds) {
-                        if (r == null) continue;
-                        oldSig.put(SyncMerge.recordKey(r.sourceKey, r.vodId), String.valueOf(r.updateTime));
-                        if (r.dataJson != null && r.dataJson.length() > 0) {
-                            localFullJson.put(SyncMerge.recordKey(r.sourceKey, r.vodId), r.dataJson);
-                        }
-                    }
-                }
-                // ★ r169：对比「本机旧数据」与「即将写入的合并结果」，判断本次落库是否真的改变了历史。
-                //   仅用于决定「要不要通知界面刷新」，不影响写入本身；按 (key,updateTime) 比较，
-                //   LWW 语义下内容变更必伴随 updateTime 前进，足以判定。
-                Map<String, String> newSig = new java.util.HashMap<>();
-                if (merged.records != null) {
-                    for (SyncPayload.RecordItem it : merged.records) {
-                        newSig.put(SyncMerge.recordKey(it.sourceKey, it.vodId), String.valueOf(it.updateTime));
-                    }
-                }
-                changed = !newSig.equals(oldSig);
-            }
-            if (scopes.progress) {
-                Map<String, String> oldSig = new java.util.HashMap<>();
-                List<PlayProgress> olds = AppDataManager.get().getPlayProgressDao().getAllRows();
-                if (olds != null) {
-                    for (PlayProgress p : olds) {
-                        if (p == null) continue;
-                        oldSig.put(SyncMerge.progressKey(p.sourceKey, p.vodId, p.flag, p.playIndex, p.epName),
-                                p.updateTime + "@" + p.position);
-                    }
-                }
-                Map<String, String> newSig = new java.util.HashMap<>();
-                if (merged.progress != null) {
-                    for (SyncPayload.ProgressItem it : merged.progress) {
-                        newSig.put(SyncMerge.progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName),
-                                it.updateTime + "@" + it.position);
-                    }
-                }
-                if (!newSig.equals(oldSig)) changed = true;
-            }
-            if (scopes.collect) {
-                Map<String, String> oldSig = new java.util.HashMap<>();
-                List<VodCollect> olds = AppDataManager.get().getVodCollectDao().getAll();
-                if (olds != null) {
-                    for (VodCollect c : olds) {
-                        if (c == null) continue;
-                        oldSig.put(SyncMerge.recordKey(c.sourceKey, c.vodId), String.valueOf(c.updateTime));
-                    }
-                }
-                Map<String, String> newSig = new java.util.HashMap<>();
-                if (merged.collects != null) {
-                    for (SyncPayload.CollectItem it : merged.collects) {
-                        newSig.put(SyncMerge.recordKey(it.sourceKey, it.vodId), String.valueOf(it.updateTime));
-                    }
-                }
-                if (!newSig.equals(oldSig)) changed = true;
-            }
-            // v98 P1：三张表放进同一个 Room 事务 —— 失败即整体回滚，不再留下"半套数据"
+            final SyncScopes sc = scopes;
+            final boolean doReset = reset;
+            // ★ 协议 v4 P0-4：整个"再合并 + 落库"放进同一个 Room 事务，
+            //   并在事务内用当前本机数据重新 merge 一次，避免同步窗口期（buildLocal 之后、
+            //   落库之前）用户在 UI 新写入的进度/历史被旧快照的 deleteAll 抹掉。
             AppDataManager.get().runInTransaction(() -> {
-            if (scopes.history) {
-                VodRecordDao dao = AppDataManager.get().getVodRecordDao();
-                dao.deleteAll();
-                for (SyncPayload.RecordItem it : merged.records) {
-                    VodRecord r = new VodRecord();
-                    r.sourceKey = it.sourceKey;
-                    r.vodId = it.vodId;
-                    String full = localFullJson.get(SyncMerge.recordKey(it.sourceKey, it.vodId));
-                    r.dataJson = full != null ? full : it.dataJson;
-                    r.updateTime = it.updateTime;
-                    dao.insert(r);
+                String deviceId = deviceId();
+                long now = com.github.tvbox.osc.sync.TrustedClock.nowPhysical();
+                // baseline 只用于「本次是否改动了本机」的对比；reset 时真正落库用空视图。
+                SyncPayload baseline = buildLocal(merged.owner, deviceId, sc, now);
+                SyncPayload fresh = doReset
+                        ? emptyLocal(merged.owner, deviceId, now)
+                        : baseline;
+                SyncPayload re = doReset
+                        ? merged
+                        : SyncMerge.merge(fresh, merged, deviceId, now);
+                // 事务内再合并可能让并集重新超过上限（本机 baseline + 云端），
+                // 因此在落库前按同一策略再裁一次，保证「云端/本机/上传包」三处口径一致。
+                if (!doReset) {
+                    truncateMergedHistory(re, sc);
+                    truncateMergedProgress(re, sc);
                 }
-            }
-            if (scopes.progress) {
-                PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
-                dao.deleteAll();
-                for (SyncPayload.ProgressItem it : merged.progress) {
-                    PlayProgress pr = new PlayProgress();
-                    pr.sourceKey = it.sourceKey == null ? "" : it.sourceKey;
-                    pr.vodId = it.vodId == null ? "" : it.vodId;
-                    pr.flag = it.flag == null ? "" : it.flag;
-                    pr.playIndex = it.playIndex;
-                    pr.epName = it.epName == null ? "" : it.epName;
-                    pr.position = it.position;
-                    pr.updateTime = it.updateTime;
-                    dao.save(pr);
+
+                boolean ch = false;
+                if (sc.history) {
+                    ch = !recordSig(baseline.records).equals(recordSig(re.records));
+                    writeHistory(re.records);
                 }
-            }
-            if (scopes.collect) {
-                VodCollectDao dao = AppDataManager.get().getVodCollectDao();
-                dao.deleteAll();
-                for (SyncPayload.CollectItem it : merged.collects) {
-                    VodCollect c = new VodCollect();
-                    c.sourceKey = it.sourceKey;
-                    c.vodId = it.vodId;
-                    c.name = it.name;
-                    c.pic = it.pic;
-                    c.updateTime = it.updateTime;
-                    dao.insert(c);
+                if (sc.progress) {
+                    if (!progressSig(baseline.progress).equals(progressSig(re.progress))) ch = true;
+                    writeProgress(re.progress);
                 }
-            }
+                if (sc.collect) {
+                    if (!collectSig(baseline.collects).equals(collectSig(re.collects))) ch = true;
+                    writeCollect(re.collects);
+                }
+                changed[0] = ch;
+
+                // 把再合并结果写回 merged，让随后上传的包与本地一致
+                merged.records = re.records;
+                merged.progress = re.progress;
+                merged.collects = re.collects;
+                merged.settings = re.settings;
+                merged.deleted = re.deleted;
+                merged.epoch = re.epoch;
+                merged.updatedAt = re.updatedAt;
+                merged.hlcMaxPhysical = re.hlcMaxPhysical;
+                merged.hlcMaxCounter = re.hlcMaxCounter;
             });
             // Hawk 写在事务之后：Room 事务回滚不了 Hawk，故此处必须幂等（重复执行结果一致）
             if (scopes.settings) {
-                // v98 P3：写 Hawk + 判定「需要哪些界面动作」交给 ConfigCenter：
-                //   · 键 → 动作的分类表（reload / home / live）在 ConfigPlan
-                //   · 何时真正执行（首屏已就绪 / 首页在前台 / 60 秒节流 + 合并）由 flush() 决定
-                // 取代原先「8 秒启动静默期 + pendingConfigEvent + 无条件直播预热」的老三件套：
-                // 老实现里 homeChanged || liveChanged 都会去预热直播，改个首页源也白跑一趟网络。
+                // v98 P3：写 Hawk + 判定「需要哪些界面动作」交给 ConfigCenter。
                 ConfigCenter.apply(merged.settingsMap());
                 ConfigCenter.flush();
             }
         } finally {
             SyncTombstones.suppress(false);
         }
-        return changed;
+        return changed[0];
+    }
+
+    /** 历史落库：事务内 deleteAll 后重建（外层 fresh merge 保证不丢窗口期 UI 写入）。 */
+    private static void writeHistory(List<SyncPayload.RecordItem> items) {
+        VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+        String self = deviceId();
+        Map<String, String> full = new java.util.HashMap<>();
+        List<VodRecord> olds = dao.getAll(Integer.MAX_VALUE);
+        if (olds != null) {
+            for (VodRecord r : olds) {
+                if (r != null && r.dataJson != null && r.dataJson.length() > 0) {
+                    full.put(SyncMerge.recordKey(r.sourceKey, r.vodId), r.dataJson);
+                }
+            }
+        }
+        dao.deleteAll();
+        if (items == null) {
+            return;
+        }
+        for (SyncPayload.RecordItem it : items) {
+            VodRecord r = new VodRecord();
+            r.sourceKey = it.sourceKey;
+            r.vodId = it.vodId;
+            String f = full.get(SyncMerge.recordKey(it.sourceKey, it.vodId));
+            // P0-8：远端 winner 时不能直接覆盖本机完整 JSON；把 slim 字段 overlay 到本机全文上
+            r.dataJson = f != null ? HistorySyncJson.overlay(f, it.dataJson) : it.dataJson;
+            r.updateTime = it.updateTime;
+            r.hlcPhysical = it.hlcPhysical > 0 ? it.hlcPhysical : it.updateTime;
+            r.hlcCounter = it.hlcCounter;
+            r.dev = notEmpty(it.dev) ? it.dev : self;
+            dao.insert(r);
+        }
+    }
+
+    private static void writeProgress(List<SyncPayload.ProgressItem> items) {
+        PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
+        String self = deviceId();
+        dao.deleteAll();
+        if (items == null) {
+            return;
+        }
+        for (SyncPayload.ProgressItem it : items) {
+            PlayProgress pr = new PlayProgress();
+            pr.sourceKey = it.sourceKey == null ? "" : it.sourceKey;
+            pr.vodId = it.vodId == null ? "" : it.vodId;
+            pr.flag = it.flag == null ? "" : it.flag;
+            pr.playIndex = it.playIndex;
+            pr.epName = it.epName == null ? "" : it.epName;
+            pr.position = it.position;
+            pr.updateTime = it.updateTime;
+            pr.hlcPhysical = it.hlcPhysical > 0 ? it.hlcPhysical : it.updateTime;
+            pr.hlcCounter = it.hlcCounter;
+            pr.dev = notEmpty(it.dev) ? it.dev : self;
+            dao.save(pr);
+        }
+    }
+
+    private static void writeCollect(List<SyncPayload.CollectItem> items) {
+        VodCollectDao dao = AppDataManager.get().getVodCollectDao();
+        String self = deviceId();
+        dao.deleteAll();
+        if (items == null) {
+            return;
+        }
+        for (SyncPayload.CollectItem it : items) {
+            VodCollect c = new VodCollect();
+            c.sourceKey = it.sourceKey;
+            c.vodId = it.vodId;
+            c.name = it.name;
+            c.pic = it.pic;
+            c.updateTime = it.updateTime;
+            c.hlcPhysical = it.hlcPhysical > 0 ? it.hlcPhysical : it.updateTime;
+            c.hlcCounter = it.hlcCounter;
+            c.dev = notEmpty(it.dev) ? it.dev : self;
+            dao.insert(c);
+        }
+    }
+
+    private static Map<String, String> recordSig(List<SyncPayload.RecordItem> list) {
+        Map<String, String> map = new java.util.LinkedHashMap<>();
+        if (list != null) {
+            for (SyncPayload.RecordItem it : list) {
+                if (it != null) {
+                    map.put(SyncMerge.recordKey(it.sourceKey, it.vodId), it.hlc().toString() + "#" + it.dataJson);
+                }
+            }
+        }
+        return map;
+    }
+
+    private static Map<String, String> progressSig(List<SyncPayload.ProgressItem> list) {
+        Map<String, String> map = new java.util.LinkedHashMap<>();
+        if (list != null) {
+            for (SyncPayload.ProgressItem it : list) {
+                if (it != null) {
+                    map.put(SyncMerge.progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName),
+                            it.hlc() + "@" + it.position);
+                }
+            }
+        }
+        return map;
+    }
+
+    private static Map<String, String> collectSig(List<SyncPayload.CollectItem> list) {
+        Map<String, String> map = new java.util.LinkedHashMap<>();
+        if (list != null) {
+            for (SyncPayload.CollectItem it : list) {
+                if (it != null) {
+                    map.put(SyncMerge.recordKey(it.sourceKey, it.vodId), it.hlc().toString());
+                }
+            }
+        }
+        return map;
     }
 
     /**
@@ -1009,6 +1138,10 @@ public final class HistorySyncManager {
     }
 
     // ---------------------------------------------------------------- 工具
+
+    private static boolean notEmpty(String s) {
+        return s != null && s.length() > 0;
+    }
 
     public static boolean hasConfig() {
         String url = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");

@@ -1356,7 +1356,7 @@ public class DetailActivity extends BaseActivity {
                         boolean sameNameRestored = false;
                         if (vodInfoRecord != null) {
                             // 本源有记录时，若其他源的同名记录更新，则以最新者为准（与"以最新播放时长为准"一致）
-                            long curUpdate = RoomDataManger.getVodRecordUpdateTime(sourceKey, vodId);
+                            com.github.tvbox.osc.sync.Hlc curUpdate = RoomDataManger.getVodRecordHlc(sourceKey, vodId);
                             VodInfo newerSameName = RoomDataManger.getVodInfoBySameNameNewerThan(sourceKey, vodId, vodInfo.name, curUpdate);
                             if (newerSameName == null && !TextUtils.isEmpty(vod_name)
                                     && !TextUtils.equals(vod_name.trim(), vodInfo.name == null ? "" : vodInfo.name.trim())) {

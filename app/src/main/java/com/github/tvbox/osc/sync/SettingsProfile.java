@@ -50,7 +50,6 @@ public final class SettingsProfile {
         try {
             Map<String, SyncPayload.SettingValue> cur = SyncSettings.collect();
             Map<String, SyncPayload.SettingValue> last = SyncSettings.loadSnapshot();
-            long now = System.currentTimeMillis();
             List<SyncPayload.SettingItem> items = new ArrayList<>();
             for (Map.Entry<String, SyncPayload.SettingValue> e : cur.entrySet()) {
                 SyncPayload.SettingItem it = new SyncPayload.SettingItem();
@@ -59,7 +58,17 @@ public final class SettingsProfile {
                 it.ty = e.getValue().ty;
                 SyncPayload.SettingValue old = last == null ? null : last.get(e.getKey());
                 boolean localChanged = old == null || !sameValue(old.v, e.getValue().v);
-                it.t = localChanged ? now : old.t;
+                if (localChanged) {
+                    // ★ 协议 v4（P0-7）：用 HLC 代替墙钟，时钟滞后的设备改设置也不会永久输掉
+                    Hlc h = HlcClock.next();
+                    it.t = h.physical;
+                    it.hlcPhysical = h.physical;
+                    it.hlcCounter = h.counter;
+                } else {
+                    it.t = old.t;
+                    it.hlcPhysical = old.hlcPhysical > 0 ? old.hlcPhysical : old.t;
+                    it.hlcCounter = old.hlcCounter;
+                }
                 items.add(it);
             }
             Hawk.put(key(HawkConfig.SYNC_SETTINGS_PROFILE, owner), GSON.toJson(items));
@@ -86,7 +95,8 @@ public final class SettingsProfile {
             Map<String, SyncPayload.SettingValue> map = new LinkedHashMap<>();
             for (SyncPayload.SettingItem it : items) {
                 if (it != null && it.key != null) {
-                    map.put(it.key, new SyncPayload.SettingValue(it.v, it.ty, it.t));
+                    map.put(it.key, new SyncPayload.SettingValue(it.v, it.ty, it.t,
+                            it.hlcPhysical, it.hlcCounter));
                 }
             }
             SyncSettings.apply(map);

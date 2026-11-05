@@ -2,6 +2,7 @@ package com.github.tvbox.osc.sync;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -12,19 +13,29 @@ import java.util.Set;
 /**
  * 同步合并引擎（纯逻辑，无 Android 依赖，便于单测）。
  *
- * <p>规则：</p>
+ * <p>规则（协议 v4）：</p>
  * <ul>
  *   <li>逐条合并，不是整文件覆盖；</li>
- *   <li>同一条记录：updateTime 大者胜；时间相同则比较写入设备 id（字典序大者胜），
- *       保证两端算出的结果一致、不会来回翻；</li>
- *   <li>墓碑（删除标记）时间大于两侧条目时间 ⇒ 删除；</li>
- *   <li>墓碑保留 90 天；</li>
- *   <li>设置按 key 逐条 LWW，值相同则保留原值。</li>
+ *   <li>同一条记录按 <b>HLC</b>（physical → counter → dev）比较，大者胜。
+ *       两端对同一批数据一定算出同一结果，不再受设备墙钟漂移影响；</li>
+ *   <li>墓碑只压制 <b>HLC 不高于自己</b> 的条目（{@code item.hlc <= tomb.hlc} 才删），
+ *       删除之后又被重新播放/重新写入的条目会正常复活；</li>
+ *   <li>墓碑按 HLC 距离回收（{@link #TOMB_KEEP_MS}），不再用本机墙钟；</li>
+ *   <li>设置按 key 逐条 LWW，同样用 HLC。</li>
  * </ul>
  */
 public final class SyncMerge {
 
-    public static final long TOMB_KEEP_MS = 90L * 24 * 3600 * 1000;
+    /**
+     * 墓碑保留期（按 HLC 距离，而非本机墙钟）。
+     *
+     * <p>已拍板：超过 180 天未同步的设备回归时，允许它持有的旧删除标记失效
+     * （否则墓碑要永久保留，云端体积与流量不可控）。</p>
+     */
+    public static final long TOMB_KEEP_MS = 180L * 24 * 3600 * 1000;
+
+    /** 每类墓碑硬上限：超出按 HLC 新者优先丢弃，防止云端体积失控。 */
+    public static final int MAX_TOMB_PER_CLASS = 500;
 
     private SyncMerge() {
     }
@@ -44,10 +55,29 @@ public final class SyncMerge {
 
     public static SyncPayload merge(SyncPayload local, SyncPayload remote, String deviceId, long now) {
         SyncPayload out = new SyncPayload();
+        out.schema = SyncPayload.SCHEMA;
         out.owner = notEmpty(local.owner) ? local.owner : remote.owner;
         out.epoch = Math.max(local.epoch, remote.epoch);
         out.updatedAt = now;
         out.dev = deviceId;
+
+        long maxP;
+        int maxC;
+        if (local.hlcMaxPhysical >= remote.hlcMaxPhysical) {
+            maxP = local.hlcMaxPhysical;
+            maxC = local.hlcMaxCounter;
+        } else {
+            maxP = remote.hlcMaxPhysical;
+            maxC = remote.hlcMaxCounter;
+        }
+        // 墓碑本身也可能携带更高的 HLC（例如删除发生在最近一次同步之后）
+        for (SyncPayload.Tomb t : allTombs(local, remote)) {
+            Hlc h = t.hlc();
+            if (h.physical > maxP || (h.physical == maxP && h.counter > maxC)) {
+                maxP = h.physical;
+                maxC = h.counter;
+            }
+        }
 
         // ── 观看历史 ──
         Map<String, SyncPayload.Tomb> recordTombs = tombMap(local.deleted.records, remote.deleted.records);
@@ -56,17 +86,18 @@ public final class SyncMerge {
         for (String key : union(localRecords.keySet(), remoteRecords.keySet())) {
             SyncPayload.RecordItem a = localRecords.get(key);
             SyncPayload.RecordItem b = remoteRecords.get(key);
-            long maxTime = Math.max(a == null ? 0 : a.updateTime, b == null ? 0 : b.updateTime);
             SyncPayload.Tomb tomb = recordTombs.get(key);
-            if (tomb != null && tomb.at > maxTime) {
-                continue;
+            if (suppressed(tomb, a) || suppressed(tomb, b)) {
+                if (tomb != null && !tombBeaten(tomb, a, b)) {
+                    continue;
+                }
             }
             SyncPayload.RecordItem win = pickRecord(a, b);
             if (win != null) {
                 out.records.add(win);
             }
         }
-        out.deleted.records = prune(recordTombs, now);
+        out.deleted.records = prune(recordTombs, maxP, maxC);
 
         // ── 播放进度 ──
         Map<String, SyncPayload.Tomb> progressTombs = tombMap(local.deleted.progress, remote.deleted.progress);
@@ -75,17 +106,18 @@ public final class SyncMerge {
         for (String key : union(localProgress.keySet(), remoteProgress.keySet())) {
             SyncPayload.ProgressItem a = localProgress.get(key);
             SyncPayload.ProgressItem b = remoteProgress.get(key);
-            long maxTime = Math.max(a == null ? 0 : a.updateTime, b == null ? 0 : b.updateTime);
             SyncPayload.Tomb tomb = progressTombs.get(key);
-            if (tomb != null && tomb.at > maxTime) {
-                continue;
+            if (suppressed(tomb, a) || suppressed(tomb, b)) {
+                if (tomb != null && !tombBeaten(tomb, a, b)) {
+                    continue;
+                }
             }
             SyncPayload.ProgressItem win = pickProgress(a, b);
             if (win != null) {
                 out.progress.add(win);
             }
         }
-        out.deleted.progress = prune(progressTombs, now);
+        out.deleted.progress = prune(progressTombs, maxP, maxC);
 
         // ── 收藏 ──
         Map<String, SyncPayload.Tomb> collectTombs = tombMap(local.deleted.collects, remote.deleted.collects);
@@ -94,17 +126,18 @@ public final class SyncMerge {
         for (String key : union(localCollects.keySet(), remoteCollects.keySet())) {
             SyncPayload.CollectItem a = localCollects.get(key);
             SyncPayload.CollectItem b = remoteCollects.get(key);
-            long maxTime = Math.max(a == null ? 0 : a.updateTime, b == null ? 0 : b.updateTime);
             SyncPayload.Tomb tomb = collectTombs.get(key);
-            if (tomb != null && tomb.at > maxTime) {
-                continue;
+            if (suppressed(tomb, a) || suppressed(tomb, b)) {
+                if (tomb != null && !tombBeaten(tomb, a, b)) {
+                    continue;
+                }
             }
             SyncPayload.CollectItem win = pickCollect(a, b);
             if (win != null) {
                 out.collects.add(win);
             }
         }
-        out.deleted.collects = prune(collectTombs, now);
+        out.deleted.collects = prune(collectTombs, maxP, maxC);
 
         // ── 设置 ──
         Map<String, SyncPayload.Tomb> settingTombs = tombMap(local.deleted.settings, remote.deleted.settings);
@@ -115,10 +148,11 @@ public final class SyncMerge {
         for (String key : settingKeys) {
             SyncPayload.SettingValue a = localSettings.get(key);
             SyncPayload.SettingValue b = remoteSettings.get(key);
-            long maxTime = Math.max(a == null ? 0 : a.t, b == null ? 0 : b.t);
             SyncPayload.Tomb tomb = settingTombs.get(key);
-            if (tomb != null && tomb.at > maxTime) {
-                continue;
+            if (suppressed(tomb, a) || suppressed(tomb, b)) {
+                if (tomb != null && !tombBeaten(tomb, a, b)) {
+                    continue;
+                }
             }
             SyncPayload.SettingValue win = pickSetting(a, b);
             if (win != null) {
@@ -126,7 +160,12 @@ public final class SyncMerge {
             }
         }
         out.setSettingsMap(mergedSettings);
-        out.deleted.settings = prune(settingTombs, now);
+        out.deleted.settings = prune(settingTombs, maxP, maxC);
+
+        // 最终 hlcMax 覆盖所有输出条目与墓碑（写入方据此推进本地时钟）
+        long[] mm = finalMax(out, maxP, maxC);
+        out.hlcMaxPhysical = mm[0];
+        out.hlcMaxCounter = (int) mm[1];
         return out;
     }
 
@@ -139,10 +178,7 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        if (a.updateTime != b.updateTime) {
-            return a.updateTime > b.updateTime ? a : b;
-        }
-        return devCompare(a.dev, b.dev) >= 0 ? a : b;
+        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
     }
 
     private static SyncPayload.ProgressItem pickProgress(SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
@@ -152,10 +188,7 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        if (a.updateTime != b.updateTime) {
-            return a.updateTime > b.updateTime ? a : b;
-        }
-        return devCompare(a.dev, b.dev) >= 0 ? a : b;
+        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
     }
 
     private static SyncPayload.CollectItem pickCollect(SyncPayload.CollectItem a, SyncPayload.CollectItem b) {
@@ -165,10 +198,7 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        if (a.updateTime != b.updateTime) {
-            return a.updateTime > b.updateTime ? a : b;
-        }
-        return devCompare(a.dev, b.dev) >= 0 ? a : b;
+        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
     }
 
     private static SyncPayload.SettingValue pickSetting(SyncPayload.SettingValue a, SyncPayload.SettingValue b) {
@@ -178,56 +208,162 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        if (a.t != b.t) {
-            return a.t > b.t ? a : b;
+        int cmp = a.hlc().compareTo(b.hlc());
+        if (cmp != 0) {
+            return cmp > 0 ? a : b;
         }
         String av = a.v == null ? "" : a.v;
         String bv = b.v == null ? "" : b.v;
         return av.compareTo(bv) >= 0 ? a : b;
     }
 
-    private static int devCompare(String a, String b) {
-        String x = a == null ? "" : a;
-        String y = b == null ? "" : b;
-        return x.compareTo(y);
+    // ---------------------------------------------------------------- 墓碑
+
+    /**
+     * 墓碑是否压制该条目：只有条目 HLC <b>不高于</b> 墓碑 HLC 时才删。
+     *
+     * <p>这样"删除后又在别的设备重新播放/重新收藏"的条目不会被旧墓碑误杀。</p>
+     */
+    private static boolean suppressed(SyncPayload.Tomb tomb, SyncPayload.RecordItem item) {
+        if (tomb == null || item == null) {
+            return false;
+        }
+        return compareIgnoringDev(item.hlc(), tomb.hlc()) <= 0;
     }
 
-    // ---------------------------------------------------------------- 索引/集合工具
+    private static boolean suppressed(SyncPayload.Tomb tomb, SyncPayload.ProgressItem item) {
+        if (tomb == null || item == null) {
+            return false;
+        }
+        return compareIgnoringDev(item.hlc(), tomb.hlc()) <= 0;
+    }
 
-    private static Map<String, SyncPayload.RecordItem> indexRecords(List<SyncPayload.RecordItem> list) {
-        Map<String, SyncPayload.RecordItem> map = new LinkedHashMap<>();
-        if (list != null) {
-            for (SyncPayload.RecordItem it : list) {
-                if (it != null) {
-                    map.put(recordKey(it.sourceKey, it.vodId), it);
+    private static boolean suppressed(SyncPayload.Tomb tomb, SyncPayload.CollectItem item) {
+        if (tomb == null || item == null) {
+            return false;
+        }
+        return compareIgnoringDev(item.hlc(), tomb.hlc()) <= 0;
+    }
+
+    private static boolean suppressed(SyncPayload.Tomb tomb, SyncPayload.SettingValue item) {
+        if (tomb == null || item == null) {
+            return false;
+        }
+        return compareIgnoringDev(item.hlc(), tomb.hlc()) <= 0;
+    }
+
+    /** 两侧条目里只要有一条压过了墓碑，就说明删除之后又被重新写入。 */
+    private static boolean tombBeaten(SyncPayload.Tomb tomb,
+                                      SyncPayload.RecordItem a, SyncPayload.RecordItem b) {
+        return (a != null && compareIgnoringDev(a.hlc(), tomb.hlc()) > 0)
+                || (b != null && compareIgnoringDev(b.hlc(), tomb.hlc()) > 0);
+    }
+
+    private static boolean tombBeaten(SyncPayload.Tomb tomb,
+                                      SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
+        return (a != null && compareIgnoringDev(a.hlc(), tomb.hlc()) > 0)
+                || (b != null && compareIgnoringDev(b.hlc(), tomb.hlc()) > 0);
+    }
+
+    private static boolean tombBeaten(SyncPayload.Tomb tomb,
+                                      SyncPayload.CollectItem a, SyncPayload.CollectItem b) {
+        return (a != null && compareIgnoringDev(a.hlc(), tomb.hlc()) > 0)
+                || (b != null && compareIgnoringDev(b.hlc(), tomb.hlc()) > 0);
+    }
+
+    private static boolean tombBeaten(SyncPayload.Tomb tomb,
+                                      SyncPayload.SettingValue a, SyncPayload.SettingValue b) {
+        return (a != null && compareIgnoringDev(a.hlc(), tomb.hlc()) > 0)
+                || (b != null && compareIgnoringDev(b.hlc(), tomb.hlc()) > 0);
+    }
+
+    /** 比较 (physical, counter)，忽略 dev —— 墓碑不带 dev，避免同毫秒跨设备漏判。 */
+    private static int compareIgnoringDev(Hlc a, Hlc b) {
+        if (a.physical != b.physical) {
+            return a.physical < b.physical ? -1 : 1;
+        }
+        if (a.counter != b.counter) {
+            return a.counter < b.counter ? -1 : 1;
+        }
+        return 0;
+    }
+
+    private static List<SyncPayload.Tomb> allTombs(SyncPayload a, SyncPayload b) {
+        List<SyncPayload.Tomb> out = new ArrayList<>();
+        addTombs(out, a);
+        addTombs(out, b);
+        return out;
+    }
+
+    private static void addTombs(List<SyncPayload.Tomb> out, SyncPayload p) {
+        if (p == null || p.deleted == null) {
+            return;
+        }
+        addTombList(out, p.deleted.records);
+        addTombList(out, p.deleted.progress);
+        addTombList(out, p.deleted.collects);
+        addTombList(out, p.deleted.settings);
+    }
+
+    private static void addTombList(List<SyncPayload.Tomb> out, List<SyncPayload.Tomb> list) {
+        if (list == null) {
+            return;
+        }
+        for (SyncPayload.Tomb t : list) {
+            if (t != null) {
+                out.add(t);
+            }
+        }
+    }
+
+    /** 计算最终 hlcMax = max(基础值, 所有输出条目, 所有墓碑)。 */
+    private static long[] finalMax(SyncPayload out, long baseP, int baseC) {
+        long p = baseP;
+        int c = baseC;
+        if (out.records != null) {
+            for (SyncPayload.RecordItem it : out.records) {
+                Hlc h = it.hlc();
+                if (h.physical > p || (h.physical == p && h.counter > c)) {
+                    p = h.physical;
+                    c = h.counter;
                 }
             }
         }
-        return map;
-    }
-
-    private static Map<String, SyncPayload.ProgressItem> indexProgress(List<SyncPayload.ProgressItem> list) {
-        Map<String, SyncPayload.ProgressItem> map = new LinkedHashMap<>();
-        if (list != null) {
-            for (SyncPayload.ProgressItem it : list) {
-                if (it != null) {
-                    map.put(progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName), it);
+        if (out.progress != null) {
+            for (SyncPayload.ProgressItem it : out.progress) {
+                Hlc h = it.hlc();
+                if (h.physical > p || (h.physical == p && h.counter > c)) {
+                    p = h.physical;
+                    c = h.counter;
                 }
             }
         }
-        return map;
-    }
-
-    private static Map<String, SyncPayload.CollectItem> indexCollects(List<SyncPayload.CollectItem> list) {
-        Map<String, SyncPayload.CollectItem> map = new LinkedHashMap<>();
-        if (list != null) {
-            for (SyncPayload.CollectItem it : list) {
-                if (it != null) {
-                    map.put(collectKey(it.sourceKey, it.vodId), it);
+        if (out.collects != null) {
+            for (SyncPayload.CollectItem it : out.collects) {
+                Hlc h = it.hlc();
+                if (h.physical > p || (h.physical == p && h.counter > c)) {
+                    p = h.physical;
+                    c = h.counter;
                 }
             }
         }
-        return map;
+        if (out.settings != null) {
+            for (SyncPayload.SettingItem it : out.settings) {
+                Hlc h = Hlc.of(it.hlcPhysical, it.hlcCounter, "", it.t);
+                if (h.physical > p || (h.physical == p && h.counter > c)) {
+                    p = h.physical;
+                    c = h.counter;
+                }
+            }
+        }
+        for (SyncPayload.Tomb t : allTombs(out, null)) {
+            Hlc h = t.hlc();
+            if (h.physical > p || (h.physical == p && h.counter > c)) {
+                p = h.physical;
+                c = h.counter;
+            }
+        }
+        return new long[]{p, c};
     }
 
     private static Map<String, SyncPayload.Tomb> tombMap(List<SyncPayload.Tomb> a, List<SyncPayload.Tomb> b) {
@@ -246,18 +382,45 @@ public final class SyncMerge {
                 continue;
             }
             SyncPayload.Tomb old = map.get(t.key);
-            if (old == null || t.at > old.at) {
+            if (old == null || t.hlc().compareTo(old.hlc()) > 0) {
                 map.put(t.key, t);
             }
         }
     }
 
-    private static List<SyncPayload.Tomb> prune(Map<String, SyncPayload.Tomb> map, long now) {
+    /**
+     * 墓碑回收：按 HLC 距离保留 {@link #TOMB_KEEP_MS}，并限制每类最多 {@link #MAX_TOMB_PER_CLASS} 条。
+     *
+     * <p>用 HLC（可信时间）而不是本机墙钟，避免慢钟设备把有效墓碑判成过期、导致删除被云端回灌。</p>
+     */
+    private static List<SyncPayload.Tomb> prune(Map<String, SyncPayload.Tomb> map, long maxP, int maxC) {
         List<SyncPayload.Tomb> out = new ArrayList<>();
+        if (map == null || map.isEmpty()) {
+            return out;
+        }
+        long horizon = maxP - TOMB_KEEP_MS;
         for (SyncPayload.Tomb t : map.values()) {
-            if (t.at >= now - TOMB_KEEP_MS) {
+            if (t == null) {
+                continue;
+            }
+            if (t.hlc().physical >= horizon) {
                 out.add(t);
             }
+        }
+        if (out.size() > MAX_TOMB_PER_CLASS) {
+            Collections.sort(out, new Comparator<SyncPayload.Tomb>() {
+                @Override
+                public int compare(SyncPayload.Tomb a, SyncPayload.Tomb b) {
+                    int c = b.hlc().compareTo(a.hlc());   // 新者在前
+                    if (c != 0) {
+                        return c;
+                    }
+                    String ka = a.key == null ? "" : a.key;
+                    String kb = b.key == null ? "" : b.key;
+                    return ka.compareTo(kb);
+                }
+            });
+            return new ArrayList<>(out.subList(0, MAX_TOMB_PER_CLASS));
         }
         return out;
     }
@@ -276,13 +439,15 @@ public final class SyncMerge {
     // ---------------------------------------------------------------- 进度裁剪
 
     /**
-     * ★ v99-r10：每部片只保留最近 {@code keepPerVod} 条播放进度记录。
+     * 每部片只保留最近 {@code keepPerVod} 条播放进度记录。
      *
      * <p><b>按「记录」计数，不按「集」聚合</b>（用户明确要求）：同一部片下各线路（flag）
      * 的记录合在一起只留最新的 N 条。理由是「切换线路」和「切源」目的相同（都为了更快的播放），
      * 所以换线路时旧线路的记录会整批迁到新线路并丢弃
      * （见 {@code PlayProgressManager.migrateByFlag}）—— 稳态下每片就是
      * 「N 集 × 当前那一条线路」，不需要再为每条线路各留 N 集。</p>
+     *
+     * <p>排序改用 HLC；同一 HLC 时按主键字典序，保证两端裁剪结果完全一致。</p>
      *
      * <p>纯函数、无 Android 依赖：本地落库（{@code PlayProgressManager.trimByVod}）
      * 与同步包（{@code HistorySyncManager.truncateMergedProgress}）共用同一套规则。</p>
@@ -312,15 +477,17 @@ public final class SyncMerge {
                 out.addAll(list);   // 未超限，整片原样保留
                 continue;
             }
-            // 2) 片内按 updateTime 降序取前 N 条
+            // 2) 片内按 HLC 降序取前 N 条
             List<SyncPayload.ProgressItem> sorted = new ArrayList<>(list);
-            Collections.sort(sorted, new java.util.Comparator<SyncPayload.ProgressItem>() {
+            Collections.sort(sorted, new Comparator<SyncPayload.ProgressItem>() {
                 @Override
                 public int compare(SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
-                    if (a.updateTime == b.updateTime) {
-                        return 0;
+                    int c = b.hlc().compareTo(a.hlc());
+                    if (c != 0) {
+                        return c;
                     }
-                    return a.updateTime > b.updateTime ? -1 : 1;
+                    return progressKey(a.sourceKey, a.vodId, a.flag, a.playIndex, a.epName)
+                            .compareTo(progressKey(b.sourceKey, b.vodId, b.flag, b.playIndex, b.epName));
                 }
             });
             out.addAll(sorted.subList(0, keepPerVod));
@@ -330,5 +497,46 @@ public final class SyncMerge {
 
     private static boolean notEmpty(String s) {
         return s != null && s.length() > 0;
+    }
+
+    // ---------------------------------------------------------------- 索引
+
+    private static Map<String, SyncPayload.RecordItem> indexRecords(List<SyncPayload.RecordItem> list) {
+        Map<String, SyncPayload.RecordItem> map = new HashMap<>();
+        if (list == null) {
+            return map;
+        }
+        for (SyncPayload.RecordItem it : list) {
+            if (it != null) {
+                map.put(recordKey(it.sourceKey, it.vodId), it);
+            }
+        }
+        return map;
+    }
+
+    private static Map<String, SyncPayload.ProgressItem> indexProgress(List<SyncPayload.ProgressItem> list) {
+        Map<String, SyncPayload.ProgressItem> map = new HashMap<>();
+        if (list == null) {
+            return map;
+        }
+        for (SyncPayload.ProgressItem it : list) {
+            if (it != null) {
+                map.put(progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName), it);
+            }
+        }
+        return map;
+    }
+
+    private static Map<String, SyncPayload.CollectItem> indexCollects(List<SyncPayload.CollectItem> list) {
+        Map<String, SyncPayload.CollectItem> map = new HashMap<>();
+        if (list == null) {
+            return map;
+        }
+        for (SyncPayload.CollectItem it : list) {
+            if (it != null) {
+                map.put(collectKey(it.sourceKey, it.vodId), it);
+            }
+        }
+        return map;
     }
 }

@@ -7,8 +7,13 @@ import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.data.AppDataManager;
 import com.github.tvbox.osc.sync.HistorySyncManager;
+import com.github.tvbox.osc.sync.Hlc;
+import com.github.tvbox.osc.sync.HlcClock;
+import com.github.tvbox.osc.sync.SettingsProfile;
 import com.github.tvbox.osc.sync.SyncScope;
+import com.github.tvbox.osc.sync.SyncMerge;
 import com.github.tvbox.osc.sync.SyncTombstones;
+import com.github.tvbox.osc.sync.TrustedClock;
 import com.google.gson.ExclusionStrategy;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
@@ -88,18 +93,18 @@ public class RoomDataManger {
         }
         record.sourceKey = sourceKey;
         record.vodId = vodInfo.id;
-        record.updateTime = System.currentTimeMillis();
+        // ★ 协议 v4：先判断内容是否真的变化，只有变化时才推进 HLC。
+        //   否则「退出再进同一集」也会刷新 HLC → contentEquals 判为不同 → 每轮都整包上传历史。
+        //   updateTime 仍按可信时间刷新，供首页「最近观看」排序（跨设备口径一致）。
         String newJson = getVodInfoGson().toJson(vodInfo);
-        // ★ v99-r21：内容实质没变就不标脏。
-        //
-        //   场景（盒子端实测反馈）：从首页第一条历史继续看同一部片的同一集，退出后
-        //   history.bin 也被上传了一次 —— 用户认为"只该传进度"。根因是这里每次都无条件
-        //   markDirty(HISTORY)，哪怕 dataJson 与库里完全一致（只是 updateTime 刷新了）。
-        //
-        //   updateTime 仍照常刷新（首页"最近观看"的排序依据），但内容一致时不上传：
-        //   HISTORY 不脏 ⇒ 同步时走 304 条件请求 ⇒ 云端 etag 未变 ⇒ 完全跳过。
-        //   真发生了变化（换集 / 换线路 / 片名或海报更新）时 dataJson 必然不同 ⇒ 照常标脏上传。
         boolean contentChanged = !newJson.equals(record.dataJson);
+        if (contentChanged || record.hlcPhysical <= 0) {
+            Hlc h = HlcClock.next();
+            record.hlcPhysical = h.physical;
+            record.hlcCounter = h.counter;
+            record.dev = HistorySyncManager.deviceId();
+        }
+        record.updateTime = Math.max(TrustedClock.nowPhysical(), record.hlcPhysical);
         record.dataJson = newJson;
         dao.insert(record);
         // v98 P2：只脏「历史」——写一条观看记录不该把收藏/设置也拖下水
@@ -110,26 +115,26 @@ public class RoomDataManger {
         pruneHistory();
     }
 
-    /** 按「保留历史记录数量」裁剪本机历史（按 updateTime 倒序，保留最新 N 条）。 */
+    /**
+     * 同步前/写历史后对本机历史做「内容收敛」（清坏行 + 同名去重）。
+     *
+     * <p>★ 协议 v4：这里<b>不再按条数物理裁剪</b>。历史上限是「账号级云端保留集」
+     * 的概念，由 {@code HistorySyncManager.truncateMergedHistory} 在合并后的同步包上统一执行；
+     * 若本机也按本机档位物理删，会在「档位尚未同步 / 用户刚调大档位」时把仅存于本机的记录删掉，
+     * 且本机与云端保留集口径不一致会每轮删除又合并回来（抖动、甚至永久丢失）。</p>
+     *
+     * <p>首页/历史页的显示条数由查询层 {@code getAll(size)} 限制，不依赖物理删除。</p>
+     */
     public static boolean pruneHistory() {
         try {
-            int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
-            if (keep <= 0) {
+            // ★ 协议 v4（P0-3）：账号档位尚未从云端拉下来时，本机档位可能是重置后的默认 15，
+            //   此时不能据它做任何裁剪——等设置同步完成后再裁。
+            if (SettingsProfile.isPendingPull(HistorySyncManager.owner())) {
                 return false;
             }
-            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
             // ★ v99-r50：把"清坏行 + 同名收敛"收敛成唯一出口 compactHistory()，
             //   所有需要收敛的路径（写入/裁剪/同步落地/读时自愈）都调它，避免口径漂移。
             boolean changed = compactHistory() > 0;
-            List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
-            if (all != null && all.size() > keep) {
-                for (int i = keep; i < all.size(); i++) {
-                    dao.delete(all.get(i));
-                }
-                // 被裁掉的影片，其播放进度随即成为孤儿，必须一并清理
-                PlayProgressManager.deleteOrphaned();
-                changed = true;
-            }
             if (changed) {
                 HistorySyncManager.markDirty(SyncScope.HISTORY);
             }
@@ -336,7 +341,7 @@ public class RoomDataManger {
             if (cur == null) {
                 winner.put(name, r);
                 winnerInfo.put(name, info);
-            } else if (r.updateTime > cur.updateTime) {
+            } else if (hlcOf(r).compareTo(hlcOf(cur)) > 0) {
                 losers.add(cur);
                 winner.put(name, r);
                 winnerInfo.put(name, info);
@@ -388,7 +393,7 @@ public class RoomDataManger {
                 //
                 //   写墓碑是安全的：删掉 loser 的同时 winner 也在同一个同步包里上传，
                 //   其它设备拉到的结果是「这部片只剩 winner 那一行」，不会整片丢失。
-                SyncTombstones.addRecord(r.sourceKey, r.vodId);
+                SyncTombstones.addRecord(r.sourceKey, r.vodId, hlcOf(r));
                 n++;
             } catch (Throwable ignored) {
             }
@@ -468,24 +473,36 @@ public class RoomDataManger {
         return record == null ? 0 : record.updateTime;
     }
 
+    /** ★ 协议 v4：取某条历史记录的 HLC（跨设备比较必须用它，不能用墙钟 updateTime）。 */
+    public static Hlc getVodRecordHlc(String sourceKey, String vodId) {
+        VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodId);
+        return record == null ? Hlc.ZERO : hlcOf(record);
+    }
+
+    private static Hlc hlcOf(VodRecord r) {
+        return Hlc.of(r.hlcPhysical, r.hlcCounter, r.dev, r.updateTime);
+    }
+
     /**
      * 在同名（其他源）历史记录里找「比 newerThan 更新」的一条。
-     * getAll 已按 updateTime desc 排序，遇到不比 newerThan 新的可直接终止。
+     * 用 HLC 比较（不能只看墙钟 updateTime）；不依赖 getAall 的排序，逐条比较。
      * 用于：本源有旧记录、但其他源刚看过同一部片时，以最新者为准。
      */
-    public static VodInfo getVodInfoBySameNameNewerThan(String sourceKey, String vodId, String name, long newerThan) {
+    public static VodInfo getVodInfoBySameNameNewerThan(String sourceKey, String vodId, String name, Hlc newerThan) {
         if (TextUtils.isEmpty(name)) return null;
         String key = VodNameNormalizer.normalize(name);
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
         List<VodRecord> all = dao.getAll(Integer.MAX_VALUE);
         if (all == null) return null;
+        VodRecord best = null;
+        VodInfo bestInfo = null;
         for (VodRecord record : all) {
             if (record == null
                     || (TextUtils.equals(sourceKey, record.sourceKey) && TextUtils.equals(vodId, record.vodId))) {
                 continue;
             }
-            if (record.updateTime <= newerThan) {
-                return null; // 已排序，后面只会更旧
+            if (newerThan != null && hlcOf(record).compareTo(newerThan) <= 0) {
+                continue; // 不依赖排序，继续找可能更新的一条
             }
             try {
                 if (record.dataJson == null || TextUtils.isEmpty(record.dataJson)) continue;
@@ -493,13 +510,17 @@ public class RoomDataManger {
                 // ★ v99-r46：与 getVodInfoBySameName 同口径（归一化后比较），变体写法也能接上进度
                 if (info != null && info.name != null
                         && TextUtils.equals(key, VodNameNormalizer.normalize(info.name))) {
-                    info.sourceKey = record.sourceKey;
-                    info.id = record.vodId;
-                    return info;
+                    if (best == null || hlcOf(record).compareTo(hlcOf(best)) > 0) {
+                        info.sourceKey = record.sourceKey;
+                        info.id = record.vodId;
+                        best = record;
+                        // 保留解析出的 info；循环结束后返回最后选中的
+                        bestInfo = info;
+                    }
                 }
             } catch (Exception ignored) { }
         }
-        return null;
+        return best == null ? null : bestInfo;
     }
 
     public static void deleteVodRecord(String sourceKey, VodInfo vodInfo) {
@@ -663,6 +684,9 @@ public class RoomDataManger {
                     //   sourceKey 也不同），故这里只 migrate 复制、不删除任何进度；
                     //   孤儿清理只清 position<=0 的空行（r72）—— 有观看记忆的行一律保留：
                     //   用户日后通过搜索重新点进该片时，进度仍能恢复。
+                    // ★ 协议 v4：删除同名旧记录必须登记墓碑（用被删行自身的 HLC），
+                    //   否则云端那份会在下一次同步被合并回来（删了又回来）。
+                    SyncTombstones.addRecord(record.sourceKey, record.vodId, hlcOf(record));
                     dao.delete(record);
                 }
             } catch (Exception ignored) {
@@ -708,7 +732,11 @@ public class RoomDataManger {
         record = new VodCollect();
         record.sourceKey = sourceKey;
         record.vodId = vodInfo.id;
-        record.updateTime = System.currentTimeMillis();
+        Hlc h = HlcClock.next();
+        record.updateTime = h.physical;
+        record.hlcPhysical = h.physical;
+        record.hlcCounter = h.counter;
+        record.dev = HistorySyncManager.deviceId();
         record.name = vodInfo.name;
         record.pic = vodInfo.pic;
         AppDataManager.get().getVodCollectDao().insert(record);

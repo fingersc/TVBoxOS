@@ -124,6 +124,43 @@ public class AppDataManager {
         }
     };
 
+    /**
+     * Room 2 → 3：为三张同步表补 HLC 列。
+     *
+     * <p>旧数据（hlcPhysical=0）用 updateTime 合成 HLC，语义与改造前等价，
+     * 因此升级不会改变任何既有数据的先后关系，也不会丢历史/进度。</p>
+     *
+     * <p>注意：绝不能用"提升 {@link #DB_FILE_VERSION} 换新文件名"的老办法来实现加列，
+     * 那会让新库为空、旧库被弃用，等于一次性丢失本机历史与进度。</p>
+     */
+    static final Migration MIGRATION_2_3_HLC = new Migration(2, 3) {
+        @Override
+        public void migrate(SupportSQLiteDatabase database) {
+            addHlcColumns(database, "vodRecord");
+            addHlcColumns(database, "play_progress");
+            addHlcColumns(database, "vodCollect");
+        }
+    };
+
+    private static void addHlcColumns(SupportSQLiteDatabase database, String table) {
+        try {
+            database.execSQL("ALTER TABLE `" + table + "` ADD COLUMN `hlcPhysical` INTEGER NOT NULL DEFAULT 0");
+        } catch (SQLiteException ignored) {
+        }
+        try {
+            database.execSQL("ALTER TABLE `" + table + "` ADD COLUMN `hlcCounter` INTEGER NOT NULL DEFAULT 0");
+        } catch (SQLiteException ignored) {
+        }
+        try {
+            database.execSQL("ALTER TABLE `" + table + "` ADD COLUMN `dev` TEXT");
+        } catch (SQLiteException ignored) {
+        }
+        try {
+            database.execSQL("UPDATE `" + table + "` SET `hlcPhysical` = `updateTime` WHERE `hlcPhysical` = 0");
+        } catch (SQLiteException ignored) {
+        }
+    }
+
     static String dbPath() {
         // v73：账号数据物理隔离 —— 每个账号一个独立数据库文件，游客沿用原文件名。
         // 这样无需改表结构、无需迁移，切换账号 = 关闭旧库 + 换文件名重开。
@@ -192,7 +229,7 @@ public class AppDataManager {
         if (dbInstance == null)
             dbInstance = Room.databaseBuilder(App.getInstance(), AppDataBase.class, dbPath())
                     .setJournalMode(RoomDatabase.JournalMode.TRUNCATE)
-                    .addMigrations(MIGRATION_V1_V2_PLAY_PROGRESS)
+                    .addMigrations(MIGRATION_V1_V2_PLAY_PROGRESS, MIGRATION_2_3_HLC)
                     .addCallback(new RoomDatabase.Callback() {
                         @Override
                         public void onCreate(@NonNull SupportSQLiteDatabase db) {

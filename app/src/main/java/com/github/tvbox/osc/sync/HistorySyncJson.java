@@ -52,4 +52,44 @@ public final class HistorySyncJson {
             return dataJson;
         }
     }
+
+    /**
+     * ★ 协议 v4（P0-8）：把同步包的<b>精简字段</b>覆盖到本机已有的<b>完整</b> dataJson 上。
+     *
+     * <p>问题背景：{@code applyLocal} 原先无条件用「本机旧全文」替换合并结果里的 dataJson。
+     * 当云端条目胜出（更新的 HLC）时，这样落库会得到「新的时间戳 + 旧的播放内容」——
+     * 例如本机停在第 3 集、手机端已看到第 5 集，同步后本机仍显示第 3 集，而且下一次
+     * 本机变脏时还会把旧内容再传回云端。</p>
+     *
+     * <p>修法：以本机全文为底（保住简介/演员等扩展字段），把同步包里的 10 个字段逐项覆盖上去。
+     * 这样既不会降级本机数据，也不会丢掉对方更新的播放进度。</p>
+     *
+     * <p>任一解析失败时返回 {@code slim}（宁可丢扩展字段，不能丢播放进度）。</p>
+     */
+    public static String overlay(String full, String slim) {
+        if (full == null || full.isEmpty()) {
+            return slim;
+        }
+        if (slim == null || slim.isEmpty()) {
+            return full;
+        }
+        if (full.equals(slim)) {
+            return full;
+        }
+        try {
+            JsonObject base = GSON.fromJson(full, JsonObject.class);
+            JsonObject patch = GSON.fromJson(slim, JsonObject.class);
+            if (base == null || patch == null) {
+                return slim;
+            }
+            for (String k : KEEP) {
+                if (patch.has(k) && !patch.get(k).isJsonNull()) {
+                    base.add(k, patch.get(k));
+                }
+            }
+            return base.toString();
+        } catch (Throwable t) {
+            return slim;
+        }
+    }
 }

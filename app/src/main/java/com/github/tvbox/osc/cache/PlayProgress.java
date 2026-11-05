@@ -23,4 +23,13 @@ public class PlayProgress implements Serializable {
     public String epName;
     public long position;      // 毫秒
     public long updateTime;    // 最后观看时间
+    /** HLC 物理分量（毫秒）；0 表示旧数据，读取时回落到 updateTime。 */
+    @androidx.room.ColumnInfo(name = "hlcPhysical", defaultValue = "0")
+    public long hlcPhysical;
+    /** HLC 逻辑计数。 */
+    @androidx.room.ColumnInfo(name = "hlcCounter", defaultValue = "0")
+    public int hlcCounter;
+    /** 最后写入该条目的设备 id（HLC 平局裁决）。 */
+    @androidx.room.ColumnInfo(name = "dev")
+    public String dev;
 }

@@ -12,7 +12,7 @@ import com.github.tvbox.osc.cache.VodCollectDao;
 import com.github.tvbox.osc.cache.VodRecord;
 import com.github.tvbox.osc.cache.VodRecordDao;
 
-@Database(entities = {Cache.class, VodRecord.class, VodCollect.class, PlayProgress.class}, version = 2)
+@Database(entities = {Cache.class, VodRecord.class, VodCollect.class, PlayProgress.class}, version = 3)
 public abstract class AppDataBase extends RoomDatabase {
     public abstract CacheDao getCacheDao();
 

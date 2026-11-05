@@ -18,8 +18,16 @@ public interface VodRecordDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     long insert(VodRecord record);
 
+    // 本机「最近观看」按可信时间 updateTime 排序（HLC 只在同步合并/裁剪时使用；
+    // 内容未变的重复观看不推进 HLC，否则会被误判成新内容而反复上传）。
     @Query("select * from vodRecord order by updateTime desc, id desc limit :size")
     List<VodRecord> getAll(int size);
+
+    @Query("select hlcPhysical from vodRecord order by hlcPhysical desc, hlcCounter desc limit 1")
+    Long maxHlcPhysical();
+
+    @Query("select hlcCounter from vodRecord order by hlcPhysical desc, hlcCounter desc limit 1")
+    Integer maxHlcCounter();
 
     @Query("select * from vodRecord where `sourceKey`=:sourceKey and `vodId`=:vodId")
     VodRecord getVodRecord(String sourceKey, String vodId);

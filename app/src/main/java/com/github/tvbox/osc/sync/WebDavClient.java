@@ -98,7 +98,31 @@ public final class WebDavClient {
             }
             resp = client.newCall(req).execute();
         }
+        observeDate(resp);
         return resp;
+    }
+
+    /**
+     * 顺便从响应头 {@code Date} 学习"服务器 vs 本机"的时钟偏移，供 {@link TrustedClock} 使用。
+     *
+     * <p>模拟器等设备时钟可能滞后/冻结，直接用它排序会让新数据永远输给旧数据。
+     * 服务器 Date 是可信 UTC 时间（秒级精度），足够修正系统性偏移。</p>
+     */
+    private static void observeDate(Response resp) {
+        try {
+            String d = resp.header("Date");
+            if (d == null || d.length() == 0) {
+                return;
+            }
+            java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat(
+                    "EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US);
+            fmt.setTimeZone(java.util.TimeZone.getTimeZone("GMT"));
+            java.util.Date date = fmt.parse(d);
+            if (date != null) {
+                TrustedClock.observeServerDate(date.getTime());
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private HttpUrl url(String path) {
@@ -273,7 +297,7 @@ public final class WebDavClient {
                 .header("Authorization", auth)
                 .put(RequestBody.create(OCTET, data));
         if (ifMatch != null && ifMatch.length() > 0) {
-            b.header("If-Match", ifMatch);
+            b.header("If-Match", strongIfMatch(ifMatch));
         }
         try (Response resp = exec(b.build())) {
             checkAuth(resp);
@@ -285,6 +309,63 @@ public final class WebDavClient {
             }
             return resp.header("ETag");
         }
+    }
+
+    /**
+     * 仅当目标文件不存在时创建（{@code If-None-Match: *}），用于旧 data.bin 迁移的一次性抢占。
+     *
+     * <p>这样多台设备同时首次升级时，只有一个能创建 split 文件，其余会走正常合并，
+     * 不会用各自本地的旧数据互相覆盖。</p>
+     */
+    public String putIfAbsent(String path, byte[] data) throws IOException {
+        Request.Builder b = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .header("If-None-Match", "*")
+                .put(RequestBody.create(OCTET, data));
+        try (Response resp = exec(b.build())) {
+            checkAuth(resp);
+            if (resp.code() == 412) {
+                throw new ConflictException();
+            }
+            if (!resp.isSuccessful()) {
+                throw new IOException("写入失败：" + resp.code());
+            }
+            return resp.header("ETag");
+        }
+    }
+
+    /**
+     * 删除文件（用于旧 data.bin 迁移完成后清理，避免新设备/清数据设备再次读到陈旧
+     * 整包而覆盖 split 文件）。404 视为已删除，不报错。
+     */
+    public void delete(String path) throws IOException {
+        Request.Builder b = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .delete();
+        try (Response resp = exec(b.build())) {
+            checkAuth(resp);
+            if (resp.code() == 404 || resp.code() == 204 || resp.code() == 200) {
+                return;
+            }
+            if (!resp.isSuccessful()) {
+                throw new IOException("删除失败：" + resp.code());
+            }
+        }
+    }
+
+    /**
+     * If-Match 只用强校验器：部分服务端返回 `W/"xxx"` 弱 ETag，
+     * 按 RFC 7232 弱校验器永远匹配不上，会导致每次写都 412。
+     * 这里去掉 `W/` 前缀后按普通 ETag 发送，兼容这类服务端。
+     */
+    private static String strongIfMatch(String etag) {
+        String e = etag == null ? "" : etag.trim();
+        if (e.startsWith("W/")) {
+            e = e.substring(2).trim();
+        }
+        return e;
     }
 
     /** 逐级创建目录（已存在或不允许创建都忽略）。 */

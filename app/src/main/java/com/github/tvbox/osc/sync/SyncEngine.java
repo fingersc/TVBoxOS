@@ -69,6 +69,11 @@ public final class SyncEngine {
         // ★ P0-2：记下「本次同步开始前」的脏标记。SyncState 是整对象读改写，
         //   收尾时若直接 clearDirty()+save()，会把期间用户新标的脏一起洗掉（lost update）。
         final boolean[] dirtyBefore = snapshotDirty(st);
+        // ★ 清空云端（clearCloud）会把 3 个数据文件的 epoch 都 +1；若逐个 scope 用
+        //   “remote.epoch > st.lastEpoch”判断，SETTINGS/HISTORY 先跑时先把 lastEpoch 抬到新值，
+        //   后面的 PROGRESS/COLLECT 就判不出 reset，云端已清空、本机却把旧进度又合并上传回来。
+        //   因此用“本轮开始前”的 epoch 作为统一水位，所有 scope 口径一致。
+        final long epochBefore = st.lastEpoch;
 
         // 1) 熔断中：不发任何请求
         if (st.inBackoff()) {
@@ -83,7 +88,9 @@ public final class SyncEngine {
         }
 
         Outcome o = new Outcome();
-        long now = System.currentTimeMillis();
+        // v4：使用可信时间（本机时钟 + 云端 Date 偏移）作为本轮基准；
+        // 同时作为 finish 里墓碑清理的水位（墓碑 at 也是 HLC physical，两者口径一致）。
+        long now = TrustedClock.nowPhysical();
         String deviceId = HistorySyncManager.deviceId();
         SyncScopes enabled = SyncScopes.load();
         String accountName = AccountContext.displayName();
@@ -109,7 +116,9 @@ public final class SyncEngine {
         migrateLegacy(dav, st, key, accountName, gen, o);
 
         if (!enabled.anyEnabled()) {
-            finish(st, now, dirtyBefore);
+            // 全部关闭时不要清任何 dirty（否则重新启用后删除/改动不会上传）。
+            finish(st, now, new boolean[SyncScope.COUNT],
+                    false, false, false, Hlc.ZERO, false);
             Outcome r = new Outcome();
             r.ok = true;
             r.requests = o.requests;
@@ -117,7 +126,28 @@ public final class SyncEngine {
             return r;
         }
 
+        // ★ 协议 v4：同步「之前」先按本机策略收敛一次（清坏记录 / 同名去重 / 按 HLC 档位裁剪）。
+        //   必须放在 history scope 构建与上传之前：dedupeSameName 产生的墓碑要能随本轮 payload 上传，
+        //   否则同步结束后才删，会被 finish 的墓碑清理（clearTombstones）直接抹掉删除意图，
+        //   造成「本机删了、云端还在，下轮又回来」。
+        boolean pruned = false;
+        if (enabled.history) {
+            try {
+                pruned = com.github.tvbox.osc.cache.RoomDataManger.pruneHistory();
+            } catch (Throwable t) {
+                LOG.e("[Sync] prune before sync failed", t);
+            }
+            if (pruned) {
+                // 本次收敛改动了本机历史：让本轮 history scope 走「完整 GET + 合并 + 上传」，
+                // 而不是被 304 提前返回（dirtyBefore 是同步开始时的快照，不含收敛产生的脏）。
+                dirtyBefore[SyncScope.HISTORY.index] = true;
+            }
+        }
+
         // 5) 逐 scope 同步
+        // 墓碑清理水位：只清「同步开始前已存在、且本轮确实上传成功」的那几类墓碑。
+        //   HlcClock.peek() 不分配新值；prune 产生的墓碑在其之前已计入。
+        Hlc tombWatermark = HlcClock.peek();
         boolean anyUploaded = false;
         boolean allNotModified = true;
         SyncPayload lastMerged = null;
@@ -126,10 +156,13 @@ public final class SyncEngine {
         // ★ r169：本次同步是否真的改动了本机数据（用于落库后通知界面刷新历史/收藏）
         boolean localChanged = false;
 
-        for (SyncScope sc : SyncScope.values()) {
+        java.util.Set<SyncScope> failedScopes = new java.util.HashSet<>();
+        boolean[] processedOk = new boolean[SyncScope.COUNT];
+        for (SyncScope sc : orderedScopes()) {
             if (!enabled.isEnabled(sc)) {
                 continue;
             }
+            try {
             HistorySyncManager.checkGeneration(gen);
             String path = AccountPaths.scopeFile(accountName, sc);
             SyncScopes one = SyncScopes.only(sc);
@@ -147,6 +180,7 @@ public final class SyncEngine {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     st.setEtag(sc, etagOut[0]);
                 }
+                processedOk[sc.index] = true;
                 continue;   // 该 scope 零下载 / 零解密 / 零写库
             }
             allNotModified = false;
@@ -185,8 +219,13 @@ public final class SyncEngine {
                 }
             }
 
-            // 5.2 epoch 变化 ⇒ 整库重置（以 history.bin 为准，清空云端时 4 个文件一起清）
-            boolean reset = (sc == SyncScope.HISTORY) && remote.epoch > st.lastEpoch;
+            // ★ 协议 v4 接收规则：读到云端包后先推进本地 HLC，保证本机后续写入的
+            //   HLC 一定大于云端已有条目（否则慢钟设备的新数据永远输给云端旧记录）。
+            HlcClock.observe(remote.hlcMaxPhysical, remote.hlcMaxCounter);
+
+            // 5.2 epoch 变化 ⇒ 整库重置（以 history.bin 为准；清空云端时 3 个数据文件一起清，
+            //     settings 不在清空范围内，其 epoch 不参与此判断）
+            boolean reset = remote.epoch > epochBefore;
             if (reset) {
                 LOG.i("[Sync] epoch reset remote=" + remote.epoch + " local=" + st.lastEpoch);
                 st.lastEpoch = remote.epoch;
@@ -199,10 +238,11 @@ public final class SyncEngine {
                     ? HistorySyncManager.emptyLocal(owner, deviceId, now)
                     : HistorySyncManager.buildLocal(owner, deviceId, one, now);
             SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
+            HlcClock.observe(merged.hlcMaxPhysical, merged.hlcMaxCounter);
             HistorySyncManager.checkGeneration(gen);
             HistorySyncManager.truncateMergedHistory(merged, one);
             HistorySyncManager.truncateMergedProgress(merged, one);
-            if (HistorySyncManager.applyLocal(merged, one)) localChanged = true;
+            if (HistorySyncManager.applyLocal(merged, one, reset)) localChanged = true;
             lastMerged = merged;
 
             // 5.4 与云端一致 ⇒ 跳过上传
@@ -212,6 +252,7 @@ public final class SyncEngine {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     st.setEtag(sc, etagOut[0]);
                 }
+                processedOk[sc.index] = true;
                 continue;
             }
 
@@ -228,17 +269,20 @@ public final class SyncEngine {
                 String[] etag2 = new String[1];
                 o.requests++;
                 byte[] again = dav.get(path, etag2);
-                long now2 = System.currentTimeMillis();   // 用新时间戳，否则条目偏旧在 LWW 里更易输
+                long now2 = TrustedClock.nowPhysical();   // 用新时间戳，否则条目偏旧在 LWW 里更易输
                 if (again != null && again.length > 0) {
                     SyncPayload r2 = decode(key, again, owner);
-                    boolean reset2 = (sc == SyncScope.HISTORY) && r2.epoch > st.lastEpoch;
+                    HlcClock.observe(r2.hlcMaxPhysical, r2.hlcMaxCounter);
+                    boolean reset2 = r2.epoch > epochBefore;
                     SyncPayload local2 = reset2
                             ? HistorySyncManager.emptyLocal(owner, deviceId, now2)
                             : HistorySyncManager.buildLocal(owner, deviceId, one, now2);
                     merged = SyncMerge.merge(local2, r2, deviceId, now2);
+                    HlcClock.observe(merged.hlcMaxPhysical, merged.hlcMaxCounter);
                     HistorySyncManager.checkGeneration(gen);
+                    HistorySyncManager.truncateMergedHistory(merged, one);
                     HistorySyncManager.truncateMergedProgress(merged, one);
-                    if (HistorySyncManager.applyLocal(merged, one)) localChanged = true;
+                    if (HistorySyncManager.applyLocal(merged, one, reset2)) localChanged = true;
                     out = Crypto.encrypt(key,
                             HistorySyncManager.GSON.toJson(merged.forScope(sc)).getBytes("UTF-8"));
                 }
@@ -251,19 +295,16 @@ public final class SyncEngine {
             }
             o.bytesUp += out.length;
             anyUploaded = true;
+            processedOk[sc.index] = true;
             LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length);
-        }
-
-        // ★ v99-r28：同步把云端数据写回本地后，立即按本机策略收敛一次
-        //   （清坏记录 → 同名去重 → 按档位裁剪）。
-        //   原来只有「用户看片写历史」才触发 pruneHistory，云端带回来的同名记录会一直躺着，
-        //   期间首页就会出现两张看起来重名的卡片（用户实测反馈）。
-        boolean pruned = false;
-        if (enabled.history) {
-            try {
-                pruned = com.github.tvbox.osc.cache.RoomDataManger.pruneHistory();
-            } catch (Throwable t) {
-                LOG.e("[Sync] prune after apply failed", t);
+            } catch (WebDavClient.AuthException ae) {
+                throw ae;
+            } catch (HistorySyncManager.SwitchAborted sa) {
+                throw sa;
+            } catch (Throwable perScope) {
+                // ★ 协议 v4：单个 scope 失败不再中止整轮；失败 scope 保持 dirty，下轮重试。
+                failedScopes.add(sc);
+                LOG.e("[Sync] scope failed " + sc + " (others continue)", perScope);
             }
         }
 
@@ -275,9 +316,24 @@ public final class SyncEngine {
             LOG.i("[Sync] notify history refresh changed=" + localChanged + " pruned=" + pruned);
         }
 
-        finish(st, now, dirtyBefore);
+        // ★ 协议 v4：只清「本轮真正处理成功且此前是脏的」scope 的 dirty；
+        //   失败/未启用的 scope 保持脏，下轮重试（旧实现会把它们一起清掉，导致丢更新）。
+        boolean[] toClear = new boolean[SyncScope.COUNT];
+        for (int i = 0; i < SyncScope.COUNT; i++) {
+            toClear[i] = dirtyBefore[i] && processedOk[i];
+        }
+        boolean allOk = failedScopes.isEmpty();
+        // ★ P0-3/P0-7：只有「设置 scope 启用且本轮确实同步成功」才清 pendingPull；
+        //   否则新设备首轮没学到账号档位（仍是默认 15），却会按 15 裁云端 50 条。
+        boolean settingsSynced = enabled.settings && processedOk[SyncScope.SETTINGS.index];
+        // ★ 只清「本轮真正上传成功」的那几类墓碑；未启用/失败的 scope 的墓碑必须保留。
+        boolean clearRecords = toClear[SyncScope.HISTORY.index];
+        boolean clearProgress = toClear[SyncScope.PROGRESS.index];
+        boolean clearCollects = toClear[SyncScope.COLLECT.index];
+        finish(st, now, toClear, clearRecords, clearProgress, clearCollects,
+                tombWatermark, settingsSynced);
 
-        o.ok = true;
+        o.ok = allOk;
         o.notModified = allNotModified;
         String tail = lastMerged == null ? "" :
                 "（历史 " + lastMerged.records.size() + " / 进度 " + lastMerged.progress.size()
@@ -285,8 +341,9 @@ public final class SyncEngine {
         // ★ v99-r14：修复过云端损坏文件时明确告知用户 —— 否则用户只会看到一次普通的
         //   「同步完成」，不会知道云端曾经坏过、以及自己的数据已被用来覆盖修复。
         String repairTip = repaired ? "（已修复损坏的云端数据文件）" : "";
-        o.message = allNotModified ? ("同步完成（无变更）" + repairTip)
-                : ("同步完成" + tail + repairTip);
+        String failTip = failedScopes.isEmpty() ? "" : "（部分范围同步失败，将自动重试：" + failedScopes + "）";
+        o.message = allNotModified ? ("同步完成（无变更）" + repairTip + failTip)
+                : ("同步完成" + tail + repairTip + failTip);
         LOG.i("[Sync] done owner=" + owner + " req=" + o.requests
                 + " down=" + o.bytesDown + " up=" + o.bytesUp + " uploaded=" + anyUploaded
                 + " repaired=" + repaired);
@@ -299,8 +356,9 @@ public final class SyncEngine {
      * <p>用户已确认「一次性切换」：迁移后不再读写 data.bin，旧版本 App 同步会拿不到数据
      * （所以要求所有设备同时升级）。</p>
      *
-     * <p>迁移过程幂等：中途失败下次会重来（PUT 是覆盖写），迁移成功才置 {@code splitMigrated}。
-     * <b>不删除 data.bin</b>：留作人工备份，靠标记位保证不再读取它。</p>
+     * <p>迁移过程幂等：中途失败下次会重来（{@code putIfAbsent} 只创建不存在的 split 文件，
+     * 已有云端版本会被完整保留）。迁移成功后才置 {@code splitMigrated}，
+     * 随后删除旧 {@code data.bin}，避免新装/清数据设备再次用它覆盖线上数据（P0-2）。</p>
      */
     private static void migrateLegacy(WebDavClient dav, SyncState st, byte[] key,
                                       String accountName, int gen, Outcome o) throws Exception {
@@ -330,10 +388,16 @@ public final class SyncEngine {
             byte[] out = Crypto.encrypt(key,
                     HistorySyncManager.GSON.toJson(part).getBytes("UTF-8"));
             o.requests++;
-            String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
-            String etM = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
-            if (etM != null) {
-                st.setEtag(sc, etM);
+            try {
+                // ★ 协议 v4：只有 split 文件不存在时才创建，绝不覆盖已有云端数据。
+                //   多台设备同时升级时，第一个创建者胜出，其余走正常合并。
+                String newEtag = dav.putIfAbsent(AccountPaths.scopeFile(accountName, sc), out);
+                String etM = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
+                if (etM != null) {
+                    st.setEtag(sc, etM);
+                }
+            } catch (WebDavClient.ConflictException exists) {
+                LOG.i("[Sync] split file already exists, keep cloud version: " + sc);
             }
         }
         st.splitMigrated = true;
@@ -341,6 +405,13 @@ public final class SyncEngine {
             st.lastEpoch = all.epoch;
         }
         st.save();
+        // ★ 迁移后删除旧 data.bin：否则新装/清数据设备（splitMigrated=false）会再次
+        //   读到陈旧整包并覆盖线上 split 文件（P0-2）。删除失败不影响迁移结果。
+        try {
+            dav.delete(AccountPaths.data(accountName));
+        } catch (Throwable ignore) {
+            LOG.i("[Sync] legacy data.bin cleanup skipped: " + ignore.getMessage());
+        }
         LOG.i("[Sync] migrated data.bin -> 4 scope files owner=" + st.owner
                 + " epoch=" + all.epoch);
     }
@@ -403,6 +474,12 @@ public final class SyncEngine {
                 p.deleted = new SyncPayload.Deleted();
             }
         }
+        // ★ 协议 v4：版本闸门。读到比本机更新的协议时拒绝写入，避免旧客户端
+        //   用自己理解的字段覆盖掉新客户端写入的 HLC / 删除信息（降级即丢数据）。
+        if (p.schema > SyncPayload.SCHEMA) {
+            throw new IOException("云端同步数据版本过新（schema=" + p.schema
+                    + "，本机支持 " + SyncPayload.SCHEMA + "），请升级 App 后再同步");
+        }
         return p;
     }
 
@@ -416,7 +493,8 @@ public final class SyncEngine {
     /**
      * 清空云端（整库重置）。**走与同步同一条路径**，不再自己拼一套 WebDAV 流程。
      *
-     * <p>语义：云端 4 个文件都写成「空 + epoch+1」，同时<b>清空本机</b>并更新本地 epoch。</p>
+     * <p>语义：云端的 <b>3 个数据文件</b>（history/progress/collect）写成「空 + epoch+1」，
+     * <b>settings 不在清空范围</b>（用户拍板）；同时清空本机三张数据表并更新本地 epoch。</p>
      *
      * <p><b>为什么必须清本机</b>：旧实现只清云端、并把 {@code lastEpoch} 更新成新值 ——
      * 结果是本机之后再也不会触发 reset（{@code remote.epoch > lastEpoch} 不成立），
@@ -426,7 +504,6 @@ public final class SyncEngine {
     public static Outcome clearCloud(String owner, byte[] key, int gen) {
         try {
             SyncState st = SyncState.load(owner);
-            SyncScopes scopes = SyncScopes.load();
             String deviceId = HistorySyncManager.deviceId();
             String accountName = AccountContext.displayName();
             if (!AccountPaths.isValidName(accountName)) {
@@ -456,9 +533,13 @@ public final class SyncEngine {
                 // 读不到就用本机记录，够用
             }
             final long epoch = base + 1;
-            final long now = System.currentTimeMillis();
+            final long now = TrustedClock.nowPhysical();
 
-            for (SyncScope sc : SyncScope.values()) {
+            // ★ 协议 v4：清空云端只清「数据」三个 scope；settings 不在清空范围内（用户拍板）。
+            SyncScope[] targets = new SyncScope[]{
+                    SyncScope.HISTORY, SyncScope.PROGRESS, SyncScope.COLLECT};
+            int okCount = 0;
+            for (SyncScope sc : targets) {
                 SyncPayload empty = new SyncPayload();
                 empty.owner = owner;
                 empty.epoch = epoch;
@@ -466,27 +547,47 @@ public final class SyncEngine {
                 empty.dev = deviceId;
                 byte[] out = Crypto.encrypt(key,
                         HistorySyncManager.GSON.toJson(empty.forScope(sc)).getBytes("UTF-8"));
-                String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
-                String etC = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
-                if (etC != null) {
-                    st.setEtag(sc, etC);
+                try {
+                    String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
+                    String etC = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
+                    if (etC != null) {
+                        st.setEtag(sc, etC);
+                    }
+                    okCount++;
+                } catch (Throwable t) {
+                    LOG.e("[Sync] clearCloud write failed scope=" + sc, t);
                 }
             }
+            if (okCount != targets.length) {
+                // 有文件没写成功：不清本机、不推进 epoch，避免半清空（下次重试）
+                return fail("清空失败：部分云端文件未能写入（" + okCount + "/" + targets.length + "）");
+            }
 
-            // 清本机：否则下次同步会把本机数据又合并上传，等于没清
-            HistorySyncManager.wipeLocal(scopes);
+            // 清本机：否则下次同步会把本机数据又合并上传，等于没清。
+            // ★ 清空范围=三个数据表（与云端一致），不依赖「scope 开关」，也不动 settings。
+            SyncScopes dataScopes = new SyncScopes();
+            dataScopes.history = true;
+            dataScopes.progress = true;
+            dataScopes.collect = true;
+            dataScopes.settings = false;
+            HistorySyncManager.wipeLocal(dataScopes);
             // ★ r169：本机三表已清空，主动通知界面刷新（首页最近观看 / 历史 / 收藏）。
             ConfigCenter.notifyHistoryRefresh();
+            // ★ 协议 v4：清空后旧删除墓碑已无意义，一并清掉（避免后续压制新数据）。
+            SyncTombstones.clear(now);
 
             st.lastEpoch = epoch;
             st.lastAt = now;
+            // 只清三个数据 scope 的脏标记；用户未上传的设置改动必须保留。
+            boolean settingsDirty = st.dirty[SyncScope.SETTINGS.index];
             st.clearDirty();
+            st.dirty[SyncScope.SETTINGS.index] = settingsDirty;
             st.clearFailure();
             st.save();
 
             Outcome r = new Outcome();
             r.ok = true;
-            r.requests = o.requests + SyncScope.COUNT;
+            r.requests = o.requests + targets.length;
             r.message = "已清空云端（其它设备下次同步会跟随清空）";
             LOG.i("[Sync] clearCloud done owner=" + owner + " epoch=" + epoch);
             return r;
@@ -560,7 +661,9 @@ public final class SyncEngine {
      * 这里改为：重新读最新状态 → 只清「本次同步开始前就已存在」的 scope →
      * 再把本次读到/写入的各 scope ETag 合进去 → 落盘。</p>
      */
-    private static void finish(SyncState st, long now, boolean[] dirtyBefore) {
+    private static void finish(SyncState st, long now, boolean[] dirtyBefore,
+                               boolean clearRecords, boolean clearProgress, boolean clearCollects,
+                               Hlc tombWatermark, boolean settingsSynced) {
         synchronized (SyncState.class) {
             SyncState cur = SyncState.load(st.owner);
             cur.lastAt = now;
@@ -585,7 +688,20 @@ public final class SyncEngine {
             cur.clearFailure();
             cur.save();
         }
-        SettingsProfile.setPendingPull(st.owner, false);
-        SyncTombstones.clear(now);
+        // ★ 协议 v4：只有「所有启用 scope 都成功」时才清墓碑；任一 scope 失败就保留，
+        //   否则该 scope 的删除墓碑会被清掉，重新启用后云端旧数据又"复活"。
+        // ★ 协议 v4：设置真正同步成功后才解除「只拉不推」；失败则保持，下轮继续以云端为准。
+        if (settingsSynced) {
+            SettingsProfile.setPendingPull(st.owner, false);
+        }
+        if (clearRecords || clearProgress || clearCollects) {
+            SyncTombstones.clear(tombWatermark, clearRecords, clearProgress, clearCollects);
+        }
+    }
+
+    /** ★ 协议 v4：设置先同步，其余 scope 随后 —— 保证 HISTORY 裁剪用的是账号级档位。 */
+    private static SyncScope[] orderedScopes() {
+        return new SyncScope[]{SyncScope.SETTINGS, SyncScope.HISTORY,
+                SyncScope.PROGRESS, SyncScope.COLLECT};
     }
 }

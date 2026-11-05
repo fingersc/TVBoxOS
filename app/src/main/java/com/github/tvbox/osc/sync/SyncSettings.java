@@ -109,8 +109,12 @@ public final class SyncSettings {
     }
 
     /**
-     * 与上次同步快照对比，找出本机改过的键并打上 now；
-     * 未变的键沿用快照里的时间（保持云端既有先后关系）。
+     * 与上次同步快照对比，找出本机改过的键并打上 HLC；未变的键沿用快照里的 HLC（保持云端既有先后关系）。
+     *
+     * <p>★ 协议 v4（P0-7）：设置项原来只带墙钟 {@code t}，时钟滞后的设备（模拟器）改设置后
+     * {@code t} 永远小于云端旧值 ⇒ <b>该次改动永久输掉</b>，用户会看到「改了又变回去」。
+     * 现在改用 HLC（物理时间 + 逻辑计数 + 设备 id），时钟偏差只影响物理分量，
+     * 逻辑分量仍能保证「后写者胜」。</p>
      */
     public static Map<String, SyncPayload.SettingValue> detectChanges(
             Map<String, SyncPayload.SettingValue> snapshot, long now) {
@@ -123,8 +127,18 @@ public final class SyncSettings {
             boolean changed = old == null
                     || !eq(old.v, cur.v)
                     || !eq(old.ty, cur.ty);
-            long t = changed ? now : old.t;
-            out.put(key, new SyncPayload.SettingValue(cur.v, cur.ty, t));
+            SyncPayload.SettingValue sv = new SyncPayload.SettingValue(cur.v, cur.ty, cur.t);
+            if (changed) {
+                Hlc h = HlcClock.next();
+                sv.t = h.physical;
+                sv.hlcPhysical = h.physical;
+                sv.hlcCounter = h.counter;
+            } else {
+                sv.t = old.t;
+                sv.hlcPhysical = old.hlcPhysical > 0 ? old.hlcPhysical : old.t;
+                sv.hlcCounter = old.hlcCounter;
+            }
+            out.put(key, sv);
         }
         return out;
     }
@@ -179,6 +193,8 @@ public final class SyncSettings {
                 item.put("v", v.v);
                 item.put("ty", v.ty);
                 item.put("t", v.t);
+                item.put("hp", v.hlcPhysical);
+                item.put("hc", v.hlcCounter);
                 o.put(e.getKey(), item);
             }
             Hawk.put(snapshotKey(), o.toString());
@@ -201,8 +217,11 @@ public final class SyncSettings {
                 if (item == null) {
                     continue;
                 }
+                long t = item.optLong("t", 0L);
+                long hp = item.optLong("hp", 0L);
+                int hc = item.optInt("hc", 0);
                 out.put(key, new SyncPayload.SettingValue(
-                        item.optString("v", ""), item.optString("ty", "s"), item.optLong("t", 0L)));
+                        item.optString("v", ""), item.optString("ty", "s"), t, hp, hc));
             }
         } catch (Throwable ignored) {
         }
