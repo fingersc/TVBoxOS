@@ -19,7 +19,7 @@ public class SyncPayload {
      * 用于跨设备时钟不可信时的确定性排序。读旧数据（schema 2/3）仍可反序列化，
      * 旧条目按 updateTime 合成 HLC。</p>
      */
-    public static final int SCHEMA = 4;
+    public static final int SCHEMA = 5;
 
     public int schema = SCHEMA;
     public String owner = "";

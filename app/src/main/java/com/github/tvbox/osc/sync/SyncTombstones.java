@@ -74,11 +74,13 @@ public final class SyncTombstones {
         add("r", SyncMerge.recordKey(sourceKey, vodId), hlc);
     }
 
+    /**
+     * v4.1：进度不做墓碑（单集删除只在本机生效；整片删除由历史墓碑隐含压制）。
+     * 保留方法仅为兼容旧调用，实际不登记任何内容。
+     */
+    @Deprecated
     public static void addProgress(String sourceKey, String vodId, String flag, int index, String epName) {
-        if (isSuppressed()) {
-            return;
-        }
-        add("p", SyncMerge.progressKey(sourceKey, vodId, flag, index, epName), HlcClock.next());
+        // no-op：v4.1 进度零墓碑
     }
 
     public static void addCollect(String sourceKey, String vodId) {
@@ -111,7 +113,7 @@ public final class SyncTombstones {
         try {
             JSONObject root = readRoot();
             fillList(root.optJSONObject("r"), payload.deleted.records);
-            fillList(root.optJSONObject("p"), payload.deleted.progress);
+            // v4.1：进度/设置不做墓碑
             fillList(root.optJSONObject("c"), payload.deleted.collects);
         } catch (Throwable ignored) {
         }
@@ -140,9 +142,8 @@ public final class SyncTombstones {
             out.put("r", doRecords
                     ? filterHlc(root.optJSONObject("r"), upTo)
                     : keepAll(root.optJSONObject("r")));
-            out.put("p", doProgress
-                    ? filterHlc(root.optJSONObject("p"), upTo)
-                    : keepAll(root.optJSONObject("p")));
+            // v4.1：进度墓碑已废弃，任何一次清理都顺带把历史遗留的 p 类清空
+            out.put("p", new JSONObject());
             out.put("c", doCollects
                     ? filterHlc(root.optJSONObject("c"), upTo)
                     : keepAll(root.optJSONObject("c")));

@@ -29,13 +29,20 @@ public final class SyncMerge {
     /**
      * 墓碑保留期（按 HLC 距离，而非本机墙钟）。
      *
-     * <p>已拍板：超过 180 天未同步的设备回归时，允许它持有的旧删除标记失效
-     * （否则墓碑要永久保留，云端体积与流量不可控）。</p>
+     * <p>v4.1 已拍板：墓碑 30 天过期；超过 30 天未同步的设备回归时，允许它持有的
+     * 旧删除标记失效（否则墓碑要永久保留，云端体积与流量不可控）。</p>
      */
-    public static final long TOMB_KEEP_MS = 180L * 24 * 3600 * 1000;
+    public static final long TOMB_KEEP_MS = 30L * 24 * 3600 * 1000;
 
-    /** 每类墓碑硬上限：超出按 HLC 新者优先丢弃，防止云端体积失控。 */
-    public static final int MAX_TOMB_PER_CLASS = 500;
+    /** 历史墓碑硬上限（每类 ≤64KB）。 */
+    public static final int MAX_TOMB_RECORDS = 200;
+
+    /** 收藏墓碑硬上限（每类 ≤64KB）。 */
+    public static final int MAX_TOMB_COLLECTS = 50;
+
+    /** 进度/设置不做墓碑（v4.1）。 */
+    public static final int MAX_TOMB_PROGRESS = 0;
+    public static final int MAX_TOMB_SETTINGS = 0;
 
     private SyncMerge() {
     }
@@ -97,27 +104,33 @@ public final class SyncMerge {
                 out.records.add(win);
             }
         }
-        out.deleted.records = prune(recordTombs, maxP, maxC);
+        out.deleted.records = prune(recordTombs, maxP, maxC, MAX_TOMB_RECORDS);
 
-        // ── 播放进度 ──
-        Map<String, SyncPayload.Tomb> progressTombs = tombMap(local.deleted.progress, remote.deleted.progress);
+        // ── 播放进度（v4.1：零进度墓碑）──
+        // 进度删除不单独传播：单集删除只在本机生效；整片删除由历史墓碑
+        // 隐含压制「同一 recordKey 且 HLC 不高于墓碑」的全部进度。
         Map<String, SyncPayload.ProgressItem> localProgress = indexProgress(local.progress);
         Map<String, SyncPayload.ProgressItem> remoteProgress = indexProgress(remote.progress);
+        // 兼容旧客户端：仍读取对端携带的进度墓碑（用于压制旧数据），但本端不再生成新进度墓碑。
+        Map<String, SyncPayload.Tomb> progressTombs = tombMap(local.deleted.progress, remote.deleted.progress);
         for (String key : union(localProgress.keySet(), remoteProgress.keySet())) {
             SyncPayload.ProgressItem a = localProgress.get(key);
             SyncPayload.ProgressItem b = remoteProgress.get(key);
-            SyncPayload.Tomb tomb = progressTombs.get(key);
-            if (suppressed(tomb, a) || suppressed(tomb, b)) {
-                if (tomb != null && !tombBeaten(tomb, a, b)) {
-                    continue;
-                }
+            SyncPayload.ProgressItem probe = a != null ? a : b;
+            SyncPayload.Tomb recordTomb = probe == null ? null
+                    : recordTombs.get(recordKey(probe.sourceKey, probe.vodId));
+            SyncPayload.Tomb progressTomb = progressTombs.get(key);
+            boolean aSuppressed = suppressed(recordTomb, a) || suppressed(progressTomb, a);
+            boolean bSuppressed = suppressed(recordTomb, b) || suppressed(progressTomb, b);
+            if (aSuppressed && bSuppressed) {
+                continue;
             }
-            SyncPayload.ProgressItem win = pickProgress(a, b);
+            SyncPayload.ProgressItem win = pickProgress(aSuppressed ? null : a, bSuppressed ? null : b);
             if (win != null) {
                 out.progress.add(win);
             }
         }
-        out.deleted.progress = prune(progressTombs, maxP, maxC);
+        out.deleted.progress = new ArrayList<>();
 
         // ── 收藏 ──
         Map<String, SyncPayload.Tomb> collectTombs = tombMap(local.deleted.collects, remote.deleted.collects);
@@ -137,30 +150,21 @@ public final class SyncMerge {
                 out.collects.add(win);
             }
         }
-        out.deleted.collects = prune(collectTombs, maxP, maxC);
+        out.deleted.collects = prune(collectTombs, maxP, maxC, MAX_TOMB_COLLECTS);
 
-        // ── 设置 ──
-        Map<String, SyncPayload.Tomb> settingTombs = tombMap(local.deleted.settings, remote.deleted.settings);
+        // ── 设置（v4.1：不做墓碑，最新值覆盖）──
         Map<String, SyncPayload.SettingValue> localSettings = local.settingsMap();
         Map<String, SyncPayload.SettingValue> remoteSettings = remote.settingsMap();
         Map<String, SyncPayload.SettingValue> mergedSettings = new LinkedHashMap<>();
         Set<String> settingKeys = union(localSettings.keySet(), remoteSettings.keySet());
         for (String key : settingKeys) {
-            SyncPayload.SettingValue a = localSettings.get(key);
-            SyncPayload.SettingValue b = remoteSettings.get(key);
-            SyncPayload.Tomb tomb = settingTombs.get(key);
-            if (suppressed(tomb, a) || suppressed(tomb, b)) {
-                if (tomb != null && !tombBeaten(tomb, a, b)) {
-                    continue;
-                }
-            }
-            SyncPayload.SettingValue win = pickSetting(a, b);
+            SyncPayload.SettingValue win = pickSetting(localSettings.get(key), remoteSettings.get(key));
             if (win != null) {
                 mergedSettings.put(key, win);
             }
         }
         out.setSettingsMap(mergedSettings);
-        out.deleted.settings = prune(settingTombs, maxP, maxC);
+        out.deleted.settings = new ArrayList<>();
 
         // 最终 hlcMax 覆盖所有输出条目与墓碑（写入方据此推进本地时钟）
         long[] mm = finalMax(out, maxP, maxC);
@@ -389,13 +393,13 @@ public final class SyncMerge {
     }
 
     /**
-     * 墓碑回收：按 HLC 距离保留 {@link #TOMB_KEEP_MS}，并限制每类最多 {@link #MAX_TOMB_PER_CLASS} 条。
-     *
-     * <p>用 HLC（可信时间）而不是本机墙钟，避免慢钟设备把有效墓碑判成过期、导致删除被云端回灌。</p>
+     * 墓碑回收：按 HLC 距离保留 {@link #TOMB_KEEP_MS}，并限制每类最多 {@code limit} 条
+     * （v4.1：历史 200、收藏 50、进度/设置 0）。用 HLC（可信时间）而非本机墙钟。
      */
-    private static List<SyncPayload.Tomb> prune(Map<String, SyncPayload.Tomb> map, long maxP, int maxC) {
+    private static List<SyncPayload.Tomb> prune(Map<String, SyncPayload.Tomb> map,
+                                                long maxP, int maxC, int limit) {
         List<SyncPayload.Tomb> out = new ArrayList<>();
-        if (map == null || map.isEmpty()) {
+        if (map == null || map.isEmpty() || limit <= 0) {
             return out;
         }
         long horizon = maxP - TOMB_KEEP_MS;
@@ -407,7 +411,7 @@ public final class SyncMerge {
                 out.add(t);
             }
         }
-        if (out.size() > MAX_TOMB_PER_CLASS) {
+        if (out.size() > limit) {
             Collections.sort(out, new Comparator<SyncPayload.Tomb>() {
                 @Override
                 public int compare(SyncPayload.Tomb a, SyncPayload.Tomb b) {
@@ -420,7 +424,7 @@ public final class SyncMerge {
                     return ka.compareTo(kb);
                 }
             });
-            return new ArrayList<>(out.subList(0, MAX_TOMB_PER_CLASS));
+            return new ArrayList<>(out.subList(0, limit));
         }
         return out;
     }

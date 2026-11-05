@@ -1374,6 +1374,16 @@ public class DetailActivity extends BaseActivity {
                             }
                             sameNameRestored = (vodInfoRecord != null);
                         }
+                        // ★ v4.1：播放状态以进度表最新一条为准（历史只存作品元数据）。
+                        if (vodInfoRecord != null) {
+                            com.github.tvbox.osc.cache.PlayProgress latestProgress =
+                                    PlayProgressManager.getLatest(vodInfoRecord.sourceKey, vodInfoRecord.id);
+                            if (latestProgress != null) {
+                                vodInfoRecord.playFlag = latestProgress.flag;
+                                vodInfoRecord.playIndex = latestProgress.playIndex;
+                                vodInfoRecord.playNote = latestProgress.epName;
+                            }
+                        }
                         // ★ v99-r78：同名 ≠ 同片 —— 恢复播放状态前必须过同片判据。
                         //   真机案例（2026-10-26「人世间」）：2022 正剧（李路/58集/剧情）与
                         //   2024 版（现代都市/82集·合集行）同名。点开 2024 版时本段按片名

@@ -66,9 +66,7 @@ public class PlayProgressManager {
             PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
             if (position <= 0) {
                 dao.delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
-                // ★ 协议 v4：显式清零也要写墓碑，否则云端旧进度会在下次同步被合并回来。
-                SyncTombstones.addProgress(sourceKey, vodId, flag, playIndex, epName);
-                // 删除必须标脏：否则别的设备永远不知道这一集被清除了
+                // v4.1：进度零墓碑；单集删除只在本机生效（整片删除由历史墓碑隐含）
                 HistorySyncManager.markDirty(SyncScope.PROGRESS);
                 return;
             }
@@ -284,12 +282,7 @@ public class PlayProgressManager {
                 dao.save(np);
                 moved++;
             }
-            // 4) 旧线路整体抛弃 + 登记墓碑（防止云端那份被 LWW 合并复活）
-            for (PlayProgress row : rows) {
-                if (row != null) {
-                    SyncTombstones.addProgress(sk, vid, ff, row.playIndex, row.epName);
-                }
-            }
+            // 4) 旧线路整体抛弃（v4.1：进度零墓碑；旧线路若仍在云端，读侧只认当前线路）
             dao.deleteByVodFlag(sk, vid, ff);
             // 5) 按「每片最多 N 条记录」裁剪一次（迁移来的这批时间戳最新，优先保留）
             trimByVod(sk, vid, keep);
@@ -313,10 +306,20 @@ public class PlayProgressManager {
         }
     }
 
+    /** ★ v4.1：取某片最新一条进度（用于历史列表/详情页恢复播放状态）。 */
+    public static PlayProgress getLatest(String sourceKey, String vodId) {
+        try {
+            return AppDataManager.get().getPlayProgressDao().getLatest(s(sourceKey), s(vodId));
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return null;
+        }
+    }
+
     public static void delete(String sourceKey, String vodId, String flag, int playIndex, String epName) {
         try {
             AppDataManager.get().getPlayProgressDao().delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
-            SyncTombstones.addProgress(sourceKey, vodId, flag, playIndex, epName);
+            // v4.1：进度零墓碑；删除只在本机生效（整片删除由历史墓碑隐含）
             HistorySyncManager.markDirty(SyncScope.PROGRESS);
         } catch (Throwable th) {
             th.printStackTrace();
@@ -418,14 +421,8 @@ public class PlayProgressManager {
             // ★ v99-r75：旧源该片的进度<b>整体清空</b> —— 这正是既有口径
             //   「同片只保留最新 10 集记录，并且都随着迁移到新源里去」：
             //   进度跟着"当前所在的源"走，旧源不留副本 ⇒ 同一部片不会在多个源各留一份。
-            // ★ v99-r77：删之前**逐行登记进度墓碑**，否则云端那份旧行会被 LWW 合并复活
-            //   （真机：旧源名下进度反复被扫出 9 行）。
-            for (PlayProgress row : rows) {
-                if (row != null) {
-                    SyncTombstones.addProgress(s(fromSourceKey), s(fromVodId),
-                            row.flag, row.playIndex, row.epName);
-                }
-            }
+            // v4.1：进度零墓碑，旧源行直接删除；若旧源历史记录已删除，云端旧进度由
+            //       历史墓碑隐含压制；否则旧线路只是读不到，不参与当前播放。
             dao.deleteByVod(s(fromSourceKey), s(fromVodId));
             HistorySyncManager.markDirty(SyncScope.PROGRESS);
             return moved;

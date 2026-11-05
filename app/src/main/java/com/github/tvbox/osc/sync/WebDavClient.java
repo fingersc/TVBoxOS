@@ -222,6 +222,67 @@ public final class WebDavClient {
         }
     }
 
+    /**
+     * ★ v4.1：一次 PROPFIND Depth:1 取目录下所有文件的 ETag（文件名 → ETag）。
+     *
+     * <p>用于抵消 sync.meta 的探测请求：原来一次同步要 dirExists(1) + 每个 scope
+     * PUT 后 recoverEtag 各一次 PROPFIND，改成开始时一次批量取、结束时一次批量刷新。
+     * 目录不存在返回 null；文件存在但服务端没给 ETag 时值为空串。
+     */
+    public java.util.Map<String, String> propfindDepth1(String path) throws IOException {
+        Request req = new Request.Builder()
+                .url(url(path))
+                .header("Authorization", auth)
+                .header("Depth", "1")
+                .method("PROPFIND", RequestBody.create(null, new byte[0]))
+                .build();
+        try (Response resp = exec(req)) {
+            checkAuth(resp);
+            if (resp.code() == 404) {
+                return null;
+            }
+            if (!resp.isSuccessful()) {
+                throw new IOException("探测目录失败：" + resp.code());
+            }
+            String body = resp.body() == null ? "" : resp.body().string();
+            java.util.Map<String, String> out = new java.util.HashMap<>();
+            java.util.regex.Pattern respPat = java.util.regex.Pattern.compile(
+                    "<[^>]*:?response\\b[^>]*>(.*?)</[^>]*:?response>",
+                    java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+            java.util.regex.Pattern hrefPat = java.util.regex.Pattern.compile(
+                    "<[^>]*:?href[^>]*>\\s*([^<]+?)\\s*</[^>]*:?href>",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+            java.util.regex.Matcher rm = respPat.matcher(body);
+            while (rm.find()) {
+                String block = rm.group(1);
+                java.util.regex.Matcher hm = hrefPat.matcher(block);
+                if (!hm.find()) {
+                    continue;
+                }
+                String href = hm.group(1).trim();
+                try {
+                    href = java.net.URLDecoder.decode(href, "UTF-8");
+                } catch (Throwable ignored) {
+                }
+                while (href.endsWith("/")) {
+                    href = href.substring(0, href.length() - 1);
+                }
+                int slash = href.lastIndexOf('/');
+                String name = slash >= 0 ? href.substring(slash + 1) : href;
+                if (name.isEmpty()) {
+                    continue;
+                }
+                String etag = "";
+                java.util.regex.Matcher em = ETAG_PATTERN.matcher(block);
+                if (em.find()) {
+                    etag = em.group(1).trim().replace("&quot;", "\"").replace("&apos;", "'");
+                }
+                out.put(name, etag);
+            }
+            return out;
+        }
+    }
+
     /** 读取文件；不存在返回 null。etagOut[0] 会带回 ETag（若有）。 */
     public byte[] get(String path, String[] etagOut) throws IOException {
         Request req = new Request.Builder()

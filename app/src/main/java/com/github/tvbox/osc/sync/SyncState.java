@@ -51,6 +51,17 @@ public final class SyncState {
      * 账号切换/清空缓存不会清这个标记 —— 它描述的是「云端格式是否已升级」。</p>
      */
     public boolean splitMigrated;
+    /**
+     * ★ v4.1：每个 scope 最近一次成功上传时的 HLC 水位。
+     * 启动时与 DB/云端实际最大 HLC 对账，若本机有更新的数据则补标脏，
+     * 避免「上次上传成功但 dirty 因异常路径没清」或「同步期间新写入被旧快照清掉」造成漏传。
+     */
+    public long[] pushedHlcPhysical = new long[4];
+    public int[] pushedHlcCounter = new int[4];
+    /** v4.1：sync.meta 的条件请求 ETag */
+    public String metaEtag;
+    /** v4.1：sync.meta 最近一次内容缓存（ETag 未变时避免重复下载） */
+    public String metaJson;
 
     public SyncState() {
     }
@@ -71,6 +82,12 @@ public final class SyncState {
                 // v99-r8：旧数据没有 etags 字段（Gson 给 null）或长度不符 ⇒ 重建
                 if (st.etags == null || st.etags.length != SyncScope.COUNT) {
                     st.etags = new String[SyncScope.COUNT];
+                }
+                if (st.pushedHlcPhysical == null || st.pushedHlcPhysical.length != 4) {
+                    st.pushedHlcPhysical = new long[4];
+                }
+                if (st.pushedHlcCounter == null || st.pushedHlcCounter.length != 4) {
+                    st.pushedHlcCounter = new int[4];
                 }
                 return st;
             }
@@ -98,6 +115,52 @@ public final class SyncState {
             etags = new String[SyncScope.COUNT];
         }
         etags[s.index] = (value == null || value.isEmpty()) ? null : value;
+    }
+
+    public Hlc pushedHlc(SyncScope s) {
+        if (s == null) {
+            return Hlc.ZERO;
+        }
+        ensurePushed();
+        return new Hlc(pushedHlcPhysical[s.index], pushedHlcCounter[s.index], "");
+    }
+
+    public void setPushedHlc(SyncScope s, Hlc h) {
+        if (s == null) {
+            return;
+        }
+        ensurePushed();
+        if (h == null) {
+            pushedHlcPhysical[s.index] = 0L;
+            pushedHlcCounter[s.index] = 0;
+            return;
+        }
+        pushMax(s.index, h.physical, h.counter);
+    }
+
+    public void bumpPushedHlc(SyncScope s, long physical, int counter) {
+        if (s == null) {
+            return;
+        }
+        ensurePushed();
+        pushMax(s.index, physical, counter);
+    }
+
+    private void pushMax(int idx, long physical, int counter) {
+        if (physical > pushedHlcPhysical[idx]
+                || (physical == pushedHlcPhysical[idx] && counter > pushedHlcCounter[idx])) {
+            pushedHlcPhysical[idx] = physical;
+            pushedHlcCounter[idx] = counter;
+        }
+    }
+
+    private void ensurePushed() {
+        if (pushedHlcPhysical == null || pushedHlcPhysical.length != 4) {
+            pushedHlcPhysical = new long[4];
+        }
+        if (pushedHlcCounter == null || pushedHlcCounter.length != 4) {
+            pushedHlcCounter = new int[4];
+        }
     }
 
     public void save() {

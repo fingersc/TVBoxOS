@@ -55,6 +55,11 @@ public final class AccountPaths {
         return normalize(name) + "/data.bin";
     }
 
+    /** v4.1：设备水位/清理屏障等元数据（单文件，变化少）。 */
+    public static String metaFile(String name) {
+        return normalize(name) + "/sync.meta";
+    }
+
     /**
      * ★ v99-r8：按 scope 分文件后的云端路径。
      *

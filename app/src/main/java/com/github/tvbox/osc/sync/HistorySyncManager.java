@@ -161,6 +161,7 @@ public final class HistorySyncManager {
         String migrateOwner = AccountContext.ownerKey();
         if (migrateOwner != null && migrateOwner.length() > 0) {
             SyncState.migrateLegacyKeys(migrateOwner);
+            reconcilePushedHlc(migrateOwner);
         }
         // v98 P2：冷启动那一次交给调度器（1.5 秒内必跑一次）；此后的周期轮询
         //         由调度器按自适应间隔接管，App 不再自己持有 30 分钟的定时器。
@@ -171,6 +172,53 @@ public final class HistorySyncManager {
     private static String key(String base) {
         String owner = AccountContext.ownerKey();
         return (owner == null || owner.length() == 0) ? base : base + "." + owner;
+    }
+
+    /**
+     * ★ v4.1：启动时用 DB 里的最大 HLC 对账「已推送水位」。
+     *
+     * <p>若本机数据 HLC 大于上次成功推送的 pushedHlc（进程被杀、上传失败、升级后首次运行），
+     * 说明有本地写入尚未上传；此时把对应 scope 标脏，保证下一次同步会带上这些数据。
+     * 没有这一步，dirty 布尔位可能在崩溃/重启后丢失，本机数据永远不再上传。</p>
+     */
+    private static void reconcilePushedHlc(String owner) {
+        try {
+            SyncState st = SyncState.load(owner);
+            com.github.tvbox.osc.data.AppDataBase db = com.github.tvbox.osc.data.AppDataManager.get();
+            boolean changed = false;
+            Long rp = db.getVodRecordDao().maxHlcPhysical();
+            Integer rc = db.getVodRecordDao().maxHlcCounter();
+            if (rp != null && rp > 0) {
+                Hlc pushed = st.pushedHlc(SyncScope.HISTORY);
+                if (rp > pushed.physical || (rp.longValue() == pushed.physical && (rc == null ? 0 : rc) > pushed.counter)) {
+                    st.markDirty(SyncScope.HISTORY);
+                    changed = true;
+                }
+            }
+            Long pp = db.getPlayProgressDao().maxHlcPhysical();
+            Integer pc = db.getPlayProgressDao().maxHlcCounter();
+            if (pp != null && pp > 0) {
+                Hlc pushed = st.pushedHlc(SyncScope.PROGRESS);
+                if (pp > pushed.physical || (pp.longValue() == pushed.physical && (pc == null ? 0 : pc) > pushed.counter)) {
+                    st.markDirty(SyncScope.PROGRESS);
+                    changed = true;
+                }
+            }
+            Long cp = db.getVodCollectDao().maxHlcPhysical();
+            Integer cc = db.getVodCollectDao().maxHlcCounter();
+            if (cp != null && cp > 0) {
+                Hlc pushed = st.pushedHlc(SyncScope.COLLECT);
+                if (cp > pushed.physical || (cp.longValue() == pushed.physical && (cc == null ? 0 : cc) > pushed.counter)) {
+                    st.markDirty(SyncScope.COLLECT);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                st.save();
+            }
+        } catch (Throwable t) {
+            LOG.e("[sync] reconcile pushedHlc failed", t);
+        }
     }
 
     /**

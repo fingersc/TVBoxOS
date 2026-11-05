@@ -36,6 +36,10 @@ public interface PlayProgressDao {
     @Query("select * from play_progress where sourceKey = :sourceKey and vodId = :vodId")
     java.util.List<PlayProgress> getByVod(String sourceKey, String vodId);
 
+    /** ★ v4.1：取某片最新一条进度（历史/进度解耦后，播放状态由进度表驱动）。 */
+    @Query("select * from play_progress where sourceKey = :sourceKey and vodId = :vodId order by hlcPhysical desc, hlcCounter desc, updateTime desc limit 1")
+    PlayProgress getLatest(String sourceKey, String vodId);
+
     /** 全量导出（同步用）。 */
     @Query("select * from play_progress order by hlcPhysical desc, hlcCounter desc")
     java.util.List<PlayProgress> getAllRows();

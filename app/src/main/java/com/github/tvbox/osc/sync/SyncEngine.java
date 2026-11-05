@@ -104,10 +104,19 @@ public final class SyncEngine {
                 Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
                 Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
 
-        // 2) 目录存在性（1 个小请求）
+        // 2) 目录存在性 + 一次性批量 ETag（v4.1：Depth:1 取代 dirExists，省后续 recoverEtag）
         o.requests++;
-        if (!dav.dirExists(dir)) {
+        java.util.Map<String, String> dirEntries = dav.propfindDepth1(dir);
+        if (dirEntries == null) {
             throw new IOException("账号目录不存在（可能被管理员删除）");
+        }
+        // 2.1) 读取 sync.meta（设备水位 / 30 天回归判定）
+        SyncMeta meta = loadMeta(dav, key, accountName, owner, o, st, dirEntries);
+        boolean staleDevice = meta.isStale(deviceId, now);
+        boolean downloadOnly = staleDevice && !forceUpload;
+        if (downloadOnly) {
+            LOG.i("[Sync] stale device " + deviceId + " (" + ((now - metaLastSeen(meta, deviceId)) / 86400000L)
+                    + "d) -> download only (no upload)");
         }
         // 3) profile 校验（v78 起有缓存，命中后 0 请求）
         AccountService.ensureProfile(dav, accountName, key);
@@ -150,6 +159,7 @@ public final class SyncEngine {
         Hlc tombWatermark = HlcClock.peek();
         boolean anyUploaded = false;
         boolean allNotModified = true;
+        boolean metaDirty = false;
         SyncPayload lastMerged = null;
         // ★ v99-r14：本次是否修复过损坏的云端文件（用于最终提示，见下方 message）
         boolean repaired = false;
@@ -234,16 +244,45 @@ public final class SyncEngine {
             // 5.3 合并 + 落库
             //     ★ P0-3：重置时用「空本地视图」，不物理删库 ——
             //     否则"删了本地但上传失败"会让数据凭空消失，且下次同步还会再删一次。
-            SyncPayload local = reset
+            SyncPayload local = (reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0))
                     ? HistorySyncManager.emptyLocal(owner, deviceId, now)
                     : HistorySyncManager.buildLocal(owner, deviceId, one, now);
+            // downloadOnly 也是“以云端覆盖本机”，必须让 applyLocal 用空本地视图重建，
+            // 否则事务内 fresh=buildLocal 会把本机旧行重新并回去，等下次不再 stale 时又上传污染云端。
+            boolean replaceLocal = reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0);
             SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
             HlcClock.observe(merged.hlcMaxPhysical, merged.hlcMaxCounter);
             HistorySyncManager.checkGeneration(gen);
             HistorySyncManager.truncateMergedHistory(merged, one);
             HistorySyncManager.truncateMergedProgress(merged, one);
-            if (HistorySyncManager.applyLocal(merged, one, reset)) localChanged = true;
+            if (HistorySyncManager.applyLocal(merged, one, replaceLocal)) localChanged = true;
             lastMerged = merged;
+
+            // ★ v4.1：记录本设备已看到的水位，并在「所有活跃设备都已看到」时回收墓碑。
+            //   保守条件：至少 2 台活跃设备 + 墓碑存在超过 24 小时（见 SyncMeta.dropSeenTombs）。
+            if (meta != null && meta.reliable) {
+                if (sc == SyncScope.HISTORY) {
+                    meta.markSeenRecords(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                } else if (sc == SyncScope.COLLECT) {
+                    meta.markSeenCollects(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                }
+                meta.dropSeenTombs(merged, now, 24L * 3600L * 1000L);
+                metaDirty = true;
+            }
+
+            // ★ v4.1：30 天未上线的设备「只下载、不上传」——把云端数据落到本机后直接结束该 scope，
+            //   避免长期离线设备的旧数据（尤其旧墓碑/旧删除）反过来污染云端。
+            if (downloadOnly && remoteBytes != null && remoteBytes.length > 0) {
+                if (etagOut[0] != null && etagOut[0].length() > 0) {
+                    st.setEtag(sc, etagOut[0]);
+                }
+                // 本机已与云端对齐到该水位（只是不上传），记下来避免下次启动被误判为「有未推送写入」。
+                st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                processedOk[sc.index] = true;
+                LOG.i("[Sync] download-only scope=" + sc + " applied " + merged.forScope(sc).records.size()
+                        + " records");
+                continue;
+            }
 
             // 5.4 与云端一致 ⇒ 跳过上传
             boolean same = remoteBytes != null && remoteBytes.length > 0
@@ -252,6 +291,8 @@ public final class SyncEngine {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     st.setEtag(sc, etagOut[0]);
                 }
+                // 云端已包含合并结果（内容一致），记录已推送水位，避免启动对账误判为未推送。
+                st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
                 processedOk[sc.index] = true;
                 continue;
             }
@@ -289,13 +330,16 @@ public final class SyncEngine {
                 o.requests++;
                 newEtag = dav.put(path, out, etag2[0]);
             }
-            String et = recoverEtag(dav, path, newEtag, o);
-            if (et != null) {
-                st.setEtag(sc, et);   // ★ r21：null 时保留旧值，绝不清空
+            // ★ v4.1：不再每 scope 单独 PROPFIND 补 ETag（省请求）；
+            //   循环结束后若发生过上传，用一次 Depth:1 批量刷新所有 scope 的 ETag。
+            if (newEtag != null && newEtag.length() > 0) {
+                st.setEtag(sc, newEtag);
             }
             o.bytesUp += out.length;
             anyUploaded = true;
             processedOk[sc.index] = true;
+            // ★ v4.1：记录本 scope 已成功推送的 HLC 水位，用于启动时判断「本机是否还有未推送的写入」。
+            st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
             LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length);
             } catch (WebDavClient.AuthException ae) {
                 throw ae;
@@ -306,6 +350,41 @@ public final class SyncEngine {
                 failedScopes.add(sc);
                 LOG.e("[Sync] scope failed " + sc + " (others continue)", perScope);
             }
+        }
+
+        // ★ v4.1：有上传时用一次 Depth:1 批量刷新所有 scope 的 ETag（取代逐 scope recoverEtag）。
+        if (anyUploaded) {
+            try {
+                o.requests++;
+                java.util.Map<String, String> after = dav.propfindDepth1(dir);
+                if (after != null) {
+                    for (SyncScope sc : orderedScopes()) {
+                        if (!enabled.isEnabled(sc)) {
+                            continue;
+                        }
+                        String full = AccountPaths.scopeFile(accountName, sc);
+                        int slash = full.lastIndexOf('/');
+                        String name = slash >= 0 ? full.substring(slash + 1) : full;
+                        String et = after.get(name);
+                        if (et != null && et.length() > 0) {
+                            st.setEtag(sc, et);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                LOG.e("[Sync] refresh etags failed (keep old)", t);
+            }
+        }
+
+        // ★ v4.1：更新设备水位（每 6 小时最多写一次 sync.meta，避免把 meta 变成写热点）。
+        try {
+            long oldSeen = metaLastSeen(meta, deviceId);
+            meta.touch(deviceId, now);
+            if (meta.reliable && (metaDirty || oldSeen <= 0L || now - oldSeen > 6L * 3600L * 1000L)) {
+                saveMeta(dav, key, accountName, owner, meta, o, st);
+            }
+        } catch (Throwable t) {
+            LOG.e("[Sync] save meta failed (ignored)", t);
         }
 
         // ★ r169：落库/裁剪真的改动了本机数据 ⇒ 主动通知界面刷新「最近观看 / 历史 / 收藏」。
@@ -348,6 +427,78 @@ public final class SyncEngine {
                 + " down=" + o.bytesDown + " up=" + o.bytesUp + " uploaded=" + anyUploaded
                 + " repaired=" + repaired);
         return o;
+    }
+
+    // ===================== v4.1：sync.meta（设备水位）=====================
+
+    /**
+     * 读取 sync.meta。任何失败（不存在/损坏/网络）都降级为「全新 meta」，绝不让 meta 阻断同步。
+     * 存在时用 {@link SyncState#metaEtag} 做条件请求，未变化时服务端返回 304、零下载。
+     */
+    private static SyncMeta loadMeta(WebDavClient dav, byte[] key, String accountName,
+                                     String owner, Outcome o, SyncState st,
+                                     java.util.Map<String, String> dirEntries) {
+        String path = AccountPaths.metaFile(accountName);
+        try {
+            // 目录清单里没有 sync.meta ⇒ 不存在，零请求返回空 meta（首次/老账号不会多一次 404）。
+            String remoteEtag = dirEntries == null ? null : dirEntries.get("sync.meta");
+            if (remoteEtag == null || remoteEtag.isEmpty()) {
+                return new SyncMeta(owner);
+            }
+            // ETag 未变 ⇒ 用本机缓存的正文，避免重复下载。
+            if (st.metaJson != null && st.metaJson.length() > 0
+                    && st.metaEtag != null && st.metaEtag.equals(remoteEtag)) {
+                SyncMeta cached = HistorySyncManager.GSON.fromJson(st.metaJson, SyncMeta.class);
+                if (cached != null) {
+                    cached.owner = owner;
+                    return cached;
+                }
+            }
+            String[] etagOut = new String[1];
+            o.requests++;
+            byte[] raw = dav.get(path, etagOut);
+            if (etagOut[0] != null) {
+                st.metaEtag = etagOut[0];
+            }
+            if (raw == null || raw.length == 0) {
+                return new SyncMeta(owner);
+            }
+            String json = new String(Crypto.decrypt(key, raw), "UTF-8");
+            st.metaJson = json;
+            SyncMeta m = HistorySyncManager.GSON.fromJson(json, SyncMeta.class);
+            if (m == null) {
+                m = new SyncMeta(owner);
+            }
+            m.owner = owner;
+            return m;
+        } catch (Throwable t) {
+            LOG.e("[Sync] load meta failed (use empty)", t);
+            SyncMeta bad = new SyncMeta(owner);
+            bad.reliable = false;
+            return bad;
+        }
+    }
+
+    private static void saveMeta(WebDavClient dav, byte[] key, String accountName,
+                                 String owner, SyncMeta meta, Outcome o, SyncState st) {
+        try {
+            byte[] out = Crypto.encrypt(key,
+                    HistorySyncManager.GSON.toJson(meta).getBytes("UTF-8"));
+            o.requests++;
+            String et = dav.put(AccountPaths.metaFile(accountName), out,
+                    (st.metaEtag == null || st.metaEtag.length() == 0) ? null : st.metaEtag);
+            if (et != null && et.length() > 0) {
+                st.metaEtag = et;
+            }
+            st.metaJson = HistorySyncManager.GSON.toJson(meta);
+        } catch (Throwable t) {
+            LOG.e("[Sync] save meta failed (ignored)", t);
+        }
+    }
+
+    private static long metaLastSeen(SyncMeta meta, String deviceId) {
+        SyncMeta.Device d = meta.device(deviceId);
+        return d == null ? 0L : d.lastSeenAt;
     }
 
     /**

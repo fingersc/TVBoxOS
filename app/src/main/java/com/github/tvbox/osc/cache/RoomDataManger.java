@@ -26,6 +26,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 
 import com.orhanobut.hawk.Hawk;
+import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -72,6 +73,25 @@ public class RoomDataManger {
         return VOD_INFO_GSON;
     }
 
+    /**
+     * 历史记录的「作品级内容」：剔除播放状态字段（playFlag/playIndex/playNote）。
+     * 用于判断历史是否真的发生变化 —— 同集继续播放只会改变进度，不应让 HISTORY 变脏。
+     */
+    private static String historyCore(String json) {
+        if (json == null || json.isEmpty()) {
+            return "";
+        }
+        try {
+            JSONObject o = new JSONObject(json);
+            o.remove("playFlag");
+            o.remove("playIndex");
+            o.remove("playNote");
+            return o.toString();
+        } catch (Throwable t) {
+            return json;
+        }
+    }
+
     public static void insertVodRecord(String sourceKey, VodInfo vodInfo) {
         VodRecordDao dao = AppDataManager.get().getVodRecordDao();
         // ★ v99-r49：同名合并恒开启（开关已删除），写入前一律收敛其它源的同名记录
@@ -97,7 +117,9 @@ public class RoomDataManger {
         //   否则「退出再进同一集」也会刷新 HLC → contentEquals 判为不同 → 每轮都整包上传历史。
         //   updateTime 仍按可信时间刷新，供首页「最近观看」排序（跨设备口径一致）。
         String newJson = getVodInfoGson().toJson(vodInfo);
-        boolean contentChanged = !newJson.equals(record.dataJson);
+        // ★ v4.1：历史/进度解耦 —— playFlag/playIndex/playNote 属于播放状态，由进度表驱动，
+        //   不再视为「历史内容变化」。否则每换一集都会标脏 HISTORY、推进历史 HLC、整包上传历史。
+        boolean contentChanged = !historyCore(newJson).equals(historyCore(record.dataJson));
         if (contentChanged || record.hlcPhysical <= 0) {
             Hlc h = HlcClock.next();
             record.hlcPhysical = h.physical;
@@ -460,6 +482,7 @@ public class RoomDataManger {
                         && TextUtils.equals(key, VodNameNormalizer.normalize(info.name))) {
                     info.sourceKey = record.sourceKey;
                     info.id = record.vodId;
+                    overlayLatestProgress(info);
                     return info;
                 }
             } catch (Exception ignored) { }
@@ -467,7 +490,23 @@ public class RoomDataManger {
         return null;
     }
     
-       /** 查询本源某影片记录的更新时间；无记录返回 0。 */
+       /** ★ v4.1：历史只存作品元数据，播放状态从进度表最新一条派生。 */
+    private static void overlayLatestProgress(VodInfo info) {
+        if (info == null) {
+            return;
+        }
+        try {
+            PlayProgress latest = PlayProgressManager.getLatest(info.sourceKey, info.id);
+            if (latest != null) {
+                info.playFlag = latest.flag;
+                info.playIndex = latest.playIndex;
+                info.playNote = latest.epName;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 查询本源某影片记录的更新时间；无记录返回 0。 */
     public static long getVodRecordUpdateTime(String sourceKey, String vodId) {
         VodRecord record = AppDataManager.get().getVodRecordDao().getVodRecord(sourceKey, vodId);
         return record == null ? 0 : record.updateTime;
@@ -513,6 +552,7 @@ public class RoomDataManger {
                     if (best == null || hlcOf(record).compareTo(hlcOf(best)) > 0) {
                         info.sourceKey = record.sourceKey;
                         info.id = record.vodId;
+                        overlayLatestProgress(info);
                         best = record;
                         // 保留解析出的 info；循环结束后返回最后选中的
                         bestInfo = info;
@@ -601,6 +641,14 @@ public class RoomDataManger {
                         //   会 NPE —— 虽被外层 catch 兜住，但每次刷新都抛一次异常刷屏。
                         if (info != null) {
                             info.sourceKey = record.sourceKey;
+                            // ★ v4.1：历史/进度解耦后，历史 dataJson 不再携带播放状态；
+                            //   列表/详情需要的 playFlag/playIndex/playNote 从进度表最新一条派生。
+                            PlayProgress latest = PlayProgressManager.getLatest(record.sourceKey, record.vodId);
+                            if (latest != null) {
+                                info.playFlag = latest.flag;
+                                info.playIndex = latest.playIndex;
+                                info.playNote = latest.epName;
+                            }
 //                        SourceBean sourceBean = ApiConfig.get().getSource(info.sourceKey);
                             if (info.name == null)
                                 info = null;
