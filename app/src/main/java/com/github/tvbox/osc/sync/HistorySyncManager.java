@@ -272,7 +272,7 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        SyncScheduler.request(owner(), "playback-exit");
+        SyncScheduler.requestWithin(owner(), "playback-exit", 0L);
     }
 
     /**

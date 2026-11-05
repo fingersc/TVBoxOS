@@ -178,6 +178,16 @@ public final class SyncEngine {
             SyncScopes one = SyncScopes.only(sc);
             boolean dirty = dirtyBefore[sc.index];
 
+            // v4.1.1: directory PROPFIND already gave every scope ETag.  If this
+            // scope is not dirty and its ETag is unchanged, skip the conditional
+            // GET entirely (one less round-trip per unchanged scope).
+            String knownEtag = dirEntries == null ? null : dirEntries.get(sc.fileName);
+            if (!dirty && knownEtag != null && knownEtag.length() > 0
+                    && knownEtag.equals(st.getEtag(sc))) {
+                processedOk[sc.index] = true;
+                continue;
+            }
+
             // 5.1 读云端：脏 ⇒ 完整 GET（合并上传都要内容）；不脏 ⇒ 条件 GET（304 省流量）
             boolean[] notModified = new boolean[1];
             String[] etagOut = new String[1];
