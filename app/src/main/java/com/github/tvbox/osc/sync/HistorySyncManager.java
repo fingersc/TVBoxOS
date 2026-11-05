@@ -797,7 +797,8 @@ public final class HistorySyncManager {
         merged.progress = SyncMerge.keepRecent(merged.progress, KEEP_PROGRESS_EPISODES);
     }
 
-    static void applyLocal(SyncPayload merged, SyncScopes scopes) {
+    static boolean applyLocal(SyncPayload merged, SyncScopes scopes) {
+        boolean changed = false;
         SyncTombstones.suppress(true);
         try {
             AppDataManager.get();
@@ -810,13 +811,62 @@ public final class HistorySyncManager {
             final Map<String, String> localFullJson = new java.util.HashMap<>();
             if (scopes.history) {
                 List<VodRecord> olds = AppDataManager.get().getVodRecordDao().getAll(Integer.MAX_VALUE);
+                Map<String, String> oldSig = new java.util.HashMap<>();
                 if (olds != null) {
                     for (VodRecord r : olds) {
-                        if (r != null && r.dataJson != null && r.dataJson.length() > 0) {
+                        if (r == null) continue;
+                        oldSig.put(SyncMerge.recordKey(r.sourceKey, r.vodId), String.valueOf(r.updateTime));
+                        if (r.dataJson != null && r.dataJson.length() > 0) {
                             localFullJson.put(SyncMerge.recordKey(r.sourceKey, r.vodId), r.dataJson);
                         }
                     }
                 }
+                // ★ r169：对比「本机旧数据」与「即将写入的合并结果」，判断本次落库是否真的改变了历史。
+                //   仅用于决定「要不要通知界面刷新」，不影响写入本身；按 (key,updateTime) 比较，
+                //   LWW 语义下内容变更必伴随 updateTime 前进，足以判定。
+                Map<String, String> newSig = new java.util.HashMap<>();
+                if (merged.records != null) {
+                    for (SyncPayload.RecordItem it : merged.records) {
+                        newSig.put(SyncMerge.recordKey(it.sourceKey, it.vodId), String.valueOf(it.updateTime));
+                    }
+                }
+                changed = !newSig.equals(oldSig);
+            }
+            if (scopes.progress) {
+                Map<String, String> oldSig = new java.util.HashMap<>();
+                List<PlayProgress> olds = AppDataManager.get().getPlayProgressDao().getAllRows();
+                if (olds != null) {
+                    for (PlayProgress p : olds) {
+                        if (p == null) continue;
+                        oldSig.put(SyncMerge.progressKey(p.sourceKey, p.vodId, p.flag, p.playIndex, p.epName),
+                                p.updateTime + "@" + p.position);
+                    }
+                }
+                Map<String, String> newSig = new java.util.HashMap<>();
+                if (merged.progress != null) {
+                    for (SyncPayload.ProgressItem it : merged.progress) {
+                        newSig.put(SyncMerge.progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName),
+                                it.updateTime + "@" + it.position);
+                    }
+                }
+                if (!newSig.equals(oldSig)) changed = true;
+            }
+            if (scopes.collect) {
+                Map<String, String> oldSig = new java.util.HashMap<>();
+                List<VodCollect> olds = AppDataManager.get().getVodCollectDao().getAll();
+                if (olds != null) {
+                    for (VodCollect c : olds) {
+                        if (c == null) continue;
+                        oldSig.put(SyncMerge.recordKey(c.sourceKey, c.vodId), String.valueOf(c.updateTime));
+                    }
+                }
+                Map<String, String> newSig = new java.util.HashMap<>();
+                if (merged.collects != null) {
+                    for (SyncPayload.CollectItem it : merged.collects) {
+                        newSig.put(SyncMerge.recordKey(it.sourceKey, it.vodId), String.valueOf(it.updateTime));
+                    }
+                }
+                if (!newSig.equals(oldSig)) changed = true;
             }
             // v98 P1：三张表放进同一个 Room 事务 —— 失败即整体回滚，不再留下"半套数据"
             AppDataManager.get().runInTransaction(() -> {
@@ -875,6 +925,7 @@ public final class HistorySyncManager {
         } finally {
             SyncTombstones.suppress(false);
         }
+        return changed;
     }
 
     /**

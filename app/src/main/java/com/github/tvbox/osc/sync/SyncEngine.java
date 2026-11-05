@@ -123,6 +123,8 @@ public final class SyncEngine {
         SyncPayload lastMerged = null;
         // ★ v99-r14：本次是否修复过损坏的云端文件（用于最终提示，见下方 message）
         boolean repaired = false;
+        // ★ r169：本次同步是否真的改动了本机数据（用于落库后通知界面刷新历史/收藏）
+        boolean localChanged = false;
 
         for (SyncScope sc : SyncScope.values()) {
             if (!enabled.isEnabled(sc)) {
@@ -200,7 +202,7 @@ public final class SyncEngine {
             HistorySyncManager.checkGeneration(gen);
             HistorySyncManager.truncateMergedHistory(merged, one);
             HistorySyncManager.truncateMergedProgress(merged, one);
-            HistorySyncManager.applyLocal(merged, one);
+            if (HistorySyncManager.applyLocal(merged, one)) localChanged = true;
             lastMerged = merged;
 
             // 5.4 与云端一致 ⇒ 跳过上传
@@ -236,7 +238,7 @@ public final class SyncEngine {
                     merged = SyncMerge.merge(local2, r2, deviceId, now2);
                     HistorySyncManager.checkGeneration(gen);
                     HistorySyncManager.truncateMergedProgress(merged, one);
-                    HistorySyncManager.applyLocal(merged, one);
+                    if (HistorySyncManager.applyLocal(merged, one)) localChanged = true;
                     out = Crypto.encrypt(key,
                             HistorySyncManager.GSON.toJson(merged.forScope(sc)).getBytes("UTF-8"));
                 }
@@ -256,12 +258,21 @@ public final class SyncEngine {
         //   （清坏记录 → 同名去重 → 按档位裁剪）。
         //   原来只有「用户看片写历史」才触发 pruneHistory，云端带回来的同名记录会一直躺着，
         //   期间首页就会出现两张看起来重名的卡片（用户实测反馈）。
+        boolean pruned = false;
         if (enabled.history) {
             try {
-                com.github.tvbox.osc.cache.RoomDataManger.pruneHistory();
+                pruned = com.github.tvbox.osc.cache.RoomDataManger.pruneHistory();
             } catch (Throwable t) {
                 LOG.e("[Sync] prune after apply failed", t);
             }
+        }
+
+        // ★ r169：落库/裁剪真的改动了本机数据 ⇒ 主动通知界面刷新「最近观看 / 历史 / 收藏」。
+        //   原来同步把云端新记录写回本机 DB 后不发任何事件，首页行只能等下一次
+        //   onFragmentResume / 配置重载才更新，表现为「退出电视后手机打开要过好几秒才出现」。
+        if (localChanged || pruned) {
+            ConfigCenter.notifyHistoryRefresh();
+            LOG.i("[Sync] notify history refresh changed=" + localChanged + " pruned=" + pruned);
         }
 
         finish(st, now, dirtyBefore);
@@ -464,6 +475,8 @@ public final class SyncEngine {
 
             // 清本机：否则下次同步会把本机数据又合并上传，等于没清
             HistorySyncManager.wipeLocal(scopes);
+            // ★ r169：本机三表已清空，主动通知界面刷新（首页最近观看 / 历史 / 收藏）。
+            ConfigCenter.notifyHistoryRefresh();
 
             st.lastEpoch = epoch;
             st.lastAt = now;

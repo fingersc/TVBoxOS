@@ -111,11 +111,11 @@ public class RoomDataManger {
     }
 
     /** 按「保留历史记录数量」裁剪本机历史（按 updateTime 倒序，保留最新 N 条）。 */
-    public static void pruneHistory() {
+    public static boolean pruneHistory() {
         try {
             int keep = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
             if (keep <= 0) {
-                return;
+                return false;
             }
             VodRecordDao dao = AppDataManager.get().getVodRecordDao();
             // ★ v99-r50：把"清坏行 + 同名收敛"收敛成唯一出口 compactHistory()，
@@ -133,7 +133,9 @@ public class RoomDataManger {
             if (changed) {
                 HistorySyncManager.markDirty(SyncScope.HISTORY);
             }
+            return changed;
         } catch (Throwable ignored) {
+            return false;
         }
     }
 

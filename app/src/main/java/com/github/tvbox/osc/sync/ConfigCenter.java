@@ -329,4 +329,16 @@ public final class ConfigCenter {
         h.removeCallbacks(FLUSH_TASK);
         h.postDelayed(FLUSH_TASK, delay);
     }
+
+    /**
+     * ★ r169：供同步层在「数据落库确实改变了本机内容」后主动通知界面刷新。
+     *
+     * <p>区别于配置变更路径（{@link #execute} 里只有历史档位变化才发同一事件）：
+     * 这里用于「云端拉回了新记录 / 进度 / 收藏」这一数据面变化。</p>
+     * <p>可从同步后台线程调用：三个订阅者均为 ThreadMode.MAIN，EventBus 会自动切回主线程；
+     * 对应 Fragment 未注册/不可见时自然 no-op（由 onFragmentResume 兜底）。</p>
+     */
+    public static void notifyHistoryRefresh() {
+        EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_HISTORY_REFRESH));
+    }
 }
