@@ -353,14 +353,15 @@ public final class SyncEngine {
                 LOG.i("[Sync] skip same scope=" + sc + " bytes=" + remoteBytes.length);
                 continue;
             }
-            // ★ v4.2.3-diag：没跳过就说明「内容不同」或「水位更高」。分别标记原因并给出差异摘要，
-            //   一次真机即可定位是 contentEquals 判不等（含异常被吞）还是水位守卫拦下。
+            // ★ v4.2.4：没跳过时留一行轻量日志（只报原因与计数，不打印包内容，避免每轮大字符串开销）。
             if (remoteBytes != null && remoteBytes.length > 0) {
                 LOG.i("[Sync] same-miss scope=" + sc
                         + " content=" + contentSame
                         + " water=" + (contentSame ? String.valueOf(waterOk) : "-")
                         + " force=" + forceUpload
-                        + " " + HistorySyncManager.diffSummary(merged, remote));
+                        + " recs=" + (merged.records == null ? 0 : merged.records.size())
+                        + "/" + (remote.records == null ? 0 : remote.records.size())
+                        + " hlc=" + merged.hlcMaxPhysical + "/" + remote.hlcMaxPhysical);
             }
 
             // 5.5 上传（只传这一个 scope；If-Match 防并发覆盖）

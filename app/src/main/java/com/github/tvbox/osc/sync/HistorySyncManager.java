@@ -966,44 +966,6 @@ public final class HistorySyncManager {
     }
 
     /**
-     * ★ v4.2.3-diag：判「不同」时给一条可定位的差异摘要（不参与任何判定逻辑）。
-     *
-     * <p>做法是把两份包各自转成规范 JSON 字符串，报告长度与<b>首个不同字符的下标</b>，
-     * 再摘取该处前后一小段原文。一次真机就能看出到底是 {@code epoch}、某条记录的
-     * {@code dev/hlc/updateTime}、还是 {@code dataJson} 内容不同。</p>
-     */
-    static String diffSummary(SyncPayload a, SyncPayload b) {
-        try {
-            String ja = GSON.toJson(canonicalForCompare(a));
-            String jb = GSON.toJson(canonicalForCompare(b));
-            int n = Math.min(ja.length(), jb.length());
-            int i = 0;
-            while (i < n && ja.charAt(i) == jb.charAt(i)) {
-                i++;
-            }
-            int s = Math.max(0, i - 50);
-            int ea = Math.min(ja.length(), i + 90);
-            int eb = Math.min(jb.length(), i + 90);
-            return "len=" + ja.length() + "/" + jb.length()
-                    + " firstDiff=" + i
-                    + " recs=" + sz(a.records) + "/" + sz(b.records)
-                    + " prog=" + sz(a.progress) + "/" + sz(b.progress)
-                    + " epoch=" + a.epoch + "/" + b.epoch
-                    + " hlcMax=" + a.hlcMaxPhysical + "." + a.hlcMaxCounter
-                    + "/" + b.hlcMaxPhysical + "." + b.hlcMaxCounter
-                    + " owner=" + a.owner + "/" + b.owner
-                    + " A[" + ja.substring(s, ea) + "]"
-                    + " B[" + jb.substring(s, eb) + "]";
-        } catch (Throwable t) {
-            return "diffSummary failed: " + t;
-        }
-    }
-
-    private static int sz(java.util.List<?> l) {
-        return l == null ? 0 : l.size();
-    }
-
-    /**
      * 生成「用于比较」的副本：列表按规范顺序排序 + 顶层元数据归一化，<b>不修改入参</b>。
      *
      * <p>★ v4.2.3：旧实现直接改 {@code a}/{@code b} 的字段再还原，GSON 抛异常（如 OOM）时

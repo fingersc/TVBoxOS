@@ -311,7 +311,21 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
+        int cmp = a.hlc().compareTo(b.hlc());
+        if (cmp != 0) {
+            return cmp > 0 ? a : b;
+        }
+        // ★ v4.2.4：HLC 完全相同的「同一版本」两条记录，updateTime 仍可能不同 ——
+        //   addVodRecord 在「内容没变、只是又看了一次」时只抬 updateTime、不抬 HLC。
+        //   旧实现 `return a`（本端）⇒ 两台设备各留各的 updateTime ⇒ contentEquals 恒判「不同」
+        //   ⇒ 每轮整包重传；而且后写的一方会把对方更新的「最近观看」时间覆盖成旧的。
+        //   这里按 (updateTime, dataJson) 取确定的最大者：两端可交换、可收敛，也不回退观看顺序。
+        if (a.updateTime != b.updateTime) {
+            return a.updateTime > b.updateTime ? a : b;
+        }
+        String aj = a.dataJson == null ? "" : a.dataJson;
+        String bj = b.dataJson == null ? "" : b.dataJson;
+        return aj.compareTo(bj) >= 0 ? a : b;
     }
 
     private static SyncPayload.ProgressItem pickProgress(SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
@@ -321,7 +335,21 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
+        int cmp = a.hlc().compareTo(b.hlc());
+        if (cmp != 0) {
+            return cmp > 0 ? a : b;
+        }
+        // ★ v4.2.4：HLC 相同（同一版本）时按 (position, dateTime, epName) 取确定的最大者，
+        //   避免「同一集的两端进度相同 HLC、只有 updateTime 不同」导致的每轮重传。
+        if (a.position != b.position) {
+            return a.position > b.position ? a : b;
+        }
+        if (a.updateTime != b.updateTime) {
+            return a.updateTime > b.updateTime ? a : b;
+        }
+        String ae = a.epName == null ? "" : a.epName;
+        String be = b.epName == null ? "" : b.epName;
+        return ae.compareTo(be) >= 0 ? a : b;
     }
 
     private static SyncPayload.CollectItem pickCollect(SyncPayload.CollectItem a, SyncPayload.CollectItem b) {
@@ -331,7 +359,23 @@ public final class SyncMerge {
         if (b == null) {
             return a;
         }
-        return a.hlc().compareTo(b.hlc()) >= 0 ? a : b;
+        int cmp = a.hlc().compareTo(b.hlc());
+        if (cmp != 0) {
+            return cmp > 0 ? a : b;
+        }
+        // ★ v4.2.4：HLC 相同时按 (updateTime, name, pic) 取确定的最大者，保证可交换、可收敛。
+        if (a.updateTime != b.updateTime) {
+            return a.updateTime > b.updateTime ? a : b;
+        }
+        String an = a.name == null ? "" : a.name;
+        String bn = b.name == null ? "" : b.name;
+        int nc = an.compareTo(bn);
+        if (nc != 0) {
+            return nc > 0 ? a : b;
+        }
+        String ap = a.pic == null ? "" : a.pic;
+        String bp = b.pic == null ? "" : b.pic;
+        return ap.compareTo(bp) >= 0 ? a : b;
     }
 
     private static SyncPayload.SettingValue pickSetting(SyncPayload.SettingValue a, SyncPayload.SettingValue b) {
