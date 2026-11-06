@@ -209,6 +209,17 @@ public final class SyncScheduler {
             } catch (Throwable t) {
                 LOG.e("[sync] retry check failed", t);
             }
+            // v4.1.4：本机不脏但被 min-gap 挡掉的拉取，也要在 min-gap 到期时补一次。
+            // 否则 boot / 回前台正好落在 min-gap 内，会直接退到 5 分钟 idle 档，
+            // 另一台设备这期间的改动要等最多 5 分钟才看到。
+            if (retryCapMs >= 0) {
+                long wait = Math.min(retryCapMs, DIRTY_DEBOUNCE_MS);
+                if (wait < 1000L) {
+                    wait = 1000L;
+                }
+                schedule(owner, "retry-pull", PRI_IDLE, wait, null);
+                return;
+            }
         }
         armIdle(owner);
     }
