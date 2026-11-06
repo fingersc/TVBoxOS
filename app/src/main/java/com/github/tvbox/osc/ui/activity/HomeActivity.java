@@ -792,7 +792,7 @@ public class HomeActivity extends BaseActivity {
                             && retries[0] < 1
                             && System.currentTimeMillis() < hardDeadline) {
                         retries[0]++;
-                        HistorySyncManager.syncNow(null);
+                        HistorySyncManager.syncNowQuiet(null);
                         handler.postDelayed(waitKill[0], 100L);
                         return;
                     }
@@ -822,7 +822,7 @@ public class HomeActivity extends BaseActivity {
             }
         };
         handler.postDelayed(timeout, 2500L);
-        HistorySyncManager.syncNow(new HistorySyncManager.Callback() {
+        HistorySyncManager.syncNowQuiet(new HistorySyncManager.Callback() {
             @Override
             public void onDone(boolean ok, String message) {
                 if (done[0]) {
@@ -835,7 +835,7 @@ public class HomeActivity extends BaseActivity {
                             && retries[0] < 1
                             && System.currentTimeMillis() < hardDeadline) {
                         retries[0]++;
-                        HistorySyncManager.syncNow(this);
+                        HistorySyncManager.syncNowQuiet(this);
                         return;
                     }
                     done[0] = true;

@@ -194,6 +194,22 @@ public class RoomDataManger {
             if (record == null) {
                 return false;
             }
+            // ★ v4.2.5：已经在第一位就不再抬时间。
+            //
+            //   「最近观看」的排序键是 updateTime（getAll 是 order by updateTime desc），
+            //   已经是最大值时把它再抬一次**不改变任何顺序**，却会让 history.bin 的内容变掉
+            //   ⇒ 每次退出播放都白传一整包（实测 7.8KB / 2 请求）。而只要本地写了它，
+            //   后面任意一轮同步合并都会发现差异并上传，省不掉，只会推迟。
+            //
+            //   边界：单设备重看榜首零风险；双设备仅在「另一台在本次同步之后写过、且本机在
+            //   拉到之前又重看了本来第一的那部」这个窄窗口内顺序晚一拍 —— 不丢数据、
+            //   两台设备仍收敛，下次再看该片自然顶回去。
+            Long maxUpdateTime = dao.maxUpdateTime();
+            if (maxUpdateTime != null && record.updateTime >= maxUpdateTime) {
+                LOG.i("history touch skip (already newest) sourceKey=" + sourceKey
+                        + " vodId=" + vodId + " updateTime=" + record.updateTime);
+                return false;
+            }
             Hlc h = HlcClock.next();
             long updateTime = Math.max(TrustedClock.nowPhysical(), h.physical);
             String dev = TextUtils.isEmpty(record.dev) ? HistorySyncManager.deviceId() : record.dev;

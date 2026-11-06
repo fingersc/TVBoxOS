@@ -29,6 +29,15 @@ public interface VodRecordDao {
     @Query("select hlcCounter from vodRecord order by hlcPhysical desc, hlcCounter desc limit 1")
     Integer maxHlcCounter();
 
+    /**
+     * ★ v4.2.5：全表最大的可信更新时间（「最近观看」的排序键）。
+     *
+     * <p>用于判断「这条记录是不是已经排在第一位」—— 已经是第一位时再抬时间不会改变
+     * 任何顺序，只会让 history.bin 变掉、白传一次。</p>
+     */
+    @Query("select max(updateTime) from vodRecord")
+    Long maxUpdateTime();
+
     @Query("select * from vodRecord where `sourceKey`=:sourceKey and `vodId`=:vodId")
     VodRecord getVodRecord(String sourceKey, String vodId);
 

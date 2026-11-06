@@ -326,12 +326,26 @@ public final class HistorySyncManager {
         return !AccountContext.isGuest() && isDirty() && hasConfig();
     }
 
-    /** 退出播放页（进度刚落盘）：有改动就交给调度器（防抖窗口内必跑一次）。 */
+    /**
+     * ★ v4.2.5：退出播放页时的「合并窗口」。
+     *
+     * <p>一次退出会连着重几笔：{@code onPause} 落进度（脏 PROGRESS）→ {@code onStop}
+     * 标脏 HISTORY → {@code onDestroyView} 再落一次进度。若第一笔就 0ms 起跑，
+     * 后两笔只能等下一轮 ⇒ 同一次退出被拆成两轮同步（一轮进度、一轮历史），
+     * 各付一次 PROPFIND + 完整 GET，看起来就是「同步了两次」。</p>
+     *
+     * <p>推迟 {@code 300ms} 让三笔都落到开跑之前，一轮带两个 scope 走。
+     * 300ms 在退出路径的 2.5s 预算内（{@code HomeActivity.exitWithSync}），
+     * 也不会把「进后台补传」推得太晚。</p>
+     */
+    static final long SETTLE_MS = 300L;
+
+    /** 退出播放页（进度刚落盘）：有改动就交给调度器（合并窗口后必跑一次）。 */
     public static void onPlaybackExit() {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        SyncScheduler.requestWithin(owner(), "playback-exit", 0L);
+        SyncScheduler.requestWithin(owner(), "playback-exit", SETTLE_MS);
     }
 
     /**
@@ -393,12 +407,12 @@ public final class HistorySyncManager {
         }
     }
 
-    /** 进后台：有改动就尽快补一次（不保证完成）；纯轮询任务由调度器取消。 */
+    /** 进后台：有改动就在合并窗口后补一次（不保证完成）；纯轮询任务由调度器取消。 */
     public static void onBackground() {
         if (AccountContext.isGuest() || !isDirty()) {
             return;
         }
-        SyncScheduler.requestWithin(owner(), SyncScheduler.REASON_BG, 0L);
+        SyncScheduler.requestWithin(owner(), SyncScheduler.REASON_BG, SETTLE_MS);
     }
 
     public static boolean isSyncing() {
@@ -459,6 +473,24 @@ public final class HistorySyncManager {
             return;
         }
         SyncScheduler.requestNow(owner(), "manual", true, cb);
+    }
+
+    /**
+     * ★ v4.2.5：退出 App 前的同步 —— 立即执行，但<b>不强制上传</b>（{@code force=false}）。
+     *
+     * <p>退出时该跑就跑，但「跑一次」不等于「必须写一次云端」：内容与云端一致时跳过 PUT
+     * 才是对的（见 {@code SyncEngine} 的 same 分支）。真正的兜底不是强推，而是
+     * dirty 标记 + 下次启动的 {@code reconcilePushedHlc}：只要本次没传成，下次一定会补。</p>
+     *
+     * <p>「立即同步」按钮仍走 {@link #syncNow(Callback)}（force=true）—— 那是用户
+     * 明确要求「别管变没变，跑一遍」的语义。</p>
+     */
+    public static void syncNowQuiet(Callback cb) {
+        if (AccountContext.isGuest() || !hasConfig()) {
+            sync(true, false, false, cb);
+            return;
+        }
+        SyncScheduler.requestNow(owner(), "exit", false, cb);
     }
 
     // ---------------------------------------------------------------- 主流程

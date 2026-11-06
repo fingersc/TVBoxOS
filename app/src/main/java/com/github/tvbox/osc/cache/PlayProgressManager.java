@@ -70,6 +70,17 @@ public class PlayProgressManager {
                 HistorySyncManager.markDirty(SyncScope.PROGRESS);
                 return;
             }
+            // ★ v4.2.5：位置没变就不是「新事件」—— 不生成新 HLC、不落库、不 trim、不标脏。
+            //
+            //   一次退出会连着重好几笔：onPause 落一次、onStop 落一次、
+            //   onDestroyView 的 saveCurrentProgressNow()/onPlaybackExit()/release() 再落几笔。
+            //   旧实现每笔都 HlcClock.next() 并覆盖 updateTime/hlcPhysical ⇒ 位置一个字节没变
+            //   也造出一个新版本：云端多一份 progress.bin（实测 14KB），而且「第一轮已传、第二轮
+            //   还传」的现象就是这么来的。位置相同 ⇒ 内容相同 ⇒ 没有任何需要传播的东西。
+            PlayProgress prev = dao.get(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+            if (prev != null && prev.hlcPhysical > 0 && prev.position == position) {
+                return;
+            }
             PlayProgress p = new PlayProgress();
             p.sourceKey = s(sourceKey);
             p.vodId = s(vodId);
