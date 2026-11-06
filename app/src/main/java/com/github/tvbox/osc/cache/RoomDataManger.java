@@ -120,7 +120,18 @@ public class RoomDataManger {
         // ★ v4.1：历史/进度解耦 —— playFlag/playIndex/playNote 属于播放状态，由进度表驱动，
         //   不再视为「历史内容变化」。否则每换一集都会标脏 HISTORY、推进历史 HLC、整包上传历史。
         boolean contentChanged = !historyCore(newJson).equals(historyCore(record.dataJson));
-        if (contentChanged || record.hlcPhysical <= 0) {
+        // ★ v4.2.8：内容没变、但这条不是「最近观看」里最新的（重看一部老片）时，也要推进 HLC 并标脏。
+        //   否则只抬 updateTime 不抬 HLC，会同时坏两件事：
+        //     ① 云端顺序永远不变 —— HISTORY scope 不脏 ⇒ 目录 ETag 短路 ⇒ 根本不上传
+        //        （用户实测 2026-11-07 01:58 日志：19:47/19:49 histWrite Clun/157844 db=15->15，
+        //         两轮都只上传了 PROGRESS，HISTORY 一次没传）；
+        //     ② 会被裁剪掉 —— truncateMergedHistory 按 HLC 降序裁到档位条数，
+        //        重看老片 HLC 仍最旧，新记录一进来它就是第一个被顶掉的。
+        //   已经是全表最新时完全不动：重看当前第一名仍然零改动、零上传。
+        Long maxUpdateTime = dao.maxUpdateTime();
+        boolean recencyChanged = record.updateTime > 0 && maxUpdateTime != null
+                && record.updateTime < maxUpdateTime;
+        if (contentChanged || recencyChanged || record.hlcPhysical <= 0) {
             Hlc h = HlcClock.next();
             record.hlcPhysical = h.physical;
             record.hlcCounter = h.counter;
@@ -130,7 +141,7 @@ public class RoomDataManger {
         record.dataJson = newJson;
         dao.insert(record);
         // v98 P2：只脏「历史」——写一条观看记录不该把收藏/设置也拖下水
-        if (contentChanged) {
+        if (contentChanged || recencyChanged) {
             HistorySyncManager.markDirty(SyncScope.HISTORY);
         }
         // v77：本机只保留当前档位的条数，超出的直接删（不写墓碑，避免传到别的设备误删）

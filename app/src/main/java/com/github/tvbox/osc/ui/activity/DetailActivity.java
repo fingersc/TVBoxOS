@@ -5757,13 +5757,16 @@ public class DetailActivity extends BaseActivity {
                     if(!isFirstLoad)mGridView.setSelection(index);
                     vodInfo.playIndex = index;
                     routeSwitchSeries = seriesAdapter.getData().get(index);
-                    //保存历史
-                    insertVod(firstsourceKey, vodInfo);
+                    //保存历史 —— ★ v4.2.8：选集事件同样要等首帧，否则首次进入详情页自动选中第一集时
+                    //   就在起播前写了历史（用户实测 2026-11-07 01:58 日志：19:45:18.948 histWrite
+                    //   Clun/157559 → 19:45:19.290 [vod] start → 19:45:19.383 onPause，全程无 [PQ] ok，
+                    //   却仍写出并上传了一条历史）。
+                    deferInsertVod(firstsourceKey, vodInfo);
                     isFirstLoad = false;
                 } else if (event.obj instanceof JSONObject) {
                     vodInfo.playerCfg = event.obj.toString();
-                    //保存历史
-                    insertVod(firstsourceKey, vodInfo);
+                    //保存历史 —— ★ v4.2.8：同上，等首帧再落库
+                    deferInsertVod(firstsourceKey, vodInfo);
                 } else if (event.obj instanceof String) {
                     String url = event.obj.toString();
                     //设置更新播放地址
@@ -6443,7 +6446,9 @@ public class DetailActivity extends BaseActivity {
             mGridView.setSelection(newIndex);
         }
 
-        insertVod(firstsourceKey, vodInfo);
+        // ★ v4.2.8：剧集列表初始化也会写一次历史（首次进入详情页、选集列表刚建好时），
+        //   同样改为等首帧，避免「未起播就留下历史」。已起播后（playbackStartedOnce）仍立即写。
+        deferInsertVod(firstsourceKey, vodInfo);
         isFirstLoad = false;
     }
 
