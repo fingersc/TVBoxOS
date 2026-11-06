@@ -386,10 +386,30 @@ public final class HistorySyncManager {
     }
 
     /**
-     * 回到前台（首页 onResume）。
+     * 回到前台（首页 onResume / 播放页 onResume）。
      *
      * <p>v98 P2：不再自己算「距上次 ≥2 分钟」，改由调度器按自适应间隔判断 ——
      * 脏 ⇒ 防抖窗口内跑；不脏 ⇒ 5/10/20/30 分钟档。</p>
+     *
+     * <p>★ v4.2.7：<b>0ms 抢跑只用于「本地不脏」的纯拉取。</b></p>
+     *
+     * <p>原来不区分脏/不脏，一律 {@code requestWithin("fg", 0)}。而「切源」会重建
+     * 播放页，播放页 {@code onResume} 又必然调到这里，于是「切源刚标脏的任务」被
+     * 立刻提前到 0ms —— 实测日志（2026-11-07 00:01，设备本地时间）：</p>
+     *
+     * <pre>
+     *   17:53:53.582 [sync] schedule reason=dirty pri=1 in 60000ms
+     *   17:53:53.643 [sync] pull-forward reason=fg capMs=0 -> keep dirty in 0ms   ← 51ms 后
+     *   17:53:54.169 [Sync] uploaded scope=HISTORY bytes=8261
+     * </pre>
+     *
+     * <p>切源本身没有时效性需求：脏标记已落盘（{@code SyncState.save()}），进程被杀
+     * 还有 boot 轮 + {@code reconcilePushedHlc} 兜底；真正有时效的是「退出播放」那一刻
+     * 的进度，那条路径有 300ms 合并窗口（{@link #onBackground()} 与
+     * {@link #onPlaybackExit()}）。</p>
+     *
+     * <p>所以脏数据交给既有防抖（60s）或退出窗口（300ms）带走，回前台只负责
+     * 「把另一台设备的改动拉下来」—— 只有那个场景才需要 0ms。</p>
      */
     public static void onForeground() {
         if (AccountContext.isGuest()) {
@@ -400,9 +420,12 @@ public final class HistorySyncManager {
         // 30s 内刚同步过则维持原调度，避免来回切换页面时抖动。
         long last = lastSyncAt();
         long now = com.github.tvbox.osc.sync.TrustedClock.nowPhysical();
-        if (last <= 0 || now < last || now - last > 30_000L) {
+        boolean stale = last <= 0 || now < last || now - last > 30_000L;
+        if (stale && !isDirty()) {
             SyncScheduler.requestWithin(owner(), "fg", 0L);
         } else {
+            // 有脏：走 60s 防抖（request() 自带 PRI_DIRTY），不抢跑；
+            // 若此刻本来就有 300ms 的退出窗口任务，只做合并、绝不推后它的执行时间。
             SyncScheduler.request(owner(), "fg");
         }
     }

@@ -319,7 +319,16 @@ public final class SyncScheduler {
         long now = System.currentTimeMillis();
         synchronized (LOCK) {
             Task pending = TASKS.get(owner);
-            if (!shouldReplace(pending == null ? -1 : pending.pri, pri)) {
+            // ★ v4.2.7：boot / light-cont 是「刚启动就马上要跑」的短延迟任务（1000ms / 0ms），
+            //   不能被后到的脏数据请求顶掉 —— PRI_DIRTY(1) 比 PRI_IDLE(2) 优先，一旦替换，
+            //   启动轮就直接被换成 60 秒后的脏任务。立即档（手动同步 / 退出 App / 切账号）
+            //   仍然可以替换它们。
+            //
+            //   背景：v4.2.7 去掉了 onForeground() 对脏任务的 0ms 抢跑，而这条抢跑原本
+            //   顺带救了「启动 1 秒内就标脏」这种情形（把 boot 任务提前到 0ms）。没有它
+            //   以后必须显式保证 boot 不被顶掉，否则启动同步会被推迟到 60 秒。
+            boolean keepBoot = pending != null && protectBootTask(pending.reason, pri);
+            if (keepBoot || !shouldReplace(pending == null ? -1 : pending.pri, pri)) {
                 // 已有更早的任务在排队 ⇒ 合并掉这次请求（防抖的关键：不推后在途任务）。
                 //
                 // ★ v99-r17：合并 ≠ 把「最多等 capMs」当作没说过。
@@ -398,6 +407,24 @@ public final class SyncScheduler {
             return true;
         }
         return newPri < pendingPri;
+    }
+
+    /**
+     * ★ v4.2.7：在途任务是否是「刚启动就马上要跑」的短延迟任务，且本次请求允许它保留。
+     *
+     * <p>{@code boot}（冷启动 1000ms）与 {@code light-cont}（首轮轻量同步后的补跑 0ms）
+     * 都属于启动链路的短延迟任务。后到的脏数据请求（{@code PRI_DIRTY}=1）优先级高于
+     * 轮询（{@code PRI_IDLE}=2），若不特殊保护就会被替换成 60 秒后的任务，把启动同步
+     * 整轮推迟 —— v4.2.7 去掉了 {@code onForeground()} 对脏任务的 0ms 抢跑后，
+     * 这条抢跑原本顺带救过这种情形，必须显式补上。</p>
+     *
+     * <p>立即档（{@code PRI_NOW}：手动同步 / 退出 App / 切账号）仍然可以替换它们。</p>
+     */
+    static boolean protectBootTask(String pendingReason, int newPri) {
+        if (pendingReason == null || newPri == PRI_NOW) {
+            return false;
+        }
+        return "boot".equals(pendingReason) || "light-cont".equals(pendingReason);
     }
 
     /**
