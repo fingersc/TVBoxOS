@@ -292,14 +292,26 @@ public final class SyncEngine {
 
             // ★ v4.1：记录本设备已看到的水位，并在「所有活跃设备都已看到」时回收墓碑。
             //   保守条件：至少 2 台活跃设备 + 墓碑存在超过 24 小时（见 SyncMeta.dropSeenTombs）。
+            // ★ v4.2.3：只有「水位真的推进」或「墓碑真的被回收」才算 meta 脏。
+            //   原来无条件置脏，使下方 saveMeta 的「6 小时一次」门槛完全失效 ——
+            //   实测 100 条上传里 42 条是 sync.meta。注意 meta.touch(deviceId, now)
+            //   仍然每轮执行（在 saveMeta 段、且不在 if 内），只是「落盘」受门槛控制：
+            //   否则一台活着、常在同步但数据长期不变的设备，云端 lastSeenAt 会一直不动，
+            //   攒到 30 天被 SyncMeta.isStale 判成 stale → downloadOnly + replaceLocal，
+            //   用云端覆盖本机，把本机独有数据清掉。
             if (meta != null && meta.reliable) {
+                boolean seenChanged;
                 if (sc == SyncScope.HISTORY) {
-                    meta.markSeenRecords(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                    seenChanged = meta.markSeenRecords(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
                 } else if (sc == SyncScope.COLLECT) {
-                    meta.markSeenCollects(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                    seenChanged = meta.markSeenCollects(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                } else {
+                    seenChanged = false;
                 }
-                meta.dropSeenTombs(merged, now, 24L * 3600L * 1000L);
-                metaDirty = true;
+                int tombsDropped = meta.dropSeenTombs(merged, now, 24L * 3600L * 1000L);
+                if (seenChanged || tombsDropped > 0) {
+                    metaDirty = true;
+                }
             }
 
             // ★ v4.1：30 天未上线的设备「只下载、不上传」——把云端数据落到本机后直接结束该 scope，
@@ -317,8 +329,18 @@ public final class SyncEngine {
             }
 
             // 5.4 与云端一致 ⇒ 跳过上传
+            //   ★ v4.2.3 两道补充：
+            //   (1) 水位守卫：same 分支下面同样会 bumpPushedHlc（把 merged 的 hlcMax 记成「已推送」）。
+            //       若 merged 的 HLC 实际高于云端却跳过上传，这条 HLC 就永远上不了云 ——
+            //       下次启动 reconcilePushedHlc 见 db.maxHlc == pushedHlc 不会补标脏，
+            //       其它设备的「最近观看」顺序拿不到这次更新，还可能被更低的 HLC 反超。
+            //       所以只有「本机水位不高于云端」才允许跳过。
+            //   (2) 补日志：这个分支以前一行日志都没有，出问题时无法判断「没上传」
+            //       是因为内容一致，还是异常静默跳过。
             boolean same = remoteBytes != null && remoteBytes.length > 0
-                    && HistorySyncManager.contentEquals(merged, remote);
+                    && HistorySyncManager.contentEquals(merged, remote)
+                    && Hlc.of(merged.hlcMaxPhysical, merged.hlcMaxCounter, "", 0L)
+                    .compareIgnoringDev(Hlc.of(remote.hlcMaxPhysical, remote.hlcMaxCounter, "", 0L)) <= 0;
             if (same && !forceUpload) {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     st.setEtag(sc, etagOut[0]);
@@ -326,6 +348,7 @@ public final class SyncEngine {
                 // 云端已包含合并结果（内容一致），记录已推送水位，避免启动对账误判为未推送。
                 st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
                 processedOk[sc.index] = true;
+                LOG.i("[Sync] skip same scope=" + sc + " bytes=" + remoteBytes.length);
                 continue;
             }
 

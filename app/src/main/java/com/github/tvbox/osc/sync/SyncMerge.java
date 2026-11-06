@@ -184,7 +184,122 @@ public final class SyncMerge {
         long[] mm = finalMax(out, maxP, maxC);
         out.hlcMaxPhysical = mm[0];
         out.hlcMaxCounter = (int) mm[1];
+        // ★ v4.2.3：合并结果排成与设备无关的确定顺序。
+        //   在此之前 records/progress/collects/settings 都是按 union() 的 HashMap 迭代序输出的，
+        //   同一批数据在两台设备上顺序可能不同 → contentEquals 比 JSON 字符串时恒判「不同」
+        //   → 内容没变也每轮整包 PUT（实测模拟器 4 轮里 2 轮 up == down）。
+        canonicalize(out);
         return out;
+    }
+
+    // ---------------------------------------------------------------- 规范顺序
+
+    /**
+     * ★ v4.2.3：把包内各列表排成「与设备无关」的确定顺序。
+     *
+     * <p>排序只在长度 &gt; 1 时新建列表，单元素/空列表保持原引用，避免无谓分配。</p>
+     *
+     * <p>规则（合并、裁剪、比较三处必须一致，否则 contentEquals 仍会误判「不同」）：</p>
+     * <ul>
+     *   <li>records：HLC 降序，同 HLC 按 recordKey 升序（与 truncateMergedHistory 裁剪口径一致，
+     *       裁 prefix 即保留最新的 N 条）；</li>
+     *   <li>progress：先按 recordKey 升序分组，组内 HLC 降序 + progressKey 升序
+     *       （与 keepRecent 的分组口径一致）；</li>
+     *   <li>collects：HLC 降序 + recordKey 升序；</li>
+     *   <li>settings：key 升序；</li>
+     *   <li>deleted.records / deleted.progress / deleted.collects / deleted.settings：HLC 降序 + key 升序
+     *       （prune 只在超限时才排序，未超限时是 HashMap 序 —— 那是另一处不确定性来源）。</li>
+     * </ul>
+     */
+    public static void canonicalize(SyncPayload p) {
+        if (p == null) {
+            return;
+        }
+        if (p.records != null && p.records.size() > 1) {
+            List<SyncPayload.RecordItem> list = new ArrayList<>(p.records);
+            Collections.sort(list, new Comparator<SyncPayload.RecordItem>() {
+                @Override
+                public int compare(SyncPayload.RecordItem a, SyncPayload.RecordItem b) {
+                    int c = b.hlc().compareTo(a.hlc());
+                    if (c != 0) {
+                        return c;
+                    }
+                    return recordKey(a.sourceKey, a.vodId).compareTo(recordKey(b.sourceKey, b.vodId));
+                }
+            });
+            p.records = list;
+        }
+        if (p.progress != null && p.progress.size() > 1) {
+            List<SyncPayload.ProgressItem> list = new ArrayList<>(p.progress);
+            Collections.sort(list, new Comparator<SyncPayload.ProgressItem>() {
+                @Override
+                public int compare(SyncPayload.ProgressItem a, SyncPayload.ProgressItem b) {
+                    int c = recordKey(a.sourceKey, a.vodId).compareTo(recordKey(b.sourceKey, b.vodId));
+                    if (c != 0) {
+                        return c;
+                    }
+                    int h = b.hlc().compareTo(a.hlc());
+                    if (h != 0) {
+                        return h;
+                    }
+                    return progressKey(a.sourceKey, a.vodId, a.flag, a.playIndex, a.epName)
+                            .compareTo(progressKey(b.sourceKey, b.vodId, b.flag, b.playIndex, b.epName));
+                }
+            });
+            p.progress = list;
+        }
+        if (p.collects != null && p.collects.size() > 1) {
+            List<SyncPayload.CollectItem> list = new ArrayList<>(p.collects);
+            Collections.sort(list, new Comparator<SyncPayload.CollectItem>() {
+                @Override
+                public int compare(SyncPayload.CollectItem a, SyncPayload.CollectItem b) {
+                    int c = b.hlc().compareTo(a.hlc());
+                    if (c != 0) {
+                        return c;
+                    }
+                    return recordKey(a.sourceKey, a.vodId).compareTo(recordKey(b.sourceKey, b.vodId));
+                }
+            });
+            p.collects = list;
+        }
+        if (p.settings != null && p.settings.size() > 1) {
+            List<SyncPayload.SettingItem> list = new ArrayList<>(p.settings);
+            Collections.sort(list, new Comparator<SyncPayload.SettingItem>() {
+                @Override
+                public int compare(SyncPayload.SettingItem a, SyncPayload.SettingItem b) {
+                    String ka = a.key == null ? "" : a.key;
+                    String kb = b.key == null ? "" : b.key;
+                    return ka.compareTo(kb);
+                }
+            });
+            p.settings = list;
+        }
+        if (p.deleted != null) {
+            p.deleted.records = sortTombs(p.deleted.records);
+            p.deleted.progress = sortTombs(p.deleted.progress);
+            p.deleted.collects = sortTombs(p.deleted.collects);
+            p.deleted.settings = sortTombs(p.deleted.settings);
+        }
+    }
+
+    private static List<SyncPayload.Tomb> sortTombs(List<SyncPayload.Tomb> tombs) {
+        if (tombs == null || tombs.size() <= 1) {
+            return tombs;
+        }
+        List<SyncPayload.Tomb> list = new ArrayList<>(tombs);
+        Collections.sort(list, new Comparator<SyncPayload.Tomb>() {
+            @Override
+            public int compare(SyncPayload.Tomb a, SyncPayload.Tomb b) {
+                int c = b.hlc().compareTo(a.hlc());
+                if (c != 0) {
+                    return c;
+                }
+                String ka = a.key == null ? "" : a.key;
+                String kb = b.key == null ? "" : b.key;
+                return ka.compareTo(kb);
+            }
+        });
+        return list;
     }
 
     // ---------------------------------------------------------------- 选择规则

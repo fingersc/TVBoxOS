@@ -100,35 +100,57 @@ public final class SyncMeta {
         }
     }
 
-    public void markSeenRecords(String id, long physical, int counter) {
+    /**
+     * 记录本设备已看到的 history 水位。
+     *
+     * <p>★ v4.2.3：返回「水位是否真的推进」—— 调用方据此决定 sync.meta 要不要落盘。
+     * 原来无论有没有推进都无条件置 metaDirty，使「6 小时一次」的门槛失效，
+     * 实测 100 条上传里 42 条是 sync.meta（白烧配额）。</p>
+     */
+    public boolean markSeenRecords(String id, long physical, int counter) {
         Device d = ensureDevice(id);
         if (physical > d.seenRecordsPhysical
                 || (physical == d.seenRecordsPhysical && counter > d.seenRecordsCounter)) {
             d.seenRecordsPhysical = physical;
             d.seenRecordsCounter = counter;
+            return true;
         }
+        return false;
     }
 
-    public void markSeenCollects(String id, long physical, int counter) {
+    /** 同 {@link #markSeenRecords}，针对收藏。 */
+    public boolean markSeenCollects(String id, long physical, int counter) {
         Device d = ensureDevice(id);
         if (physical > d.seenCollectsPhysical
                 || (physical == d.seenCollectsPhysical && counter > d.seenCollectsCounter)) {
             d.seenCollectsPhysical = physical;
             d.seenCollectsCounter = counter;
+            return true;
         }
+        return false;
     }
 
     /**
      * 墓碑回收：删除「所有活跃设备都已看到」且已存在超过 minAgeMs 的墓碑。
      * 保守策略：至少要有 2 台活跃设备（单设备账号没有跨设备复活风险，交给 30 天年龄回收即可），
      * 且墓碑存在超过 minAgeMs，避免刚上线的新设备尚未登记就被误判为「全员已见」。
+     *
+     * <p>★ v4.2.3：返回真正被回收的墓碑条数。回收会改变包内容（必须上传），
+     * 所以这也是 sync.meta 需要落盘的条件之一 —— 回收结果要连同新水位一起发布出去。</p>
      */
-    public void dropSeenTombs(SyncPayload p, long nowMs, long minAgeMs) {
+    public int dropSeenTombs(SyncPayload p, long nowMs, long minAgeMs) {
         if (p == null || p.deleted == null) {
-            return;
+            return 0;
         }
+        int before = size(p.deleted.records) + size(p.deleted.collects);
         p.deleted.records = filterSeen(p.deleted.records, nowMs, minAgeMs, true);
         p.deleted.collects = filterSeen(p.deleted.collects, nowMs, minAgeMs, false);
+        int after = size(p.deleted.records) + size(p.deleted.collects);
+        return before > after ? before - after : 0;
+    }
+
+    private static int size(List<SyncPayload.Tomb> list) {
+        return list == null ? 0 : list.size();
     }
 
     private List<SyncPayload.Tomb> filterSeen(List<SyncPayload.Tomb> tombs, long nowMs,

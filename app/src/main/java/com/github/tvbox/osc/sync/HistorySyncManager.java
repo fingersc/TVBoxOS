@@ -931,53 +931,77 @@ public final class HistorySyncManager {
     }
 
     /**
-     * v78：比较两份包的内容是否一致（忽略每次都变的 updatedAt / dev）。
+     * v78 / v4.2.3：比较两份包的内容是否一致。
      *
-     * <p>只用于"没必要上传"的判定：误判为不同最多多传一次，不会丢数据。</p>
+     * <p>只用于"没必要上传"的判定：误判为不同最多多传一次，不会丢数据；
+     * 但「误判为相同」会漏传，所以这里只做<b>与内容无关</b>的归一化：</p>
+     * <ul>
+     *   <li>顶层 {@code updatedAt / dev / hlcMax* / scope} 是本机生成的元数据，置零置空；</li>
+     *   <li>各列表按 {@link SyncMerge#canonicalize} 的规范顺序排序 —— <b>在副本上排</b>，
+     *       不改原对象。这样「内容相同、只是数组顺序不同」能正确判等
+     *       （合并输出的顺序来自 HashMap 迭代，与云端文件里的数组顺序天然不同）。</li>
+     * </ul>
+     *
+     * <p>★ 逐条的 {@code hlcPhysical / hlcCounter / updateTime / dev} 一律参与比较。
+     * 它们是合并裁决与墓碑压制的输入，不是可以忽略的元数据：把逐条 HLC 也归一化，
+     * 会让「本机 touch 过但正片内容没变」的记录跳过上传，而 {@code SyncEngine} 的
+     * same 分支同样会 {@code bumpPushedHlc}，把没上传的水位记成已推送 ——
+     * 那条 HLC 就永远上不了云，其它设备的「最近观看」顺序拿不到这次更新，
+     * 还可能被更低的 HLC 反超。</p>
      */
     static boolean contentEquals(SyncPayload a, SyncPayload b) {
         if (a == null || b == null) {
             return false;
         }
         try {
-            long at = a.updatedAt;
-            long bt = b.updatedAt;
-            String ad = a.dev;
-            String bd = b.dev;
-            long ahp = a.hlcMaxPhysical;
-            int ahc = a.hlcMaxCounter;
-            long bhp = b.hlcMaxPhysical;
-            int bhc = b.hlcMaxCounter;
-            String asc = a.scope;
-            String bsc = b.scope;
-            // ★ 协议 v4：scope 与 hlcMax 都是「本机生成」的元数据，不代表内容差异，
-            //   不归一化会导致每轮都判定为「不同」→ 每轮都整包 PUT（白烧配额）。
-            a.updatedAt = 0L;
-            b.updatedAt = 0L;
-            a.dev = "";
-            b.dev = "";
-            a.hlcMaxPhysical = 0L;
-            b.hlcMaxPhysical = 0L;
-            a.hlcMaxCounter = 0;
-            b.hlcMaxCounter = 0;
-            a.scope = null;
-            b.scope = null;
-            String ja = GSON.toJson(a);
-            String jb = GSON.toJson(b);
-            a.updatedAt = at;
-            b.updatedAt = bt;
-            a.dev = ad;
-            b.dev = bd;
-            a.hlcMaxPhysical = ahp;
-            a.hlcMaxCounter = ahc;
-            b.hlcMaxPhysical = bhp;
-            b.hlcMaxCounter = bhc;
-            a.scope = asc;
-            b.scope = bsc;
+            String ja = GSON.toJson(canonicalForCompare(a));
+            String jb = GSON.toJson(canonicalForCompare(b));
             return ja.equals(jb);
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * 生成「用于比较」的副本：列表按规范顺序排序 + 顶层元数据归一化，<b>不修改入参</b>。
+     *
+     * <p>★ v4.2.3：旧实现直接改 {@code a}/{@code b} 的字段再还原，GSON 抛异常（如 OOM）时
+     * 还原不到，调用方会拿着 {@code hlcMax=0 / dev=""} 的包去上传 —— 副本写法从根上消除这个风险。</p>
+     *
+     * <p>列表元素是共享引用（不做深拷贝），只新建容器并按规范顺序重排。</p>
+     */
+    private static SyncPayload canonicalForCompare(SyncPayload src) {
+        SyncPayload p = new SyncPayload();
+        p.schema = src.schema;
+        p.owner = src.owner;
+        p.epoch = src.epoch;
+        p.records = src.records == null
+                ? new ArrayList<SyncPayload.RecordItem>() : new ArrayList<>(src.records);
+        p.progress = src.progress == null
+                ? new ArrayList<SyncPayload.ProgressItem>() : new ArrayList<>(src.progress);
+        p.collects = src.collects == null
+                ? new ArrayList<SyncPayload.CollectItem>() : new ArrayList<>(src.collects);
+        p.settings = src.settings == null
+                ? new ArrayList<SyncPayload.SettingItem>() : new ArrayList<>(src.settings);
+        p.deleted = new SyncPayload.Deleted();
+        if (src.deleted != null) {
+            p.deleted.records = src.deleted.records == null
+                    ? new ArrayList<SyncPayload.Tomb>() : new ArrayList<>(src.deleted.records);
+            p.deleted.progress = src.deleted.progress == null
+                    ? new ArrayList<SyncPayload.Tomb>() : new ArrayList<>(src.deleted.progress);
+            p.deleted.collects = src.deleted.collects == null
+                    ? new ArrayList<SyncPayload.Tomb>() : new ArrayList<>(src.deleted.collects);
+            p.deleted.settings = src.deleted.settings == null
+                    ? new ArrayList<SyncPayload.Tomb>() : new ArrayList<>(src.deleted.settings);
+        }
+        SyncMerge.canonicalize(p);
+        // 顶层归一化：这四项是「本机生成」的元数据，不代表内容差异
+        p.updatedAt = 0L;
+        p.dev = "";
+        p.hlcMaxPhysical = 0L;
+        p.hlcMaxCounter = 0;
+        p.scope = null;
+        return p;
     }
 
     /**
