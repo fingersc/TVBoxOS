@@ -52,8 +52,10 @@ public class PlayProgressManager {
      * 退出播放页仍由 {@code PlayFragment.onDestroyView} 的
      * {@code saveCurrentProgressNow()} + {@code onPlaybackExit()} 无条件落盘 + 标脏 + 同步兜底。</p>
      *
-     * <p><b>删除路径（{@code position <= 0}）不受该参数影响，一律标脏</b>：
-     * 删除是用户可见的语义变化，且周期落盘的调用方都有 {@code pos <= 0} 守卫，永远不会走到删除分支。</p>
+     * <p><b>删除路径（{@code position <= 0}）不受该参数影响，真正删掉行时一律标脏</b>：
+     * 删除是用户可见的语义变化；但「删了个不存在的行」不是事件（★ v4.2.6 起按
+     * {@code dao.delete} 的返回值判定，空删不再标脏）。周期落盘的调用方都有
+     * {@code pos <= 0} 守卫，正常情况下不会走到删除分支。</p>
      *
      * @param markDirty false = 只写本地库，不触发同步（仅周期落盘用）
      */
@@ -65,9 +67,15 @@ public class PlayProgressManager {
             }
             PlayProgressDao dao = AppDataManager.get().getPlayProgressDao();
             if (position <= 0) {
-                dao.delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+                int deleted = dao.delete(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
                 // v4.1：进度零墓碑；单集删除只在本机生效（整片删除由历史墓碑隐含）
-                HistorySyncManager.markDirty(SyncScope.PROGRESS);
+                // ★ v4.2.6：只有「真的删掉了一行」才算用户可见的语义变化。
+                //   旧实现无条件标脏：起播失败/首次进片时调过来的两笔 position=0 落盘，
+                //   库里本来就没有这一行，却照样把 PROGRESS 标脏 ⇒ 补跑一轮把同一份
+                //   progress.bin（实测 14KB）又原样传一次。空删不是事件。
+                if (deleted > 0) {
+                    HistorySyncManager.markDirty(SyncScope.PROGRESS);
+                }
                 return;
             }
             // ★ v4.2.5：位置没变就不是「新事件」—— 不生成新 HLC、不落库、不 trim、不标脏。

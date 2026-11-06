@@ -3482,6 +3482,17 @@ public class PlayFragment extends BaseLazyFragment {
         playbackStarted = true;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
+        // ★ v4.2.6：首帧到达才让详情页落历史 —— 详情页的 jumpToPlay() 现在只挂起写入，
+        //   起播失败（无片源 / 解析失败）不会在历史里留一条假记录，也不会因此改动
+        //   「最近观看」的顺序。
+        try {
+            android.app.Activity a = getActivity();
+            if (a instanceof DetailActivity) {
+                ((DetailActivity) a).onPlaybackStarted();
+            }
+        } catch (Throwable ignore) {
+            // 回调失败不影响播放
+        }
         // ★ 起播保护窗收尾：首帧已出，聚合搜索可以立刻恢复派发
         //   （不必再等 5s 兜底）。见 SearchSession.STARTUP_GUARD_MAX_MS。
         if (startupGuardListener != null) {

@@ -903,6 +903,69 @@ public class DetailActivity extends BaseActivity {
 
     private List<Runnable> pauseRunnable = null;
 
+    // ★ v4.2.6：历史改为「起播成功才落库」。
+    //
+    //   旧行为：jumpToPlay() 在把播放地址塞进 Bundle 之前就 insertVod()，
+    //   于是「点了播放但没起播」（无片源 / 解析失败 / 秒退）也会在历史里留一条，
+    //   而且它会把 updateTime 抬到当下 ⇒ 首页「最近观看」的顺序被这条假记录改掉，
+    //   同步侧又因为内容没变而不标脏 ⇒ 本地顺序变了、云端毫无变化（用户实测
+    //   2026-11-07 00:00 日志：17:48:09.801 `histWrite …/99871`，全程没有 `[vod] start`）。
+    //
+    //   现在：jumpToPlay() 只挂起，等 PlayFragment 首帧回调 markPlaybackStarted()
+    //   再真正落库；playbackStartedOnce 之后的下一次 jumpToPlay（换集/切源续播）
+    //   走原来的立即写入，保证后续行为不变。
+    private boolean pendingHistWrite = false;
+    private String pendingHistSourceKey = null;
+    private VodInfo pendingHistVodInfo = null;
+    private boolean playbackStartedOnce = false;
+
+    /** 挂起一次历史写入，等首帧到达再落库；本会话已起播过则保持旧行为立即写。 */
+    private void deferInsertVod(String sourceKey, VodInfo info) {
+        if (TextUtils.isEmpty(sourceKey) || info == null) {
+            return;
+        }
+        if (playbackStartedOnce) {
+            insertVod(sourceKey, info);
+            return;
+        }
+        pendingHistWrite = true;
+        pendingHistSourceKey = sourceKey;
+        pendingHistVodInfo = info;
+    }
+
+    private void cancelPendingHistWrite() {
+        pendingHistWrite = false;
+        pendingHistSourceKey = null;
+        pendingHistVodInfo = null;
+    }
+
+    /**
+     * 由 {@code PlayFragment.markPlaybackStarted()}（首帧 / 正式开始播放）回调。
+     *
+     * <p>可能来自播放器回调线程，统一 post 回主线程，避免在非 UI 线程碰 Room。</p>
+     */
+    public void onPlaybackStarted() {
+        if (isFinishing()) {
+            return;
+        }
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                playbackStartedOnce = true;
+                if (!pendingHistWrite) {
+                    return;
+                }
+                String sk = pendingHistSourceKey;
+                VodInfo info = pendingHistVodInfo;
+                cancelPendingHistWrite();
+                if (TextUtils.isEmpty(sk) || info == null) {
+                    return;
+                }
+                insertVod(sk, info);
+            }
+        });
+    }
+
     private void jumpToPlay() {
         com.github.tvbox.osc.util.PerfTrace.begin("detail.jumpToPlay");
         List<VodInfo.VodSeries> jumpList = getPlayingSeriesList();
@@ -912,8 +975,8 @@ public class DetailActivity extends BaseActivity {
             VodInfo.VodSeries jumpSeries = jumpList.get(clampIndex(vodInfo.playIndex, jumpList));
             setTextShow(tvPlayUrl, "播放地址：", jumpSeries.url);
             Bundle bundle = new Bundle();
-            //保存历史
-            insertVod(firstsourceKey, vodInfo);
+            //保存历史 —— ★ v4.2.6：只挂起，等首帧确认起播成功再落库（见 deferInsertVod）
+            deferInsertVod(firstsourceKey, vodInfo);
         //   insertVod(sourceKey, vodInfo);
             bundle.putString("sourceKey", sourceKey);
 //            bundle.putSerializable("VodInfo", vodInfo);
@@ -7722,6 +7785,9 @@ public class DetailActivity extends BaseActivity {
     @Override
     protected void onDestroy() {
         resetDetailFallback();
+        // ★ v4.2.6：详情页销毁 = 这一轮播放彻底结束；没等到首帧的挂起写入直接丢弃，
+        //   绝不能等到下一次起播才补写一条早已过期的历史。
+        cancelPendingHistWrite();
         super.onDestroy();
         // ★ 兜底静音：详情页销毁意味着这一轮播放彻底结束（返回首页 / 退出播放页），
         //   绝不能把声音留在后台。
