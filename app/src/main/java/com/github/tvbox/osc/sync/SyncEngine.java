@@ -337,10 +337,12 @@ public final class SyncEngine {
             //       所以只有「本机水位不高于云端」才允许跳过。
             //   (2) 补日志：这个分支以前一行日志都没有，出问题时无法判断「没上传」
             //       是因为内容一致，还是异常静默跳过。
-            boolean same = remoteBytes != null && remoteBytes.length > 0
-                    && HistorySyncManager.contentEquals(merged, remote)
+            boolean contentSame = remoteBytes != null && remoteBytes.length > 0
+                    && HistorySyncManager.contentEquals(merged, remote);
+            boolean waterOk = contentSame
                     && Hlc.of(merged.hlcMaxPhysical, merged.hlcMaxCounter, "", 0L)
                     .compareIgnoringDev(Hlc.of(remote.hlcMaxPhysical, remote.hlcMaxCounter, "", 0L)) <= 0;
+            boolean same = contentSame && waterOk;
             if (same && !forceUpload) {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     st.setEtag(sc, etagOut[0]);
@@ -350,6 +352,15 @@ public final class SyncEngine {
                 processedOk[sc.index] = true;
                 LOG.i("[Sync] skip same scope=" + sc + " bytes=" + remoteBytes.length);
                 continue;
+            }
+            // ★ v4.2.3-diag：没跳过就说明「内容不同」或「水位更高」。分别标记原因并给出差异摘要，
+            //   一次真机即可定位是 contentEquals 判不等（含异常被吞）还是水位守卫拦下。
+            if (remoteBytes != null && remoteBytes.length > 0) {
+                LOG.i("[Sync] same-miss scope=" + sc
+                        + " content=" + contentSame
+                        + " water=" + (contentSame ? String.valueOf(waterOk) : "-")
+                        + " force=" + forceUpload
+                        + " " + HistorySyncManager.diffSummary(merged, remote));
             }
 
             // 5.5 上传（只传这一个 scope；If-Match 防并发覆盖）
