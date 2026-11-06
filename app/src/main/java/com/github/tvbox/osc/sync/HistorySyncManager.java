@@ -69,6 +69,21 @@ public final class HistorySyncManager {
 
     private static volatile boolean syncing;
     private static boolean started;
+    /**
+     * ★ v4.2.2（B）：冷启动那一轮是否只跑 SETTINGS + HISTORY。
+     *
+     * <p>首页「最近观看」只依赖 HISTORY（SETTINGS 提供账号档位，必须先行）。
+     * 首轮把 PROGRESS/COLLECT 推迟，可少 2 个条件 GET，首屏「那张卡片」出现得更早；
+     * 被推迟的 scope 脏标记保持不变，紧随其后的一轮补跑照常上传，不丢数据。</p>
+     */
+    private static volatile boolean firstRoundPending;
+    /**
+     * ★ v4.2.2（B）：首轮轻量同步结束后，下一轮「补跑」是否跳过 min-gap。
+     *
+     * <p>只放宽最小间隔，<b>「仅 Wi-Fi」门禁照旧生效</b> —— 补跑绝不能烧移动流量。
+     * 用完即复位，避免长期绕过间隔。</p>
+     */
+    private static volatile boolean continuePending;
     /** 页面主动拉取的节流时间戳（避免来回切页面刷请求）。 */
     private static long lastPullAt;
     /** 账号切换代数：切换时 +1，在途同步发现代数变了就放弃写库（防串库）。 */
@@ -168,9 +183,12 @@ public final class HistorySyncManager {
             SyncState.migrateLegacyKeys(migrateOwner);
             reconcilePushedHlc(migrateOwner);
         }
-        // v98 P2：冷启动那一次交给调度器（1.5 秒内必跑一次）；此后的周期轮询
+        // v98 P2：冷启动那一次交给调度器（1 秒内必跑一次）；此后的周期轮询
         //         由调度器按自适应间隔接管，App 不再自己持有 30 分钟的定时器。
-        SyncScheduler.requestWithin(migrateOwner, "boot", 1500L);
+        // ★ v4.2.2（B）：并把这一轮标记为「首轮轻量同步」——只处理 SETTINGS + HISTORY，
+        //   让首页「最近观看」尽快出现（PROGRESS/COLLECT 交给紧随其后的下一轮）。
+        firstRoundPending = true;
+        SyncScheduler.requestWithin(migrateOwner, "boot", 1000L);
     }
 
     /** 按账号命名空间取 Hawk 键（游客用原键）。 */
@@ -502,6 +520,14 @@ public final class HistorySyncManager {
             return;
         }
         if (!manual) {
+            // ★ v4.2.2（B）：首轮轻量同步的「补跑」跳过 min-gap —— 它紧跟首轮 0ms 排队，
+            //   若被 30s 间隔挡住，被推迟的 PROGRESS/COLLECT 就要再等半分钟才上传。
+            //   「仅 Wi-Fi」门禁不跳过（见下方），补跑同样不能烧移动流量。
+            boolean continuation;
+            synchronized (LOCK) {
+                continuation = continuePending;
+                continuePending = false;
+            }
             long last = lastSyncAt();
             // r18：切后台的补传走更短的最小间隔（见 MIN_GAP_BACKGROUND_MS）。
             long gap = background ? MIN_GAP_BACKGROUND_MS : MIN_GAP_MS;
@@ -513,7 +539,9 @@ public final class HistorySyncManager {
                 // 首次学习偏移 / 时钟回拨：保守视为“刚同步过”，只等一个正常 gap，绝不放大。
                 elapsed = 0;
             }
-            if (elapsed < gap) {
+            if (continuation) {
+                LOG.i("[sync] continuation round, skip min-gap elapsed=" + elapsed + "ms");
+            } else if (elapsed < gap) {
                 syncing = false;
                 // ★ v99-r39：按「真实剩余时间」重排，而不是套用 retry-dirty 的固定 60 秒档。
                 //   距上次同步只差几秒时却被推到 60 秒后，退出播放那一刻的进度就传不上去了。
@@ -524,6 +552,13 @@ public final class HistorySyncManager {
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {
                 syncing = false;
+                // ★ v4.2.2（B）：补跑被门禁挡下时把标记还回去，避免「首轮推迟的 scope」
+                //   在这一次被吃掉标记后，又要按普通 30s 间隔再等一轮。
+                if (continuation) {
+                    synchronized (LOCK) {
+                        continuePending = true;
+                    }
+                }
                 SyncScheduler.skipped(owner, "wifi-only");
                 return;
             }
@@ -531,11 +566,26 @@ public final class HistorySyncManager {
             //         只有回退到旧 doSync 时才需要在这里挡一道。
             if (!Hawk.get(HawkConfig.SYNC_ENGINE_V2, true) && SyncState.load(owner).inBackoff()) {
                 syncing = false;
+                if (continuation) {
+                    synchronized (LOCK) {
+                        continuePending = true;
+                    }
+                }
                 SyncScheduler.skipped(owner, "backoff");
                 return;
             }
         }
         final long t0 = System.currentTimeMillis();
+        // ★ v4.2.2（B）：首轮轻量同步标记。只有「冷启动那一次」为真，用完立即复位，
+        //   保证紧随其后的补跑（fg / retry-pull / dirty）走完整 4 个 scope。
+        final boolean lightFirstRound;
+        synchronized (LOCK) {
+            lightFirstRound = firstRoundPending;
+            firstRoundPending = false;
+        }
+        if (lightFirstRound) {
+            LOG.i("[sync] light first round (SETTINGS+HISTORY only)");
+        }
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -560,7 +610,7 @@ public final class HistorySyncManager {
                     //   （"exception X is never thrown in body of corresponding try statement"）。
                     //   改为：只 catch Throwable 兜底，具体的错误语义由 Outcome.message 承载。
                     {
-                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, force);
+                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, force, lightFirstRound);
                         ok = r.ok;
                         msg = r.message == null ? "同步完成" : r.message;
                         engineHandled = true;
@@ -599,6 +649,14 @@ public final class HistorySyncManager {
                     SyncScheduler.skipped(owner, "aborted");
                 } else {
                     SyncScheduler.onSyncResult(owner, ok && (up > 0 || !notModified), up > 0);
+                }
+                // ★ v4.2.2（B）：首轮轻量同步收尾后，立刻排一轮补跑把 PROGRESS/COLLECT 处理掉。
+                //   放在 onSyncResult 之后：补跑是独立的一次调度，不与首轮合并。
+                //   只在首轮「成功」时补跑：失败时交给调度器的退避/补排，避免失败即立刻重试。
+                if (lightFirstRound && ok && !aborted) {
+                    continuePending = true;
+                    LOG.i("[sync] light first round done, schedule continuation");
+                    SyncScheduler.requestWithin(owner, "light-cont", 0L);
                 }
             }
         }, "tvbox-sync").start();

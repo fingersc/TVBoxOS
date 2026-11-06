@@ -65,6 +65,22 @@ public final class SyncEngine {
      * @param forceUpload 强制上传（手动同步 / 切换账号后）
      */
     public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload) throws Exception {
+        return run(owner, key, gen, forceUpload, false);
+    }
+
+    /**
+     * ★ v4.2.2（B）：冷启动首轮「轻量同步」。
+     *
+     * <p>首页「最近观看」只需要 HISTORY（+ 账号档位所在的 SETTINGS），而 PROGRESS/COLLECT
+     * 每个 scope 都要一次条件 GET、脏时还要 PUT，把首屏等待从 ~2s 拉长到 2.5s+。
+     * {@code lightFirstRound=true} 时本轮只处理 SETTINGS + HISTORY，其余 scope 保持脏标记，
+     * 由调用方紧接着排一轮补跑。</p>
+     *
+     * <p>注意：<b>不会</b>因此少传数据 —— 被跳过的 scope 的 {@code processedOk} 为 false，
+     * {@link #finish} 不会清它们的 dirty，补跑那轮照常上传。</p>
+     */
+    public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload,
+                              boolean lightFirstRound) throws Exception {
         SyncState st = SyncState.load(owner);
         // ★ P0-2：记下「本次同步开始前」的脏标记。SyncState 是整对象读改写，
         //   收尾时若直接 clearDirty()+save()，会把期间用户新标的脏一起洗掉（lost update）。
@@ -170,6 +186,12 @@ public final class SyncEngine {
         boolean[] processedOk = new boolean[SyncScope.COUNT];
         for (SyncScope sc : orderedScopes()) {
             if (!enabled.isEnabled(sc)) {
+                continue;
+            }
+            // ★ v4.2.2（B）：首轮轻量同步只跑 SETTINGS + HISTORY，其余 scope 留到补跑那轮。
+            //   processedOk 保持 false ⇒ finish 不清它的 dirty ⇒ 补跑照常上传，不会丢改动。
+            if (lightFirstRound && sc != SyncScope.SETTINGS && sc != SyncScope.HISTORY) {
+                LOG.i("[Sync] light first round: defer scope=" + sc);
                 continue;
             }
             try {
@@ -778,8 +800,14 @@ public final class SyncEngine {
      * <p>上层（HSM）因此不需要再自己 {@code noteFailure()}，避免双重计数。</p>
      */
     public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload) {
+        return runSafe(owner, key, gen, forceUpload, false);
+    }
+
+    /** ★ v4.2.2（B）：带 {@code lightFirstRound} 的版本，见 {@link #run(String, byte[], int, boolean, boolean)}。 */
+    public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload,
+                                  boolean lightFirstRound) {
         try {
-            return run(owner, key, gen, forceUpload);
+            return run(owner, key, gen, forceUpload, lightFirstRound);
         } catch (HistorySyncManager.SwitchAborted e) {
             // 切换账号作废：不计失败
             // ★ v99-r11-fix：通过返回值告知上层"这是作废、不是失败"（runSafe 不抛异常）
