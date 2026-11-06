@@ -1905,6 +1905,18 @@ public class PlayFragment extends BaseLazyFragment {
         //   「电视上看的进度，手机上要等下次打开播放页才看得到」。
         //   位置没变时节流会直接跳过，所以瞬时抖动依然不会触发同步。
         saveProgressOnInterrupt(true);
+        // v4.3 混合版：同集播放时历史 dataJson 不变，若只等 onStop 标 HISTORY 脏，
+        // 用户直接划掉任务（onStop 未执行）就永远不会把该片顶到最近观看第一位。
+        // 这里只做一次本机单行 HLC/updateTime 推进（无网络、不标脏），
+        // 由 onStop 或下次启动的 reconcilePushedHlc 兜底上传。
+        try {
+            if (mVodInfo != null && mVideoView != null && mVideoView.getCurrentPosition() > 0
+                    && !TextUtils.isEmpty(pkSourceKey) && !TextUtils.isEmpty(pkVodId)) {
+                historyTouchedOnPause = RoomDataManger.touchVodRecordPlayback(pkSourceKey, pkVodId);
+            }
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
         // P2：离开前台就不再因卡顿触发切源（回到前台会自动恢复）
         stallSwitchAllowed = false;
         // ★ 不立即暂停，改成「延迟确认」。
@@ -1996,6 +2008,13 @@ public class PlayFragment extends BaseLazyFragment {
         // 周期落盘：离开界面就不需要了（onDestroyView 的 removeCallbacksAndMessages 也会兜底）
         if (mHandler != null) {
             mHandler.removeCallbacks(progressTickRun);
+        }
+        // v4.3 混合版：onPause 已在本机推进历史 HLC（同集播放也有顺序变化）→ 退出前标脏，
+        // onBackground 的 0ms 补传即可把这条历史带上；若 onStop 没来得及执行，
+        // 下次启动 reconcilePushedHlc 会发现 DB max HLC > pushedHlc 并补标脏。
+        if (historyTouchedOnPause) {
+            HistorySyncManager.markDirty(com.github.tvbox.osc.sync.SyncScope.HISTORY);
+            historyTouchedOnPause = false;
         }
         HistorySyncManager.onBackground();
         LOG.i("echo-lifecycle onStop -> requestBackgroundSync");
@@ -2095,6 +2114,8 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     private VodInfo mVodInfo;
+    /** v4.3 混合版：本次 onPause 是否已在本机推进历史 HLC；onStop 据此决定是否标脏 HISTORY。 */
+    private boolean historyTouchedOnPause;
     /** ★ r144：日期表缓存守卫——同一部剧/同一套线路只建一次。 */
     private VodInfo dateTableBuiltVod;
     private String dateTableBuiltShow = "";

@@ -53,7 +53,10 @@ public final class HistorySyncManager {
     /** 退出/手动同步撞上「正在同步」时，挂起等待当前同步收尾的回调（v4.1.2）。 */
     private static final ArrayList<Callback> WAITERS = new ArrayList<>();
     /** 两次自动同步的最小间隔（手动同步不受此限）。 */
-    private static final long MIN_GAP_MS = 60 * 1000L;
+    // v4.2.1：前台最小间隔从 60s 降到 30s，与 onForeground 的 30s 新鲜度门控对齐。
+    // 否则「回前台立即拉」会在执行层被 60s min-gap 二次挡住（真机日志 05:23:56
+    // 已排 0ms，仍被 min-gap 推到 14s 后）。最坏 2 次/分钟，仍属低频。
+    private static final long MIN_GAP_MS = 30 * 1000L;
 
     /**
      * ★ v99-r18：切后台/退出播放页那「最后一次补传」的最小间隔。

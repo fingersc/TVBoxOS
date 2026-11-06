@@ -174,6 +174,42 @@ public class RoomDataManger {
     }
 
     /**
+     * v4.3 混合版：播放进度变化时，仅在本机把对应历史记录的 HLC/可信更新时间推进，
+     * 让「最近观看」顺序即时反映本次播放（同集播放也算一次观看）。
+     *
+     * <p>本方法<b>不标 HISTORY 脏、不产生任何网络请求</b>：真正的上传由
+     * {@code PlayFragment.onStop()}（确认 onPause 已 touch）或下次启动的
+     * {@code reconcilePushedHlc}（DB 最大 HLC > pushedHlc）触发，避免每次 onPause
+     * 都整包上传 history（实测每次约 7KB / 2 请求，频繁退出会很浪费）。</p>
+     *
+     * @return true 表示记录存在且已更新（调用方可在 onStop 时据此标脏 HISTORY）
+     */
+    public static boolean touchVodRecordPlayback(String sourceKey, String vodId) {
+        if (TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(vodId)) {
+            return false;
+        }
+        try {
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            VodRecord record = dao.getVodRecord(sourceKey, vodId);
+            if (record == null) {
+                return false;
+            }
+            Hlc h = HlcClock.next();
+            long updateTime = Math.max(TrustedClock.nowPhysical(), h.physical);
+            String dev = TextUtils.isEmpty(record.dev) ? HistorySyncManager.deviceId() : record.dev;
+            int rows = dao.touchHlc(sourceKey, vodId, h.physical, h.counter, dev, updateTime);
+            if (rows > 0) {
+                LOG.i("history touch sourceKey=" + sourceKey + " vodId=" + vodId
+                        + " hlc=" + h.physical + "/" + h.counter);
+            }
+            return rows > 0;
+        } catch (Throwable t) {
+            LOG.e("history touch failed", t);
+            return false;
+        }
+    }
+
+    /**
      * 同步前/写历史后对本机历史做「内容收敛」（清坏行 + 同名去重）。
      *
      * <p>★ 协议 v4：这里<b>不再按条数物理裁剪</b>。历史上限是「账号级云端保留集」

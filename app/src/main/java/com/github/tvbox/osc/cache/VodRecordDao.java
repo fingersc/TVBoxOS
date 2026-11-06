@@ -32,6 +32,14 @@ public interface VodRecordDao {
     @Query("select * from vodRecord where `sourceKey`=:sourceKey and `vodId`=:vodId")
     VodRecord getVodRecord(String sourceKey, String vodId);
 
+    /**
+     * v4.3 混合版：只推进某条历史的 HLC/可信更新时间，用于「同集播放也要把该片顶到最近观看第一位」。
+     * 单行 UPDATE，不改 dataJson、不触发内容比对；是否上传由调用方决定（onStop/启动对账才标脏）。
+     */
+    @Query("UPDATE vodRecord SET hlcPhysical=:physical, hlcCounter=:counter, dev=:dev, updateTime=:updateTime "
+            + "WHERE `sourceKey`=:sourceKey AND `vodId`=:vodId")
+    int touchHlc(String sourceKey, String vodId, long physical, int counter, String dev, long updateTime);
+
     @Delete
     int delete(VodRecord record);
 
