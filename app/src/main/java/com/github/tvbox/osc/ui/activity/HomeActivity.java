@@ -772,6 +772,7 @@ public class HomeActivity extends BaseActivity {
         }
         Toast.makeText(mContext, "正在同步观看记录…", Toast.LENGTH_SHORT).show();
         final boolean[] done = {false};
+        final int[] retries = {0};   // v4.1.3：退出时最多再补一轮，避免脏标记异常时反复请求
         final Handler handler = new Handler(Looper.getMainLooper());
         // 硬上限：正常情况下 2.5s 内完成；若此时仍有一轮同步在途，最多再等 2.5s，
         // 绝不因为「忙/超时」把在途同步直接杀在半路。
@@ -784,6 +785,17 @@ public class HomeActivity extends BaseActivity {
                     return;
                 }
                 if (!HistorySyncManager.isSyncing() || System.currentTimeMillis() >= hardDeadline) {
+                    // v4.1.3：同步已收尾但可能又有新 dirty（例如退出瞬间刚写进度），
+                    // 在硬上限内再补一轮，避免“ok 但本次没传”的窗口。
+                    if (!HistorySyncManager.isSyncing()
+                            && HistorySyncManager.isDirty()
+                            && retries[0] < 1
+                            && System.currentTimeMillis() < hardDeadline) {
+                        retries[0]++;
+                        HistorySyncManager.syncNow(null);
+                        handler.postDelayed(waitKill[0], 100L);
+                        return;
+                    }
                     done[0] = true;
                     handler.removeCallbacks(waitKill[0]);
                     HistorySyncManager.flushState();
@@ -817,6 +829,15 @@ public class HomeActivity extends BaseActivity {
                     return;
                 }
                 if (ok) {
+                    // v4.1.3：本轮成功不代表“退出瞬间的新写入”已经上传。
+                    // 仍有 dirty 时在硬上限内再补一轮；超过硬上限则 flush 后退出。
+                    if (HistorySyncManager.isDirty()
+                            && retries[0] < 1
+                            && System.currentTimeMillis() < hardDeadline) {
+                        retries[0]++;
+                        HistorySyncManager.syncNow(this);
+                        return;
+                    }
                     done[0] = true;
                     handler.removeCallbacks(waitKill[0]);
                     handler.removeCallbacks(timeout);

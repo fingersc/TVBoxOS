@@ -183,6 +183,42 @@ public final class HistorySyncManager {
      * 说明有本地写入尚未上传；此时把对应 scope 标脏，保证下一次同步会带上这些数据。
      * 没有这一步，dirty 布尔位可能在崩溃/重启后丢失，本机数据永远不再上传。</p>
      */
+    /**
+     * v4.1.3：本机 DB 中某个 scope 的最大 HLC。
+     * 用于判断「同步结束时，是否还有本机写入没有推送到 pushedHlc」。
+     */
+    public static Hlc localMaxHlc(SyncScope scope) {
+        if (scope == null) {
+            return Hlc.ZERO;
+        }
+        try {
+            com.github.tvbox.osc.data.AppDataBase db = AppDataManager.get();
+            Long p = null;
+            Integer c = null;
+            switch (scope) {
+                case HISTORY:
+                    p = db.getVodRecordDao().maxHlcPhysical();
+                    c = db.getVodRecordDao().maxHlcCounter();
+                    break;
+                case PROGRESS:
+                    p = db.getPlayProgressDao().maxHlcPhysical();
+                    c = db.getPlayProgressDao().maxHlcCounter();
+                    break;
+                case COLLECT:
+                    p = db.getVodCollectDao().maxHlcPhysical();
+                    c = db.getVodCollectDao().maxHlcCounter();
+                    break;
+                default:
+                    return Hlc.ZERO;
+            }
+            return new Hlc(p == null ? 0L : p.longValue(),
+                    c == null ? 0 : c.intValue(), "");
+        } catch (Throwable t) {
+            LOG.e("[sync] localMaxHlc failed: " + scope, t);
+            return Hlc.ZERO;
+        }
+    }
+
     private static void reconcilePushedHlc(String owner) {
         try {
             SyncState st = SyncState.load(owner);

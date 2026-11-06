@@ -409,7 +409,19 @@ public final class SyncEngine {
         //   失败/未启用的 scope 保持脏，下轮重试（旧实现会把它们一起清掉，导致丢更新）。
         boolean[] toClear = new boolean[SyncScope.COUNT];
         for (int i = 0; i < SyncScope.COUNT; i++) {
-            toClear[i] = dirtyBefore[i] && processedOk[i];
+            boolean clear = dirtyBefore[i] && processedOk[i];
+            SyncScope sc = SyncScope.values()[i];
+            // ★ v4.1.3：只有「本机 DB 的最大 HLC 已经不超过 pushedHlc」才允许清 dirty。
+            //   否则 applyLocal 之后、finish 之前的新写入会被本轮一起清掉，要等下次启动
+            //   reconcilePushedHlc 才重新标脏。SETTINGS 没有 DB HLC，交给 settingsSynced。
+            if (clear && sc != SyncScope.SETTINGS) {
+                Hlc localMax = HistorySyncManager.localMaxHlc(sc);
+                Hlc pushed = st.pushedHlc(sc);
+                if (localMax.compareIgnoringDev(pushed) > 0) {
+                    clear = false;
+                }
+            }
+            toClear[i] = clear;
         }
         boolean allOk = failedScopes.isEmpty();
         // ★ P0-3/P0-7：只有「设置 scope 启用且本轮确实同步成功」才清 pendingPull；
@@ -845,6 +857,23 @@ public final class SyncEngine {
                         cur.dirty[i] = false;   // 只清"本次同步确实覆盖到"的那些
                     }
                 }
+            }
+            // ★ v4.1.3：把本轮推进的 pushedHlc/meta 合并回最新状态。
+            //   原来 st 只是局部快照，bumpPushedHlc/saveMeta 的结果会随 finish 丢弃，
+            //   导致下轮误判「未推送」或重复 GET sync.meta。
+            if (st.pushedHlcPhysical != null && st.pushedHlcCounter != null) {
+                for (int i = 0; i < SyncScope.COUNT
+                        && i < st.pushedHlcPhysical.length
+                        && i < st.pushedHlcCounter.length; i++) {
+                    cur.bumpPushedHlc(SyncScope.values()[i],
+                            st.pushedHlcPhysical[i], st.pushedHlcCounter[i]);
+                }
+            }
+            if (st.metaEtag != null && st.metaEtag.length() > 0) {
+                cur.metaEtag = st.metaEtag;
+            }
+            if (st.metaJson != null && st.metaJson.length() > 0) {
+                cur.metaJson = st.metaJson;
             }
             cur.clearFailure();
             cur.save();
