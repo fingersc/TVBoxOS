@@ -360,7 +360,16 @@ public final class HistorySyncManager {
         if (AccountContext.isGuest()) {
             return;
         }
-        SyncScheduler.request(owner(), "fg");
+        // v4.2：回前台若距上次成功同步已超过 30s，立即补拉一次（0ms 提前），
+        // 不再走 5/10/20/30 分钟的 idle 档——否则另一台设备的删除/进度要等很久。
+        // 30s 内刚同步过则维持原调度，避免来回切换页面时抖动。
+        long last = lastSyncAt();
+        long now = com.github.tvbox.osc.sync.TrustedClock.nowPhysical();
+        if (last <= 0 || now < last || now - last > 30_000L) {
+            SyncScheduler.requestWithin(owner(), "fg", 0L);
+        } else {
+            SyncScheduler.request(owner(), "fg");
+        }
     }
 
     /** 进后台：有改动就尽快补一次（不保证完成）；纯轮询任务由调度器取消。 */

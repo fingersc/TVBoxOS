@@ -138,6 +138,42 @@ public class RoomDataManger {
     }
 
     /**
+     * v4.2：如果本机已经不存在这条历史（例如另一台设备删除后本机同步删除），
+     * 但本机仍在播放该片，退出播放时用当前 VodInfo 重建一条历史，并用新 HLC 写回。
+     *
+     * <p>只在记录缺失时插入；记录存在时什么都不做，避免每次退播放页都刷新历史 HLC、
+     * 触发整包上传。</p>
+     */
+    public static boolean reviveVodRecordIfMissing(String sourceKey, VodInfo vodInfo) {
+        if (vodInfo == null || TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(vodInfo.id)) {
+            return false;
+        }
+        try {
+            VodRecordDao dao = AppDataManager.get().getVodRecordDao();
+            if (dao.getVodRecord(sourceKey, vodInfo.id) != null) {
+                return false;
+            }
+            VodRecord record = new VodRecord();
+            record.sourceKey = sourceKey;
+            record.vodId = vodInfo.id;
+            Hlc h = HlcClock.next();
+            record.hlcPhysical = h.physical;
+            record.hlcCounter = h.counter;
+            record.dev = HistorySyncManager.deviceId();
+            record.updateTime = Math.max(TrustedClock.nowPhysical(), h.physical);
+            record.dataJson = getVodInfoGson().toJson(vodInfo);
+            dao.insert(record);
+            HistorySyncManager.markDirty(SyncScope.HISTORY);
+            LOG.i("history revive sourceKey=" + sourceKey + " vodId=" + vodInfo.id
+                    + " hlc=" + h.physical + "/" + h.counter);
+            return true;
+        } catch (Throwable t) {
+            LOG.e("history revive failed", t);
+            return false;
+        }
+    }
+
+    /**
      * 同步前/写历史后对本机历史做「内容收敛」（清坏行 + 同名去重）。
      *
      * <p>★ 协议 v4：这里<b>不再按条数物理裁剪</b>。历史上限是「账号级云端保留集」

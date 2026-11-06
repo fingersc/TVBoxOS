@@ -90,17 +90,31 @@ public final class SyncMerge {
         Map<String, SyncPayload.Tomb> recordTombs = tombMap(local.deleted.records, remote.deleted.records);
         Map<String, SyncPayload.RecordItem> localRecords = indexRecords(local.records);
         Map<String, SyncPayload.RecordItem> remoteRecords = indexRecords(remote.records);
+        // v4.2：删除后另一台设备仍在播放。进度 HLC 已高于历史墓碑，说明删除之后
+        // 该片又被播放过；这条进度应把历史一起“复活”，否则首页只删不加，
+        // 与「以最后仍在播放的设备为准」的语义相反。
+        Map<String, Hlc> progressAfterTomb = new LinkedHashMap<>();
+        collectProgressAfterTomb(progressAfterTomb, local.progress, recordTombs);
+        collectProgressAfterTomb(progressAfterTomb, remote.progress, recordTombs);
         for (String key : union(localRecords.keySet(), remoteRecords.keySet())) {
             SyncPayload.RecordItem a = localRecords.get(key);
             SyncPayload.RecordItem b = remoteRecords.get(key);
             SyncPayload.Tomb tomb = recordTombs.get(key);
+            Hlc revived = tomb == null ? null : progressAfterTomb.get(key);
             if (suppressed(tomb, a) || suppressed(tomb, b)) {
-                if (tomb != null && !tombBeaten(tomb, a, b)) {
+                if (tomb != null && !tombBeaten(tomb, a, b) && revived == null) {
                     continue;
                 }
             }
             SyncPayload.RecordItem win = pickRecord(a, b);
             if (win != null) {
+                if (revived != null && compareIgnoringDev(win.hlc(), tomb.hlc()) <= 0) {
+                    win.hlcPhysical = revived.physical;
+                    win.hlcCounter = revived.counter;
+                    if (win.updateTime < revived.physical) {
+                        win.updateTime = revived.physical;
+                    }
+                }
                 out.records.add(win);
             }
         }
@@ -375,6 +389,37 @@ public final class SyncMerge {
         putTombs(map, a);
         putTombs(map, b);
         return map;
+    }
+
+    /**
+     * v4.2：收集「HLC 高于同类历史墓碑」的进度，按 recordKey 取最大 HLC。
+     *
+     * <p>它表示：删除之后该片又被播放过，历史应当随之复活（见 merge 的记录分支）。</p>
+     */
+    private static void collectProgressAfterTomb(Map<String, Hlc> out,
+                                                 List<SyncPayload.ProgressItem> list,
+                                                 Map<String, SyncPayload.Tomb> recordTombs) {
+        if (list == null) {
+            return;
+        }
+        for (SyncPayload.ProgressItem p : list) {
+            if (p == null) {
+                continue;
+            }
+            String key = recordKey(p.sourceKey, p.vodId);
+            SyncPayload.Tomb tomb = recordTombs.get(key);
+            if (tomb == null) {
+                continue;
+            }
+            Hlc h = p.hlc();
+            if (compareIgnoringDev(h, tomb.hlc()) <= 0) {
+                continue;
+            }
+            Hlc old = out.get(key);
+            if (old == null || h.compareTo(old) > 0) {
+                out.put(key, h);
+            }
+        }
     }
 
     private static void putTombs(Map<String, SyncPayload.Tomb> map, List<SyncPayload.Tomb> list) {

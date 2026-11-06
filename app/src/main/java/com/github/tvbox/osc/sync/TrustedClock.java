@@ -28,6 +28,15 @@ public final class TrustedClock {
     /** 与当前偏移相差超过 2s 才采纳新样本（过滤 Date 秒级抖动）。 */
     private static final long ADOPT_THRESHOLD_MS = 2000L;
 
+    /**
+     * v4.2：偏差超过 10 分钟时直接吸附到服务端时间，不再做 50% 平滑。
+     *
+     * <p>模拟器/平板可能一开机就偏几个小时（实测 -6h17m）。50% 平滑要十几轮
+     * 才收敛，这期间 HLC 仍然错得离谱，会制造大量“看起来更新/更旧”的假象。
+     * 大偏差一次到底；2s–10min 的小偏差仍平滑，避免网络抖动带偏。</p>
+     */
+    private static final long SNAP_THRESHOLD_MS = 10L * 60 * 1000;
+
     private static volatile long sOffset = Long.MIN_VALUE;
 
     private TrustedClock() {
@@ -74,8 +83,17 @@ public final class TrustedClock {
             return;
         }
         long cur = offset();
-        if (Math.abs(candidate - cur) > ADOPT_THRESHOLD_MS) {
-            long next = cur + (candidate - cur) / 2;
+        long delta = candidate - cur;
+        if (Math.abs(delta) > ADOPT_THRESHOLD_MS) {
+            long next;
+            if (Math.abs(delta) > SNAP_THRESHOLD_MS) {
+                // v4.2：设备时钟整机偏几小时，平滑收敛太慢，直接吸附。
+                next = candidate;
+                android.util.Log.i("TVBox-rt", "[clock] offset snap cur=" + cur
+                        + " candidate=" + candidate + " delta=" + delta);
+            } else {
+                next = cur + delta / 2;
+            }
             sOffset = next;
             try {
                 Hawk.put(KEY_OFFSET, next);

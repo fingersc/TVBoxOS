@@ -54,6 +54,7 @@ import com.github.tvbox.osc.bean.Subtitle;
 import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.CacheManager;
 import com.github.tvbox.osc.cache.PlayProgressManager;
+import com.github.tvbox.osc.cache.RoomDataManger;
 import com.github.tvbox.osc.dlna.CastVideo;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.player.ExoPlayer;
@@ -2066,6 +2067,16 @@ public class PlayFragment extends BaseLazyFragment {
             // mCurrentPosition（只在 getCurrentPosition() 被调用时更新），
             // 这里先按真实位置落一次盘，再释放。
             saveCurrentProgressNow();
+            // v4.2：另一台设备可能在本次播放期间删除了这条历史；本机仍在本片播放页
+            // 说明用户还在使用它，退出时若历史已不存在则按当前 VodInfo 重建一条，
+            // 以“后播放者为准”覆盖墓碑（HLC 由 RoomDataManger 内部生成）。
+            if (mVodInfo != null && !TextUtils.isEmpty(pkSourceKey)) {
+                try {
+                    RoomDataManger.reviveVodRecordIfMissing(pkSourceKey, mVodInfo);
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                }
+            }
             // v73：退出播放页时进度刚落盘，立即补一次同步（60 秒门槛内部判断），
             // 避免「看完就退出 App」时只能等下次启动补传。
             HistorySyncManager.onPlaybackExit();
