@@ -294,8 +294,8 @@ public final class HistorySyncManager {
      * v98 P2：按 scope 标脏 —— 「改一个设置」不再等价于「四张表全脏」。
      *
      * <p>当前引擎还没按 scope 裁剪请求体（协议不变、行为等价），按 scope 标脏
-     * 立刻生效的是<b>调度层</b>：只有真脏的账号才走 60 秒防抖的立即档，
-     * 其余走自适应间隔。</p>
+     * 立刻生效的是<b>调度层</b>：只有真脏的账号才走防抖的立即档
+     * （播放中 5 分钟、其他场景 60 秒），其余走自适应间隔。</p>
      */
     public static void markDirty(SyncScope... scopes) {
         // 旧键仍写一份：回退到旧引擎（SYNC_ENGINE_V2=false）时仍然看得到脏标记
@@ -424,7 +424,7 @@ public final class HistorySyncManager {
         if (stale && !isDirty()) {
             SyncScheduler.requestWithin(owner(), "fg", 0L);
         } else {
-            // 有脏：走 60s 防抖（request() 自带 PRI_DIRTY），不抢跑；
+            // 有脏：走防抖（播放中 5 分钟、其他场景 60 秒，request() 自带 PRI_DIRTY），不抢跑；
             // 若此刻本来就有 300ms 的退出窗口任务，只做合并、绝不推后它的执行时间。
             SyncScheduler.request(owner(), "fg");
         }

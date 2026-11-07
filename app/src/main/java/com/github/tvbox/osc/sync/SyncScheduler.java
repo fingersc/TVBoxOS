@@ -35,7 +35,7 @@ public final class SyncScheduler {
 
     /** 立即执行：手动同步 / 切换账号 / 退出 App 前。 */
     static final int PRI_NOW = 0;
-    /** 本地有改动：60 秒防抖后执行。 */
+    /** 本地有改动：播放中 5 分钟、其他场景 60 秒防抖后执行。 */
     static final int PRI_DIRTY = 1;
     /** 单纯轮询云端：按自适应间隔执行。 */
     static final int PRI_IDLE = 2;
@@ -48,6 +48,19 @@ public final class SyncScheduler {
      * 60 秒与 {@code HistorySyncManager} 的最小间隔一致，取两者交集。</p>
      */
     private static final long DIRTY_DEBOUNCE_MS = 60_000L;
+
+    /**
+     * ★ 播放中的脏数据防抖窗口（5 分钟）。
+     *
+     * <p>播放页在前台时，切源 / 换集 / seek 会产生密集脏写入；若仍按 60 秒跑，
+     * 一轮完整的条件 GET + 合并 + PUT 就变成「每分钟一次」，云端版本列表也被刷成
+     * 每分钟一条。播放中把窗口放宽到 5 分钟，把这些写入合并成一次。</p>
+     *
+     * <p><b>不影响退出路径</b>：{@code onPlaybackExit()} / {@code onBackground()} 走
+     * {@code requestWithin(capMs=300ms)}，{@link #schedule} 里 capMs 的取小在放大之后，
+     * 该任务仍会被提前到 300ms。非播放场景（收藏 / 设置 / 首页）继续用 60 秒。</p>
+     */
+    private static final long PLAYING_DIRTY_DEBOUNCE_MS = 5 * 60_000L;
 
     /**
      * 「没有上限」的 capMs 哨兵。
@@ -387,10 +400,7 @@ public final class SyncScheduler {
                 main().removeCallbacks(pending);
                 TASKS.remove(owner);
             }
-            long delay = delayOf(pri, SyncState.load(owner).intervalIdx);
-            if (capMs >= 0 && capMs < delay) {
-                delay = capMs;
-            }
+            long delay = delayFor(pri, SyncState.load(owner).intervalIdx, playing, capMs);
             Task t = new Task(owner, reason, pri, force, cb);
             // ★ v4.2.8：替换在途任务时也要继承它的 background —— 实测有另一条丢法：
             //   onBackground()（reason=bg, pri=2）先排上，300ms 内 markDirty 的 dirty(pri=1)
@@ -504,6 +514,23 @@ public final class SyncScheduler {
             default:
                 return intervalFor(idx);
         }
+    }
+
+    /**
+     * 实际排期延迟：在 {@link #delayOf} 的基础上应用「播放中脏数据放宽」与 capMs。
+     *
+     * <p>播放中（播放页在前台）把 PRI_DIRTY 的窗口从 60 秒放宽到 5 分钟；
+     * 但 {@code capMs} 的取小放在最后 —— 退出 / 切后台传入的 300ms 仍然能把任务提前。</p>
+     */
+    static long delayFor(int pri, int idx, boolean playing, long capMs) {
+        long delay = delayOf(pri, idx);
+        if (pri == PRI_DIRTY && playing) {
+            delay = Math.max(delay, PLAYING_DIRTY_DEBOUNCE_MS);
+        }
+        if (capMs >= 0 && capMs < delay) {
+            delay = capMs;
+        }
+        return delay;
     }
 
     /** 有变化 ⇒ 回到 5 分钟档；连续无变化 ⇒ 升档（封顶 30 分钟）。 */
