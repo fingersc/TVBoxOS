@@ -131,13 +131,22 @@ public class RoomDataManger {
         Long maxUpdateTime = dao.maxUpdateTime();
         boolean recencyChanged = record.updateTime > 0 && maxUpdateTime != null
                 && record.updateTime < maxUpdateTime;
-        if (contentChanged || recencyChanged || record.hlcPhysical <= 0) {
+        if (contentChanged || recencyChanged || record.hlcPhysical <= 0 || record.updateTime <= 0) {
             Hlc h = HlcClock.next();
             record.hlcPhysical = h.physical;
             record.hlcCounter = h.counter;
             record.dev = HistorySyncManager.deviceId();
+            // ★ v4.3.4（r182）：updateTime 必须与 HLC 同步推进，不能无条件刷新。
+            //   以前这一行在 if 之外：内容没变、又不是「重看老片」时 HLC 不动，但 updateTime
+            //   被刷成本机当前可信时间 ⇒ 两台设备「同一 HLC + 不同 updateTime」⇒
+            //   SyncMerge.pickRecord 按 updateTime 取最大者后仍与对端不等 ⇒ contentEquals 判
+            //   「不同」⇒ 每次重看当前最近一部都白传一次整包 HISTORY（r181 日志实测：手机
+            //   recs=15/15、hlc 完全相同，仅 updateTime(1794040464767->1794040382615) 不同）。
+            //   挪进来后与第 130 行注释「已经是全表最新时完全不动」一致：HLC 不变 ⇒ updateTime
+            //   不变；重看老片走 recencyChanged 分支，HLC 推进、updateTime 照旧抬到最前。
+            //   `record.updateTime <= 0` 兜住老版本遗留的「有 HLC 但 updateTime=0」脏行。
+            record.updateTime = Math.max(TrustedClock.nowPhysical(), record.hlcPhysical);
         }
-        record.updateTime = Math.max(TrustedClock.nowPhysical(), record.hlcPhysical);
         record.dataJson = newJson;
         dao.insert(record);
         // v98 P2：只脏「历史」——写一条观看记录不该把收藏/设置也拖下水
@@ -835,6 +844,13 @@ public class RoomDataManger {
                     //   否则云端那份会在下一次同步被合并回来（删了又回来）。
                     SyncTombstones.addRecord(record.sourceKey, record.vodId, hlcOf(record));
                     dao.delete(record);
+                    // ★ v4.3.4（r182）：同名合并会静默删掉「其它源的同名记录」，是 HISTORY 条数
+                    //   悄悄变少的唯一非裁剪元凶（r181 已排除 truncateMergedHistory 与
+                    //   compactHistory：两者均无日志、truncated=0、pruned=false）。补一行日志，
+                    //   下次条数下降可直接对上；sameFilm 决定进度是否已迁移（false 会另有 skip 行）。
+                    LOG.i("[Hist] dedupeSameName del=" + record.sourceKey + "/" + record.vodId
+                            + " name=" + name + " keep=" + sourceKey + "/" + vodInfo.id
+                            + " sameFilm=" + sameFilm);
                 }
             } catch (Exception ignored) {
             }
