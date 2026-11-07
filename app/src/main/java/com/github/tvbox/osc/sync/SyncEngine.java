@@ -230,6 +230,13 @@ public final class SyncEngine {
                     && knownEtag != null && knownEtag.length() > 0
                     && knownEtag.equals(st.getEtag(sc))
                     && st.remoteHash(sc) != null;
+            // 诊断：云端 ETag 未变却没指纹 ⇒ 只能老实 GET 一次（正常情况下每次 ETag 变化后只发生一次）。
+            if (!skipFetch && dirty && !forceUpload && !downloadOnly
+                    && knownEtag != null && knownEtag.length() > 0
+                    && knownEtag.equals(st.getEtag(sc)) && st.remoteHash(sc) == null) {
+                LOG.i("[Sync] no-fingerprint scope=" + sc + " etag=" + shortEtag(knownEtag)
+                        + " -> full GET this round");
+            }
             if (skipFetch) {
                 shadow = HistorySyncManager.buildLocal(owner, deviceId, one, now);
                 HistorySyncManager.truncateMergedHistory(shadow, one);
@@ -1020,6 +1027,25 @@ public final class SyncEngine {
                     String e = st.etags[i];
                     if (e != null && !e.isEmpty()) {
                         cur.setEtag(SyncScope.values()[i], e);
+                    }
+                }
+            }
+            // ★ v4.3.1（r180-A 修正）：把本轮算出的远端指纹合并回最新状态。
+            //   原来只拷了 etags，忘了 remoteHash/remoteSize ⇒ 指纹随 st 这个局部快照一起被丢弃，
+            //   云端下一轮永远"没有指纹"⇒ skipFetch 永不成立、每轮照旧完整 GET（r179-180 首版实测即此症状）。
+            //   与上面 r4.1.3 的 pushedHlc 是同一类错误：st 只是局部快照，不拷回来就等于白算。
+            if (st.remoteHash != null && st.remoteSize != null && st.etags != null) {
+                for (int i = 0; i < SyncScope.COUNT
+                        && i < st.remoteHash.length
+                        && i < st.remoteSize.length
+                        && i < st.etags.length; i++) {
+                    SyncScope s = SyncScope.values()[i];
+                    String h = st.remoteHash[i];
+                    String e = st.etags[i];
+                    if (h != null && !h.isEmpty() && e != null && !e.isEmpty()) {
+                        cur.setRemoteSnapshot(s, e, h, st.remoteSize[i]);
+                    } else {
+                        cur.clearRemoteSnapshot(s);
                     }
                 }
             }
