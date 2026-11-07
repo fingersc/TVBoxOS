@@ -1052,6 +1052,364 @@ public final class HistorySyncManager {
         }
     }
 
+    // ================= ★ v4.3.3-diag（r181）：same-miss / 合并 差异窗口 =================
+    //
+    // 背景（1548 双设备日志）：
+    //   ① 两次「recs 相同、hlc 也完全相同，却 content=false」（手机 15:50:01 HISTORY recs=15/15、
+    //      模拟器 15:54:50 HISTORY recs=14/14）—— 旧日志只报「判了不同」，不报「哪里不同」，
+    //      导致每轮白跑一次 GET + PUT（各约 1.7KB），却始终定位不到差异字段，只能靠猜。
+    //   ② HISTORY 条数从 15 掉到 14（全程 pruned=false，排除 pruneHistory）—— 同样只看到结果，
+    //      看不到是哪条 key 被谁丢的。
+    //
+    // 这里补一行结构化差异，**只在 same-miss 且 content=false 时调用**，正常轮次零开销：
+    //   rec[+0 -1 ~0] -abc|12345(nt) prog[=] col[=]
+    //     +   只在本端有（本轮会带上云）
+    //     -   只在云端有（本轮被合并/墓碑/裁剪丢弃）；(t)=命中墓碑，(nt)=无墓碑（多为上限裁剪）
+    //     ~   两边都有但内容不同，后面附字段级差异与 dataJson 的首个分歧点
+    // 不调用 GSON.toJson，只做字段比较与字符串切片，开销与记录数线性相关。
+
+    /** 一次集合比较的计数。 */
+    private static final class DiffCount {
+        int add;
+        int del;
+        int chg;
+    }
+
+    /**
+     * 两个包（同一 scope）的逐条差异摘要，见上方格式说明。异常时返回 {@code diff-failed:...}，
+     * 绝不让诊断代码影响同步主流程。
+     */
+    static String diffBrief(SyncPayload a, SyncPayload b) {
+        if (a == null || b == null) {
+            return "null";
+        }
+        try {
+            StringBuilder out = new StringBuilder(192);
+            DiffCount c = new DiffCount();
+            String ex = diffRecords(a, b, c);
+            out.append("rec").append(summary(c)).append(ex);
+            c = new DiffCount();
+            ex = diffProgress(a, b, c);
+            out.append(" prog").append(summary(c)).append(ex);
+            c = new DiffCount();
+            ex = diffCollects(a, b, c);
+            out.append(" col").append(summary(c)).append(ex);
+            return out.toString();
+        } catch (Throwable t) {
+            return "diff-failed:" + t;
+        }
+    }
+
+    private static String summary(DiffCount c) {
+        if (c.add == 0 && c.del == 0 && c.chg == 0) {
+            return "[=]";
+        }
+        return "[+" + c.add + " -" + c.del + " ~" + c.chg + "]";
+    }
+
+    private static String diffRecords(SyncPayload a, SyncPayload b, DiffCount c) {
+        Map<String, SyncPayload.RecordItem> ma = new LinkedHashMap<>();
+        if (a.records != null) {
+            for (SyncPayload.RecordItem it : a.records) {
+                if (it != null) {
+                    ma.put(SyncMerge.recordKey(it.sourceKey, it.vodId), it);
+                }
+            }
+        }
+        Map<String, SyncPayload.RecordItem> mb = new LinkedHashMap<>();
+        if (b.records != null) {
+            for (SyncPayload.RecordItem it : b.records) {
+                if (it != null) {
+                    mb.put(SyncMerge.recordKey(it.sourceKey, it.vodId), it);
+                }
+            }
+        }
+        StringBuilder ex = new StringBuilder(128);
+        int shown = 0;
+        for (Map.Entry<String, SyncPayload.RecordItem> e : ma.entrySet()) {
+            SyncPayload.RecordItem other = mb.get(e.getKey());
+            if (other == null) {
+                c.add++;
+                if (shown < 2) {
+                    ex.append(" +").append(e.getKey());
+                    shown++;
+                }
+            } else {
+                String fd = recordFields(e.getValue(), other);
+                if (fd.length() > 0) {
+                    c.chg++;
+                    if (shown < 2) {
+                        ex.append(" ~").append(e.getKey()).append('{').append(fd).append('}');
+                        shown++;
+                    }
+                }
+            }
+        }
+        for (String k : mb.keySet()) {
+            if (!ma.containsKey(k)) {
+                c.del++;
+                if (shown < 2) {
+                    ex.append(" -").append(k).append(tombMark(a, k));
+                    shown++;
+                }
+            }
+        }
+        return ex.toString();
+    }
+
+    private static String diffProgress(SyncPayload a, SyncPayload b, DiffCount c) {
+        Map<String, SyncPayload.ProgressItem> ma = new LinkedHashMap<>();
+        if (a.progress != null) {
+            for (SyncPayload.ProgressItem it : a.progress) {
+                if (it != null) {
+                    ma.put(SyncMerge.progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName), it);
+                }
+            }
+        }
+        Map<String, SyncPayload.ProgressItem> mb = new LinkedHashMap<>();
+        if (b.progress != null) {
+            for (SyncPayload.ProgressItem it : b.progress) {
+                if (it != null) {
+                    mb.put(SyncMerge.progressKey(it.sourceKey, it.vodId, it.flag, it.playIndex, it.epName), it);
+                }
+            }
+        }
+        StringBuilder ex = new StringBuilder(128);
+        int shown = 0;
+        for (Map.Entry<String, SyncPayload.ProgressItem> e : ma.entrySet()) {
+            SyncPayload.ProgressItem other = mb.get(e.getKey());
+            if (other == null) {
+                c.add++;
+                if (shown < 2) {
+                    ex.append(" +").append(e.getKey());
+                    shown++;
+                }
+            } else {
+                String fd = progressFields(e.getValue(), other);
+                if (fd.length() > 0) {
+                    c.chg++;
+                    if (shown < 2) {
+                        ex.append(" ~").append(e.getKey()).append('{').append(fd).append('}');
+                        shown++;
+                    }
+                }
+            }
+        }
+        for (String k : mb.keySet()) {
+            if (!ma.containsKey(k)) {
+                c.del++;
+                if (shown < 2) {
+                    ex.append(" -").append(k);
+                    shown++;
+                }
+            }
+        }
+        return ex.toString();
+    }
+
+    private static String diffCollects(SyncPayload a, SyncPayload b, DiffCount c) {
+        Map<String, SyncPayload.CollectItem> ma = new LinkedHashMap<>();
+        if (a.collects != null) {
+            for (SyncPayload.CollectItem it : a.collects) {
+                if (it != null) {
+                    ma.put(SyncMerge.collectKey(it.sourceKey, it.vodId), it);
+                }
+            }
+        }
+        Map<String, SyncPayload.CollectItem> mb = new LinkedHashMap<>();
+        if (b.collects != null) {
+            for (SyncPayload.CollectItem it : b.collects) {
+                if (it != null) {
+                    mb.put(SyncMerge.collectKey(it.sourceKey, it.vodId), it);
+                }
+            }
+        }
+        StringBuilder ex = new StringBuilder(96);
+        int shown = 0;
+        for (Map.Entry<String, SyncPayload.CollectItem> e : ma.entrySet()) {
+            SyncPayload.CollectItem other = mb.get(e.getKey());
+            if (other == null) {
+                c.add++;
+                if (shown < 2) {
+                    ex.append(" +").append(e.getKey());
+                    shown++;
+                }
+            } else {
+                String fd = collectFields(e.getValue(), other);
+                if (fd.length() > 0) {
+                    c.chg++;
+                    if (shown < 2) {
+                        ex.append(" ~").append(e.getKey()).append('{').append(fd).append('}');
+                        shown++;
+                    }
+                }
+            }
+        }
+        for (String k : mb.keySet()) {
+            if (!ma.containsKey(k)) {
+                c.del++;
+                if (shown < 2) {
+                    ex.append(" -").append(k).append(tombMarkCollect(a, k));
+                    shown++;
+                }
+            }
+        }
+        return ex.toString();
+    }
+
+    /** 记录墓碑标记：有墓碑 → {@code (t)}；无墓碑 → {@code (nt)}（多半是被上限裁掉）。 */
+    private static String tombMark(SyncPayload merged, String key) {
+        if (merged == null || merged.deleted == null || merged.deleted.records == null) {
+            return "(nt)";
+        }
+        for (SyncPayload.Tomb t : merged.deleted.records) {
+            if (t != null && key.equals(t.key)) {
+                return "(t)";
+            }
+        }
+        return "(nt)";
+    }
+
+    private static String tombMarkCollect(SyncPayload merged, String key) {
+        if (merged == null || merged.deleted == null || merged.deleted.collects == null) {
+            return "(nt)";
+        }
+        for (SyncPayload.Tomb t : merged.deleted.collects) {
+            if (t != null && key.equals(t.key)) {
+                return "(t)";
+            }
+        }
+        return "(nt)";
+    }
+
+    private static String recordFields(SyncPayload.RecordItem x, SyncPayload.RecordItem y) {
+        StringBuilder sb = new StringBuilder(96);
+        if (!eq(x.sourceKey, y.sourceKey)) {
+            sb.append("sourceKey;");
+        }
+        if (!eq(x.vodId, y.vodId)) {
+            sb.append("vodId;");
+        }
+        if (x.updateTime != y.updateTime) {
+            sb.append("updateTime(").append(x.updateTime).append("->").append(y.updateTime).append(");");
+        }
+        if (!eq(x.dev, y.dev)) {
+            sb.append("dev(").append(x.dev).append("->").append(y.dev).append(");");
+        }
+        if (x.hlcPhysical != y.hlcPhysical) {
+            sb.append("hlcP(").append(x.hlcPhysical).append("->").append(y.hlcPhysical).append(");");
+        }
+        if (x.hlcCounter != y.hlcCounter) {
+            sb.append("hlcC(").append(x.hlcCounter).append("->").append(y.hlcCounter).append(");");
+        }
+        if (!eq(x.dataJson, y.dataJson)) {
+            sb.append("dataJson").append(jsonDiff(x.dataJson, y.dataJson)).append(';');
+        }
+        return sb.toString();
+    }
+
+    private static String progressFields(SyncPayload.ProgressItem x, SyncPayload.ProgressItem y) {
+        StringBuilder sb = new StringBuilder(96);
+        if (!eq(x.sourceKey, y.sourceKey)) {
+            sb.append("sourceKey;");
+        }
+        if (!eq(x.vodId, y.vodId)) {
+            sb.append("vodId;");
+        }
+        if (!eq(x.flag, y.flag)) {
+            sb.append("flag;");
+        }
+        if (x.playIndex != y.playIndex) {
+            sb.append("playIndex(").append(x.playIndex).append("->").append(y.playIndex).append(");");
+        }
+        if (!eq(x.epName, y.epName)) {
+            sb.append("epName;");
+        }
+        if (x.position != y.position) {
+            sb.append("position(").append(x.position).append("->").append(y.position).append(");");
+        }
+        if (x.updateTime != y.updateTime) {
+            sb.append("updateTime(").append(x.updateTime).append("->").append(y.updateTime).append(");");
+        }
+        if (!eq(x.dev, y.dev)) {
+            sb.append("dev(").append(x.dev).append("->").append(y.dev).append(");");
+        }
+        if (x.hlcPhysical != y.hlcPhysical) {
+            sb.append("hlcP(").append(x.hlcPhysical).append("->").append(y.hlcPhysical).append(");");
+        }
+        if (x.hlcCounter != y.hlcCounter) {
+            sb.append("hlcC(").append(x.hlcCounter).append("->").append(y.hlcCounter).append(");");
+        }
+        return sb.toString();
+    }
+
+    private static String collectFields(SyncPayload.CollectItem x, SyncPayload.CollectItem y) {
+        StringBuilder sb = new StringBuilder(80);
+        if (!eq(x.sourceKey, y.sourceKey)) {
+            sb.append("sourceKey;");
+        }
+        if (!eq(x.vodId, y.vodId)) {
+            sb.append("vodId;");
+        }
+        if (!eq(x.name, y.name)) {
+            sb.append("name;");
+        }
+        if (!eq(x.pic, y.pic)) {
+            sb.append("pic;");
+        }
+        if (x.updateTime != y.updateTime) {
+            sb.append("updateTime(").append(x.updateTime).append("->").append(y.updateTime).append(");");
+        }
+        if (!eq(x.dev, y.dev)) {
+            sb.append("dev(").append(x.dev).append("->").append(y.dev).append(");");
+        }
+        if (x.hlcPhysical != y.hlcPhysical) {
+            sb.append("hlcP(").append(x.hlcPhysical).append("->").append(y.hlcPhysical).append(");");
+        }
+        if (x.hlcCounter != y.hlcCounter) {
+            sb.append("hlcC(").append(x.hlcCounter).append("->").append(y.hlcCounter).append(");");
+        }
+        return sb.toString();
+    }
+
+    /** dataJson 的首个分歧点 + 两侧片段（各 ≤ 72 字符），用于定位「内容哪里不一样」。 */
+    private static String jsonDiff(String a, String b) {
+        int la = a == null ? 0 : a.length();
+        int lb = b == null ? 0 : b.length();
+        int n = Math.min(la, lb);
+        int i = 0;
+        while (i < n && a.charAt(i) == b.charAt(i)) {
+            i++;
+        }
+        int from = i > 24 ? i - 24 : 0;
+        return "(" + la + "->" + lb + " @" + i
+                + " A=" + snip(a, from, i + 48)
+                + " B=" + snip(b, from, i + 48) + ")";
+    }
+
+    private static String snip(String s, int from, int to) {
+        if (s == null) {
+            return "null";
+        }
+        if (from < 0) {
+            from = 0;
+        }
+        if (from > s.length()) {
+            from = s.length();
+        }
+        if (to > s.length()) {
+            to = s.length();
+        }
+        if (to < from) {
+            to = from;
+        }
+        return s.substring(from, to);
+    }
+
+    private static boolean eq(String a, String b) {
+        return a == null ? b == null : a.equals(b);
+    }
+
     /**
      * 生成「用于比较」的副本：列表按规范顺序排序 + 顶层元数据归一化，<b>不修改入参</b>。
      *
@@ -1136,6 +1494,15 @@ public final class HistorySyncManager {
             }
         });
         merged.records = new ArrayList<>(sorted.subList(0, keep));
+        // ★ v4.3.3-diag（r181）：裁剪是「HISTORY 条数悄悄变少」的候选元凶之一（另一种是墓碑
+        //   压制）。以前裁完一声不响，只能看到 15→14 却不知道谁被裁、为什么。只报前 2 个 key。
+        int before = sorted.size();
+        int n = 0;
+        StringBuilder dropped = new StringBuilder(64);
+        for (int i = keep; i < before && n < 2; i++, n++) {
+            dropped.append(' ').append(SyncMerge.recordKey(sorted.get(i).sourceKey, sorted.get(i).vodId));
+        }
+        LOG.i("[Sync] truncate HISTORY " + before + "->" + keep + " dropped=" + dropped);
     }
 
     /**

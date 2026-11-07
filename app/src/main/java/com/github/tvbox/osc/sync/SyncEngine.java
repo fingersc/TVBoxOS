@@ -424,6 +424,9 @@ public final class SyncEngine {
                 continue;
             }
             // ★ v4.2.4：没跳过时留一行轻量日志（只报原因与计数，不打印包内容，避免每轮大字符串开销）。
+            // ★ v4.3.3-diag（r181）：content=false 时再补一段逐条差异（新增/缺失/内容变化 + 首个
+            //   差异样例的字段级对比），否则「recs 与 hlc 都相同却判不同」「HISTORY 少了一条」
+            //   这两类问题只能靠猜。detail 只在真正判不同时计算，正常轮次零开销。
             if (remoteBytes != null && remoteBytes.length > 0) {
                 LOG.i("[Sync] same-miss scope=" + sc
                         + " content=" + contentSame
@@ -431,7 +434,8 @@ public final class SyncEngine {
                         + " force=" + forceUpload
                         + " recs=" + (merged.records == null ? 0 : merged.records.size())
                         + "/" + (remote.records == null ? 0 : remote.records.size())
-                        + " hlc=" + merged.hlcMaxPhysical + "/" + remote.hlcMaxPhysical);
+                        + " hlc=" + merged.hlcMaxPhysical + "/" + remote.hlcMaxPhysical
+                        + (contentSame ? "" : " diff=" + HistorySyncManager.diffBrief(merged, remote)));
             }
 
             // 5.5 上传（只传这一个 scope；If-Match 防并发覆盖）
