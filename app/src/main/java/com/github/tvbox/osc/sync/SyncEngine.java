@@ -1,6 +1,7 @@
 package com.github.tvbox.osc.sync;
 
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.orhanobut.hawk.Hawk;
 
@@ -128,6 +129,9 @@ public final class SyncEngine {
         }
         // 2.1) 读取 sync.meta（设备水位 / 30 天回归判定）
         SyncMeta meta = loadMeta(dav, key, accountName, owner, o, st, dirEntries);
+        // ★ v4.3.5（r183）：把账号级历史上限在「本机 ⇄ meta」之间对齐。必须早点做——
+        //   下面的 history scope 裁剪（truncateMergedHistory）就要用到这个值。
+        boolean metaTierChanged = syncMetaTier(meta, st, enabled);
         boolean staleDevice = meta.isStale(deviceId, now);
         boolean downloadOnly = staleDevice && !forceUpload;
         if (downloadOnly) {
@@ -553,7 +557,8 @@ public final class SyncEngine {
         try {
             long oldSeen = metaLastSeen(meta, deviceId);
             meta.touch(deviceId, now);
-            if (meta.reliable && (metaDirty || oldSeen <= 0L || now - oldSeen > 6L * 3600L * 1000L)) {
+            if (meta.reliable && (metaDirty || metaTierChanged || oldSeen <= 0L
+                    || now - oldSeen > 6L * 3600L * 1000L)) {
                 saveMeta(dav, key, accountName, owner, meta, o, st);
             }
         } catch (Throwable t) {
@@ -1096,6 +1101,50 @@ public final class SyncEngine {
         if (clearRecords || clearProgress || clearCollects) {
             SyncTombstones.clear(tombWatermark, clearRecords, clearProgress, clearCollects);
         }
+    }
+
+    /**
+     * ★ v4.3.5（r183）：把 sync.meta 里的账号级历史上限与本机镜像对齐。
+     *
+     * <p>两个方向：
+     * <ul>
+     *   <li><b>拉</b>：meta 有档位而本机镜像不同 ⇒ 写入 {@link SyncState#accountHistoryNum}，
+     *       这样即使本机设置同步关闭、或本轮 meta 未变，裁剪也能拿到账号值；</li>
+     *   <li><b>推</b>：本机「设置同步开启」且<b>真的设过</b> {@code HISTORY_NUM} 时，
+     *       把自己的档位发布到 meta。<b>不发布</b>的两种情况：设置同步关闭（无权代表账号）、
+     *       Hawk 里没有该键（{@code resetDefaults} 之后是默认值，发出去会把云端的 50 覆盖成 15）。</li>
+     * </ul>
+     *
+     * @return meta 是否因此需要立即落盘（档位变化不受「6 小时一次」门槛限制）
+     */
+    private static boolean syncMetaTier(SyncMeta meta, SyncState st, SyncScopes enabled) {
+        if (meta == null || st == null) {
+            return false;
+        }
+        // ⓪ 修复：meta 里没有档位（旧版本未带该字段 / 本机 metaJson 缓存是升级前写下的）
+        //   但本机镜像有时，先补回来，避免这次落盘把云端已经发布好的档位清零。
+        if (meta.historyNum <= 0 && st.accountHistoryNum > 0) {
+            meta.historyNum = st.accountHistoryNum;
+        }
+        // ① 拉：meta → 本机镜像
+        if (meta.historyNum > 0 && meta.historyNum != st.accountHistoryNum) {
+            st.accountHistoryNum = meta.historyNum;
+            st.save();
+            LOG.i("[Sync] account tier <- meta " + meta.historyNum);
+        }
+        // ② 推：本机 → meta（仅设置同步开启、且本机真的设过档位）
+        if (enabled != null && enabled.settings && Hawk.contains(HawkConfig.HISTORY_NUM)) {
+            int mine = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
+            if (mine > 0 && mine != meta.historyNum) {
+                int old = meta.historyNum;
+                meta.historyNum = mine;
+                st.accountHistoryNum = mine;
+                st.save();
+                LOG.i("[Sync] account tier meta: " + old + " -> " + mine);
+                return true;
+            }
+        }
+        return false;
     }
 
     /** ★ 协议 v4：设置先同步，其余 scope 随后 —— 保证 HISTORY 裁剪用的是账号级档位。 */

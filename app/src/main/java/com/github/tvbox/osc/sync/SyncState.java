@@ -63,6 +63,14 @@ public final class SyncState {
     /** v4.1：sync.meta 最近一次内容缓存（ETag 未变时避免重复下载） */
     public String metaJson;
     /**
+     * ★ v4.3.5（r183）：从 sync.meta 学到的账号级历史上限（0 = 未知）。
+     *
+     * <p>落盘在 SyncState 里而不是每次去解析 metaJson，是为了让
+     * {@code HistorySyncManager.accountHistoryKeep()} 在「本轮没拉 meta」「设置同步关闭」时
+     * 也能立刻拿到账号档位。Hawk 用 Gson 序列化整个对象，新增字段老数据读出来就是 0。
+     */
+    public int accountHistoryNum = 0;
+    /**
      * ★ v4.3.0（r180-A）：各 scope 最近一次「配对观测」到的远端内容指纹（规范化 JSON 的 SHA-256）。
      *
      * <p>语义严格是「在 {@link #etags} 里那个 ETag 下，远端内容是这个指纹」——

@@ -1508,10 +1508,25 @@ public final class HistorySyncManager {
     /**
      * 账号级历史上限。返回 0 表示「档位未知，不要裁」。
      *
-     * <p>判定顺序：设置同步被关闭 → 未知；本机仍在 pendingPull（还没把账号设置拉下来）
-     * → 未知；否则用本机档位（稳态下同账号各设备的 {@code HISTORY_NUM} 会收敛一致）。</p>
+     * <p>★ v4.3.5（r183）判定顺序：
+     * <ol>
+     *   <li><b>账号级档位</b>（{@link SyncState#accountHistoryNum}，来自 sync.meta）——
+     *       它与「设置同步」开关无关，所以关掉设置同步的设备也能裁到同一个值；</li>
+     *   <li>兜底：本机档位（设置同步开启且已拉到账号设置）。老账号 / meta 尚未发布过时走这里。</li>
+     * </ol>
+     * 仍返回 0 的两种情况：meta 里还没有档位，且本机设置同步关闭或仍在 pendingPull。</p>
      */
     private static int accountHistoryKeep(String owner, SyncScopes scopes) {
+        // ① 账号级档位：任何设备都读得到，不受 scope 开关影响。
+        try {
+            int metaKeep = SyncState.load(owner).accountHistoryNum;
+            if (metaKeep > 0) {
+                return metaKeep;
+            }
+        } catch (Throwable ignore) {
+            // 读不到就退回本机判断，绝不因异常而不裁/误裁
+        }
+        // ② 兜底：本机档位。
         // 注意：逐 scope 同步时传入的是 SyncScopes.only(sc)（只启用当前 scope），
         // 不能用它的 settings 标志判断「设置同步是否开启」，否则永远返回 0、历史永不裁剪。
         // 这里必须读全局开关。

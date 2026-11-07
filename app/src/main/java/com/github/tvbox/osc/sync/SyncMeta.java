@@ -26,6 +26,23 @@ public final class SyncMeta {
     public String owner = "";
     public long resetHlcPhysical = 0L;
     public int resetHlcCounter = 0;
+
+    /**
+     * ★ v4.3.5（r183）：账号级历史上限（15 / 30 / 50），0 表示「未知」。
+     *
+     * <p><b>为什么搬到这里</b>：档位之前只存在「设置同步」这个可选 scope 里，一旦某台设备关掉
+     * 设置同步，{@code accountHistoryKeep()} 就拿不到档位、返回 0「不裁」，于是它与另一台设备
+     * 在「N 条」与「keep 条」之间无限来回翻，每轮各传一次整包，而且不会自愈。
+     *
+     * <p>sync.meta 是<b>所有设备都会读</b>的协议文件（{@code loadMeta} 在 scope 循环之外无条件执行），
+     * 与各 scope 开关无关，因此把档位放这里，任何设备都能裁到同一个账号级数值。
+     *
+     * <p><b>兼容</b>：旧版本读写 meta 时不会带这个字段（Gson 只序列化它认识的字段），会把它抹成
+     * 缺失；新版读到 0 就退回旧逻辑，并且只要有一台「设置同步开启」的设备同步一轮就会重新发布，
+     * 自愈。所以不升 {@link #SCHEMA}，也不需要数据迁移。
+     */
+    public int historyNum = 0;
+
     public List<Device> devices = new ArrayList<>();
 
     /** 仅内存标记：false 表示读取失败/内容不可信，本轮不要回写覆盖云端 meta。不参与序列化。 */

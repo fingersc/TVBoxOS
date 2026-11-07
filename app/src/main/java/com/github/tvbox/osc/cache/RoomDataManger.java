@@ -153,7 +153,14 @@ public class RoomDataManger {
         if (contentChanged || recencyChanged) {
             HistorySyncManager.markDirty(SyncScope.HISTORY);
         }
-        // v77：本机只保留当前档位的条数，超出的直接删（不写墓碑，避免传到别的设备误删）
+        // ★ v4.3.4：这里**不裁条数**。原注释「本机只保留当前档位的条数」是 v77 的旧行为，
+        //   早已不成立：pruneHistory() → compactHistory() 只做「清坏行 + 同名收敛」，不看
+        //   HISTORY_NUM。所以刚看完一部新剧时本机表会暂时多一条（15→16），而显示层
+        //   getAllVodRecord() 用 min(limit, hisNum) 截断，用户在界面上看不到这条多出来的记录。
+        //   真正的档位裁剪只发生在同步侧：truncateMergedHistory() 按「账号档位 + HLC 降序」
+        //   裁 merged，再由 applyLocal() 整表写回本机、并随上传写回云端（r181 日志实测：
+        //   `truncate HISTORY 16->15 dropped= <key>`，两端丢弃的 key 完全一致）。
+        //   所以这次调用只是顺手做一次本地自愈（坏行/重名），不是「本机档位兜底」。
         pruneHistory();
     }
 
