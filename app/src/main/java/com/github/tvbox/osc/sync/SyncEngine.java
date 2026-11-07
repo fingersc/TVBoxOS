@@ -184,6 +184,10 @@ public final class SyncEngine {
 
         java.util.Set<SyncScope> failedScopes = new java.util.HashSet<>();
         boolean[] processedOk = new boolean[SyncScope.COUNT];
+        // ★ v4.3.0（r180-A）：上传后用于「指纹配对」的暂存
+        long[] uploadedLen = new long[SyncScope.COUNT];
+        String[] uploadedHash = new String[SyncScope.COUNT];
+        boolean[] needPair = new boolean[SyncScope.COUNT];
         for (SyncScope sc : orderedScopes()) {
             if (!enabled.isEnabled(sc)) {
                 continue;
@@ -210,84 +214,131 @@ public final class SyncEngine {
                 continue;
             }
 
-            // 5.1 读云端：脏 ⇒ 完整 GET（合并上传都要内容）；不脏 ⇒ 条件 GET（304 省流量）
+            // 5.1 读云端。★ v4.3.0（r180-A）：脏 + 云端 ETag 未变 ⇒ 云端必然就是我上次传上去
+            //   的那一份（本机库是它的超集：applyLocal 写过它，之后的写入 HLC 都更新），
+            //   所以不必下载：直接建本机包 —— 指纹与记账相同就整段跳过（零请求），
+            //   不同就把本机包直接 PUT 上去（少一次 GET）。
+            //   正确性兜底：万一判断错了（云端其实已变），If-Match 会让服务器回 409，
+            //   走下面的冲突重试分支（重 GET + 重合并 + 重传），不会覆盖对方数据。
+            //   不脏 ⇒ 条件 GET（304 省流量）；首次/force/下载模式 ⇒ 照旧完整 GET。
+            SyncPayload shadow = null;
             boolean[] notModified = new boolean[1];
             String[] etagOut = new String[1];
-            o.requests++;
-            byte[] remoteBytes = dirty
-                    ? dav.get(path, etagOut)
-                    : dav.getIfNoneMatch(path, st.getEtag(sc), notModified, etagOut);
-
-            if (notModified[0]) {
-                if (etagOut[0] != null && etagOut[0].length() > 0) {
-                    st.setEtag(sc, etagOut[0]);
-                }
-                processedOk[sc.index] = true;
-                continue;   // 该 scope 零下载 / 零解密 / 零写库
-            }
-            allNotModified = false;
-            o.bytesDown += remoteBytes == null ? 0 : remoteBytes.length;
-
-            // ★ v99-r14：解密失败先定性，再决定怎么办。
-            //
-            //   decrypt() 有三种失败形态：
-            //     · SecurityException("bad mac")            —— HMAC 不匹配
-            //     · IllegalArgumentException("bad magic/length") —— 文件结构坏（被截断的典型症状）
-            //     · GeneralSecurityException(BadPadding)    —— 密文被改
-            //
-            //   旧代码把它们一律算作失败，前一种还被 runSafe 归成「账号或密码不正确」——
-            //   这是误判：密码校验本该走 profile.json（明文 + 派生 verify，独立通道），
-            //   数据文件解密失败推不出密码错误。
-            //
-            //   现在先用 profile.json 复核：
-            //     · 复核通过 ⇒ 密钥是对的 ⇒ 只能是云端文件损坏 ⇒ 用本机数据重传覆盖（自愈）
-            //     · 复核失败 ⇒ 才是真的密钥不匹配（账号被重置 / 用别的密码登同名目录）
-            //                 ⇒ 抛错，且【不重传】，避免用错密钥的数据覆盖云端
+            byte[] remoteBytes;
             SyncPayload remote;
-            try {
-                remote = decode(key, remoteBytes, owner);
-            } catch (SecurityException | GeneralSecurityException
-                    | IllegalArgumentException corrupt) {
-                if (AccountService.verifyPassword(dav, accountName, key)) {
-                    LOG.i("[Sync] scope=" + sc + " cloud file corrupt ("
-                            + corrupt.getClass().getSimpleName() + "), repair by re-upload");
-                    // 以「空远端」继续：5.3 合并后等于本机数据，5.5 的 same 判定必然为 false
-                    //   ⇒ 走上传分支，用本机完整数据覆盖掉损坏的文件。
-                    remote = HistorySyncManager.emptyLocal(owner, deviceId, now);
-                    repaired = true;
-                } else {
-                    throw new IOException("账号密码与云端不匹配（账号可能被管理员重置，"
-                            + "或用了不同密码登录同名目录）");
+            boolean skipFetch = dirty && !forceUpload && !downloadOnly
+                    && knownEtag != null && knownEtag.length() > 0
+                    && knownEtag.equals(st.getEtag(sc))
+                    && st.remoteHash(sc) != null;
+            if (skipFetch) {
+                shadow = HistorySyncManager.buildLocal(owner, deviceId, one, now);
+                HistorySyncManager.truncateMergedHistory(shadow, one);
+                HistorySyncManager.truncateMergedProgress(shadow, one);
+                String lh = HistorySyncManager.payloadHash(shadow);
+                if (lh != null && lh.equals(st.remoteHash(sc))) {
+                    processedOk[sc.index] = true;
+                    st.bumpPushedHlc(sc, shadow.hlcMaxPhysical, shadow.hlcMaxCounter);
+                    LOG.i("[Sync] skip same(local) scope=" + sc + " etag=" + shortEtag(knownEtag)
+                            + " recs=" + (shadow.records == null ? 0 : shadow.records.size()));
+                    continue;
+                }
+                LOG.i("[Sync] skip get scope=" + sc + " etag=" + shortEtag(knownEtag)
+                        + " (cloud unchanged, upload local only)");
+                allNotModified = false;   // 本轮要上传 ⇒ 不是「无变更」
+                etagOut[0] = knownEtag;
+                remoteBytes = null;
+                remote = null;
+            } else {
+                o.requests++;
+                remoteBytes = dirty
+                        ? dav.get(path, etagOut)
+                        : dav.getIfNoneMatch(path, st.getEtag(sc), notModified, etagOut);
+
+                if (notModified[0]) {
+                    if (etagOut[0] != null && etagOut[0].length() > 0) {
+                        st.setEtag(sc, etagOut[0]);
+                    }
+                    processedOk[sc.index] = true;
+                    continue;   // 该 scope 零下载 / 零解密 / 零写库
+                }
+                allNotModified = false;
+                o.bytesDown += remoteBytes == null ? 0 : remoteBytes.length;
+
+                // ★ v99-r14：解密失败先定性，再决定怎么办。
+                //
+                //   decrypt() 有三种失败形态：
+                //     · SecurityException("bad mac")            —— HMAC 不匹配
+                //     · IllegalArgumentException("bad magic/length") —— 文件结构坏（被截断的典型症状）
+                //     · GeneralSecurityException(BadPadding)    —— 密文被改
+                //
+                //   旧代码把它们一律算作失败，前一种还被 runSafe 归成「账号或密码不正确」——
+                //   这是误判：密码校验本该走 profile.json（明文 + 派生 verify，独立通道），
+                //   数据文件解密失败推不出密码错误。
+                //
+                //   现在先用 profile.json 复核：
+                //     · 复核通过 ⇒ 密钥是对的 ⇒ 只能是云端文件损坏 ⇒ 用本机数据重传覆盖（自愈）
+                //     · 复核失败 ⇒ 才是真的密钥不匹配（账号被重置 / 用别的密码登同名目录）
+                //                 ⇒ 抛错，且【不重传】，避免用错密钥的数据覆盖云端
+                try {
+                    remote = decode(key, remoteBytes, owner);
+                } catch (SecurityException | GeneralSecurityException
+                        | IllegalArgumentException corrupt) {
+                    if (AccountService.verifyPassword(dav, accountName, key)) {
+                        LOG.i("[Sync] scope=" + sc + " cloud file corrupt ("
+                                + corrupt.getClass().getSimpleName() + "), repair by re-upload");
+                        // 以「空远端」继续：5.3 合并后等于本机数据，5.5 的 same 判定必然为 false
+                        //   ⇒ 走上传分支，用本机完整数据覆盖掉损坏的文件。
+                        remote = HistorySyncManager.emptyLocal(owner, deviceId, now);
+                        repaired = true;
+                    } else {
+                        throw new IOException("账号密码与云端不匹配（账号可能被管理员重置，"
+                                + "或用了不同密码登录同名目录）");
+                    }
+                }
+                // ★ v4.3.0（r180-A）：GET 200 是「原子配对」——ETag 与内容出自同一次响应
+                //   ⇒ 记下这枚指纹，供下轮「云端未变」时直接比对。
+                if (remoteBytes != null && remoteBytes.length > 0
+                        && etagOut[0] != null && etagOut[0].length() > 0) {
+                    st.setRemoteSnapshot(sc, etagOut[0], HistorySyncManager.payloadHash(remote),
+                            remoteBytes.length);
                 }
             }
 
             // ★ 协议 v4 接收规则：读到云端包后先推进本地 HLC，保证本机后续写入的
             //   HLC 一定大于云端已有条目（否则慢钟设备的新数据永远输给云端旧记录）。
-            HlcClock.observe(remote.hlcMaxPhysical, remote.hlcMaxCounter);
+            if (remote != null) {
+                HlcClock.observe(remote.hlcMaxPhysical, remote.hlcMaxCounter);
+            }
 
             // 5.2 epoch 变化 ⇒ 整库重置（以 history.bin 为准；清空云端时 3 个数据文件一起清，
             //     settings 不在清空范围内，其 epoch 不参与此判断）
-            boolean reset = remote.epoch > epochBefore;
+            boolean reset = remote != null && remote.epoch > epochBefore;
             if (reset) {
                 LOG.i("[Sync] epoch reset remote=" + remote.epoch + " local=" + st.lastEpoch);
                 st.lastEpoch = remote.epoch;
             }
 
             // 5.3 合并 + 落库
-            //     ★ P0-3：重置时用「空本地视图」，不物理删库 ——
-            //     否则"删了本地但上传失败"会让数据凭空消失，且下次同步还会再删一次。
-            SyncPayload local = (reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0))
-                    ? HistorySyncManager.emptyLocal(owner, deviceId, now)
-                    : HistorySyncManager.buildLocal(owner, deviceId, one, now);
-            // downloadOnly 也是“以云端覆盖本机”，必须让 applyLocal 用空本地视图重建，
-            // 否则事务内 fresh=buildLocal 会把本机旧行重新并回去，等下次不再 stale 时又上传污染云端。
-            boolean replaceLocal = reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0);
-            SyncPayload merged = SyncMerge.merge(local, remote, deviceId, now);
-            HlcClock.observe(merged.hlcMaxPhysical, merged.hlcMaxCounter);
-            HistorySyncManager.checkGeneration(gen);
-            HistorySyncManager.truncateMergedHistory(merged, one);
-            HistorySyncManager.truncateMergedProgress(merged, one);
-            if (HistorySyncManager.applyLocal(merged, one, replaceLocal)) localChanged = true;
+            SyncPayload merged;
+            if (shadow != null) {
+                // ★ v4.3.0（r180-A）：没下载云端 ⇒ 本机包就是上传内容，不做合并/落库
+                merged = shadow;
+            } else {
+                //     ★ P0-3：重置时用「空本地视图」，不物理删库 ——
+                //     否则"删了本地但上传失败"会让数据凭空消失，且下次同步还会再删一次。
+                SyncPayload local = (reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0))
+                        ? HistorySyncManager.emptyLocal(owner, deviceId, now)
+                        : HistorySyncManager.buildLocal(owner, deviceId, one, now);
+                // downloadOnly 也是“以云端覆盖本机”，必须让 applyLocal 用空本地视图重建，
+                // 否则事务内 fresh=buildLocal 会把本机旧行重新并回去，等下次不再 stale 时又上传污染云端。
+                boolean replaceLocal = reset || (downloadOnly && remoteBytes != null && remoteBytes.length > 0);
+                merged = SyncMerge.merge(local, remote, deviceId, now);
+                HlcClock.observe(merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                HistorySyncManager.checkGeneration(gen);
+                HistorySyncManager.truncateMergedHistory(merged, one);
+                HistorySyncManager.truncateMergedProgress(merged, one);
+                if (HistorySyncManager.applyLocal(merged, one, replaceLocal)) localChanged = true;
+            }
             lastMerged = merged;
 
             // ★ v4.1：记录本设备已看到的水位，并在「所有活跃设备都已看到」时回收墓碑。
@@ -300,16 +351,17 @@ public final class SyncEngine {
             //   攒到 30 天被 SyncMeta.isStale 判成 stale → downloadOnly + replaceLocal，
             //   用云端覆盖本机，把本机独有数据清掉。
             if (meta != null && meta.reliable) {
-                boolean seenChanged;
+                // 水位推进的「副作用」仍然每轮执行（返回值不再决定是否落盘）
                 if (sc == SyncScope.HISTORY) {
-                    seenChanged = meta.markSeenRecords(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
+                    meta.markSeenRecords(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
                 } else if (sc == SyncScope.COLLECT) {
-                    seenChanged = meta.markSeenCollects(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
-                } else {
-                    seenChanged = false;
+                    meta.markSeenCollects(deviceId, merged.hlcMaxPhysical, merged.hlcMaxCounter);
                 }
                 int tombsDropped = meta.dropSeenTombs(merged, now, 24L * 3600L * 1000L);
-                if (seenChanged || tombsDropped > 0) {
+                // ★ v4.3.0（r180-B）：seenChanged 不再触发 meta 落盘 —— 它几乎每轮都变，
+                //   正是它让「6 小时一次」门槛完全失效。只留「墓碑真被回收」这个罕见事件；
+                //   水位推进仍由 6 小时保底 + meta.touch 兜住（见下方 saveMeta 段）。
+                if (tombsDropped > 0) {
                     metaDirty = true;
                 }
             }
@@ -318,7 +370,9 @@ public final class SyncEngine {
             //   避免长期离线设备的旧数据（尤其旧墓碑/旧删除）反过来污染云端。
             if (downloadOnly && remoteBytes != null && remoteBytes.length > 0) {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
-                    st.setEtag(sc, etagOut[0]);
+                    // ★ v4.3.0（r180-A）：条件 GET 拿到的是完整内容 ⇒ 原子配对
+                    st.setRemoteSnapshot(sc, etagOut[0],
+                            HistorySyncManager.payloadHash(remote), remoteBytes.length);
                 }
                 // 本机已与云端对齐到该水位（只是不上传），记下来避免下次启动被误判为「有未推送写入」。
                 st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
@@ -345,7 +399,9 @@ public final class SyncEngine {
             boolean same = contentSame && waterOk;
             if (same && !forceUpload) {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
-                    st.setEtag(sc, etagOut[0]);
+                    // ★ v4.3.0（r180-A）：内容一致 ⇒ 云端就是这份内容，原子配对
+                    st.setRemoteSnapshot(sc, etagOut[0],
+                            HistorySyncManager.payloadHash(remote), remoteBytes.length);
                 }
                 // 云端已包含合并结果（内容一致），记录已推送水位，避免启动对账误判为未推送。
                 st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
@@ -365,7 +421,7 @@ public final class SyncEngine {
             }
 
             // 5.5 上传（只传这一个 scope；If-Match 防并发覆盖）
-            byte[] out = Crypto.encrypt(key,
+            byte[] out = Crypto.encryptAuto(key,
                     HistorySyncManager.GSON.toJson(merged.forScope(sc)).getBytes("UTF-8"));
             String newEtag;
             try {
@@ -391,7 +447,7 @@ public final class SyncEngine {
                     HistorySyncManager.truncateMergedHistory(merged, one);
                     HistorySyncManager.truncateMergedProgress(merged, one);
                     if (HistorySyncManager.applyLocal(merged, one, reset2)) localChanged = true;
-                    out = Crypto.encrypt(key,
+                    out = Crypto.encryptAuto(key,
                             HistorySyncManager.GSON.toJson(merged.forScope(sc)).getBytes("UTF-8"));
                 }
                 o.requests++;
@@ -399,15 +455,24 @@ public final class SyncEngine {
             }
             // ★ v4.1：不再每 scope 单独 PROPFIND 补 ETag（省请求）；
             //   循环结束后若发生过上传，用一次 Depth:1 批量刷新所有 scope 的 ETag。
+            // ★ v4.3.0（r180-A）：上传成功即「原子配对」——PUT 响应带 ETag 时立刻记下指纹；
+            //   没带 ETag 就先失效，等循环结束那次 PROPFIND 用「长度相等」重新配对。
+            String sentHash = HistorySyncManager.payloadHash(merged);
             if (newEtag != null && newEtag.length() > 0) {
-                st.setEtag(sc, newEtag);
+                st.setRemoteSnapshot(sc, newEtag, sentHash, out.length);
+            } else {
+                st.clearRemoteSnapshot(sc);
+                needPair[sc.index] = true;
             }
+            uploadedLen[sc.index] = out.length;
+            uploadedHash[sc.index] = sentHash;
             o.bytesUp += out.length;
             anyUploaded = true;
             processedOk[sc.index] = true;
             // ★ v4.1：记录本 scope 已成功推送的 HLC 水位，用于启动时判断「本机是否还有未推送的写入」。
             st.bumpPushedHlc(sc, merged.hlcMaxPhysical, merged.hlcMaxCounter);
-            LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length);
+            LOG.i("[Sync] uploaded scope=" + sc + " bytes=" + out.length
+                    + " container=" + (Crypto.isCompressed(out) ? "gz" : "plain"));
             } catch (WebDavClient.AuthException ae) {
                 throw ae;
             } catch (HistorySyncManager.SwitchAborted sa) {
@@ -419,22 +484,45 @@ public final class SyncEngine {
             }
         }
 
-        // ★ v4.1：有上传时用一次 Depth:1 批量刷新所有 scope 的 ETag（取代逐 scope recoverEtag）。
-        if (anyUploaded) {
+        // ★ v4.3.0（r180-C）：只在「有 PUT 没回 ETag」时才补这次 PROPFIND；
+        //   否则 PUT 响应的 ETag 已经是权威值，不必再刷一遍（省 1 个请求）。
+        //   同时对 needPair 的 scope 用「长度相等」把 (etag → 指纹) 配对起来。
+        boolean needRefresh = false;
+        for (int i = 0; i < SyncScope.COUNT; i++) {
+            if (needPair[i]) {
+                needRefresh = true;
+                break;
+            }
+        }
+        if (anyUploaded && needRefresh) {
             try {
                 o.requests++;
-                java.util.Map<String, String> after = dav.propfindDepth1(dir);
+                java.util.Map<String, Long> sizes = new java.util.HashMap<>();
+                java.util.Map<String, String> after = dav.propfindDepth1(dir, sizes);
                 if (after != null) {
                     for (SyncScope sc : orderedScopes()) {
                         if (!enabled.isEnabled(sc)) {
                             continue;
                         }
+                        if (!needPair[sc.index]) {
+                            continue;   // 该 scope 的 ETag 已由 PUT 响应给出
+                        }
                         String full = AccountPaths.scopeFile(accountName, sc);
                         int slash = full.lastIndexOf('/');
                         String name = slash >= 0 ? full.substring(slash + 1) : full;
                         String et = after.get(name);
-                        if (et != null && et.length() > 0) {
-                            st.setEtag(sc, et);
+                        if (et == null || et.length() == 0) {
+                            continue;
+                        }
+                        Long sz = sizes.get(name);
+                        if (sz != null && sz == uploadedLen[sc.index] && uploadedHash[sc.index] != null) {
+                            st.setRemoteSnapshot(sc, et, uploadedHash[sc.index], sz);
+                        } else {
+                            // 长度对不上 ⇒ 可能是别人在「我的 PUT」与「这次 PROPFIND」之间写了
+                            //   （S7）⇒ 不能把这枚 ETag 跟我的内容配对：指纹置空，下轮老实 GET。
+                            st.clearRemoteSnapshot(sc);
+                            LOG.i("[Sync] pair-miss scope=" + sc + " expect=" + uploadedLen[sc.index]
+                                    + " got=" + (sz == null ? -1 : sz));
                         }
                     }
                 }
@@ -615,7 +703,7 @@ public final class SyncEngine {
         HistorySyncManager.checkGeneration(gen);
         for (SyncScope sc : SyncScope.values()) {
             SyncPayload part = all.forScope(sc);
-            byte[] out = Crypto.encrypt(key,
+            byte[] out = Crypto.encryptAuto(key,
                     HistorySyncManager.GSON.toJson(part).getBytes("UTF-8"));
             o.requests++;
             try {
@@ -624,10 +712,18 @@ public final class SyncEngine {
                 String newEtag = dav.putIfAbsent(AccountPaths.scopeFile(accountName, sc), out);
                 String etM = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
                 if (etM != null) {
-                    st.setEtag(sc, etM);
+                    // ★ v4.3.0（r180-A）：只有 PUT 直接回了 ETag 才是原子配对；
+                    //   recoverEtag 走的是 PROPFIND，没校验长度 ⇒ 指纹置空，下轮老实 GET。
+                    if (newEtag != null && newEtag.length() > 0) {
+                        st.setRemoteSnapshot(sc, etM, HistorySyncManager.payloadHash(part), out.length);
+                    } else {
+                        st.setEtag(sc, etM);
+                        st.clearRemoteSnapshot(sc);
+                    }
                 }
             } catch (WebDavClient.ConflictException exists) {
                 LOG.i("[Sync] split file already exists, keep cloud version: " + sc);
+                st.clearRemoteSnapshot(sc);   // 云端是别人的版本，指纹未知
             }
         }
         st.splitMigrated = true;
@@ -720,6 +816,14 @@ public final class SyncEngine {
         return st.dirty.clone();
     }
 
+    /** ★ v4.3.0：日志里只打 ETag 前 8 位，避免每行几百字节。 */
+    private static String shortEtag(String e) {
+        if (e == null) {
+            return "null";
+        }
+        return e.length() > 8 ? e.substring(0, 8) : e;
+    }
+
     /**
      * 清空云端（整库重置）。**走与同步同一条路径**，不再自己拼一套 WebDAV 流程。
      *
@@ -775,13 +879,18 @@ public final class SyncEngine {
                 empty.epoch = epoch;
                 empty.updatedAt = now;
                 empty.dev = deviceId;
-                byte[] out = Crypto.encrypt(key,
+                byte[] out = Crypto.encryptAuto(key,
                         HistorySyncManager.GSON.toJson(empty.forScope(sc)).getBytes("UTF-8"));
                 try {
                     String newEtag = dav.put(AccountPaths.scopeFile(accountName, sc), out, null);
                     String etC = recoverEtag(dav, AccountPaths.scopeFile(accountName, sc), newEtag, o);
                     if (etC != null) {
-                        st.setEtag(sc, etC);
+                        if (newEtag != null && newEtag.length() > 0) {
+                            st.setRemoteSnapshot(sc, etC, HistorySyncManager.payloadHash(empty), out.length);
+                        } else {
+                            st.setEtag(sc, etC);
+                            st.clearRemoteSnapshot(sc);
+                        }
                     }
                     okCount++;
                 } catch (Throwable t) {

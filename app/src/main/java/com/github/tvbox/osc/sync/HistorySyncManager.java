@@ -1024,6 +1024,35 @@ public final class HistorySyncManager {
     }
 
     /**
+     * ★ v4.3.0（r180-A）：算出「与 contentEquals 完全同一套规范化」的内容指纹（SHA-256 hex）。
+     *
+     * <p>用途：{@code SyncEngine} 在「云端 ETag 未变、不需要下载」时，用本机包的指纹与上次
+     * 记录下来的远端指纹比对 —— 相等就说明云端内容与本机规范化结果一致，可零请求跳过上传。</p>
+     *
+     * <p>口径必须与 {@link #contentEquals} 一致（同一个 {@link #canonicalForCompare}），
+     * 否则「指纹相等」推不出「内容相等」。失败返回 null（调用方按「未知」处理 ⇒ 老实 GET）。</p>
+     */
+    static String payloadHash(SyncPayload p) {
+        if (p == null) {
+            return null;
+        }
+        try {
+            String json = GSON.toJson(canonicalForCompare(p));
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(json.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder(d.length * 2);
+            for (byte b : d) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            LOG.e("[Sync] payloadHash failed (treated as unknown)", t);
+            return null;
+        }
+    }
+
+    /**
      * 生成「用于比较」的副本：列表按规范顺序排序 + 顶层元数据归一化，<b>不修改入参</b>。
      *
      * <p>★ v4.2.3：旧实现直接改 {@code a}/{@code b} 的字段再还原，GSON 抛异常（如 OOM）时

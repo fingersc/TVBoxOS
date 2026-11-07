@@ -62,6 +62,16 @@ public final class SyncState {
     public String metaEtag;
     /** v4.1：sync.meta 最近一次内容缓存（ETag 未变时避免重复下载） */
     public String metaJson;
+    /**
+     * ★ v4.3.0（r180-A）：各 scope 最近一次「配对观测」到的远端内容指纹（规范化 JSON 的 SHA-256）。
+     *
+     * <p>语义严格是「在 {@link #etags} 里那个 ETag 下，远端内容是这个指纹」——
+     * 它必须和 ETag 来自<b>同一次观测</b>，否则会误判"云端就是我的内容"而跳过下载。
+     * 配对规则写在 {@code SyncEngine} 的上传段；这里只负责存。</p>
+     */
+    public String[] remoteHash = new String[SyncScope.COUNT];
+    /** ★ v4.3.0（r180-A）：与 {@link #remoteHash} 同一次观测到的密文字节数（上传后配对校验用）。 */
+    public long[] remoteSize = new long[SyncScope.COUNT];
 
     public SyncState() {
     }
@@ -89,6 +99,13 @@ public final class SyncState {
                 if (st.pushedHlcCounter == null || st.pushedHlcCounter.length != 4) {
                     st.pushedHlcCounter = new int[4];
                 }
+                // ★ v4.3.0：老数据没有指纹字段（Gson 给 null）⇒ 重建，等价于"下轮做一次完整 GET"
+                if (st.remoteHash == null || st.remoteHash.length != SyncScope.COUNT) {
+                    st.remoteHash = new String[SyncScope.COUNT];
+                }
+                if (st.remoteSize == null || st.remoteSize.length != SyncScope.COUNT) {
+                    st.remoteSize = new long[SyncScope.COUNT];
+                }
                 return st;
             }
         } catch (Throwable ignored) {
@@ -114,7 +131,71 @@ public final class SyncState {
         if (etags == null || etags.length != SyncScope.COUNT) {
             etags = new String[SyncScope.COUNT];
         }
-        etags[s.index] = (value == null || value.isEmpty()) ? null : value;
+        String next = (value == null || value.isEmpty()) ? null : value;
+        String old = etags[s.index];
+        etags[s.index] = next;
+        // ★ v4.3.0：ETag 一变，之前记的指纹就不再对应这份内容 ⇒ 立刻作废。
+        //   这条不变式是「跳过下载」的安全底线，别在别处绕过它直接写 etags[]。
+        if (old == null ? next != null : !old.equals(next)) {
+            ensureRemote();
+            remoteHash[s.index] = null;
+            remoteSize[s.index] = 0L;
+        }
+    }
+
+    // ------------------------------------------------ ★ v4.3.0 远端内容指纹（r180-A）
+
+    private void ensureRemote() {
+        if (remoteHash == null || remoteHash.length != SyncScope.COUNT) {
+            remoteHash = new String[SyncScope.COUNT];
+        }
+        if (remoteSize == null || remoteSize.length != SyncScope.COUNT) {
+            remoteSize = new long[SyncScope.COUNT];
+        }
+    }
+
+    /** 该 scope 记下的远端内容指纹（无则 null ⇒ 必须走完整 GET）。 */
+    public String remoteHash(SyncScope s) {
+        if (s == null) {
+            return null;
+        }
+        ensureRemote();
+        return remoteHash[s.index];
+    }
+
+    /** 该 scope 记下的远端密文长度（0 表示未知）。 */
+    public long remoteSize(SyncScope s) {
+        if (s == null) {
+            return 0L;
+        }
+        ensureRemote();
+        return remoteSize[s.index];
+    }
+
+    /**
+     * 记下「在这个 ETag 下，远端内容是这份指纹」。
+     *
+     * <p>调用方必须保证三者来自同一次观测（GET 响应头 + 解码结果、304 继承、
+     * PUT 响应头 + 刚发出的字节，或上传后 PROPFIND + 长度校验）。</p>
+     */
+    public void setRemoteSnapshot(SyncScope s, String etag, String hash, long size) {
+        if (s == null) {
+            return;
+        }
+        setEtag(s, etag);
+        ensureRemote();
+        remoteHash[s.index] = (hash == null || hash.isEmpty()) ? null : hash;
+        remoteSize[s.index] = Math.max(0L, size);
+    }
+
+    /** 作废某个 scope 的远端指纹（配对失败 / 云端异常时用）。 */
+    public void clearRemoteSnapshot(SyncScope s) {
+        if (s == null) {
+            return;
+        }
+        ensureRemote();
+        remoteHash[s.index] = null;
+        remoteSize[s.index] = 0L;
     }
 
     public Hlc pushedHlc(SyncScope s) {

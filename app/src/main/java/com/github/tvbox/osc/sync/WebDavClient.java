@@ -190,6 +190,17 @@ public final class WebDavClient {
             java.util.regex.Pattern.compile("<[^>]*:?getetag>\\s*([^<]+?)\\s*</[^>]*:?getetag>",
                     java.util.regex.Pattern.CASE_INSENSITIVE);
 
+    /**
+     * ★ v4.3.0（r180-A）：PROPFIND 里的 getcontentlength。
+     *
+     * <p>用途：上传后服务端不回 ETag 时要再 PROPFIND 一次，那次拿到的 ETag
+     * 必须靠"文件长度 == 我刚发出去的字节数"来确认它对应的是<b>我</b>那次写入。</p>
+     */
+    private static final java.util.regex.Pattern SIZE_PATTERN =
+            java.util.regex.Pattern.compile(
+                    "<[^>]*:?getcontentlength[^>]*>\\s*([0-9]+)\\s*</[^>]*:?getcontentlength>",
+                    java.util.regex.Pattern.CASE_INSENSITIVE);
+
     public String getEtag(String path) throws IOException {
         Request req = new Request.Builder()
                 .url(url(path))
@@ -230,6 +241,16 @@ public final class WebDavClient {
      * 目录不存在返回 null；文件存在但服务端没给 ETag 时值为空串。
      */
     public java.util.Map<String, String> propfindDepth1(String path) throws IOException {
+        return propfindDepth1(path, null);
+    }
+
+    /**
+     * ★ v4.3.0（r180-A）：同时取出每个文件的 Content-Length。
+     *
+     * @param sizeOut 非 null 时填充「文件名 → 字节数」；服务端没给长度的文件不出现
+     */
+    public java.util.Map<String, String> propfindDepth1(String path,
+                                                        java.util.Map<String, Long> sizeOut) throws IOException {
         Request req = new Request.Builder()
                 .url(url(path))
                 .header("Authorization", auth)
@@ -278,6 +299,15 @@ public final class WebDavClient {
                     etag = em.group(1).trim().replace("&quot;", "\"").replace("&apos;", "'");
                 }
                 out.put(name, etag);
+                if (sizeOut != null) {
+                    java.util.regex.Matcher sm = SIZE_PATTERN.matcher(block);
+                    if (sm.find()) {
+                        try {
+                            sizeOut.put(name, Long.parseLong(sm.group(1)));
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
             }
             return out;
         }
