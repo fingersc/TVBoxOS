@@ -602,7 +602,10 @@ public final class HistorySyncManager {
                 //   距上次同步只差几秒时却被推到 60 秒后，退出播放那一刻的进度就传不上去了。
                 //   留 300ms 余量：避免算出来 0 导致同一毫秒内反复重试。
                 long wait = Math.max(gap - elapsed, 300L);
-                SyncScheduler.skipped(owner, background ? "min-gap-bg" : "min-gap", wait);
+                // ★ v4.2.8：把 background 一起传下去 —— 否则重排出来的 retry 任务会退回
+                //   30 秒档，退出播放的补传从「再等 1.6 秒」变成「再等 20 秒」
+                //   （真机日志 2026-11-07 20:38:31.330 / 20:38:32.920 / 20:38:53.137）。
+                SyncScheduler.skipped(owner, background ? "min-gap-bg" : "min-gap", wait, background);
                 return;
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {

@@ -176,7 +176,7 @@ public final class SyncScheduler {
      * <p>只在<b>前台</b>重试：后台不打扰（脏标记已落盘，回前台时 onForeground 会按脏优先排队）。</p>
      */
     public static void skipped(String owner, String reason) {
-        skipped(owner, reason, NO_CAP);
+        skipped(owner, reason, NO_CAP, false);
     }
 
     /**
@@ -198,12 +198,33 @@ public final class SyncScheduler {
      * @param retryCapMs 距下次可再试的真实剩余毫秒；{@link #NO_CAP} 表示按原档位重排
      */
     public static void skipped(String owner, String reason, long retryCapMs) {
+        skipped(owner, reason, retryCapMs, false);
+    }
+
+    /**
+     * ★ v4.2.8：带「进后台紧急性」的重排。
+     *
+     * <p><b>要解决的问题</b>：{@link Task#background} 是「这次同步该走 10 秒档还是 30 秒档」的唯一依据，
+     * 但原来的重排路径 {@code schedule(owner, "retry-dirty", PRI_DIRTY, retryCapMs, null)} 会
+     * <b>新建一个 background=false 的任务</b> —— 于是「退出播放」第一次被挡时按 10 秒档算出
+     * retryIn≈1.6s，第二次重试却退回 30 秒档，又要再等 20 秒。</p>
+     *
+     * <pre>
+     *   20:38:31.330 [sync] skip reason=min-gap-bg retryIn=1588ms     ← 10s 档
+     *   20:38:32.920 [sync] skip reason=min-gap retryIn=19998ms       ← 退回 30s 档（丢了 background）
+     *   20:38:53.137 [Sync] done ...                                   ← 退出播放 22.6 秒后才传上去
+     * </pre>
+     *
+     * <p>所以重排时必须把 {@code background} 一路带下去。</p>
+     */
+    public static void skipped(String owner, String reason, long retryCapMs, boolean background) {
         LOG.i("[sync] skip owner=" + owner + " reason=" + reason
-                + (retryCapMs >= 0 ? " retryIn=" + retryCapMs + "ms" : ""));
+                + (retryCapMs >= 0 ? " retryIn=" + retryCapMs + "ms" : "")
+                + (background ? " bg=1" : ""));
         if (isForeground() && owner != null && !owner.isEmpty()) {
             try {
                 if (SyncState.load(owner).anyDirty()) {
-                    schedule(owner, "retry-dirty", PRI_DIRTY, retryCapMs, null);
+                    schedule(owner, "retry-dirty", PRI_DIRTY, retryCapMs, false, background, null);
                     return;
                 }
             } catch (Throwable t) {
@@ -217,7 +238,7 @@ public final class SyncScheduler {
                 if (wait < 1000L) {
                     wait = 1000L;
                 }
-                schedule(owner, "retry-pull", PRI_IDLE, wait, null);
+                schedule(owner, "retry-pull", PRI_IDLE, wait, false, background, null);
                 return;
             }
         }
@@ -307,12 +328,21 @@ public final class SyncScheduler {
 
     private static void schedule(String owner, String reason, int pri, long capMs,
                                  HistorySyncManager.Callback cb) {
-        schedule(owner, reason, pri, capMs, false, cb);
+        schedule(owner, reason, pri, capMs, false, false, cb);
     }
 
     /** ★ v99-r20：{@code force} 见 {@link #requestNow(String, String, boolean, HistorySyncManager.Callback)}。 */
     private static void schedule(String owner, String reason, int pri, long capMs, boolean force,
                                  HistorySyncManager.Callback cb) {
+        schedule(owner, reason, pri, capMs, force, false, cb);
+    }
+
+    /**
+     * ★ v4.2.8：{@code background} 显式传入 —— 供 {@link #skipped(String, String, long, boolean)}
+     * 把「进后台紧急性」带进重排出来的 retry 任务（原来只靠 reason 判断，retry 会丢）。
+     */
+    private static void schedule(String owner, String reason, int pri, long capMs, boolean force,
+                                 boolean background, HistorySyncManager.Callback cb) {
         if (owner == null || owner.isEmpty()) {
             return;
         }
@@ -337,7 +367,7 @@ public final class SyncScheduler {
                 //   把防抖窗口无限延后，一次都发不出去）。
                 // ★ v99-r19：不管走「提前」还是「纯合并」，紧急性都要跟着传给在途任务。
                 //   只增不减（|=）—— 已经紧急的任务不会因为后来一次普通请求而退回慢档。
-                pending.background |= REASON_BG.equals(reason);
+                pending.background |= REASON_BG.equals(reason) || background;
                 long pf = pullForwardMs(pending == null ? -1L : pending.runAt, now, capMs);
                 if (pf >= 0) {
                     main().removeCallbacks(pending);
@@ -362,7 +392,13 @@ public final class SyncScheduler {
                 delay = capMs;
             }
             Task t = new Task(owner, reason, pri, force, cb);
-            t.background = REASON_BG.equals(reason);
+            // ★ v4.2.8：替换在途任务时也要继承它的 background —— 实测有另一条丢法：
+            //   onBackground()（reason=bg, pri=2）先排上，300ms 内 markDirty 的 dirty(pri=1)
+            //   把它替换成新任务，background 就没了（真机日志 2026-11-07 20:33:44.550/595,
+            //   随后 skip reason=min-gap retryIn=28721ms，退出播放整整等了 29.8 秒）。
+            //   只增不减：更紧急的任务可以继承，但不会把已有紧急性冲掉。
+            t.background = background || REASON_BG.equals(reason)
+                    || (pending != null && pending.background);
             t.runAt = now + delay;
             TASKS.put(owner, t);
             main().postDelayed(t, delay);

@@ -2089,7 +2089,14 @@ public class PlayFragment extends BaseLazyFragment {
             // v4.2：另一台设备可能在本次播放期间删除了这条历史；本机仍在本片播放页
             // 说明用户还在使用它，退出时若历史已不存在则按当前 VodInfo 重建一条，
             // 以“后播放者为准”覆盖墓碑（HLC 由 RoomDataManger 内部生成）。
-            if (mVodInfo != null && !TextUtils.isEmpty(pkSourceKey)) {
+            //
+            // ★ v4.2.8：必须限定在「本次真的出过首帧」。否则「详情页点了播放、
+            //   片源没起来就直接退出」也会在这里重建一条历史 —— 用户看到的就是
+            //   「没起播的片子进了历史记录」，而且因为拿了新 HLC 还会被传到云端
+            //   （真机日志 2026-11-07 20:33:44.595 `history revive ... vodId=13073`，
+            //   紧跟着 20:34:14 就 `uploaded scope=HISTORY bytes=8437`）。
+            //   deferInsertVod 只管住 insertVod 那条路，revive 是第二个写入口。
+            if (mVodInfo != null && !TextUtils.isEmpty(pkSourceKey) && everPlayedThisCycle) {
                 try {
                     RoomDataManger.reviveVodRecordIfMissing(pkSourceKey, mVodInfo);
                 } catch (Throwable th) {
@@ -2195,6 +2202,14 @@ public class PlayFragment extends BaseLazyFragment {
     private int autoSwitchedPlayerType = -1;
     private boolean allowAutoSwitchLine = true;
     private boolean playbackStarted = false;
+    /**
+     * ★ v4.2.8：本轮播放是否<b>真的出过首帧</b>（只增不减，{@link #pauseForHidden()} 不清）。
+     *
+     * <p>与 {@link #playbackStarted} 的区别：后者会被 {@code pauseForHidden()} / 换源重置清零，
+     * 到 {@code onDestroyView()} 时往往已经是 false；而历史复活只看「这次进来到底有没有播出画面」。
+     * 用它挡住「详情页点了播放、首帧没出就退出」被 {@code reviveVodRecordIfMissing} 补出一条假历史。</p>
+     */
+    private boolean everPlayedThisCycle = false;
 
     /**
      * ★ v64：卡顿统计闸门 —— 只有<b>真正出过画面</b>（{@code STATE_PLAYING}，
@@ -3156,6 +3171,9 @@ public class PlayFragment extends BaseLazyFragment {
         //   allowSwitch=false：这是「换新一轮」的收尾，不允许据此再触发一次切源（防递归）。
         settlePendingStall(false);
         playbackStarted = false;
+        // ★ v4.2.8：换源/换线开始新一轮 ⇒ 首帧标记也要重头算，
+        //   否则「A 播过 → 切到 B 但 B 没出画面」会被当成播过。
+        everPlayedThisCycle = false;
         stallGateOpen = false;
         firstFrameAtMs = 0L;
         stallSwitchAllowed = true;
@@ -3480,6 +3498,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     void markPlaybackStarted() {
         playbackStarted = true;
+        everPlayedThisCycle = true;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
         // ★ v4.2.6：首帧到达才让详情页落历史 —— 详情页的 jumpToPlay() 现在只挂起写入，
