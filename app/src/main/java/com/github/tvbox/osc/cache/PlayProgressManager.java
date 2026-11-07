@@ -325,6 +325,31 @@ public class PlayProgressManager {
         }
     }
 
+    /** 读取某一集的完整记录（含 HLC），用于切源时判断新旧；无记录返回 null。 */
+    public static PlayProgress getRecord(String sourceKey, String vodId, String flag, int playIndex, String epName) {
+        try {
+            return AppDataManager.get().getPlayProgressDao()
+                    .get(s(sourceKey), s(vodId), s(flag), playIndex, s(epName));
+        } catch (Throwable th) {
+            th.printStackTrace();
+            return null;
+        }
+    }
+
+    /**
+     * ★ r187：按 HLC 比较两条进度谁更新（{@code a} 比 {@code b} 新 ⇒ &gt;0）。
+     * 切源迁移用它替代「新源已有值就不覆盖」——陈旧小值不再挡住当前播放进度。
+     */
+    public static int compareHlc(PlayProgress a, PlayProgress b) {
+        if (a == null) {
+            return b == null ? 0 : -1;
+        }
+        if (b == null) {
+            return 1;
+        }
+        return hlcOf(a).compareTo(hlcOf(b));
+    }
+
     /** ★ v4.1：取某片最新一条进度（用于历史列表/详情页恢复播放状态）。 */
     public static PlayProgress getLatest(String sourceKey, String vodId) {
         try {
@@ -422,6 +447,10 @@ public class PlayProgressManager {
                     int idx = com.github.tvbox.osc.util.EpisodeNameMatcher.findIndex(targetEp, toEpNames);
                     if (idx >= 0) {
                         targetEp = toEpNames.get(idx);
+                    } else if (rows.size() == 1 && toEpNames.size() == 1) {
+                        // ★ r187：单片电影（唯一集）集名写法不通（「HD中字」↔「正片」）时，
+                        //   按唯一集对齐，避免整片搬不过去。
+                        targetEp = toEpNames.get(0);
                     }
                 }
                 // ★ v99-r77：坐标取自新源（线路 + 该线路内下标），与读侧同源
@@ -430,8 +459,10 @@ public class PlayProgressManager {
                     // 新源没有这一集 ⇒ 无处可落 ⇒ 不写（写了也读不到）
                     continue;
                 }
-                // 新源该集已有记忆则以新源为准，不覆盖
-                if (get(toSourceKey, toVodId, coord.flag, coord.index, coord.epName) > 0) {
+                // ★ r187：改为「按 HLC 新旧择优」——只有新源这条记录确实更新才保留；
+                //   否则用旧源（=当前正在播放）的位置覆盖，防止陈旧小值挡住真实进度。
+                PlayProgress exist = getRecord(toSourceKey, toVodId, coord.flag, coord.index, coord.epName);
+                if (exist != null && exist.position > 0 && compareHlc(exist, row) >= 0) {
                     continue;
                 }
                 save(toSourceKey, toVodId, coord.flag, coord.index, coord.epName, row.position);

@@ -411,6 +411,15 @@ public class RemoteServer extends NanoHTTPD {
             resp.addHeader("Accept-Ranges", "bytes");
             return resp;
         }
+        if (seg.stream != null) {
+            // r187：边下边发。首字节已到才走到这里；之后 CDN 断流只会让本次读取
+            // 提前结束，播放器下一片照常走 200/302，不会卡住整个播放。
+            Response.IStatus ok = Response.Status.lookup(200);
+            Response resp = NanoHTTPD.newChunkedResponse(ok == null ? Response.Status.OK : ok,
+                    seg.mime == null ? "video/mp2t" : seg.mime, seg.stream);
+            resp.addHeader("Cache-Control", "no-store");
+            return resp;
+        }
         if (seg.data == null || seg.code == 404) {
             return createPlainTextResponse(Response.Status.NOT_FOUND, "segment unavailable");
         }

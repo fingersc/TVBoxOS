@@ -41,8 +41,10 @@ import okhttp3.ResponseBody;
  * <ol>
  *   <li>播放开始解析 m3u8 时，{@link #prepare} 把切片行改写成本地
  *       {@code /seg?sk=<sessionKey>&i=<序号>}（见 {@link M3u8PrefetchPlan}）；</li>
- *   <li>播放器请求某一 {@code /seg} 时，本类确保该片及后续 W-1 片同时在下载
- *       （{@link #serveSegment} 阻塞等待目标片，窗口由 {@link PrefetchController} 自适应）；</li>
+ *   <li>播放器请求某一 {@code /seg} 时：该片已下载完 ⇒ 直接回整片；正在下载 ⇒
+ *       <b>边下边发</b>（chunked，首字节到就返回）；没下 ⇒ 最多等
+ *       {@link #FIRST_BYTE_WAIT_MS} 拿首字节，拿不到就 302 回源。
+ *       窗口宽度由 {@link PrefetchController} 自适应；</li>
  *   <li>任何异常/超时/不支持 → {@link SegResult#redirect} 让播放器 302 回源，等同于旧行为，
  *       绝不让「加速」成为新的故障点。</li>
  * </ol>
@@ -59,8 +61,8 @@ public final class PrefetchManager {
     private static final int MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
 
     private static final int MAX_SESSIONS = 2;
-    private static final long WAIT_FIRST_MS = 20000;
-    private static final long WAIT_OTHERS_MS = 12000;
+    /** 首字节等待上限：拿不到就 302 回源，绝不把播放器卡在本地代理上。 */
+    private static final long FIRST_BYTE_WAIT_MS = 1500;
     /** 单个切片下载的墙钟上限（慢速滴流服务器保护）。 */
     private static final long SEG_DOWNLOAD_DEADLINE_MS = 45000;
 
@@ -138,6 +140,8 @@ public final class PrefetchManager {
         public int code;              // 200/206/302/404
         public String mime;
         public byte[] data;
+        /** 非 null 时走 chunked 边下边发；与 {@link #data} 二选一。 */
+        public InputStream stream;
         public boolean partial;
         public long rangeStart;
         public long rangeEnd;
@@ -177,6 +181,15 @@ public final class PrefetchManager {
             }
             return r;
         }
+
+        /** 边下边发：返回已拿到首字节的流，由 NanoHTTPD chunked 写给播放器。 */
+        static SegResult stream(String mime, InputStream in) {
+            SegResult r = new SegResult();
+            r.code = 200;
+            r.mime = mime;
+            r.stream = in;
+            return r;
+        }
     }
 
     private static final class Seg {
@@ -187,6 +200,9 @@ public final class PrefetchManager {
 
         int state = EMPTY;
         byte[] data;
+        /** 下载中的增量缓冲（边下边发用）；DONE 后与 data 指向同一数组（长度一致时）。 */
+        byte[] grow;
+        int length;
         long size;
         int attempts;
     }
@@ -315,8 +331,9 @@ public final class PrefetchManager {
         }
         LOG.d("prefetch session " + shortSk(sk) + " segs=" + plan.segments.size()
                 + " bitrate=" + plan.bitrateMbps + " host=" + s.host);
-        // 起播预取前 2 片（当免费探针）
-        schedule(s, 1);
+        // ★ r187：不再从第 1 片盲预取——续播/seek 时起播点是任意 i，
+        //   盲下 1、2、3 既浪费流量又抢同 host 并发，反而拖慢真正要的那片。
+        //   由第一次 /seg 请求的 index 驱动预取（见 serveSegment）。
         Prepared p = new Prepared();
         p.rewritten = plan.rewritten;
         return p;
@@ -341,7 +358,15 @@ public final class PrefetchManager {
         return sk.length() > 6 ? sk.substring(0, 6) : sk;
     }
 
-    /** 处理播放器的 /seg 请求：等待（或触发）该切片下载，必要时 302 回源。 */
+    /**
+     * 处理播放器的 /seg 请求：
+     * <ul>
+     *   <li>整片已在内存 ⇒ 200/206 直接回（支持 Range）；</li>
+     *   <li>正在下载/刚发起 ⇒ 最多等 {@link #FIRST_BYTE_WAIT_MS} 拿首字节，
+     *       拿到就 chunked 边下边发；</li>
+     *   <li>拿不到 ⇒ 302 回源，绝不阻塞。</li>
+     * </ul>
+     */
     public SegResult serveSegment(String sk, int index, String rangeHeader) {
         Session s;
         synchronized (sessions) {
@@ -354,18 +379,38 @@ public final class PrefetchManager {
         if (index < 1 || index > s.segs.size()) {
             return SegResult.redirect(null);
         }
-        s.cursor = index;
-        schedule(s, index);
-        byte[] data = waitFor(s, index, index == 1 ? WAIT_FIRST_MS : WAIT_OTHERS_MS);
-        if (data == null) {
-            // 下载失败/超时：直接让播放器回源，等同于旧行为
+        String mime = mimeFor(s.segs.get(index - 1).url);
+        byte[] ready = readyData(s, index);
+        if (ready != null) {
+            s.cursor = index;
+            return applyRange(mime, ready, rangeHeader);
+        }
+        if (rangeHeader != null && !rangeHeader.isEmpty()) {
+            // 区间请求只从完整缓冲服务（HLS 极少走这条）；未就绪就回源
+            s.cursor = index;
+            schedule(s, index);
             return SegResult.redirect(s.segs.get(index - 1).url);
         }
-        String mime = mimeFor(s.segs.get(index - 1).url);
-        return applyRange(mime, data, rangeHeader);
+        s.cursor = index;
+        schedule(s, index);
+        Seg st = awaitFirstByte(s, index, FIRST_BYTE_WAIT_MS);
+        if (st == null || st.length <= 0) {
+            return SegResult.redirect(s.segs.get(index - 1).url);
+        }
+        return SegResult.stream(mime, new SegStream(s, index));
     }
 
-    private byte[] waitFor(Session s, int index, long timeoutMs) {
+    private static byte[] readyData(Session s, int index) {
+        synchronized (s.lock) {
+            Seg st = s.states.get(index);
+            if (st != null && st.state == Seg.DONE && st.data != null) {
+                return st.data;
+            }
+            return null;
+        }
+    }
+
+    private Seg awaitFirstByte(Session s, int index, long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         synchronized (s.lock) {
             while (true) {
@@ -374,8 +419,8 @@ public final class PrefetchManager {
                 }
                 Seg st = s.states.get(index);
                 if (st != null) {
-                    if (st.state == Seg.DONE && st.data != null) {
-                        return st.data;
+                    if (st.length > 0) {
+                        return st;
                     }
                     if (st.state == Seg.FAILED) {
                         return null;
@@ -386,11 +431,84 @@ public final class PrefetchManager {
                     return null;
                 }
                 try {
-                    s.lock.wait(Math.min(remain, 500));
+                    s.lock.wait(Math.min(remain, 200));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return null;
                 }
+            }
+        }
+    }
+
+    /** 把共享的下载缓冲当流读；下载线程往里追加，本流从头消费。 */
+    private static final class SegStream extends InputStream {
+        private final Session s;
+        private final int index;
+        private int pos;
+        private boolean closed;
+
+        SegStream(Session s, int index) {
+            this.s = s;
+            this.index = index;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n <= 0 ? -1 : (one[0] & 0xff);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (b == null) {
+                throw new NullPointerException();
+            }
+            if (off < 0 || len < 0 || off + len > b.length) {
+                throw new IndexOutOfBoundsException();
+            }
+            if (len == 0) {
+                return 0;
+            }
+            synchronized (s.lock) {
+                while (true) {
+                    if (closed || s.closed) {
+                        throw new IOException("segment stream closed");
+                    }
+                    Seg st = s.states.get(index);
+                    if (st == null) {
+                        throw new IOException("segment gone");
+                    }
+                    if (pos > st.length) {
+                        throw new IOException("segment reset");
+                    }
+                    if (pos < st.length) {
+                        int n = Math.min(len, st.length - pos);
+                        System.arraycopy(st.grow, pos, b, off, n);
+                        pos += n;
+                        return n;
+                    }
+                    if (st.state == Seg.DONE) {
+                        return -1;
+                    }
+                    if (st.state == Seg.FAILED) {
+                        throw new IOException("segment download failed");
+                    }
+                    try {
+                        s.lock.wait(500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("interrupted");
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            synchronized (s.lock) {
+                s.lock.notifyAll();
             }
         }
     }
@@ -460,7 +578,7 @@ public final class PrefetchManager {
             hostHeld = true;
 
             long t0 = System.currentTimeMillis();
-            byte[] data = fetch(seg.url, s.okHeaders, s);
+            byte[] data = fetchStreaming(s, st, seg.url);
             long dt = Math.max(1, System.currentTimeMillis() - t0);
 
             synchronized (s.lock) {
@@ -507,8 +625,9 @@ public final class PrefetchManager {
         }
     }
 
-    private byte[] fetch(String url, Headers headers, Session s) throws IOException {
-        Request.Builder rb = new Request.Builder().url(url).headers(headers).get();
+    /** 下载整片，同时把到达的字节追加进 {@code st.grow}，让 /seg 可以边下边发。 */
+    private byte[] fetchStreaming(Session s, Seg st, String url) throws IOException {
+        Request.Builder rb = new Request.Builder().url(url).headers(s.okHeaders).get();
         Response resp = http.newCall(rb.build()).execute();
         try {
             int code = resp.code();
@@ -519,20 +638,36 @@ public final class PrefetchManager {
             if (body == null) {
                 throw new IOException("empty body");
             }
-            InputStream in = body.byteStream();
             long len = body.contentLength();
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(
-                    len > 0 && len < MAX_SEGMENT_BYTES ? (int) len : 65536);
+            int cap = len > 0 && len <= MAX_SEGMENT_BYTES ? (int) len : 65536;
+            synchronized (s.lock) {
+                st.grow = new byte[cap];
+                st.length = 0;
+            }
+            InputStream in = body.byteStream();
             byte[] buf = new byte[16384];
-            long total = 0;
+            int total = 0;
             long deadline = System.currentTimeMillis() + SEG_DOWNLOAD_DEADLINE_MS;
             int n;
             while ((n = in.read(buf)) > 0) {
                 if (s.closed) {
                     throw new IOException("session closed");
                 }
-                bos.write(buf, 0, n);
-                total += n;
+                synchronized (s.lock) {
+                    if (st.grow == null || total + n > st.grow.length) {
+                        int want = total + n;
+                        int next = Math.max(want, st.grow == null ? 65536 : st.grow.length + st.grow.length / 2);
+                        byte[] bigger = new byte[next];
+                        if (st.grow != null) {
+                            System.arraycopy(st.grow, 0, bigger, 0, total);
+                        }
+                        st.grow = bigger;
+                    }
+                    System.arraycopy(buf, 0, st.grow, total, n);
+                    total += n;
+                    st.length = total;
+                    s.lock.notifyAll();
+                }
                 if (total > MAX_SEGMENT_BYTES) {
                     throw new IOException("segment too large");
                 }
@@ -543,7 +678,10 @@ public final class PrefetchManager {
             if (total == 0) {
                 throw new IOException("empty segment");
             }
-            return bos.toByteArray();
+            if (st.grow.length == total) {
+                return st.grow;
+            }
+            return Arrays.copyOf(st.grow, total);
         } finally {
             resp.close();
         }

@@ -7516,7 +7516,9 @@ public class DetailActivity extends BaseActivity {
                     + " => 换片，不迁移进度");
             return;
         }
-        long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
+        com.github.tvbox.osc.cache.PlayProgress oldRow = PlayProgressManager.getRecord(
+                oldRecord.sourceKey, oldRecord.id, oldFlag, oldRecord.playIndex, oldSeriesName);
+        long oldTime = oldRow == null ? 0 : oldRow.position;
         LOG.sw("[FB] migrate " + oldRecord.sourceKey + "/" + oldRecord.id + " ep=" + oldSeriesName
                 + " -> " + newSourceKey + "/" + newVodId + " ep=" + newSeriesName
                 + " oldTime=" + oldTime + " newVal=" + newVal);
@@ -7544,10 +7546,15 @@ public class DetailActivity extends BaseActivity {
             //   "迁移写入了、起播读不到"⇒ 从 0 播几秒就把迁移值覆盖掉。
             LOG.sw("[FB] progressWrite key=" + newSourceKey + "/" + newVodId + "/" + newFlag
                     + "/" + newIndex + "/" + newSeriesName + " => " + oldTime);
-            // 新源该集已有记忆（整片搬移时可能已搬到）⇒ 以新源为准，不覆盖
-            long nowVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            // ★ r187：按 HLC 新旧择优。当前播放所在旧源的记录（oldRow）刚刚保存过、
+            //   时间戳最新，理应覆盖新源里任何更旧的陈旧小值（如 5733ms）。
+            com.github.tvbox.osc.cache.PlayProgress nowRow = PlayProgressManager.getRecord(
+                    newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            long nowVal = nowRow == null ? 0 : nowRow.position;
             boolean wrote = false;
-            if (nowVal <= 0) {
+            if (oldRow != null && oldRow.position > 0
+                    && (nowRow == null || nowRow.position <= 0
+                        || PlayProgressManager.compareHlc(oldRow, nowRow) > 0)) {
                 PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
                 wrote = true;
             }
