@@ -131,7 +131,7 @@ public final class SyncEngine {
         SyncMeta meta = loadMeta(dav, key, accountName, owner, o, st, dirEntries);
         // ★ v4.3.5（r183）：把账号级历史上限在「本机 ⇄ meta」之间对齐。必须早点做——
         //   下面的 history scope 裁剪（truncateMergedHistory）就要用到这个值。
-        boolean metaTierChanged = syncMetaTier(meta, st, enabled);
+        boolean metaTierChanged = syncMetaTier(meta, st);
         boolean staleDevice = meta.isStale(deviceId, now);
         boolean downloadOnly = staleDevice && !forceUpload;
         if (downloadOnly) {
@@ -358,6 +358,12 @@ public final class SyncEngine {
                 if (HistorySyncManager.applyLocal(merged, one, replaceLocal)) localChanged = true;
             }
             lastMerged = merged;
+            // ★ v4.3.7（r185）：档位发布就放在「settings 合并完、接着跑 HISTORY 之前」。
+            //   ① 这里拿到的是合并后的值（HLC 决定的赢家），两台设备算出同一个值，不会来回翻；
+            //   ② 仍在 HISTORY 裁剪之前，所以改档位当轮就能按新档位裁（保持 r183 的时机）。
+            if (sc == SyncScope.SETTINGS) {
+                metaTierChanged = pushMetaTier(meta, st, enabled, merged);
+            }
 
             // ★ v4.1：记录本设备已看到的水位，并在「所有活跃设备都已看到」时回收墓碑。
             //   保守条件：至少 2 台活跃设备 + 墓碑存在超过 24 小时（见 SyncMeta.dropSeenTombs）。
@@ -557,8 +563,26 @@ public final class SyncEngine {
         try {
             long oldSeen = metaLastSeen(meta, deviceId);
             meta.touch(deviceId, now);
-            if (meta.reliable && (metaDirty || metaTierChanged || oldSeen <= 0L
-                    || now - oldSeen > 6L * 3600L * 1000L)) {
+            // ★ v4.3.7（r185）：档位发布已在 scope 循环里「settings 合并之后」完成（见 pushMetaTier），
+            //   这里只负责把 meta 落盘。原来比较本机 Hawk 会导致陈旧设备推回旧档位、再推一次
+            //   —— 实测一次改档位产生 3 个 sync.meta 版本。
+            boolean needSave = metaDirty || metaTierChanged || oldSeen <= 0L
+                    || now - oldSeen > 6L * 3600L * 1000L;
+            if (meta.reliable && needSave) {
+                StringBuilder why = new StringBuilder();
+                if (metaDirty) {
+                    why.append(" tombs");
+                }
+                if (metaTierChanged) {
+                    why.append(" tier");
+                }
+                if (oldSeen <= 0L) {
+                    why.append(" oldSeen");
+                }
+                if (now - oldSeen > 6L * 3600L * 1000L) {
+                    why.append(" 6h");
+                }
+                LOG.i("[Sync] meta write reason=" + (why.length() == 0 ? "forced" : why.toString().trim()));
                 saveMeta(dav, key, accountName, owner, meta, o, st);
             }
         } catch (Throwable t) {
@@ -1123,20 +1147,18 @@ public final class SyncEngine {
     }
 
     /**
-     * ★ v4.3.5（r183）：把 sync.meta 里的账号级历史上限与本机镜像对齐。
+     * ★ v4.3.5（r183）/ v4.3.7（r185）：把 sync.meta 里的账号级历史上限**拉**到本机镜像。
      *
-     * <p>两个方向：
-     * <ul>
-     *   <li><b>拉</b>：meta 有档位而本机镜像不同 ⇒ 写入 {@link SyncState#accountHistoryNum}，
-     *       这样即使本机设置同步关闭、或本轮 meta 未变，裁剪也能拿到账号值；</li>
-     *   <li><b>推</b>：本机「设置同步开启」且<b>真的设过</b> {@code HISTORY_NUM} 时，
-     *       把自己的档位发布到 meta。<b>不发布</b>的两种情况：设置同步关闭（无权代表账号）、
-     *       Hawk 里没有该键（{@code resetDefaults} 之后是默认值，发出去会把云端的 50 覆盖成 15）。</li>
-     * </ul>
+     * <p>只做拉取（外加旧值修复），<b>不发布</b>。发布见 {@link #pushMetaTier}——
+     * 原来这里比较本机 Hawk（本轮尚未合并云端的值），陈旧设备会把旧档位推回云端、
+     * apply 完再推一次，实测一次改档位产生 3 个 sync.meta 版本。</p>
      *
-     * @return meta 是否因此需要立即落盘（档位变化不受「6 小时一次」门槛限制）
+     * <p>拉取的意义：即使本机设置同步关闭、或本轮 meta 未变，{@code accountHistoryKeep}
+     * 也能拿到账号级档位，避免「永不裁剪」导致云端在 N/keep 之间来回翻。</p>
+     *
+     * @return 恒为 false（本方法不再修改 meta；发布由 {@link #pushMetaTier} 返回）
      */
-    private static boolean syncMetaTier(SyncMeta meta, SyncState st, SyncScopes enabled) {
+    private static boolean syncMetaTier(SyncMeta meta, SyncState st) {
         if (meta == null || st == null) {
             return false;
         }
@@ -1151,19 +1173,62 @@ public final class SyncEngine {
             st.save();
             LOG.i("[Sync] account tier <- meta " + meta.historyNum);
         }
-        // ② 推：本机 → meta（仅设置同步开启、且本机真的设过档位）
-        if (enabled != null && enabled.settings && Hawk.contains(HawkConfig.HISTORY_NUM)) {
-            int mine = HistoryHelper.getHisNum(Hawk.get(HawkConfig.HISTORY_NUM, 0));
-            if (mine > 0 && mine != meta.historyNum) {
-                int old = meta.historyNum;
-                meta.historyNum = mine;
-                st.accountHistoryNum = mine;
-                st.save();
-                LOG.i("[Sync] account tier meta: " + old + " -> " + mine);
-                return true;
-            }
-        }
+        // ② 推：★ v4.3.7（r185）**从这里移除**。
+        //   原来这里比的是本机 Hawk（本轮尚未合并云端的值），会让陈旧设备把旧档位推回云端，
+        //   等 settings 合并完再推一次 —— 一次改档位产生 3 个 sync.meta 版本；调大档位时
+        //   窗口期内别的设备还会按被推回去的小值裁剪历史。发布改由 pushMetaTier() 用
+        //   「合并后的 settings 值」执行，位置在 scope 循环内、settings 合并之后。
         return false;
+    }
+
+    /**
+     * ★ v4.3.7（r185）：把账号级历史上限发布到 {@code sync.meta}。
+     *
+     * <p>输入是**本轮合并后的 settings 值**，不是本机 Hawk：</p>
+     * <ul>
+     *   <li>合并结果由 settings 里的 HLC 决定先后（{@code detectChanges} 打点），
+     *       两台设备算出来的是同一个值 ⇒ 最多各写一次，不可能来回翻；</li>
+     *   <li>本机没改过档位、只是拉到了别人的新值时，合并结果 == meta ⇒ 不写；</li>
+     *   <li>settings scope 没跑/失败（{@code mergedSettings == null}）⇒ 不写，
+     *       比原来「盲推 Hawk」更保守。</li>
+     * </ul>
+     *
+     * @return true 表示 meta 的档位被改变，本次需要落盘
+     */
+    private static boolean pushMetaTier(SyncMeta meta, SyncState st, SyncScopes enabled,
+                                        SyncPayload mergedSettings) {
+        if (meta == null || st == null || mergedSettings == null) {
+            return false;
+        }
+        if (enabled == null || !enabled.settings) {
+            return false;
+        }
+        int mine = 0;
+        try {
+            java.util.Map<String, SyncPayload.SettingValue> map = mergedSettings.settingsMap();
+            SyncPayload.SettingValue sv = map == null ? null : map.get(HawkConfig.HISTORY_NUM);
+            if (sv != null && sv.v != null) {
+                String ty = sv.ty == null ? "s" : sv.ty;
+                if ("i".equals(ty) || "l".equals(ty)) {
+                    int idx = Integer.parseInt(sv.v.trim());
+                    // 只认 0..2 的合法档位下标，避免 HistoryHelper 越界回落成默认 15 而误发布
+                    if (idx >= 0 && idx < 3) {
+                        mine = HistoryHelper.getHisNum(idx);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            mine = 0;
+        }
+        if (mine <= 0 || mine == meta.historyNum) {
+            return false;
+        }
+        int old = meta.historyNum;
+        meta.historyNum = mine;
+        st.accountHistoryNum = mine;
+        st.save();
+        LOG.i("[Sync] account tier meta: " + old + " -> " + mine);
+        return true;
     }
 
     /** ★ 协议 v4：设置先同步，其余 scope 随后 —— 保证 HISTORY 裁剪用的是账号级档位。 */
