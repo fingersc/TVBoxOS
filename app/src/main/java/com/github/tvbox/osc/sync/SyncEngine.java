@@ -638,10 +638,17 @@ public final class SyncEngine {
             // ETag 未变 ⇒ 用本机缓存的正文，避免重复下载。
             if (st.metaJson != null && st.metaJson.length() > 0
                     && st.metaEtag != null && st.metaEtag.equals(remoteEtag)) {
-                SyncMeta cached = HistorySyncManager.GSON.fromJson(st.metaJson, SyncMeta.class);
-                if (cached != null) {
-                    cached.owner = owner;
-                    return cached;
+                try {
+                    SyncMeta cached = HistorySyncManager.GSON.fromJson(st.metaJson, SyncMeta.class);
+                    if (cached != null) {
+                        cached.owner = owner;
+                        return cached;
+                    }
+                } catch (RuntimeException cacheBad) {
+                    // ★ v4.3.6（r184）：缓存的是旧格式正文（字段名被混淆过），丢掉缓存重新拉。
+                    LOG.i("[Sync] meta cache unreadable, refetch: " + cacheBad.getMessage());
+                    st.metaJson = null;
+                    st.metaEtag = null;
                 }
             }
             String[] etagOut = new String[1];
@@ -654,11 +661,23 @@ public final class SyncEngine {
                 return new SyncMeta(owner);
             }
             String json = new String(Crypto.decrypt(key, raw), "UTF-8");
-            st.metaJson = json;
-            SyncMeta m = HistorySyncManager.GSON.fromJson(json, SyncMeta.class);
-            if (m == null) {
-                m = new SyncMeta(owner);
+            SyncMeta m = null;
+            try {
+                m = HistorySyncManager.GSON.fromJson(json, SyncMeta.class);
+            } catch (RuntimeException legacy) {
+                // ★ v4.3.6（r184）：云端 meta 是不可解析的旧格式（典型：r182 及更早用混淆字段名写的
+                //   {"a":[...]}）。这里绝不能 reliable=false —— 那会让 saveMeta 永远跳过，永久卡死。
+                //   正确做法是当成「meta 缺失」重建，本轮即以新格式写回（oldSeen<=0 会触发落盘）。
+                //   安全性：isStale() 对「无记录」的设备返回 false（见 SyncMeta#isStale 注释），
+                //   所以重建不会触发 downloadOnly，不会用云端覆盖本机。
+                LOG.i("[Sync] meta legacy format, rebuild: " + legacy.getMessage());
+                m = null;
             }
+            if (m == null) {
+                st.metaJson = null;   // 别把读不懂的正文留在缓存里反复重试
+                return new SyncMeta(owner);
+            }
+            st.metaJson = json;
             m.owner = owner;
             return m;
         } catch (Throwable t) {

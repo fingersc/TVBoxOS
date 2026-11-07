@@ -1,5 +1,7 @@
 package com.github.tvbox.osc.sync;
 
+import androidx.annotation.Keep;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -17,6 +19,7 @@ import java.util.List;
  * <p>注意：sync.meta 只是<b>提示</b>，WebDAV 没有多文件事务。真正的数据一致性仍由各 scope 的
  * 内容合并保证；meta 丢失/损坏时退化为「按 30 天年龄回收墓碑」，不影响正确性。</p>
  */
+@Keep
 public final class SyncMeta {
 
     public static final int SCHEMA = 1;
@@ -38,8 +41,16 @@ public final class SyncMeta {
      * 与各 scope 开关无关，因此把档位放这里，任何设备都能裁到同一个账号级数值。
      *
      * <p><b>兼容</b>：旧版本读写 meta 时不会带这个字段（Gson 只序列化它认识的字段），会把它抹成
-     * 缺失；新版读到 0 就退回旧逻辑，并且只要有一台「设置同步开启」的设备同步一轮就会重新发布，
-     * 自愈。所以不升 {@link #SCHEMA}，也不需要数据迁移。
+     * 缺失；新版读到 0 就退回旧逻辑，并且只要有一台「设置同步开启」的设备同步一轮就会重新发布。
+     *
+     * <p>★ v4.3.6（r184）：<b>本类与 {@link Device} 必须带 {@code @Keep}</b>。之前两者都没有，
+     * R8 会把字段名混淆成 {@code a/b/c…}，sync.meta 的 JSON key 就变成「随构建变化」的。
+     * r183 在 {@code devices} 前面插了 {@code historyNum}，字段顺序一变、混淆映射整体移位，
+     * 旧 meta 里的 {@code "a":[...]}（devices 数组）在新版眼里是 int 字段，直接抛
+     * {@code Expected an int but was BEGIN_ARRAY path $.a}；而解析失败会把 {@code reliable}
+     * 置 false，{@code saveMeta} 于是永远跳过 ⇒ 永久卡死、自愈不了。
+     * 加上 {@code @Keep} 后字段名固定为源码名，与 {@link SyncPayload} 及其条目类的做法一致。
+     * 所以不升 {@link #SCHEMA}，也不需要数据迁移。
      */
     public int historyNum = 0;
 
@@ -48,6 +59,7 @@ public final class SyncMeta {
     /** 仅内存标记：false 表示读取失败/内容不可信，本轮不要回写覆盖云端 meta。不参与序列化。 */
     public transient boolean reliable = true;
 
+    @Keep
     public static final class Device {
         public String id = "";
         /** 最后一次成功同步的可信时间（毫秒） */
