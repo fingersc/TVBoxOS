@@ -99,6 +99,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private TextView tvShowPreviewText;
     private TextView tvFastSearchText;
     private TextView tvm3u8AdText;
+    private TextView tvm3u8PrefetchText;
     private TextView tvAutoSwitchLineText;
     private TextView tvRecStyleText;
     private TextView tvIjkCachePlay;
@@ -147,6 +148,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         SETTING_NAMES.put(HawkConfig.PLAY_SCALE, "画面缩放");
         SETTING_NAMES.put(HawkConfig.SHOW_PREVIEW, "窗口预览");
         SETTING_NAMES.put(HawkConfig.M3U8_PURIFY, "去广告");
+        SETTING_NAMES.put(HawkConfig.M3U8_PREFETCH, "分片预取");
         SETTING_NAMES.put(HawkConfig.AUTO_SWITCH_LINE, "自动换线");
         SETTING_NAMES.put(HawkConfig.DOH_URL, "安全DNS");
         SETTING_NAMES.put(HawkConfig.PARSE_WEBVIEW, "嗅探Webview");
@@ -817,6 +819,15 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 tvm3u8AdText.setText(!is_purify ? "开启" : "关闭");
             }
         });
+        findViewById(R.id.m3u8Prefetch).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                FastClickCheckUtil.check(v);
+                boolean on = cur(HawkConfig.M3U8_PREFETCH, true);
+                draftPut(HawkConfig.M3U8_PREFETCH, !on);
+                tvm3u8PrefetchText.setText(!on ? "开启" : "关闭");
+            }
+        });
         findViewById(R.id.danmuOpen).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -892,6 +903,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
         tvFastSearchText.setText(cur(HawkConfig.FAST_SEARCH_MODE, true) ? "开启" : "关闭");
         tvm3u8AdText = findViewById(R.id.m3u8AdText);
         tvm3u8AdText.setText(cur(HawkConfig.M3U8_PURIFY, false) ? "开启" : "关闭");
+        tvm3u8PrefetchText = findViewById(R.id.m3u8PrefetchText);
+        tvm3u8PrefetchText.setText(cur(HawkConfig.M3U8_PREFETCH, true) ? "开启" : "关闭");
         tvDanmuOpenText = findViewById(R.id.danmuOpenText);
         tvDanmuOpenText.setText(cur(HawkConfig.DANMU_OPEN, DanmuHelper.isOpen()) ? "开启" : "关闭");
         tvDanmuApiText = findViewById(R.id.danmuApiText);

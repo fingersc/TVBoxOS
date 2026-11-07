@@ -38,6 +38,7 @@ import com.github.tvbox.osc.bean.IJKCode;
 import com.github.tvbox.osc.bean.ParseBean;
 import com.github.tvbox.osc.bean.SourceBean;
 import com.github.tvbox.osc.server.ControlManager;
+import com.github.tvbox.osc.server.PrefetchManager;
 import com.github.tvbox.osc.server.RemoteServer;
 import com.github.tvbox.osc.subtitle.widget.SimpleSubtitleView;
 import com.google.android.exoplayer2.ui.SubtitleView;
@@ -155,7 +156,7 @@ public class VodController extends BaseController {
                         if (isInPlaybackState()) {
                             try {
                                 float speed = (float) mPlayerConfig.getDouble("sp");
-                                mControlWrapper.setSpeed(speed);
+                                applyPlaybackSpeed(speed);
                             } catch (JSONException e) {
                                 e.printStackTrace();
                             }
@@ -658,7 +659,7 @@ public class VodController extends BaseController {
                     updatePlayerCfgView();
                     listener.updatePlayerCfg();
                     speed_old = 1.0f;
-                    mControlWrapper.setSpeed(1.0f);
+                    applyPlaybackSpeed(1.0f);
                 } catch (JSONException e) {
                     e.printStackTrace();
                 }
@@ -1095,7 +1096,7 @@ public class VodController extends BaseController {
                         updatePlayerCfgView();
                         listener.updatePlayerCfg();
                         speed_old = value;
-                        mControlWrapper.setSpeed(value);
+                        applyPlaybackSpeed(value);
                     } catch (JSONException e) {
                         e.printStackTrace();
                     }
@@ -1286,6 +1287,15 @@ public class VodController extends BaseController {
         skipEnd = true;
         mHandler.removeMessages(1004);
         mHandler.sendEmptyMessageDelayed(1004, 100);
+    }
+
+    /**
+     * ★ A′：倍速是预取需求的一部分（码率×倍速×安全系数），所有改倍速的入口
+     *   都必须同步给 PrefetchManager，否则 2× 观看时窗口不会加深。
+     */
+    private void applyPlaybackSpeed(float speed) {
+        mControlWrapper.setSpeed(speed);
+        PrefetchManager.setPlaybackSpeed(speed);
     }
 
     public void setHasDanmu(boolean hasDanmu) {
@@ -1713,7 +1723,7 @@ public class VodController extends BaseController {
             mPlayerConfig.put("sp", speed);
             updatePlayerCfgView();
             listener.updatePlayerCfg();
-            mControlWrapper.setSpeed(speed);
+            applyPlaybackSpeed(speed);
             findViewById(R.id.play_speed_3_container).setVisibility(View.VISIBLE);
         } catch (JSONException f) {
             f.printStackTrace();
@@ -1727,7 +1737,7 @@ public class VodController extends BaseController {
                 mPlayerConfig.put("sp", speed);
                 updatePlayerCfgView();
                 listener.updatePlayerCfg();
-                mControlWrapper.setSpeed(speed);
+                applyPlaybackSpeed(speed);
             } catch (JSONException f) {
                 f.printStackTrace();
             }
@@ -2123,25 +2133,49 @@ public class VodController extends BaseController {
 
     private void processM3u8Content(String url, String content, HashMap<String, String> headers) {
         String basePath = getBasePath(url);
-        // ★ v43：改用原子结果 —— 内容与广告计数来自同一次净化调用，
-        //   不再读 M3u8.currentAdCount 这个会被并发覆盖的静态字段。
-        M3u8.Result purified = M3u8.purifyResult(basePath, content);
+        // ★ 分片并行下载（A′）：默认开启；关闭时不改变任何旧行为。
+        boolean purifyOn = Hawk.get(HawkConfig.M3U8_PURIFY, false);
+        String mediaContent = content;
+        int adCount = 0;
+        if (purifyOn) {
+            // ★ v43：改用原子结果 —— 内容与广告计数来自同一次净化调用，
+            //   不再读 M3u8.currentAdCount 这个会被并发覆盖的静态字段。
+            M3u8.Result purified = M3u8.purifyResult(basePath, content);
+            if (purified != null) {
+                mediaContent = purified.content;
+                adCount = purified.adCount;
+            }
+        }
         // ★ v43：按播放会话存放净化内容，避免并发播放（预览+全屏/快速切源）
         //   互相覆盖 RemoteServer 里的单一静态字段导致画面串流。
         //   会话 key 由本次流的 URL 派生：同一集在不同源/线路地址都不同，
         //   天然区分「并发的两条流」，且不需要引入新状态。
         String sessionKey = m3u8SessionKey(url);
-        RemoteServer.putM3u8Content(sessionKey, purified.content);
-        if (purified.content == null || purified.adCount == 0) {
+        if (mediaContent == null) {
+            RemoteServer.putM3u8Content(sessionKey, null);
             listener.startPlayUrl(url, headers);
-        } else {
-            String proxyUrl = ControlManager.get().getAddress(true) + "proxyM3u8";
-            if (sessionKey.length() > 0) {
-                proxyUrl = proxyUrl + "?sk=" + android.net.Uri.encode(sessionKey);
-            }
-            listener.onM3u8ProxyUrl(proxyUrl, url);
-            listener.startPlayUrl(proxyUrl, headers);
-            Toast.makeText(getContext(), "已移除视频广告 " + purified.adCount + " 条", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // ★ A′：解析切片并按 /seg?sk=<sessionKey>&i=<序号> 改写播放列表，向后预取；
+        //   不支持（master/byterange/异常）时 prepared=null，退回原行为。
+        PrefetchManager.Prepared prepared = PrefetchManager.get()
+                .prepare(sessionKey, url, mediaContent, headers);
+        String playContent = prepared != null ? prepared.rewritten : mediaContent;
+        RemoteServer.putM3u8Content(sessionKey, playContent);
+        boolean needProxy = adCount > 0 || prepared != null;
+        if (!needProxy) {
+            // 无广告可去、也不做并行预取 → 保持原来的直连行为
+            listener.startPlayUrl(url, headers);
+            return;
+        }
+        String proxyUrl = ControlManager.get().getAddress(true) + "proxyM3u8";
+        if (sessionKey.length() > 0) {
+            proxyUrl = proxyUrl + "?sk=" + android.net.Uri.encode(sessionKey);
+        }
+        listener.onM3u8ProxyUrl(proxyUrl, url);
+        listener.startPlayUrl(proxyUrl, headers);
+        if (adCount > 0) {
+            Toast.makeText(getContext(), "已移除视频广告 " + adCount + " 条", Toast.LENGTH_SHORT).show();
         }
     }
 

@@ -64,6 +64,8 @@ public class HawkConfig {
     public static final String LIVE_GROUP_LIST = "live_group_list";
     public static final String LIVE_API_URL = "live_api_url";
     public static final String M3U8_PURIFY = "m3u8_purify";
+    /** 分片并行下载（A′：本地分片代理 + 跨切片滚动预取），默认开启。 */
+    public static final String M3U8_PREFETCH = "m3u8_prefetch";
     public static final String AUTO_SWITCH_LINE = "auto_switch_line";
     public static final String SCREEN_DISPLAY = "screen_display";
     public static final String LIVE_WEB_HEADER = "live_web_header";

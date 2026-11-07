@@ -66,6 +66,7 @@ import com.github.tvbox.osc.player.TrackInfoBean;
 import com.github.tvbox.osc.player.controller.VodController;
 import com.github.tvbox.osc.player.danmu.DanmuLoadController;
 import com.github.tvbox.osc.server.ControlManager;
+import com.github.tvbox.osc.server.PrefetchManager;
 import com.github.tvbox.osc.ui.adapter.SelectDialogAdapter;
 import com.github.tvbox.osc.ui.activity.DetailActivity;
 import com.github.tvbox.osc.ui.dialog.CastDeviceDialog;
@@ -771,6 +772,13 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     private void clearM3u8ProxyUrl() {
+        // A′：播放会话结束/切走时释放预取会话（缓冲与在途请求），避免内存滞留。
+        if (!TextUtils.isEmpty(m3u8SourceUrl)) {
+            try {
+                PrefetchManager.get().release(MD5.string2MD5(m3u8SourceUrl));
+            } catch (Throwable ignored) {
+            }
+        }
         m3u8ProxyUrl = null;
         m3u8SourceUrl = null;
     }
@@ -1204,7 +1212,8 @@ public class PlayFragment extends BaseLazyFragment {
         startSwitchLinePlayTimeout();
         url = attachProxySiteKey(url);
         if(!url.startsWith("data:application"))EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_REFRESH, url));//更新播放地址
-        if (!Hawk.get(HawkConfig.M3U8_PURIFY, false)) {
+        boolean prefetchOn = PrefetchManager.isEnabled();
+        if (!Hawk.get(HawkConfig.M3U8_PURIFY, false) && !prefetchOn) {
             goPlayUrl(url,headers);
             return;
         }

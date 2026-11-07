@@ -48,7 +48,8 @@ public final class SyncSettings {
             //   ★ v99-r49：同名合并固定开启、开关删除 ⇒ 只有档位参与同步。
             HawkConfig.HISTORY_NUM,
             // 播放偏好
-            HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.PLAY_TIME_STEP,
+            HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.M3U8_PREFETCH,
+            HawkConfig.PLAY_TIME_STEP,
             HawkConfig.SCREEN_DISPLAY, HawkConfig.IJK_CACHE_PLAY,
             // 字幕
             HawkConfig.SUBTITLE_TEXT_SIZE, HawkConfig.SUBTITLE_TIME_DELAY,
@@ -68,7 +69,7 @@ public final class SyncSettings {
 
     private static final String[] BOOL_KEYS = {
             HawkConfig.HOME_REC_STYLE, HawkConfig.FAST_SEARCH_MODE,
-            HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.IJK_CACHE_PLAY,
+            HawkConfig.AUTO_SWITCH_LINE, HawkConfig.M3U8_PURIFY, HawkConfig.M3U8_PREFETCH, HawkConfig.IJK_CACHE_PLAY,
             HawkConfig.DANMU_OPEN, HawkConfig.DANMU_RANDOM_COLOR, HawkConfig.LIVE_SHOW_NET_SPEED,
             HawkConfig.LIVE_SHOW_TIME, HawkConfig.LIVE_CHANNEL_REVERSE, HawkConfig.LIVE_CROSS_GROUP,
             HawkConfig.SHOW_PREVIEW, HawkConfig.DEFAULT_LOAD_LIVE,

@@ -208,6 +208,11 @@ public class RemoteServer extends NanoHTTPD {
             if (fileName.indexOf('?') >= 0) {
                 fileName = fileName.substring(0, fileName.indexOf('?'));
             }
+            // ★ A′：本地分片代理。必须在 method 判断之前拦截，GET/HEAD 都走这里，
+            //   给了 Range 就回 206，没给就回整片；片不在缓冲/下载失败则 302 回源。
+            if (fileName.equals("/seg")) {
+                return handleSegment(session);
+            }
             if (session.getMethod() == Method.GET) {
                 if (isProxyRequest(fileName, session.getParms())) {
                     return handleProxy(session);
@@ -384,6 +389,41 @@ public class RemoteServer extends NanoHTTPD {
         if (params == null) return false;
         if (!params.containsKey("do") && !params.containsKey("go")) return false;
         return fileName.equals("/proxy") || fileName.equals("/");
+    }
+
+    private Response handleSegment(IHTTPSession session) {
+        Map<String, String> parms = session.getParms();
+        String sessionKey = parms == null ? null : parms.get("sk");
+        int index = -1;
+        try {
+            index = Integer.parseInt(parms == null ? null : parms.get("i"));
+        } catch (Throwable ignored) {
+        }
+        PrefetchManager.SegResult seg = PrefetchManager.get()
+                .serveSegment(sessionKey, index, session.getHeaders().get("range"));
+        if (seg == null) {
+            return createPlainTextResponse(Response.Status.NOT_FOUND, "no segment");
+        }
+        if (seg.redirectUrl != null) {
+            // 稳定优先：本地拿不到就 302 回源，由播放器/CDN 自己完成，绝不卡住播放。
+            Response resp = NanoHTTPD.newFixedLengthResponse(Response.Status.lookup(302), NanoHTTPD.MIME_PLAINTEXT, "");
+            resp.addHeader("Location", seg.redirectUrl);
+            resp.addHeader("Accept-Ranges", "bytes");
+            return resp;
+        }
+        if (seg.data == null || seg.code == 404) {
+            return createPlainTextResponse(Response.Status.NOT_FOUND, "segment unavailable");
+        }
+        Response.IStatus status = seg.partial ? Response.Status.lookup(206) : Response.Status.lookup(200);
+        if (status == null) status = Response.Status.OK;
+        Response resp = NanoHTTPD.newFixedLengthResponse(status,
+                seg.mime == null ? "video/mp2t" : seg.mime,
+                new ByteArrayInputStream(seg.data), seg.data.length);
+        resp.addHeader("Accept-Ranges", "bytes");
+        if (seg.partial) {
+            resp.addHeader("Content-Range", "bytes " + seg.rangeStart + "-" + seg.rangeEnd + "/" + seg.rangeTotal);
+        }
+        return resp;
     }
 
     private Response handleProxy(IHTTPSession session) {
