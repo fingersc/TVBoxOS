@@ -192,6 +192,31 @@ public final class SyncMerge {
         return out;
     }
 
+    /**
+     * ★ v4.3.2（r180-A 修正）：给「没有经过 {@link #merge} 的本地包」补算 hlcMax。
+     *
+     * <p>{@code HistorySyncManager.buildLocal} 只负责把本机行摊成 payload，<b>不会</b>填
+     * {@code hlcMaxPhysical / hlcMaxCounter}（那是 merge 的输出）。r180-A 的 shadow 包走的是
+     * buildLocal 这条捷径，hlcMax 恒为 0，于是：</p>
+     * <ul>
+     *   <li>{@code bumpPushedHlc(sc, 0, 0)} 变成空操作 ⇒ 水位不推进；</li>
+     *   <li>{@code SyncEngine} 收尾的「本机 DB 最大 HLC ≤ pushedHlc 才清 dirty」守卫永远不成立
+     *       ⇒ 该 scope 的 dirty 永远清不掉 ⇒ 每轮都重算一次 skipFetch、退出时还要多补一轮；</li>
+     *   <li>上传出去的包 hlcMax=0，对端据此推进时钟时也拿不到有效值。</li>
+     * </ul>
+     * <p>所以 shadow 包必须补这一步。调用点刻意放在【截断之前】：这样算出的 max 等于
+     * {@code HistorySyncManager.localMaxHlc(sc)}，与 finish() 的清 dirty 守卫同口径；
+     * 若放在截断之后，被裁掉的旧行会让 max 偏小、守卫再次不成立，dirty 依旧清不掉。</p>
+     */
+    public static void computeHlcMax(SyncPayload p) {
+        if (p == null) {
+            return;
+        }
+        long[] mm = finalMax(p, p.hlcMaxPhysical, p.hlcMaxCounter);
+        p.hlcMaxPhysical = mm[0];
+        p.hlcMaxCounter = (int) mm[1];
+    }
+
     // ---------------------------------------------------------------- 规范顺序
 
     /**

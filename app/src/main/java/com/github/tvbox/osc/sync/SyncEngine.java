@@ -239,6 +239,13 @@ public final class SyncEngine {
             }
             if (skipFetch) {
                 shadow = HistorySyncManager.buildLocal(owner, deviceId, one, now);
+                // ★ v4.3.2：buildLocal 不填 hlcMax（那是 merge 的产物）。不补这一步，
+                //   bumpPushedHlc(0,0) 就是空操作 ⇒ 水位不推进 ⇒ finish() 的
+                //   「本机 DB 最大 HLC ≤ pushedHlc 才清 dirty」守卫永远不成立 ⇒ 该 scope 的
+                //   dirty 永远清不掉（实测每轮都重复 skip 判定、每次退出还要多补一轮）。
+                //   刻意在【截断之前】算：这样它等于 localMaxHlc(sc)，与守卫同口径；
+                //   被截断掉的旧行本来也永远不会被上传，不该反过来卡住 dirty 的清除。
+                SyncMerge.computeHlcMax(shadow);
                 HistorySyncManager.truncateMergedHistory(shadow, one);
                 HistorySyncManager.truncateMergedProgress(shadow, one);
                 String lh = HistorySyncManager.payloadHash(shadow);
