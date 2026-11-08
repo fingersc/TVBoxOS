@@ -4,16 +4,20 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
+import android.graphics.Rect;
 import android.hardware.Camera;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.ViewConfiguration;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -36,6 +40,7 @@ import com.orhanobut.hawk.Hawk;
 
 import org.json.JSONObject;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -54,6 +59,9 @@ import okhttp3.Response;
  * 切后台回来就是黑屏）；补连续对焦（原来没设置对焦模式，近距离永远糊）；
  * 预览尺寸按屏幕比例挑选并校正 Surface 宽高比（原来固定全屏拉伸，画面变形）；
  * 解码前拷贝帧数据（原来直接引用相机会复用的 buffer，解码结果不稳定）。</p>
+ *
+ * <p>r190：新增「手动缩放」（双指捏合 → Camera1 数字变焦，屏幕显示倍率）与「点按对焦」，
+ * 并把解码改为「先解取景框中心区域、失败再退回全帧」，便于扫远距离、画面里偏小的二维码。</p>
  */
 public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callback {
 
@@ -74,6 +82,25 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     private int displayOrientation = 90;
     private long lastDecodeAt;
 
+    // ---- r190 手动缩放（Camera1 数字变焦）与点按对焦 ----
+    private TextView tvZoom;
+    private ScaleGestureDetector scaleDetector;
+    private boolean zoomSupported;
+    private int maxZoom;
+    private int[] zoomRatios;
+    private int curZoom;
+    /** 当前实际变焦倍率（用于手势基准与显示） */
+    private float zoomRatio = 1f;
+    /** 手势累积的目标倍率（不被索引量化打断，避免小步双击不动） */
+    private float accumRatio = 1f;
+    private boolean zoomUnsupportedShown;
+    private long lastZoomApplyAt;
+    // ---- 触摸判定（区分「点按对焦」与「双指缩放」）----
+    private float downX, downY;
+    private long downTime;
+    private boolean potentialTap;
+    private boolean scaled;
+
     @Override
     protected int getLayoutResID() {
         return R.layout.activity_qr_scan;
@@ -93,6 +120,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         flp.width = side;
         flp.height = side;
         frame.setLayoutParams(flp);
+        tvZoom = findViewById(R.id.tvZoom);
+        setupZoomAndTouch(side);
         surface.getHolder().addCallback(this);
         if (hasCameraPermission()) {
             permissionGranted = true;
@@ -203,6 +232,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                 previewH = size.height;
             }
             camera.setParameters(params);
+            initZoomForCamera();
             camera.setDisplayOrientation(calcDisplayOrientation());
             camera.setPreviewDisplay(surface.getHolder());
             camera.setPreviewCallback(new Camera.PreviewCallback() {
@@ -348,6 +378,253 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         }, 800);
     }
 
+    // ---------------------------------------------------------------- 缩放 / 对焦
+
+    private int dp(int v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    /** 把倍率提示放到取景框正下方（取景框固定居中，故可按屏幕高/2 + 框半高定位）。 */
+    private void positionZoomTip(int frameSide) {
+        if (tvZoom == null) {
+            return;
+        }
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        FrameLayout.LayoutParams zp = (FrameLayout.LayoutParams) tvZoom.getLayoutParams();
+        zp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP;
+        zp.topMargin = screenH / 2 + frameSide / 2 + dp(10);
+        tvZoom.setLayoutParams(zp);
+    }
+
+    private void setupZoomAndTouch(int frameSide) {
+        positionZoomTip(frameSide);
+        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScaleBegin(ScaleGestureDetector detector) {
+                if (!zoomSupported) {
+                    return false;
+                }
+                accumRatio = zoomRatio;
+                return true;
+            }
+
+            @Override
+            public boolean onScale(ScaleGestureDetector detector) {
+                scaled = true;
+                if (!zoomSupported) {
+                    return false;
+                }
+                float maxRatio = maxZoomRatio();
+                accumRatio *= detector.getScaleFactor();
+                if (accumRatio < 1f) {
+                    accumRatio = 1f;
+                }
+                if (accumRatio > maxRatio) {
+                    accumRatio = maxRatio;
+                }
+                int idx = ratioToIndex(accumRatio);
+                if (idx != curZoom) {
+                    curZoom = idx;
+                    zoomRatio = zoomRatios[idx] / 100f;
+                    requestApplyZoom();
+                    updateZoomTip();
+                }
+                return true;
+            }
+        });
+        surface.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                scaleDetector.onTouchEvent(e);
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = e.getX();
+                        downY = e.getY();
+                        downTime = System.currentTimeMillis();
+                        potentialTap = true;
+                        scaled = false;
+                        break;
+                    case MotionEvent.ACTION_POINTER_DOWN:
+                        potentialTap = false;
+                        if (!zoomSupported) {
+                            showZoomUnsupportedOnce();
+                        }
+                        break;
+                    case MotionEvent.ACTION_MOVE:
+                        if (potentialTap) {
+                            float dx = e.getX() - downX;
+                            float dy = e.getY() - downY;
+                            if (dx * dx + dy * dy > (float) slop * slop) {
+                                potentialTap = false;
+                            }
+                        }
+                        break;
+                    case MotionEvent.ACTION_UP:
+                        if (potentialTap && !scaled && System.currentTimeMillis() - downTime < 350) {
+                            focusAt(e.getX(), e.getY());
+                        }
+                        potentialTap = false;
+                        break;
+                    case MotionEvent.ACTION_CANCEL:
+                        potentialTap = false;
+                        break;
+                }
+                return true;
+            }
+        });
+    }
+
+    private void showZoomUnsupportedOnce() {
+        if (zoomUnsupportedShown) {
+            return;
+        }
+        zoomUnsupportedShown = true;
+        Toast.makeText(this, "本机相机不支持手动缩放", Toast.LENGTH_SHORT).show();
+    }
+
+    private void initZoomForCamera() {
+        zoomSupported = false;
+        maxZoom = 0;
+        zoomRatios = null;
+        curZoom = 0;
+        zoomRatio = 1f;
+        accumRatio = 1f;
+        Camera c = camera;
+        if (c != null) {
+            try {
+                Camera.Parameters p = c.getParameters();
+                if (p.isZoomSupported()) {
+                    List<Integer> ratios = p.getZoomRatios();
+                    int mz = p.getMaxZoom();
+                    if (ratios != null && !ratios.isEmpty() && mz > 0 && mz < ratios.size()) {
+                        zoomRatios = new int[ratios.size()];
+                        for (int i = 0; i < ratios.size(); i++) {
+                            zoomRatios[i] = ratios.get(i);
+                        }
+                        maxZoom = mz;
+                        zoomSupported = true;
+                    }
+                }
+            } catch (Throwable t) {
+                zoomSupported = false;
+            }
+        }
+        updateZoomTip();
+    }
+
+    private float maxZoomRatio() {
+        if (zoomRatios != null && maxZoom > 0 && maxZoom < zoomRatios.length) {
+            return zoomRatios[maxZoom] / 100f;
+        }
+        return 1f;
+    }
+
+    private int ratioToIndex(float ratio) {
+        if (zoomRatios == null || zoomRatios.length == 0) {
+            return 0;
+        }
+        int best = 0;
+        float bestDiff = Float.MAX_VALUE;
+        for (int i = 0; i < zoomRatios.length; i++) {
+            float d = Math.abs(zoomRatios[i] / 100f - ratio);
+            if (d < bestDiff) {
+                bestDiff = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private final Runnable zoomApplyRunnable = new Runnable() {
+        @Override
+        public void run() {
+            lastZoomApplyAt = System.currentTimeMillis();
+            applyZoomToCamera();
+        }
+    };
+
+    private void requestApplyZoom() {
+        long now = System.currentTimeMillis();
+        if (now - lastZoomApplyAt >= 40) {
+            lastZoomApplyAt = now;
+            applyZoomToCamera();
+        } else {
+            main.removeCallbacks(zoomApplyRunnable);
+            main.postDelayed(zoomApplyRunnable, 50);
+        }
+    }
+
+    private void applyZoomToCamera() {
+        Camera c = camera;
+        if (c == null) {
+            return;
+        }
+        try {
+            Camera.Parameters p = c.getParameters();
+            p.setZoom(curZoom);
+            c.setParameters(p);
+        } catch (Throwable t) {
+            LOG.e("[Sync] setZoom failed", t);
+        }
+    }
+
+    private void updateZoomTip() {
+        if (tvZoom == null) {
+            return;
+        }
+        if (!zoomSupported || curZoom <= 0 || zoomRatios == null || curZoom >= zoomRatios.length) {
+            tvZoom.setVisibility(View.GONE);
+            return;
+        }
+        tvZoom.setText(String.format(java.util.Locale.US, "%.1f×", zoomRatios[curZoom] / 100f));
+        tvZoom.setVisibility(View.VISIBLE);
+    }
+
+    /** 点按处对焦：设置对焦/测光区域并触发一次自动对焦（不合适/不支持时静默忽略）。 */
+    private void focusAt(float x, float y) {
+        Camera c = camera;
+        if (c == null) {
+            return;
+        }
+        try {
+            Camera.Parameters p = c.getParameters();
+            if (p.getMaxNumFocusAreas() > 0) {
+                Rect area = buildFocusRect(x, y);
+                List<Camera.Area> areas = new ArrayList<>();
+                areas.add(new Camera.Area(area, 800));
+                p.setFocusAreas(areas);
+                if (p.getMaxNumMeteringAreas() > 0) {
+                    p.setMeteringAreas(areas);
+                }
+                c.setParameters(p);
+            }
+            c.autoFocus(new Camera.AutoFocusCallback() {
+                @Override
+                public void onAutoFocus(boolean success, Camera cam) {
+                    // 连续对焦模式无需恢复；AUTO 兜底模式由 startAutoFocusLoop 继续轮询
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 触摸点(相对预览视图) → Camera1 的 -1000..1000 对焦区域坐标。 */
+    private Rect buildFocusRect(float x, float y) {
+        int w = surface.getWidth() > 0 ? surface.getWidth() : 1;
+        int h = surface.getHeight() > 0 ? surface.getHeight() : 1;
+        int half = 180;
+        int cx = (int) (x / w * 2000f - 1000f);
+        int cy = (int) (y / h * 2000f - 1000f);
+        cx = clamp(cx, -1000 + half, 1000 - half);
+        cy = clamp(cy, -1000 + half, 1000 - half);
+        return new Rect(cx - half, cy - half, cx + half, cy + half);
+    }
+
+    private int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
     private void closeCamera() {
         try {
             if (camera != null) {
@@ -407,9 +684,30 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         }
     }
 
+    /** 先解「取景框」中心区域（去掉四周背景，二值化更稳），失败再退回全帧，兼顾不漏扫。 */
     private String decode(byte[] data, int w, int h) {
+        String text = decodeRegion(data, w, h, 0.72f);
+        if (text == null) {
+            text = decodeRegion(data, w, h, 1.0f);
+        }
+        return text;
+    }
+
+    /** 以整帧中心为准裁出 frac 比例的矩形区域解码；frac>=1 即整帧。 */
+    private String decodeRegion(byte[] data, int w, int h, float frac) {
         try {
-            PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(data, w, h, 0, 0, w, h, false);
+            int cw = Math.round(w * frac);
+            int ch = Math.round(h * frac);
+            if (cw <= 0 || cw > w) {
+                cw = w;
+            }
+            if (ch <= 0 || ch > h) {
+                ch = h;
+            }
+            int left = (w - cw) / 2;
+            int top = (h - ch) / 2;
+            PlanarYUVLuminanceSource source =
+                    new PlanarYUVLuminanceSource(data, w, h, left, top, cw, ch, false);
             BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
             return reader.decodeWithState(bitmap).getText();
         } catch (Throwable t) {
