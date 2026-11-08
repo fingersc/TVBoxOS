@@ -205,6 +205,11 @@ public final class PrefetchManager {
         int length;
         long size;
         int attempts;
+        /**
+         * r194：正在读这一片的 {@link SegStream} 读者数。
+         * &gt;0 时禁止淘汰该片——否则会把正在流式发送的数组清掉，播放器读到半截。
+         */
+        int readers;
     }
 
     private final class Session {
@@ -397,7 +402,7 @@ public final class PrefetchManager {
         if (st == null || st.length <= 0) {
             return SegResult.redirect(s.segs.get(index - 1).url);
         }
-        return SegResult.stream(mime, new SegStream(s, index));
+        return SegResult.stream(mime, new SegStream(s, index, st));
     }
 
     private static byte[] readyData(Session s, int index) {
@@ -419,7 +424,8 @@ public final class PrefetchManager {
                 }
                 Seg st = s.states.get(index);
                 if (st != null) {
-                    if (st.length > 0) {
+                    // r194：只认「正在下」或「已下完」的片，避免把淘汰后残留的旧片当成新片发出去
+                    if (st.length > 0 && (st.state == Seg.LOADING || st.state == Seg.DONE)) {
                         return st;
                     }
                     if (st.state == Seg.FAILED) {
@@ -444,12 +450,33 @@ public final class PrefetchManager {
     private static final class SegStream extends InputStream {
         private final Session s;
         private final int index;
+        /** r194：构造时锁定的那一片（读者计数挂在它上面，避免换对象后计数漂移）。 */
+        private final Seg seg;
         private int pos;
         private boolean closed;
+        private boolean released;
 
         SegStream(Session s, int index) {
+            this(s, index, null);
+        }
+
+        /**
+         * r194：直接锁定调用方已确认的那一片（{@code known}），避免「拿到 Seg 后又被淘汰移除」
+         * 导致读者计数挂在一个已不在 states 里的对象上。
+         */
+        SegStream(Session s, int index, Seg known) {
             this.s = s;
             this.index = index;
+            Seg st = known;
+            synchronized (s.lock) {
+                if (st == null) {
+                    st = s.states.get(index);
+                }
+                if (st != null) {
+                    st.readers++;
+                }
+            }
+            this.seg = st;
         }
 
         @Override
@@ -475,7 +502,7 @@ public final class PrefetchManager {
                     if (closed || s.closed) {
                         throw new IOException("segment stream closed");
                     }
-                    Seg st = s.states.get(index);
+                    Seg st = seg != null ? seg : s.states.get(index);
                     if (st == null) {
                         throw new IOException("segment gone");
                     }
@@ -483,16 +510,28 @@ public final class PrefetchManager {
                         throw new IOException("segment reset");
                     }
                     if (pos < st.length) {
+                        // r194：增量缓冲可能已被释放（读者走完后），退回整片缓冲读
+                        byte[] src = st.grow != null ? st.grow : st.data;
+                        if (src == null) {
+                            throw new IOException("segment buffer released");
+                        }
                         int n = Math.min(len, st.length - pos);
-                        System.arraycopy(st.grow, pos, b, off, n);
+                        System.arraycopy(src, pos, b, off, n);
                         pos += n;
                         return n;
                     }
                     if (st.state == Seg.DONE) {
+                        releaseReader(st);
                         return -1;
                     }
                     if (st.state == Seg.FAILED) {
+                        releaseReader(st);
                         throw new IOException("segment download failed");
+                    }
+                    if (st.state == Seg.EMPTY) {
+                        // r194：该片已被淘汰/重试释放，不能再干等下去（否则这个请求线程会永久挂住）
+                        releaseReader(st);
+                        throw new IOException("segment released");
                     }
                     try {
                         s.lock.wait(500);
@@ -507,7 +546,30 @@ public final class PrefetchManager {
         @Override
         public void close() {
             closed = true;
+            Seg st = seg;
             synchronized (s.lock) {
+                releaseReader(st);
+                s.lock.notifyAll();
+            }
+        }
+
+        /** r194：读者退场 → 计数减一；无人再读且该片已下完时释放下载增量缓冲。 */
+        private void releaseReader(Seg st) {
+            if (released) {
+                return;
+            }
+            released = true;
+            if (st == null) {
+                return;
+            }
+            synchronized (s.lock) {
+                if (st.readers > 0) {
+                    st.readers--;
+                }
+                if (st.readers == 0 && st.state != Seg.LOADING) {
+                    // grow 与 data 可能是同一数组：置空 grow 不影响 data 持有的整片
+                    st.grow = null;
+                }
                 s.lock.notifyAll();
             }
         }
@@ -585,6 +647,10 @@ public final class PrefetchManager {
                 st.state = Seg.DONE;
                 st.data = data;
                 st.size = data.length;
+                if (st.readers == 0) {
+                    // r194：没人读这一片 → 释放下载增量缓冲（data 已持有整片）
+                    st.grow = null;
+                }
                 double bpm = data.length / (double) dt;
                 s.ewmaBpm = s.ewmaBpm <= 0 ? bpm : (s.ewmaBpm * 0.7 + bpm * 0.3);
                 if (seg.durationSec > 0) {
@@ -609,6 +675,10 @@ public final class PrefetchManager {
                     st.state = Seg.EMPTY; // 重试一次
                 } else {
                     st.state = Seg.FAILED;
+                    if (st.readers == 0) {
+                        // r194：失败的片不再需要增量缓冲
+                        st.grow = null;
+                    }
                 }
                 s.record(true);
                 adapt(s);
@@ -688,29 +758,82 @@ public final class PrefetchManager {
     }
 
     private void store(Session s, int index, long size, byte[] data) {
-        s.lru.put(index, size);
-        s.totalBytes += size;
-        s.states.get(index).data = data;
-        while (s.totalBytes > SESSION_MEMORY_BUDGET) {
+        synchronized (s.lock) {
+            Seg st = s.states.get(index);
+            if (st == null) {
+                // r194：该片已被淘汰或会话已重置 —— 不再缓存，直接丢弃（否则又挂回 states）
+                return;
+            }
+            st.data = data;
+            s.lru.put(index, retainedOf(st));
+            evictIfNeeded(s);
+        }
+    }
+
+    /** r194：该片当前真实占用的堆字节（data 与 grow 指向同一数组时只算一次）。 */
+    private static long retainedOf(Seg st) {
+        if (st == null) {
+            return 0;
+        }
+        long n = 0;
+        if (st.data != null) {
+            n += st.data.length;
+        }
+        if (st.grow != null && st.grow != st.data) {
+            n += st.grow.length;
+        }
+        return n;
+    }
+
+    /** r194：会话内真实占用合计（直接扫 states，不再依赖可能漂移的记账值）。 */
+    private static long totalRetained(Session s) {
+        long n = 0;
+        for (Seg st : s.states.values()) {
+            n += retainedOf(st);
+        }
+        return n;
+    }
+
+    /**
+     * r194：超出 {@link #SESSION_MEMORY_BUDGET} 时淘汰播放头之后的旧片，并**真正释放字节**。
+     *
+     * <p>旧实现只把 {@code st.data} 置空，而 {@code st.grow} 仍引用着同一个数组
+     * （Content-Length 命中时 data 与 grow 就是同一块），一字节都没释放；
+     * 同时 {@code s.states} 只增不减，于是整部已播视频的分片全部滞留在堆上，
+     * 按码率线性增长（实测约 13MB/min），最终 Java 堆 OOM、进程被杀。</p>
+     */
+    private void evictIfNeeded(Session s) {
+        while (true) {
+            s.totalBytes = totalRetained(s);
+            if (s.totalBytes <= SESSION_MEMORY_BUDGET) {
+                return;
+            }
             boolean evicted = false;
             Iterator<Map.Entry<Integer, Long>> it = s.lru.entrySet().iterator();
             while (it.hasNext()) {
                 Map.Entry<Integer, Long> e = it.next();
                 int idx = e.getKey();
-                if (idx < s.cursor - 1) {
-                    it.remove();
-                    s.totalBytes -= e.getValue();
-                    Seg st = s.states.get(idx);
-                    if (st != null) {
-                        st.data = null;
-                        st.state = Seg.EMPTY;
-                    }
-                    evicted = true;
-                    break;
+                if (idx >= s.cursor - 1) {
+                    continue; // 只淘汰播放头之后的旧片
                 }
+                Seg st = s.states.get(idx);
+                if (st != null && (st.readers > 0 || st.state == Seg.LOADING)) {
+                    continue; // 正在流式发送 / 正在下载，不能动
+                }
+                it.remove();
+                if (st != null) {
+                    st.data = null;
+                    st.grow = null;
+                    st.length = 0;
+                    st.size = 0;
+                    st.state = Seg.EMPTY;
+                    s.states.remove(idx); // r194：条目真正移出，避免 states 无界增长
+                }
+                evicted = true;
+                break;
             }
             if (!evicted) {
-                break;
+                return; // 没有可淘汰的（都在播放头附近，或正在发送/下载）
             }
         }
     }
@@ -793,6 +916,9 @@ public final class PrefetchManager {
         synchronized (s.lock) {
             for (Seg st : s.states.values()) {
                 st.data = null;
+                st.grow = null; // r194：增量缓冲一并释放
+                st.length = 0;
+                st.size = 0;
                 st.state = Seg.EMPTY;
             }
             s.states.clear();
