@@ -97,11 +97,18 @@ public class SearchSession {
      * 一堆假的失败记录。</p>
      *
      * <p>取值依据：本项目 {@code DETAIL_FALLBACK_SOURCE_TIMEOUT_MS = 3500} 是
-     * 单源超时基准，5s ≈ 1.5 倍；而 {@code DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000}
+     * 单源超时基准；而 {@code DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = 8000}
      * 是整轮预算，拿来做窗口等于把搜索停掉一整轮，代价过大。
-     * 窗口以「首帧到达」事件优先结束（快源通常 2s 内），5s 只是兜底。</p>
+     * 窗口以「首帧到达」事件优先结束（快源通常 2s 内），兜底值取 10s。</p>
+     *
+     * <p>r190：5s → 10s。1449 日志实测 9 个保护窗里 7 个在整 5.0s 超时，
+     * 而这些源的真实首帧是 6114/7128/8132/9434/12775ms —— 5s 一到就把搜索
+     * 派发放开，正好落在最慢那几秒的临界点上。10s 覆盖到绝大多数慢源，
+     * 且窗口本就以首帧事件优先结束，快源不受影响。
+     * 未做「有字节流入就续期」：那需要播放器→SearchSession 的新回调，
+     * 而窗口只压后台补拉（t1/t2），收益远小于跨层耦合的代价。</p>
      */
-    public static final long STARTUP_GUARD_MAX_MS = 5000L;
+    public static final long STARTUP_GUARD_MAX_MS = 10000L;
 
     /**
      * 进程级单例。

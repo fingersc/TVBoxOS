@@ -142,7 +142,15 @@ public class OkHttp {
      * <b>6005ms</b> 才超时，随后才回落 IPv4 {@code 104.21.62.60}（还是 SSL reset）。
      * 也就是说一张封面白等 6 秒。这里只<b>排序</b>不删除：IPv4 优先，v6 仍保留作兜底，
      * 与 {@code MODULE_DNS} 的既有口径一致，不会误杀只有 v6 可用的情况。</p>
+     *
+     * <p>r190：排序后<b>最多只试 2 个地址</b>（1 个 IPv4 + 1 个 IPv6 兜底）。
+     * 1449 日志实测失败的完整路径是 v4 RST 223ms → v6#1 4004ms → v6#2 4006ms
+     * ≈ 8.2s；砍到 2 个地址后同样的失败路径 ≈ 4.2s，正好把"死图床白等 8 秒"
+     * 压到用户可接受的 4 秒级。跨请求仍由 ImgUtil 的失败 URL TTL（75s）兜底，
+     * 这里不做任何跨请求的黑名单。</p>
      */
+    private static final int PROXY_DNS_MAX_ADDRESSES = 2;
+
     private static final Dns PROXY_DNS = hostname -> {
         List<InetAddress> all = Dns.SYSTEM.lookup(hostname);
         if (all == null || all.size() <= 1) {
@@ -158,6 +166,9 @@ public class OkHttp {
             if (!(address instanceof java.net.Inet4Address)) {
                 ordered.add(address);
             }
+        }
+        if (ordered.size() > PROXY_DNS_MAX_ADDRESSES) {
+            return new ArrayList<>(ordered.subList(0, PROXY_DNS_MAX_ADDRESSES));
         }
         return ordered;
     };

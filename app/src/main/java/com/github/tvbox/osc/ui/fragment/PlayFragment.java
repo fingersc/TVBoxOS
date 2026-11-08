@@ -156,7 +156,16 @@ public class PlayFragment extends BaseLazyFragment {
     /** P2（r153）：单次长卡顿（≥15s）即时检查 —— 不等恢复，卡满阈值就直接换源。 */
     private static final int MSG_STALL_SWITCH_CHECK = 104;
     private static final long RESOLVE_PLAY_URL_TIMEOUT_MS = 15 * 1000L;
-    private static final long SWITCH_LINE_PLAY_TIMEOUT_MS = 20 * 1000L;
+    /**
+     * r190：切线的"等到出画面"上限，20s → 10s。
+     *
+     * <p>1449 日志里两条 {@code switchLineTimeout cost=20095ms / 20059ms} 就吃掉
+     * 了 40 秒，而同一份日志里成功起播的真实首帧是 1766~3267ms（新源）、
+     * 慢源也只有 6114~12775ms —— 20s 纯属白等。10s 仍比最慢的成功首帧（12.8s）
+     * 短一点，但配合 parseStall(5s) 与 stalls 自动切源，已经够用；
+     * 继续拉长只会让用户多盯黑屏。</p>
+     */
+    private static final long SWITCH_LINE_PLAY_TIMEOUT_MS = 10 * 1000L;
     /**
      * 解析停滞宽限：页面 onPageFinished 之后再等这么久，仍无视频地址就判停滞。
      *
