@@ -135,18 +135,49 @@ public class OkHttp {
     }
 
     /**
+     * r189：中转取图的 DNS —— 系统 DNS 结果里把 IPv4 排到前面。
+     *
+     * <p>背景（11-08 日志）：{@code images.weserv.nl} 的 AAAA 记录
+     * {@code 2606:4700:3032::ac43:dca3} 在模拟器/部分网络上是黑洞，connect 干等
+     * <b>6005ms</b> 才超时，随后才回落 IPv4 {@code 104.21.62.60}（还是 SSL reset）。
+     * 也就是说一张封面白等 6 秒。这里只<b>排序</b>不删除：IPv4 优先，v6 仍保留作兜底，
+     * 与 {@code MODULE_DNS} 的既有口径一致，不会误杀只有 v6 可用的情况。</p>
+     */
+    private static final Dns PROXY_DNS = hostname -> {
+        List<InetAddress> all = Dns.SYSTEM.lookup(hostname);
+        if (all == null || all.size() <= 1) {
+            return all;
+        }
+        List<InetAddress> ordered = new ArrayList<>(all.size());
+        for (InetAddress address : all) {
+            if (address instanceof java.net.Inet4Address) {
+                ordered.add(address);
+            }
+        }
+        for (InetAddress address : all) {
+            if (!(address instanceof java.net.Inet4Address)) {
+                ordered.add(address);
+            }
+        }
+        return ordered;
+    };
+
+    /**
      * 图片"中转重试"client（v99-r100）：直连失败后，用它对公共中转（images.weserv.nl）再取一次。
      *
-     * <p>关键：DNS 用 {@link Dns#SYSTEM}，不再用 altImageDns()（腾讯 DoH ∪ 系统）。
-     * 因为这里要解析的是 weserv 自身域名（不被墙），走 DoH 只会白白增加几秒延迟、DoH 被拦时还会失败；
-     * 系统 DNS 快且会缓存。读取超时放宽到 20s —— 中转要回源取图，首字节可能较慢，需给足时间。</p>
+     * <p>关键：DNS 用系统 DNS（不走 DoH）—— 这里要解析的是 weserv 自身域名（不被墙），
+     * 走 DoH 只会白白增加几秒延迟、DoH 被拦时还会失败。</p>
+     *
+     * <p>r189：{@code connectTimeout 6s → 4s}，且 DNS 换成 {@link #PROXY_DNS}（IPv4 优先）。
+     * 日志证据：weserv 的 v6 地址干等 6s 才失败，换成 4s + v4 优先后，一张封面最多白等 4s，
+     * 常见情况直接走 v4 秒连；读取超时 20s 保留（中转要回源取图，首字节可能慢）。</p>
      */
     public static OkHttpClient imageRetryClient() {
         return client().newBuilder()
-                .connectTimeout(6, TimeUnit.SECONDS)
+                .connectTimeout(4, TimeUnit.SECONDS)
                 .readTimeout(20, TimeUnit.SECONDS)
                 .writeTimeout(10, TimeUnit.SECONDS)
-                .dns(Dns.SYSTEM)
+                .dns(PROXY_DNS)
                 .build();
     }
 

@@ -206,8 +206,15 @@ public class ImgUtil {
     /** 已确认加载失败的封面 URL 上限（LRU，防止无限增长）。 */
     private static final int MAX_FAILED_URLS = 256;
 
-    /** 失败标记有效期：超过该时长再次绑定会重新尝试加载（避免一次网络抖动永久钉死为兜底图）。 */
-    private static final long FAILED_URL_TTL_MS = 5 * 60 * 1000L;
+    /**
+     * 失败标记有效期：超过该时长再次绑定会重新尝试加载（避免一次网络抖动永久钉死为兜底图）。
+     *
+     * <p>r189：5min → 75s。依据 11-08 日志，封面失败的主因是 weserv 中转的 v6 黑洞 +
+     * SSL 重置这类<b>短时</b>故障；5 分钟太长，用户滑回同一页仍看到兜底图，误以为"没封面"。
+     * 75s 既避开「反复闪烁」（同一屏内不会重试），又能在一两分钟后自动恢复。
+     * 只对<b>本会话内存</b>生效，不落盘。</p>
+     */
+    private static final long FAILED_URL_TTL_MS = 75 * 1000L;
 
     /**
      * 已确认加载失败的封面 URL → 失败时间戳（access-order LRU）。

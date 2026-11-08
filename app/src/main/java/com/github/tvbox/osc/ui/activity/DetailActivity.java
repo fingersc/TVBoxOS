@@ -1272,8 +1272,11 @@ public class DetailActivity extends BaseActivity {
                     if (fallbackResult) {
                         setSwitchPhase(SwitchSession.Phase.MATCHING);
                         SourceBean fallbackSource = ApiConfig.get().getSource(sourceKey);
-                        String fallbackName = fallbackSource == null ? sourceKey : fallbackSource.getName();
-                        Toast.makeText(DetailActivity.this, "站点切换至" + fallbackName, Toast.LENGTH_SHORT).show();
+                        // r189（B2）：切站提示必须等「同片/同集确认」通过后再弹。
+                        //   旧实现详情一回来就弹「站点切换至X」，随后候选又被身份守卫拒掉，
+                        //   用户看到的就是 3.5 秒连闪 8 个站却什么都没播（黑球 11-08 日志原样）。
+                        //   先记下名字，确认通过处（detailFallbackConfirmed）再弹。
+                        pendingSwitchSourceName = fallbackSource == null ? sourceKey : fallbackSource.getName();
                     }
                     showSuccess();
                     if(!TextUtils.isEmpty(absXml.msg) && !absXml.msg.equals("数据列表")){
@@ -1697,7 +1700,7 @@ public class DetailActivity extends BaseActivity {
                             if (movieSingleCase) {
                                 sameEpisodeConfirmed = confirmMovieSingleIdentity(
                                         expectedName, currentEpisode.name,
-                                        sourceKey, vodId, vodInfo);
+                                        sourceKey, vodId, vodInfo, fallbackResult);
                             } else {
                                 // ★ r141：同集确认升级为「列表级」。
                                 //   原名级 isSameEpisodeStrict 只比日期/期号/显式分段，认不出
@@ -1748,6 +1751,12 @@ public class DetailActivity extends BaseActivity {
                         // ★ r165：本候选已通过同集确认守卫（或被判定无需守卫），允许其后续
                         //   insertVod 正常写历史/合并同名记录（此时 playNote 才是可信落点）。
                         detailFallbackConfirmed = true;
+                        // r189（B2）：确认通过后才弹「站点切换至X」—— 此刻切源真的成立。
+                        if (!TextUtils.isEmpty(pendingSwitchSourceName)) {
+                            Toast.makeText(DetailActivity.this,
+                                    "站点切换至" + pendingSwitchSourceName, Toast.LENGTH_SHORT).show();
+                            pendingSwitchSourceName = null;
+                        }
 
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
@@ -2331,6 +2340,12 @@ public class DetailActivity extends BaseActivity {
             detailFallbackCycleFrozenOrder.clear();
             detailFallbackTimedOutKey = null;
             detailFallbackTimedOutSource = null;
+            // ★ r189：换片 ⇒ 旧片的补拉队列/降权记录全部作废，并重新开放补拉。
+            //   不清的话：上一部片熔断后新片永远补不了；旧片的排队项还会被当成新片的。
+            stopPrefetch();
+            resetPrefetchGate();
+            // ★ r189（B1）：换片 ⇒ 身份自举的种子/基准/计数一律归零（它们是「这一部片」的账）。
+            resetMovieIdentityBootstrap();
             }
         }
 
@@ -3047,27 +3062,66 @@ public class DetailActivity extends BaseActivity {
      * ★ r156：电影单片同片确认。
      * <p>用 {@link FilmIdentity#isSameFilmStrict}：年份/导演都未知 → 不自动切（用户拍板）；
      * 明确不是同一部片（年份不同/导演交叉不上）→ 记 mismatch 并拉黑该候选源。</p>
+     *
+     * <p><b>r189（B1）</b>：基准（{@code detailFallbackRefVideo}）缺失时不再一律拒绝。
+     * 基准只在「首轮详情成功」时记录（见 1297 行），而黑球这次首轮源
+     * {@code iqiyizyapi.com} 的 TLS 被重置 ⇒ 基准永远为空 ⇒ 8 个候选全部
+     * {@code movieIdentityUnknown → alignNoEpisode}，用户 5.3 秒里看它连闪 8 站却没有画面。
+     * 现在改为「候选互为佐证」自举：先记种子候选，第二个候选与之同年份/同导演（严格判据）
+     * 才建立基准；共识不足（例如只有一个候选、或两个候选元数据互相矛盾）则仍不自动切，
+     * 交给 r189（B2）的「请手动选源」提示。</p>
+     *
+     * <p><b>r189（B2）</b>：{@code autoSwitch == false} 表示用户手动选源（快速搜索/手动切源），
+     * 此时按用户意图放行 —— 否则「请手动选源」提示之后用户点进去还会被同一守卫拦死，等于无路可走。</p>
      */
     private boolean confirmMovieSingleIdentity(String expectedName, String currentName,
-                                               String sourceKey, String vodId, VodInfo vodInfo) {
-        int refYear = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
-        String refDirector = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.director;
+                                               String sourceKey, String vodId, VodInfo vodInfo,
+                                               boolean autoSwitch) {
         int tgtYear = vodInfo == null ? 0 : vodInfo.year;
-        String tgtDirector = vodInfo == null ? "" : vodInfo.director;
+        String tgtDirector = vodInfo == null ? "" : (vodInfo.director == null ? "" : vodInfo.director);
+
+        if (!autoSwitch) {
+            // r189（B2）：手动选源 = 用户明确意图，自动同片判据不再拦。
+            movieIdentityManualPicked = true;
+            LOG.sw("[FB] movieIdentityManualPick source=" + sourceKey + " id=" + vodId
+                    + " expected=" + expectedName + " actual=" + currentName
+                    + " tgtY=" + tgtYear + " tgtDirector=" + tgtDirector);
+            return true;
+        }
+
+        int refYear = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
+        String refDirector = detailFallbackRefVideo == null
+                ? "" : (detailFallbackRefVideo.director == null ? "" : detailFallbackRefVideo.director);
+        boolean refFromBootstrap = false;
+        if (refYear <= 0 && TextUtils.isEmpty(refDirector) && movieIdentityBootstrapSet) {
+            refYear = movieIdentityBootstrapYear;
+            refDirector = movieIdentityBootstrapDirector;
+            refFromBootstrap = true;
+        }
+
+        if (refYear <= 0 && TextUtils.isEmpty(refDirector)) {
+            // r189（B1）：基准缺失 —— 走「候选互为佐证」自举。
+            return bootstrapMovieIdentity(expectedName, currentName, sourceKey, vodId, tgtYear, tgtDirector);
+        }
 
         if (!FilmIdentity.isSameFilmStrict(refYear, refDirector, tgtYear, tgtDirector)) {
             boolean conflict = FilmIdentity.isSameFilmConflict(
                     refYear, refDirector, tgtYear, tgtDirector);
-            String refId = detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.id;
+            String refId = refFromBootstrap
+                    ? ("bootstrap-" + movieIdentityBootstrapYear)
+                    : (detailFallbackRefVideo == null ? "" : detailFallbackRefVideo.id);
             String tag = conflict ? "movieIdentityMismatch" : "movieIdentityUnknown";
             LOG.sw("[FB] " + tag
                     + " source=" + sourceKey + " id=" + vodId
                     + " expected=" + expectedName + " actual=" + currentName
                     + " ref=" + refId + "/y" + refYear
                     + " tgt=" + vodInfo.id + "/y" + tgtYear
-                    + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector);
+                    + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector
+                    + (refFromBootstrap ? " refSrc=bootstrap" : ""));
             if (conflict) {
                 detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
+            } else {
+                movieIdentityUnknownRejects++;
             }
             return false;
         }
@@ -3076,8 +3130,73 @@ public class DetailActivity extends BaseActivity {
                 + " source=" + sourceKey + " id=" + vodId
                 + " expected=" + expectedName + " actual=" + currentName
                 + " refY=" + refYear + " tgtY=" + tgtYear
-                + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector);
+                + " refDirector=" + refDirector + " tgtDirector=" + tgtDirector
+                + (refFromBootstrap ? " refSrc=bootstrap" : ""));
         return true;
+    }
+
+    /**
+     * r189（B1）：基准缺失时用「候选互为佐证」自举身份基准。
+     *
+     * <p>规则刻意保守：</p>
+     * <ol>
+     *   <li>第一个候选只当「种子」，<b>不</b>放行（不猜）；</li>
+     *   <li>后续候选与种子满足 {@link FilmIdentity#isSameFilmStrict}（同年份或同导演，且无冲突）
+     *       → 建立基准，<b>只放行当前候选</b>；</li>
+     *   <li>与种子冲突 → 不拉黑、只把种子换成信息更全的那个候选，继续找共识；</li>
+     *   <li>整轮凑不出共识 → 返回 false，最终由 B2 提示「无法自动确认，请手动选源」。</li>
+     * </ol>
+     */
+    private boolean bootstrapMovieIdentity(String expectedName, String currentName,
+                                           String sourceKey, String vodId, int tgtYear, String tgtDirector) {
+        String key = getDetailFallbackKey(sourceKey, vodId);
+        if (TextUtils.isEmpty(movieIdentitySeedKey)) {
+            movieIdentitySeedKey = key;
+            movieIdentitySeedYear = tgtYear;
+            movieIdentitySeedDirector = tgtDirector;
+            // 记一次「身份未知未放行」：这样若整轮只有这一个候选、凑不出共识，
+            // B2 的「请手动选源」提示仍会触发（否则 silent 空页）。
+            movieIdentityUnknownRejects++;
+            LOG.sw("[FB] movieIdentitySeed source=" + sourceKey + " id=" + vodId
+                    + " expected=" + expectedName + " actual=" + currentName
+                    + " y=" + tgtYear + " director=" + tgtDirector);
+            return false;
+        }
+        if (FilmIdentity.isSameFilmStrict(movieIdentitySeedYear, movieIdentitySeedDirector, tgtYear, tgtDirector)) {
+            movieIdentityBootstrapSet = true;
+            movieIdentityBootstrapYear = movieIdentitySeedYear;
+            movieIdentityBootstrapDirector = movieIdentitySeedDirector;
+            LOG.sw("[FB] movieIdentityBootstrap year=" + movieIdentityBootstrapYear
+                    + " director=" + movieIdentityBootstrapDirector
+                    + " seed=" + movieIdentitySeedKey + " + " + key
+                    + " source=" + sourceKey + " id=" + vodId);
+            movieIdentitySeedKey = "";
+            return true;
+        }
+        LOG.sw("[FB] movieIdentitySeedConflict seed=" + movieIdentitySeedKey
+                + " seedY=" + movieIdentitySeedYear + " seedDirector=" + movieIdentitySeedDirector
+                + " next=" + key + " nextY=" + tgtYear + " nextDirector=" + tgtDirector);
+        // 种子与当前候选互相矛盾：两个都不放行；把种子换成信息更全的一个继续找共识。
+        if (tgtYear > 0 || !TextUtils.isEmpty(tgtDirector)) {
+            movieIdentitySeedKey = key;
+            movieIdentitySeedYear = tgtYear;
+            movieIdentitySeedDirector = tgtDirector;
+        }
+        movieIdentityUnknownRejects++;
+        return false;
+    }
+
+    /** r189（B1）：换片/彻底复位时清掉身份自举状态（都是「这一部片」的账）。 */
+    private void resetMovieIdentityBootstrap() {
+        movieIdentitySeedKey = "";
+        movieIdentitySeedYear = 0;
+        movieIdentitySeedDirector = "";
+        movieIdentityBootstrapSet = false;
+        movieIdentityBootstrapYear = 0;
+        movieIdentityBootstrapDirector = "";
+        movieIdentityUnknownRejects = 0;
+        movieIdentityManualPicked = false;
+        pendingSwitchSourceName = null;
     }
 
     /**
@@ -3190,11 +3309,15 @@ public class DetailActivity extends BaseActivity {
      * 使 1-非凡 / 2-非凡 / 3-非凡 这类本质同站的马甲只补拉第一份。</p>
      */
     private void enqueuePrefetch(Movie.Video video) {
+        // r189（A1）：页面已销毁 / 本轮补拉已熔断 ⇒ 不再入队。
+        if (prefetchStopped) return;
         if (video == null || TextUtils.isEmpty(video.sourceKey)) return;
         String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
         if (TextUtils.isEmpty(show)) return;
         String station = stationGroupOf(video.sourceKey);
         if (TextUtils.isEmpty(station)) return;
+        // r189（A3）：本轮超时过的站点组不再补拉（只降权 harvest，不影响它作为可播放候选）。
+        if (prefetchDemotedStations.contains(station)) return;
         if (detailTableStationSeen.contains(show.trim() + "|" + station)) return;
         String key = video.sourceKey + "|" + video.id;
         if (!prefetchQueuedKeys.add(key)) return;
@@ -3202,20 +3325,34 @@ public class DetailActivity extends BaseActivity {
         pumpPrefetch();
     }
 
-    /** r134：补拉队列单飞推进 —— 一次只放一个请求，9s 无回包算超时丢弃。 */
+    /**
+     * r134：补拉队列单飞推进 —— 一次只放一个请求，超时丢弃。
+     *
+     * <p>r189：超时由 {@link #PREFETCH_TIMEOUT_MS}（6s）判定且会真正取消请求；
+     * 已熔断（{@link #prefetchStopped}）时队列不再推进。</p>
+     */
     private void pumpPrefetch() {
-        if (prefetchBusy || prefetchQueue.isEmpty()) return;
-        Movie.Video video = prefetchQueue.poll();
-        if (video == null || TextUtils.isEmpty(video.sourceKey)) return;
+        if (prefetchStopped || prefetchBusy) return;
+        Movie.Video video = null;
+        while (!prefetchQueue.isEmpty()) {
+            Movie.Video queued = prefetchQueue.poll();
+            if (queued == null || TextUtils.isEmpty(queued.sourceKey)) continue;
+            // r189（A3）：降权站点的排队项直接丢弃（它仍在候选池里，只是不再补拉集名）。
+            if (prefetchDemotedStations.contains(stationGroupOf(queued.sourceKey))) continue;
+            video = queued;
+            break;
+        }
+        if (video == null) return;
         String show = TextUtils.isEmpty(detailFallbackAnchorTitle) ? video.name : detailFallbackAnchorTitle;
         prefetchInFlightShow = show == null ? "" : show.trim();
         prefetchInFlightKey = video.sourceKey + "|" + video.id;
+        prefetchInFlightStation = stationGroupOf(video.sourceKey);
         prefetchBusy = true;
         if (LOG.isDebugEnabled()) {
             LOG.sw("[FB] prefetchStart key=" + prefetchInFlightKey + " show=" + prefetchInFlightShow);
         }
         prefetchWatchdog.removeCallbacks(prefetchWatchdogTask);
-        prefetchWatchdog.postDelayed(prefetchWatchdogTask, 9000);
+        prefetchWatchdog.postDelayed(prefetchWatchdogTask, PREFETCH_TIMEOUT_MS);
         try {
             sourceViewModel.prefetchDetail(video.sourceKey, String.valueOf(video.id));
         } catch (Throwable th) {
@@ -3239,10 +3376,14 @@ public class DetailActivity extends BaseActivity {
             }
             if (names != null && names.size() >= 2 && !TextUtils.isEmpty(show)) {
                 commitHarvest(show, stationGroupOf(srcKey), names, srcKey);
+                // r189（A3）：一次成功即清零连续超时计数 —— 熔断只针对「连续」坏站点。
+                prefetchConsecutiveTimeouts = 0;
                 if (LOG.isDebugEnabled()) {
                     LOG.sw("[FB] prefetchSeries key=" + prefetchInFlightKey + " n=" + names.size());
                 }
             } else {
+                // 回包成功但没有集列表：也算一次「有响应」，不应累加到熔断计数。
+                prefetchConsecutiveTimeouts = 0;
                 if (LOG.isDebugEnabled()) {
                     LOG.sw("[FB] prefetchEmpty key=" + prefetchInFlightKey);
                 }
@@ -3258,7 +3399,44 @@ public class DetailActivity extends BaseActivity {
         prefetchBusy = false;
         prefetchInFlightKey = null;
         prefetchInFlightShow = null;
+        prefetchInFlightStation = null;
         pumpPrefetch();
+    }
+
+    /**
+     * r189（A1）：补拉硬停 —— 清队列、释单飞位、摘看门狗，并掐掉在飞补拉请求。
+     *
+     * <p>为什么必须单独有它：{@code onDestroy()} 原先只 {@code cancelTag("detail")}，
+     * 看门狗每 9s 仍会从队列拉起下一个死源，于是日志里出现「详情页已销毁 72 秒后
+     * 还在一条接一条 prefetchTimeout」的 8×9s 空转（11:31:48–11:32:51）。</p>
+     *
+     * <p>用独立 tag {@link #PREFETCH_TAG}：只掐补拉，绝不误杀当前播放源的详情请求。</p>
+     */
+    private void stopPrefetch() {
+        prefetchStopped = true;
+        prefetchQueue.clear();
+        prefetchQueuedKeys.clear();
+        prefetchBusy = false;
+        prefetchInFlightKey = null;
+        prefetchInFlightShow = null;
+        prefetchInFlightStation = null;
+        prefetchWatchdog.removeCallbacksAndMessages(null);
+        try {
+            OkGo.getInstance().cancelTag(PREFETCH_TAG);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * r189（A3）：换片/新片进来时重新开放补拉。
+     *
+     * <p>只清「本会话降权」与连续超时计数；{@code detailTableStationSeen} 是跨片按
+     * 「片名|站点」记账的，不能清，否则同一部片会重复补拉同一站。</p>
+     */
+    private void resetPrefetchGate() {
+        prefetchStopped = false;
+        prefetchConsecutiveTimeouts = 0;
+        prefetchDemotedStations.clear();
     }
 
     private int countSameStationCandidates(String sourceKey) {
@@ -4899,9 +5077,27 @@ public class DetailActivity extends BaseActivity {
 
     /**
      * 本轮转没有任何可切的源：保留当前详情页画面（而不是把页面清空），并复位状态。
+     *
+     * <p><b>r189（B2）</b>：若本轮是「候选都被同片身份守卫拒掉」（
+     * {@code movieIdentityUnknownRejects >= 2}），说明不是网络问题而是<b>认不出来</b>——
+     * 旧实现此时静默复位、连「站点切换至X」都弹过好几遍，用户只看到连闪却不播（黑球 11-08）。
+     * 现在明确告知「无法自动确认是同一部影片，请手动选源」，并直接拉起快速搜索让用户挑。
+     * 注意 {@link #showDetailFallbackEmptyIfNeeded()} 内部会 reset 掉计数，必须先读后调。</p>
      */
     private void finishDetailFallbackWithoutResult() {
+        int rejects = movieIdentityUnknownRejects;
+        boolean identityExhausted = !detailFallbackConfirmed && rejects >= 2 && !movieIdentityManualPicked;
+        if (identityExhausted) {
+            LOG.sw("[FB] identityExhausted rejects=" + rejects
+                    + " poolSize=" + detailFallbackUsableCandidateCount()
+                    + " expected=" + (mVideo == null ? "" : mVideo.name));
+        }
         showDetailFallbackEmptyIfNeeded();
+        if (identityExhausted) {
+            Toast.makeText(DetailActivity.this,
+                    "无法自动确认是同一部影片，请手动选源", Toast.LENGTH_LONG).show();
+            openQuickSearchDialog();
+        }
     }
 
     private void finishDetailFallbackDetailOnTimeout() {
@@ -5625,6 +5821,8 @@ public class DetailActivity extends BaseActivity {
         //   否则会漏掉此前「有集却超时」的事实（详见字段注释）。
         if (!keepCache) {
             detailFallbackHadEpisodePlaybackFail = false;
+            // r189（B1）：彻底复位（换片/退出）⇒ 身份自举的种子、基准、拒统计一并归零。
+            resetMovieIdentityBootstrap();
         }
         detailFallbackActive = false;
         // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
@@ -5821,16 +6019,90 @@ public class DetailActivity extends BaseActivity {
     private boolean prefetchBusy = false;
     private String prefetchInFlightKey = null;
     private String prefetchInFlightShow = null;
+    /**
+     * r189：补拉请求的独立 OkGo tag。
+     *
+     * <p>必须与「详情」tag 分开：详情 tag 是当前播放源的命脉（超时/换源时会
+     * {@code cancelTag("detail")}），补拉只是建表素材，掐它绝不能连带当前源。</p>
+     */
+    private static final String PREFETCH_TAG = "prefetch_detail";
+
+    /**
+     * r189：补拉看门狗超时（9000 → 6000）。
+     *
+     * <p>依据 11-08 日志：健康源 200–800ms 就回包（prefetchEmpty），6s 足够；
+     * 而挂站每个都占满 9s 且串行，8 个就是 63s 空转。降到 6s 并真正取消请求后，
+     * 坏网下最多 3×6s≈18s 就熔断。</p>
+     */
+    private static final long PREFETCH_TIMEOUT_MS = 6000L;
+
+    /** r189：连续多少次补拉超时即熔断本轮补拉（一次成功即清零）。 */
+    private static final int PREFETCH_CIRCUIT_THRESHOLD = 3;
+
+    /** r189：补拉是否已被硬停（页面销毁 / 熔断）。置真后队列不再推进。 */
+    private boolean prefetchStopped = false;
+
+    /** r189：本轮连续超时计数（成功一次清零），用于会话内熔断。 */
+    private int prefetchConsecutiveTimeouts = 0;
+
+    /**
+     * r189：本轮「降权」的站点组（stationGroupOf）。
+     *
+     * <p>只影响补拉取集名的取舍，<b>绝不</b>影响该站点作为可播放候选参与切源；
+     * 且只活在本 Activity 生命周期内 —— 不落盘、不跨会话，避免误杀
+     * 「这次连接抖动、稍后还能用」的站点（用户 m00207 的质疑）。</p>
+     */
+    private final Set<String> prefetchDemotedStations = new HashSet<>();
+
+    /** r189：在飞补拉所属站点组（超时时据此降权；换片/转投时置空）。 */
+    private String prefetchInFlightStation = null;
+
     private final android.os.Handler prefetchWatchdog = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable prefetchWatchdogTask = new Runnable() {
         @Override
         public void run() {
-            if (prefetchBusy) {
-                LOG.sw("[FB] prefetchTimeout key=" + prefetchInFlightKey);
-                finishPrefetch();
+            if (!prefetchBusy) return;
+            LOG.sw("[FB] prefetchTimeout key=" + prefetchInFlightKey
+                    + " station=" + prefetchInFlightStation);
+            // r189（A1）：看门狗到点必须真的掐掉在飞请求 —— 旧实现只 finishPrefetch() 放弃等待，
+            //   请求还在后台跑，回调回来仍会占单飞位，队列于是持续空转。
+            try {
+                OkGo.getInstance().cancelTag(PREFETCH_TAG);
+            } catch (Throwable ignored) {
             }
+            // r189（A3）：只在本会话内降权该站点组（不拉黑、不落盘）。
+            if (!TextUtils.isEmpty(prefetchInFlightStation)) {
+                prefetchDemotedStations.add(prefetchInFlightStation);
+            }
+            prefetchConsecutiveTimeouts++;
+            if (prefetchConsecutiveTimeouts >= PREFETCH_CIRCUIT_THRESHOLD) {
+                LOG.sw("[FB] prefetchCircuitOpen consecutive=" + prefetchConsecutiveTimeouts
+                        + " demoted=" + prefetchDemotedStations.size());
+                stopPrefetch();
+                return;
+            }
+            finishPrefetch();
         }
     };
+
+    /**
+     * r189（B1）：电影单片「身份基准自举」的种子候选 —— 首轮详情失败导致
+     * {@code detailFallbackRefVideo == null} 时，先记下第一个候选的年/导演，
+     * 等第二个候选与之互为佐证（同年份/同导演）才建立基准。
+     */
+    private String movieIdentitySeedKey = "";
+    private int movieIdentitySeedYear = 0;
+    private String movieIdentitySeedDirector = "";
+    /** 自举出的基准（仅在 {@code detailFallbackRefVideo} 仍为空时兜底使用）。 */
+    private boolean movieIdentityBootstrapSet = false;
+    private int movieIdentityBootstrapYear = 0;
+    private String movieIdentityBootstrapDirector = "";
+    /** 本轮「身份未知」被拒次数 —— 用于 B2：全轮都被身份判据拒掉时提示手动选源。 */
+    private int movieIdentityUnknownRejects = 0;
+    /** 本轮是否发生过「用户手动选源」（手动选源时身份判据按用户意图放行）。 */
+    private boolean movieIdentityManualPicked = false;
+    /** r189（B2）：等候选通过同片/同集确认后再弹的切站提示名。 */
+    private String pendingSwitchSourceName = null;
 
     private final List<String> detailFallbackSourceOrder = new ArrayList<>();
     /**
@@ -7826,6 +8098,9 @@ public class DetailActivity extends BaseActivity {
         } catch (Throwable th) {
             th.printStackTrace();
         }
+        // r189（A1）：先硬停补拉 —— 页面都要销毁了，补拉队列一条都不许再跑。
+        //   必须在 cancelTag("detail") 之前：stopPrefetch 只掐自己的独立 tag。
+        stopPrefetch();
         OkGo.getInstance().cancelTag("fenci");
         OkGo.getInstance().cancelTag("detail");
         OkGo.getInstance().cancelTag("quick_search");

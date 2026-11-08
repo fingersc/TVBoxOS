@@ -923,7 +923,9 @@ public class SourceViewModel extends ViewModel {
             extend=fallback ? getFixUrl(extend, 6) : getFixUrl(extend);
 
             GetRequest<String> request = OkGo.<String>get(sourceBean.getApi())
-                    .tag("detail")
+                    // r189（A1）：补拉详情必须用自己的 tag —— 页面销毁/补拉超时要能单独掐掉它，
+                    //   而不能连带 cancelTag("detail") 把当前播放源的详情也一起杀掉。
+                    .tag(out == prefetchDetailResult ? "prefetch_detail" : "detail")
                     .params("ac", type == 0 ? "videolist" : "detail")
                     .params("limit", DETAIL_LIMIT)
                     .params("ids", id);
