@@ -158,6 +158,47 @@ public class ModelSettingFragment extends BaseLazyFragment {
         SETTING_NAMES.put(HawkConfig.HISTORY_NUM, "历史记录");
     }
 
+    /**
+     * ★ r192：各设置项「Hawk 里没有该键时的有效默认值」。
+     * 判定"改没改"必须拿它当基准 —— 旧实现把未落盘的键记成 null，
+     * 用户把选项选回默认那项（值等价、语义未变）也会被判成改动并弹保存。
+     * 新增设置项时：这里与 refreshUi()/点击处理里的 cur(key, def) 必须同步加。
+     */
+    private static final java.util.HashMap<String, Object> DEFAULTS = new java.util.HashMap<>();
+    static {
+        DEFAULTS.put(HawkConfig.PARSE_WEBVIEW, true);
+        DEFAULTS.put(HawkConfig.DOH_URL, 0);
+        DEFAULTS.put(HawkConfig.PLAY_SCALE, 0);
+        DEFAULTS.put(HawkConfig.PLAY_TYPE, 2);
+        DEFAULTS.put(HawkConfig.PLAY_RENDER, 1);
+        DEFAULTS.put(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC);
+        DEFAULTS.put(HawkConfig.SEARCH_VIEW, 0);
+        DEFAULTS.put(HawkConfig.HISTORY_NUM, 0);
+        DEFAULTS.put(HawkConfig.SHOW_PREVIEW, true);
+        DEFAULTS.put(HawkConfig.FAST_SEARCH_MODE, true);
+        DEFAULTS.put(HawkConfig.M3U8_PURIFY, false);
+        DEFAULTS.put(HawkConfig.M3U8_PREFETCH, true);
+        DEFAULTS.put(HawkConfig.DANMU_OPEN, true);      // = DanmuHelper.isOpen() 的默认
+        DEFAULTS.put(HawkConfig.AUTO_SWITCH_LINE, true);
+        DEFAULTS.put(HawkConfig.HOME_REC_STYLE, false);
+        DEFAULTS.put(HawkConfig.DEFAULT_LOAD_LIVE, false);
+        DEFAULTS.put(HawkConfig.IJK_CACHE_PLAY, false);
+    }
+
+    private static Object defaultOf(String key) {
+        return DEFAULTS.containsKey(key) ? DEFAULTS.get(key) : null;
+    }
+
+    private static boolean valueEquals(Object a, Object b) {
+        if (a == null || b == null) {
+            return a == b;
+        }
+        if (a instanceof Number && b instanceof Number) {
+            return ((Number) a).longValue() == ((Number) b).longValue();
+        }
+        return a.equals(b);
+    }
+
     public static ModelSettingFragment newInstance() {
         return new ModelSettingFragment().setArguments();
     }
@@ -969,11 +1010,12 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private void captureBaseline() {
         baseline.clear();
         for (String k : SETTING_NAMES.keySet()) {
-            baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : null);
+            // ★ r192：未落盘的键记「有效默认值」而不是 null（判定基准与界面显示一致）
+            baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : defaultOf(k));
         }
         for (String k : API_DEPENDENT_KEYS) {
             if (!baseline.containsKey(k)) {
-                baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : null);
+                baseline.put(k, Hawk.contains(k) ? Hawk.get(k, (Object) null) : defaultOf(k));
             }
         }
     }
@@ -984,10 +1026,11 @@ public class ModelSettingFragment extends BaseLazyFragment {
         }
         Object old = baseline.get(key);
         Object now = draft.get(key);
-        if (old == null) {
-            return now != null;
+        // 兜底：API 键不能用实时 Hawk（草稿期会临时落盘），其它键若期间被同步写入则以实时值为准
+        if (old == null && !isApiDependent(key)) {
+            old = Hawk.contains(key) ? Hawk.get(key, (Object) null) : defaultOf(key);
         }
-        return !old.equals(now);
+        return !valueEquals(old, now);
     }
 
     private boolean hasChanges() {
@@ -1279,6 +1322,11 @@ public class ModelSettingFragment extends BaseLazyFragment {
         boolean historyNumChanged = false;
         for (java.util.Map.Entry<String, Object> e : draft.entrySet()) {
             String k = e.getKey();
+            // ★ r192：只落盘「语义确实变了」的草稿。旧实现把"点了两下回到原值"的键也写回，
+            //   既会和已保存值无谓地产生一条 Hawk 变更，还会被同步层当成新改动上传。
+            if (!changed(k)) {
+                continue;
+            }
             Hawk.put(k, e.getValue());               // API 类也在此正式落盘
             if (HawkConfig.API_URL.equals(k) || HawkConfig.LIVE_API_URL.equals(k)) {
                 apiChanged = true;

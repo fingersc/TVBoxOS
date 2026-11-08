@@ -631,8 +631,6 @@
                     android:id="@+id/m3u8Prefetch"
                     android:layout_width="@dimen/vs_0"
                     android:layout_height="match_parent"
-                    android:layout_marginStart="@dimen/vs_5"
-                    android:layout_marginLeft="@dimen/vs_5"
                     android:layout_weight="1"
                     android:background="@drawable/shape_setting_model_focus"
                     android:focusable="true"
