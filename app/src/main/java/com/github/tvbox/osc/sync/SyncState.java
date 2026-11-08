@@ -354,8 +354,16 @@ public final class SyncState {
     public static void migrateLegacyKeys(String owner) {
         try {
             if (Hawk.get(MIGRATED + owner, false)) {
+                // ★ r193 P3-1：本账号早已迁过 ⇒ 无后缀的全局 sync_dirty 若还在，
+                //   只可能是「认领之后」由游客态 markDirty 写下的残留（nobody reads/clears it），
+                //   直接清掉，避免被后面登录的账号误当成 legacy 脏标记。
+                Hawk.delete(HawkConfig.SYNC_DIRTY);
                 return;
             }
+            // ★ r193 P3-1：无后缀的全局 sync_dirty 至多属于「第一个做 legacy 迁移的账号」。
+            //   读一次即认领，认领完立刻删除 —— 既保住 v74 之前老版本的 legacy 迁移能力，
+            //   又不让游客态残留被后面的账号当成自己的脏标记。
+            boolean globalLegacyDirty = Hawk.get(HawkConfig.SYNC_DIRTY, false);
             SyncState st = new SyncState(owner);
             st.lastAt = readLong(HawkConfig.SYNC_LAST_AT + "." + owner, -1L);
             if (st.lastAt < 0) {
@@ -366,7 +374,7 @@ public final class SyncState {
                 st.lastEpoch = Hawk.get(HawkConfig.SYNC_LAST_EPOCH, 0L);
             }
             boolean legacyDirty = Hawk.get(HawkConfig.SYNC_DIRTY + "." + owner, false)
-                    || Hawk.get(HawkConfig.SYNC_DIRTY, false);
+                    || globalLegacyDirty;
             if (legacyDirty) {
                 st.markDirty();
             }
@@ -378,6 +386,9 @@ public final class SyncState {
             Hawk.put(HawkConfig.SYNC_FAIL_COUNT + "." + owner, 0);
             st.save();
             Hawk.put(MIGRATED + owner, true);
+            // ★ r193 P3-1：全局无后缀的 sync_dirty 已认领完毕 ⇒ 立刻删除，
+            //   避免它被下一个登录的账号当成自己的 legacy 脏标记（4 个 scope 全标脏）。
+            Hawk.delete(HawkConfig.SYNC_DIRTY);
             LOG.i("[Sync] state migrated owner=" + owner + " lastAt=" + st.lastAt
                     + " dirty=" + legacyDirty);
         } catch (Throwable t) {

@@ -298,11 +298,17 @@ public final class HistorySyncManager {
      * （播放中 5 分钟、其他场景 60 秒），其余走自适应间隔。</p>
      */
     public static void markDirty(SyncScope... scopes) {
-        // 旧键仍写一份：回退到旧引擎（SYNC_ENGINE_V2=false）时仍然看得到脏标记
-        Hawk.put(key(HawkConfig.SYNC_DIRTY), true);
+        // ★ r193 P3-1：游客态直接返回，**不写任何脏标记**。
+        //   此前这里先写旧散键再判游客，游客下 key(base) 落到无后缀的全局键
+        //   「sync_dirty」：既没人读（isDirty 游客恒 false）也没人清，
+        //   还会在首个账号做 legacy 迁移时被误当成「该账号的脏标记」
+        //   （见 SyncState.migrateLegacyKeys），把 4 个 scope 全部标脏。
         if (AccountContext.isGuest()) {
             return;
         }
+        // 旧键仍写一份：回退到旧引擎（SYNC_ENGINE_V2=false）时仍然看得到脏标记
+        // （登录态下 key() 会带上 owner 后缀，不会污染全局键）
+        Hawk.put(key(HawkConfig.SYNC_DIRTY), true);
         SyncState st = SyncState.load(owner());
         st.markDirty(scopes);
         st.save();
