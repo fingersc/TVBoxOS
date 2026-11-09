@@ -29,6 +29,15 @@ public final class AccountSwitcher {
     /** 切换到指定账号（调用方必须已通过密码或扫码完成认证）。 */
     public static void switchTo(final String owner, final String name, final byte[] key,
                                 final Callback cb) {
+        switchTo(owner, name, key, true, cb);
+    }
+
+    /**
+     * r197：waitForSync=false 时「切换完成」不等首轮同步跑完（扫码登录专用，电视立刻显示已登录），
+     * 首轮同步转后台继续；true 保持原语义（密码登录 / 手动切账号需要等云端设置到位）。
+     */
+    public static void switchTo(final String owner, final String name, final byte[] key,
+                                final boolean waitForSync, final Callback cb) {
         if (owner == null || owner.isEmpty() || key == null) {
             post(cb, false, "账号信息不完整，请重新认证");
             return;
@@ -77,12 +86,24 @@ public final class AccountSwitcher {
                         final String msg = message;
                         // v98 P2：切换账号是「必须立刻拉一次」的场景，
                         //        走调度器的立即档（不再借用历史页 pullNow 的 20 秒节流）
-                        SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
-                            @Override
-                            public void onDone(boolean ok, String text) {
-                                post(cb, true, ok ? msg : msg + "；同步未完成，稍后会自动重试");
-                            }
-                        });
+                        if (waitForSync) {
+                            SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
+                                @Override
+                                public void onDone(boolean ok, String text) {
+                                    post(cb, true, ok ? msg : msg + "；同步未完成，稍后会自动重试");
+                                }
+                            });
+                        } else {
+                            // r197：扫码登录——账号切好就先回调（电视立刻显示已登录），
+                            //        首轮同步放后台跑，不再让用户盯着「正在登录」等网盘往返。
+                            post(cb, true, msg);
+                            SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
+                                @Override
+                                public void onDone(boolean ok, String text) {
+                                    LOG.i("[Sync] qr background sync done ok=" + ok);
+                                }
+                            });
+                        }
                     }
                 });
             }

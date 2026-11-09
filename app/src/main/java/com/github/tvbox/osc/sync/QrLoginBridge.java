@@ -139,6 +139,7 @@ public final class QrLoginBridge {
      * @return ok / expired / bad / mismatch
      */
     public static String accept(String t, String hexCipher) {
+        final long tAccept = System.currentTimeMillis();
         if (!isValid(t)) {
             return "expired";
         }
@@ -188,7 +189,8 @@ public final class QrLoginBridge {
                 verifyAndSwitch(url, davUser, davPass, owner, name, accountKey);
             }
         }, "tvbox-qr-verify").start();
-        LOG.i("[Sync] qr login accepted user=" + name);
+        LOG.i("[Sync] qr login accepted user=" + name
+                + " (crypto+check " + (System.currentTimeMillis() - tAccept) + "ms)");
         return "ok";
     }
 
@@ -206,7 +208,10 @@ public final class QrLoginBridge {
             String usePass = usePhoneConfig ? davPass : Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, "");
             // 用"生效的存储"确认账号目录存在，避免切到一个不存在的账号上
             WebDavClient dav = new WebDavClient(useUrl, useUser, usePass);
-            if (!dav.dirExists(AccountPaths.dir(name))) {
+            long tDir = System.currentTimeMillis();
+            boolean exists = dav.dirExists(AccountPaths.dir(name));
+            LOG.i("[Sync] qr dirExists=" + exists + " (" + (System.currentTimeMillis() - tDir) + "ms)");
+            if (!exists) {
                 notifyLoginFailed("电视上没有这个账号：请确认电视与本机用的是同一份网盘");
                 return;
             }
@@ -226,9 +231,13 @@ public final class QrLoginBridge {
             @Override
             public void run() {
                 // v76：统一走账号切换编排（保存当前设置快照 / 切库 / 恢复目标快照 / 拉一次）
-                AccountSwitcher.switchTo(owner, name, accountKey, new AccountSwitcher.Callback() {
+                final long tSwitch = System.currentTimeMillis();
+                // r197：扫码路径不等首轮同步——切换完成即回「已登录」，同步后台继续（false = 不等同步）
+                AccountSwitcher.switchTo(owner, name, accountKey, false, new AccountSwitcher.Callback() {
                     @Override
                     public void onDone(boolean ok, String message) {
+                        LOG.i("[Sync] qr switch done ok=" + ok + " ("
+                                + (System.currentTimeMillis() - tSwitch) + "ms)");
                         if (ok) {
                             notifyLoginOk(name);
                         } else {

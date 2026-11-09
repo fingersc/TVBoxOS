@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- v75：扫码页。SurfaceView 居中交给 Java 按预览比例设尺寸（避免拉伸变形），
-     取景框尺寸也在 Java 里按屏幕宽度换算。 -->
+     取景框尺寸也在 Java 里按屏幕短边换算。
+     r197：上下两条提示文字移到取景框的上下两边（竖排居中），不再整条铺满屏幕。 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
@@ -12,36 +13,54 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
-    <View
-        android:id="@+id/scanFrame"
-        android:layout_width="240dp"
-        android:layout_height="240dp"
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:background="@drawable/shape_scan_frame" />
+        android:gravity="center_horizontal"
+        android:orientation="vertical">
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="top"
-        android:background="#66000000"
-        android:padding="@dimen/vs_16"
-        android:text="对准电视上的二维码"
-        android:textColor="@android:color/white"
-        android:textSize="18sp" />
+        <TextView
+            android:id="@+id/tvScanTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/vs_8"
+            android:background="#66000000"
+            android:gravity="center"
+            android:paddingLeft="@dimen/vs_12"
+            android:paddingRight="@dimen/vs_12"
+            android:paddingTop="@dimen/vs_8"
+            android:paddingBottom="@dimen/vs_8"
+            android:text="对准电视上的二维码"
+            android:textColor="@android:color/white"
+            android:textSize="18sp" />
 
-    <TextView
-        android:id="@+id/tvScanTip"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
-        android:background="#66000000"
-        android:gravity="center"
-        android:padding="@dimen/vs_16"
-        android:text=""
-        android:textColor="@android:color/white"
-        android:textSize="16sp" />
+        <View
+            android:id="@+id/scanFrame"
+            android:layout_width="240dp"
+            android:layout_height="240dp"
+            android:background="@drawable/shape_scan_frame" />
 
-    <!-- r190：双指缩放时的倍率提示，位置在 Java 里按取景框放到其正下方 -->
+        <TextView
+            android:id="@+id/tvScanTip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_8"
+            android:background="#66000000"
+            android:gravity="center"
+            android:maxWidth="360dp"
+            android:minHeight="24dp"
+            android:paddingLeft="@dimen/vs_12"
+            android:paddingRight="@dimen/vs_12"
+            android:paddingTop="@dimen/vs_8"
+            android:paddingBottom="@dimen/vs_8"
+            android:text=""
+            android:textColor="@android:color/white"
+            android:textSize="16sp"
+            android:visibility="invisible" />
+    </LinearLayout>
+
+    <!-- r190：双指缩放时的倍率提示，位置在 Java 里按取景框放到其右侧 -->
     <TextView
         android:id="@+id/tvZoom"
         android:layout_width="wrap_content"

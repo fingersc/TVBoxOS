@@ -19,6 +19,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.ViewConfiguration;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -109,6 +110,18 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     private boolean potentialTap;
     private boolean scaled;
 
+    // ---- r197 曝光（电视屏过亮→预览过曝→二维码黑白对比被冲掉，自动压暗）----
+    private volatile boolean expSupported;
+    private int expMin;
+    private int expMax;
+    private volatile int expCur;
+    private float expStep;
+    private long lastExpCheckAt;
+    private int lastExpP95 = -1;
+    private int expNoEffect;
+    private volatile int expP95 = -1;
+    private final int[] expHist = new int[256];
+
     @Override
     protected int getLayoutResID() {
         return R.layout.activity_qr_scan;
@@ -126,7 +139,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                 Collections.singletonList(BarcodeFormat.QR_CODE));
         reader.setHints(hints);
         if (AccountContext.isGuest()) {
-            tvScanTip.setText("请先在本机登录账号，再扫码");
+            setTip("请先在本机登录账号，再扫码");
             return;
         }
         View frame = findViewById(R.id.scanFrame);
@@ -134,8 +147,11 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         // 原来按宽算，横屏时会等于屏宽（1280~1920），远大于屏高，直接撑出屏幕。
         int shortSide = Math.min(getResources().getDisplayMetrics().widthPixels,
                 getResources().getDisplayMetrics().heightPixels);
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        // r197：取景框上下各贴着一条提示文字，矮屏上给它们留出空间，避免把框挤出屏幕
         int side = (int) (shortSide * 0.68f);
-        FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) frame.getLayoutParams();
+        side = Math.min(side, screenH - dp(150));
+        LinearLayout.LayoutParams flp = (LinearLayout.LayoutParams) frame.getLayoutParams();
         flp.width = side;
         flp.height = side;
         frame.setLayoutParams(flp);
@@ -167,13 +183,13 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                             permissionGranted = true;
                             openCameraIfReady();
                         } else {
-                            tvScanTip.setText("未授予相机权限");
+                            setTip("未授予相机权限");
                         }
                     }
 
                     @Override
                     public void onDenied(List<String> permissions, boolean never) {
-                        tvScanTip.setText("未授予相机权限");
+                        setTip("未授予相机权限");
                     }
                 });
     }
@@ -237,7 +253,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         try {
             camera = Camera.open();
         } catch (Throwable t) {
-            tvScanTip.setText("相机打开失败：" + t.getMessage());
+            setTip("相机打开失败：" + t.getMessage());
             return;
         }
         try {
@@ -252,6 +268,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             }
             camera.setParameters(params);
             initZoomForCamera();
+            initExposureForCamera();
             camera.setDisplayOrientation(calcDisplayOrientation());
             camera.setPreviewDisplay(surface.getHolder());
             camera.setPreviewCallback(new Camera.PreviewCallback() {
@@ -262,12 +279,13 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             });
             camera.startPreview();
             applySurfaceAspect();
+            applyCenterMetering();
             if (autoFocusFallback) {
                 startAutoFocusLoop();
             }
         } catch (Throwable t) {
             LOG.e("[Sync] camera preview failed", t);
-            tvScanTip.setText("相机初始化失败：" + t.getMessage());
+            setTip("相机初始化失败：" + t.getMessage());
             closeCamera();
         }
     }
@@ -432,6 +450,157 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
+
+    // ---------------------------------------------------------------- 曝光（r197）
+
+    /** r197：底部提示与取景框绑定后，空文本会留一条空底块，统一用可见性控制。 */
+    private void setTip(String text) {
+        if (tvScanTip == null) {
+            return;
+        }
+        tvScanTip.setText(text == null ? "" : text);
+        tvScanTip.setVisibility(text == null || text.isEmpty() ? View.INVISIBLE : View.VISIBLE);
+    }
+
+    /** 相机打开后读一次曝光能力（补偿范围/步长/当前值）；不支持补偿时只靠测光区。 */
+    private void initExposureForCamera() {
+        try {
+            Camera.Parameters p = camera.getParameters();
+            expMin = p.getMinExposureCompensation();
+            expMax = p.getMaxExposureCompensation();
+            expStep = p.getExposureCompensationStep();
+            expCur = p.getExposureCompensation();
+            expSupported = expMax > expMin;
+        } catch (Throwable t) {
+            expSupported = false;
+        }
+        lastExpCheckAt = 0;
+        lastExpP95 = -1;
+        expNoEffect = 0;
+        LOG.i("[QrScan] preview " + previewW + "x" + previewH + ", zoomMax=" + maxZoom
+                + ", exp=[" + expMin + "," + expMax + "] step=" + expStep);
+        if (!expSupported) {
+            LOG.i("[QrScan] exposure compensation unsupported, rely on metering area only");
+        }
+    }
+
+    /**
+     * r197：把测光区收到画面中心（取景框/二维码所在处）。
+     *
+     * <p>电视是暗环境里的高亮发光体，整幅测光会让 AE 偏向暗部，屏幕区域直接过曝，
+     * 二维码的黑白模块对比被压平。中心测光让 AE 以二维码为主体曝光。</p>
+     */
+    private void applyCenterMetering() {
+        if (camera == null) {
+            return;
+        }
+        try {
+            Camera.Parameters p = camera.getParameters();
+            if (p.getMaxNumMeteringAreas() > 0) {
+                List<Camera.Area> areas = new ArrayList<>();
+                areas.add(new Camera.Area(new Rect(-400, -400, 400, 400), 1000));
+                p.setMeteringAreas(areas);
+                camera.setParameters(p);
+            }
+        } catch (Throwable t) {
+            LOG.e("[QrScan] set metering area failed", t);
+        }
+    }
+
+    /**
+     * r197：按中心区域亮度自适应曝光补偿。p95 太高说明白色模块接近裁切，往负方向压；
+     * 压过头（p95 太低）再往 0 回。只在变化时调参数，且每次重新 getParameters，避免被缩放覆盖。
+     */
+    private void maybeAdjustExposure(byte[] data, int w, int h) {
+        if (!expSupported || data == null || w <= 0 || h <= 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastExpCheckAt < 500) {
+            return;
+        }
+        lastExpCheckAt = now;
+        int len = Math.min(data.length, w * h);
+        int x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
+        int[] hist = expHist;
+        Arrays.fill(hist, 0);
+        int total = 0;
+        for (int yy = y0; yy < y1; yy += 8) {
+            int row = yy * w;
+            for (int xx = x0; xx < x1; xx += 8) {
+                int idx = row + xx;
+                if (idx < len) {
+                    hist[data[idx] & 0xff]++;
+                    total++;
+                }
+            }
+        }
+        if (total < 64) {
+            return;
+        }
+        int p95 = percentile(hist, total, 0.95f);
+        expP95 = p95;
+        // 设备忽略补偿：连续多次调整后 p95 仍不动，就别再反复 setParameters 折腾了
+        if (lastExpP95 >= 0 && Math.abs(p95 - lastExpP95) < 5) {
+            expNoEffect++;
+            if (expNoEffect >= 3) {
+                expSupported = false;
+                LOG.i("[QrScan] exposure adjust has no effect on this device, stop");
+                return;
+            }
+        } else {
+            expNoEffect = 0;
+        }
+        lastExpP95 = p95;
+        int target = expCur;
+        if (p95 >= 240 && expCur > expMin) {
+            target = expCur - 1;
+        } else if (p95 <= 170 && expCur < 0) {
+            target = expCur + 1;
+        }
+        if (target != expCur) {
+            expCur = target;
+            requestApplyExposure();
+        }
+    }
+
+    private int percentile(int[] hist, int total, float frac) {
+        int need = Math.max(1, Math.round(total * frac));
+        int acc = 0;
+        for (int i = 0; i < hist.length; i++) {
+            acc += hist[i];
+            if (acc >= need) {
+                return i;
+            }
+        }
+        return 255;
+    }
+
+    private void requestApplyExposure() {
+        main.post(exposureRunnable);
+    }
+
+    private final Runnable exposureRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (camera == null || done) {
+                return;
+            }
+            try {
+                Camera.Parameters p = camera.getParameters();
+                if (p.getExposureCompensation() == expCur) {
+                    return;
+                }
+                p.setExposureCompensation(expCur);
+                camera.setParameters(p);
+                LOG.i("[QrScan] exposure p95=" + expP95 + " -> exp=" + expCur
+                        + " (" + (expCur * expStep) + "EV)");
+            } catch (Throwable t) {
+                expSupported = false;
+                LOG.e("[QrScan] apply exposure failed", t);
+            }
+        }
+    };
 
     /** r196：横屏下把倍率提示放到取景框右侧（底部有提示条，放下面会被盖住）。 */
     private void positionZoomTip(int frameSide) {
@@ -692,6 +861,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         if (decoding || done || data == null) {
             return;
         }
+        // r197：先按中心亮度自适应曝光（自带 500ms 节流，与解码节流无关）
+        maybeAdjustExposure(data, previewW, previewH);
         long now = System.currentTimeMillis();
         // 大预览帧拷贝/解码更重，按像素量降频，避免拖慢预览：
         // >4MP（4K/1440p）每 700ms 解一次，>2.5MP 每 400ms，其余 250ms。
@@ -773,7 +944,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
 
     private void submit(String qrText) {
         closeCamera();
-        tvScanTip.setText("正在发送账号到电视…");
+        setTip("正在发送账号到电视…");
         final String url = qrText == null ? "" : qrText.trim();
         new Thread(new Runnable() {
             @Override
@@ -813,7 +984,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                     try (Response resp = client.newCall(req).execute()) {
                         String text = resp.body() == null ? "" : resp.body().string();
                         if (text.contains("ok")) {
-                            msg = "登录信息已发送，电视将自动登录";
+                            msg = "已发送，电视正在登录…";
                         } else if (text.contains("no_dir")) {
                             msg = "电视上没有这个账号：请确认电视与本机用的是同一份网盘";
                         } else if (text.contains("mismatch")) {
@@ -833,14 +1004,14 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                 main.post(new Runnable() {
                     @Override
                     public void run() {
-                        tvScanTip.setText(out);
+                        setTip(out);
                         Toast.makeText(QrScanActivity.this, out, Toast.LENGTH_SHORT).show();
                         main.postDelayed(new Runnable() {
                             @Override
                             public void run() {
                                 finish();
                             }
-                        }, 1200);
+                        }, 800);
                     }
                 });
             }
