@@ -104,9 +104,9 @@ public final class QrLoginBridge {
     private QrLoginBridge() {
     }
 
-    /** 生成一次性 token（同时作废旧 token）。 */
+    /** 生成一次性 token（64 位随机 → 16 位十六进制，同时作废旧 token）。 */
     public static synchronized String newToken() {
-        byte[] r = new byte[4];
+        byte[] r = new byte[8];
         new SecureRandom().nextBytes(r);
         StringBuilder sb = new StringBuilder();
         for (byte b : r) {
@@ -150,7 +150,7 @@ public final class QrLoginBridge {
         final String name;
         final byte[] accountKey;
         try {
-            byte[] key = Crypto.deriveKey(t, "tvbox-qr-login");
+            byte[] key = Crypto.deriveQrKey(t);
             byte[] cipher = hexToBytes(hexCipher);
             String json = new String(Crypto.decrypt(key, cipher), "UTF-8");
             JSONObject o = new JSONObject(json);

@@ -81,6 +81,24 @@ public final class Crypto {
     }
 
     /**
+     * 扫码登录专用密钥派生（r198）。
+     *
+     * <p>扫码 token 是电视端生成的一次性 64 位随机串，本身就是高熵材料，用 SHA-256 派生即可；
+     * 而 PBKDF2 20 万轮在手机 / 电视盒上一次要 1~3 秒，是「扫码后上传要等 3~4 秒」的主因。</p>
+     *
+     * <p>布局与 {@link #deriveKey} 一致：前 32 字节加密、后 32 字节做 MAC。</p>
+     */
+    public static byte[] deriveQrKey(String token) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] enc = md.digest(("tvbox-qr-enc:" + token).getBytes("UTF-8"));
+        byte[] mac = md.digest(("tvbox-qr-mac:" + token).getBytes("UTF-8"));
+        byte[] out = new byte[KEY_BYTES];
+        System.arraycopy(enc, 0, out, 0, 32);
+        System.arraycopy(mac, 0, out, 32, 32);
+        return out;
+    }
+
+    /**
      * 固定写 v1（不压缩）。
      *
      * <p>★ v4.3.0：只给「极小 / 需要跨版本兼容」的数据用 ——

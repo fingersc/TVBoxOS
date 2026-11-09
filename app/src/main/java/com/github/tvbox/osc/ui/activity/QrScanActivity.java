@@ -950,6 +950,7 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             @Override
             public void run() {
                 String msg;
+                final long tStart = System.currentTimeMillis();
                 try {
                     okhttp3.HttpUrl parsed = okhttp3.HttpUrl.parse(url);
                     if (parsed == null) {
@@ -959,7 +960,9 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                     if (token == null) {
                         throw new IllegalArgumentException("二维码缺少令牌");
                     }
-                    byte[] key = Crypto.deriveKey(token, "tvbox-qr-login");
+                    // r198：扫码 token 是 64 位随机串，用 SHA-256 派生即可；
+                    // 原来的 PBKDF2 20 万轮在手机上要 1~3 秒，是「上传慢」的主因。
+                    byte[] key = Crypto.deriveQrKey(token);
                     JSONObject o = new JSONObject();
                     o.put("url", Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""));
                     o.put("davUser", Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""));
@@ -983,6 +986,8 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                             .build();
                     try (Response resp = client.newCall(req).execute()) {
                         String text = resp.body() == null ? "" : resp.body().string();
+                        LOG.i("[Sync] qr submit done in " + (System.currentTimeMillis() - tStart)
+                                + "ms, resp=" + text);
                         if (text.contains("ok")) {
                             msg = "已发送，电视正在登录…";
                         } else if (text.contains("no_dir")) {
