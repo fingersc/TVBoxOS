@@ -748,7 +748,9 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
 
                     OkHttpClient client = new OkHttpClient.Builder()
                             .connectTimeout(8, TimeUnit.SECONDS)
-                            .readTimeout(8, TimeUnit.SECONDS)
+                            // r195：电视端改为「先回执、后台校验」，正常几百毫秒即返回；
+                            // 这里留 12s 只是兜底，避免极端网络下把仍在处理的请求误判成失败。
+                            .readTimeout(12, TimeUnit.SECONDS)
                             .build();
                     Request req = new Request.Builder()
                             .url(parsed)
@@ -766,6 +768,9 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
                             msg = "发送失败：" + text;
                         }
                     }
+                } catch (java.net.SocketTimeoutException te) {
+                    LOG.e("[Sync] qr submit timeout", te);
+                    msg = "电视响应超时：可能仍在登录，请稍后看电视是否已登录";
                 } catch (Throwable t) {
                     LOG.e("[Sync] qr submit failed", t);
                     msg = "发送失败：" + t.getMessage();

@@ -29,9 +29,16 @@ public final class QrLoginBridge {
     private static volatile String expectedOwner;
     private static final List<Listener> LISTENERS = new ArrayList<>();
 
-    /** 扫码登录成功回调（弹窗据此自动关闭并提示）。 */
+    /** 扫码登录状态回调（弹窗/账号页据此更新提示）。 */
     public interface Listener {
+        /** 已受理，正在后台校验存储并切换账号。 */
+        void onLoginPending();
+
+        /** 登录成功。 */
         void onLoginOk(String name);
+
+        /** 登录失败（校验存储或切换账号失败）。 */
+        void onLoginFailed(String message);
     }
 
     public static void addListener(Listener l) {
@@ -51,17 +58,47 @@ public final class QrLoginBridge {
         }
     }
 
-    private static void notifyLoginOk(String name) {
-        List<Listener> copy;
+    private static List<Listener> copyListeners() {
         synchronized (LISTENERS) {
-            copy = new ArrayList<>(LISTENERS);
+            return new ArrayList<>(LISTENERS);
         }
-        for (Listener l : copy) {
+    }
+
+    private static void notifyLoginOk(String name) {
+        for (Listener l : copyListeners()) {
             try {
                 l.onLoginOk(name);
             } catch (Throwable ignored) {
             }
         }
+    }
+
+    private static void notifyLoginPending() {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                for (Listener l : copyListeners()) {
+                    try {
+                        l.onLoginPending();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        });
+    }
+
+    private static void notifyLoginFailed(final String message) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                for (Listener l : copyListeners()) {
+                    try {
+                        l.onLoginFailed(message);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        });
     }
 
     private QrLoginBridge() {
@@ -99,24 +136,30 @@ public final class QrLoginBridge {
      * <p>传的是「已派生的账号密钥」而不是密码：手机端本来就不保存密码，
      * 密钥正是 AccountContext 保存的登录凭据，电视拿到即可保持登录。</p>
      *
-     * @return ok / expired / bad
+     * @return ok / expired / bad / mismatch
      */
     public static String accept(String t, String hexCipher) {
         if (!isValid(t)) {
             return "expired";
         }
+        final String url;
+        final String davUser;
+        final String davPass;
+        final String owner;
+        final String name;
+        final byte[] accountKey;
         try {
             byte[] key = Crypto.deriveKey(t, "tvbox-qr-login");
             byte[] cipher = hexToBytes(hexCipher);
             String json = new String(Crypto.decrypt(key, cipher), "UTF-8");
             JSONObject o = new JSONObject(json);
-            final String url = o.optString("url", "");
-            final String davUser = o.optString("davUser", "");
-            final String davPass = o.optString("davPass", "");
-            final String owner = o.optString("owner", "");
-            final String name = o.optString("name", "");
-            final String keyHex = o.optString("keyHex", "");
-            final byte[] accountKey = hexToBytes(keyHex);
+            url = o.optString("url", "");
+            davUser = o.optString("davUser", "");
+            davPass = o.optString("davPass", "");
+            owner = o.optString("owner", "");
+            name = o.optString("name", "");
+            String keyHex = o.optString("keyHex", "");
+            accountKey = hexToBytes(keyHex);
             if (url.length() == 0 || owner.length() == 0 || name.length() == 0
                     || accountKey == null || accountKey.length != 64) {
                 return "bad";
@@ -125,49 +168,77 @@ public final class QrLoginBridge {
             if (expectedOwner != null && !expectedOwner.equals(owner)) {
                 return "mismatch";
             }
-            expectedOwner = null;
-            // v78：本机已配置存储时以本机为准，避免扫码把整台设备的网盘换掉（其它账号会瞬间"找不到"）。
-            // 仅当本机还没配置存储时，才采用手机带来的配置（相当于扫码顺手完成存储配置）。
-            String localUrl = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");
-            if (localUrl == null || localUrl.isEmpty()) {
-                Hawk.put(HawkConfig.SYNC_WEBDAV_URL, url);
-                Hawk.put(HawkConfig.SYNC_WEBDAV_USER, davUser);
-                Hawk.put(HawkConfig.SYNC_WEBDAV_PASS, davPass);
-            }
-            // 用"生效的存储"确认账号目录存在，避免切到一个不存在的账号上
-            try {
-                WebDavClient dav = new WebDavClient(
-                        Hawk.get(HawkConfig.SYNC_WEBDAV_URL, ""),
-                        Hawk.get(HawkConfig.SYNC_WEBDAV_USER, ""),
-                        Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, ""));
-                if (!dav.dirExists(AccountPaths.dir(name))) {
-                    return "no_dir";
-                }
-            } catch (Throwable t3) {
-                LOG.e("[Sync] qr storage check failed", t3);
-                return "bad";
-            }
-            token = null;
-            new Handler(Looper.getMainLooper()).post(new Runnable() {
-                @Override
-                public void run() {
-                    // v76：统一走账号切换编排（保存当前设置快照 / 切库 / 恢复目标快照 / 拉一次）
-                    AccountSwitcher.switchTo(owner, name, accountKey, new AccountSwitcher.Callback() {
-                        @Override
-                        public void onDone(boolean ok, String message) {
-                            if (ok) {
-                                notifyLoginOk(name);
-                            }
-                        }
-                    });
-                }
-            });
-            LOG.i("[Sync] qr login accepted user=" + name);
-            return "ok";
         } catch (Throwable t2) {
             LOG.e("[Sync] qr login failed", t2);
             return "bad";
         }
+        // r195：本地校验一过就原子消费 token 并立刻回执；耗时的网盘校验/账号切换放后台。
+        // 否则电视端 PROPFIND 可能耗时 10~30s，手机 8s 读超时先报「发送失败」，随后电视又登录成功。
+        synchronized (QrLoginBridge.class) {
+            if (!isValid(t)) {
+                return "expired";
+            }
+            token = null;
+            expectedOwner = null;
+        }
+        notifyLoginPending();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                verifyAndSwitch(url, davUser, davPass, owner, name, accountKey);
+            }
+        }, "tvbox-qr-verify").start();
+        LOG.i("[Sync] qr login accepted user=" + name);
+        return "ok";
+    }
+
+    /** 后台校验存储并切换账号：耗时操作都在这里，不阻塞 /qrlogin 的 HTTP 响应。 */
+    private static void verifyAndSwitch(String url, String davUser, String davPass,
+                                        final String owner, final String name, final byte[] accountKey) {
+        try {
+            // v78：本机已配置存储时以本机为准，避免扫码把整台设备的网盘换掉（其它账号会瞬间"找不到"）。
+            // 仅当本机还没配置存储时，才采用手机带来的配置（相当于扫码顺手完成存储配置），
+            // 且校验通过后才真正写入 —— 避免校验失败却把全局存储配置改掉。
+            String localUrl = Hawk.get(HawkConfig.SYNC_WEBDAV_URL, "");
+            boolean usePhoneConfig = localUrl == null || localUrl.isEmpty();
+            String useUrl = usePhoneConfig ? url : localUrl;
+            String useUser = usePhoneConfig ? davUser : Hawk.get(HawkConfig.SYNC_WEBDAV_USER, "");
+            String usePass = usePhoneConfig ? davPass : Hawk.get(HawkConfig.SYNC_WEBDAV_PASS, "");
+            // 用"生效的存储"确认账号目录存在，避免切到一个不存在的账号上
+            WebDavClient dav = new WebDavClient(useUrl, useUser, usePass);
+            if (!dav.dirExists(AccountPaths.dir(name))) {
+                notifyLoginFailed("电视上没有这个账号：请确认电视与本机用的是同一份网盘");
+                return;
+            }
+            if (usePhoneConfig) {
+                Hawk.put(HawkConfig.SYNC_WEBDAV_URL, url);
+                Hawk.put(HawkConfig.SYNC_WEBDAV_USER, davUser);
+                Hawk.put(HawkConfig.SYNC_WEBDAV_PASS, davPass);
+            }
+        } catch (Throwable t3) {
+            LOG.e("[Sync] qr storage check failed", t3);
+            String m = t3.getMessage();
+            notifyLoginFailed("校验存储失败：" + (m == null || m.isEmpty()
+                    ? t3.getClass().getSimpleName() : m));
+            return;
+        }
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                // v76：统一走账号切换编排（保存当前设置快照 / 切库 / 恢复目标快照 / 拉一次）
+                AccountSwitcher.switchTo(owner, name, accountKey, new AccountSwitcher.Callback() {
+                    @Override
+                    public void onDone(boolean ok, String message) {
+                        if (ok) {
+                            notifyLoginOk(name);
+                        } else {
+                            notifyLoginFailed(message == null || message.isEmpty()
+                                    ? "切换账号失败" : message);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     public static byte[] hexToBytes(String hex) {

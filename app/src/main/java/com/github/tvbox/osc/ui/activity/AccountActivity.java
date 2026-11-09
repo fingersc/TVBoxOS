@@ -140,6 +140,21 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvSyncStatus.setText("已登录：" + name + "，正在同步…");
     }
 
+    /** r195：后台校验/切换失败（存储地址不一致、账号目录不存在、切换异常等）。 */
+    @Override
+    public void onLoginFailed(String message) {
+        try {
+            Toast.makeText(this, "扫码登录失败：" + (message == null ? "" : message),
+                    Toast.LENGTH_LONG).show();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    public void onLoginPending() {
+        // 账号页无需额外提示：成功/失败回调到达时页面会照常刷新
+    }
+
     @Override
     protected void onDestroy() {
         QrLoginBridge.removeListener(this);
