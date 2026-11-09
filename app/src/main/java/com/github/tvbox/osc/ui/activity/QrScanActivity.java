@@ -29,7 +29,9 @@ import com.github.tvbox.osc.sync.Crypto;
 import com.github.tvbox.osc.sync.QrLoginBridge;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LOG;
+import com.google.zxing.BarcodeFormat;
 import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
 import com.google.zxing.MultiFormatReader;
 import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.common.HybridBinarizer;
@@ -41,6 +43,9 @@ import com.orhanobut.hawk.Hawk;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -62,6 +67,9 @@ import okhttp3.Response;
  *
  * <p>r190：新增「手动缩放」（双指捏合 → Camera1 数字变焦，屏幕显示倍率）与「点按对焦」，
  * 并把解码改为「先解取景框中心区域、失败再退回全帧」，便于扫远距离、画面里偏小的二维码。</p>
+ *
+ * <p>r196：扫码页改为横屏（与全 App 一致）；预览尺寸上限从 1920 放开到设备支持的上限
+ * （最高 3840×2160，超 4MP 自动降频解码），只解二维码并开 TRY_HARDER，提升远距离小码的识别率。</p>
  */
 public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callback {
 
@@ -110,12 +118,23 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     protected void init() {
         surface = findViewById(R.id.surface);
         tvScanTip = findViewById(R.id.tvScanTip);
+        // r196：只解二维码格式（电视登录码）并开 TRY_HARDER，小码/远距离时扫描更彻底；
+        // 顺带避免 1D 阅读器把电视画面里的横条误判成条码。
+        EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS,
+                Collections.singletonList(BarcodeFormat.QR_CODE));
+        reader.setHints(hints);
         if (AccountContext.isGuest()) {
             tvScanTip.setText("请先在本机登录账号，再扫码");
             return;
         }
         View frame = findViewById(R.id.scanFrame);
-        int side = (int) (getResources().getDisplayMetrics().widthPixels * 0.68f);
+        // r196：跟随全 App 的横屏。取景框按「屏幕短边」换算，横竖屏都不会溢出；
+        // 原来按宽算，横屏时会等于屏宽（1280~1920），远大于屏高，直接撑出屏幕。
+        int shortSide = Math.min(getResources().getDisplayMetrics().widthPixels,
+                getResources().getDisplayMetrics().heightPixels);
+        int side = (int) (shortSide * 0.68f);
         FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) frame.getLayoutParams();
         flp.width = side;
         flp.height = side;
@@ -309,54 +328,84 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
     }
 
     /**
-     * 挑最接近屏幕宽高比的预览尺寸：竖屏 9:16 时优先选 16:9（1280×720），
-     * 这样旋转后画面不会变形。
+     * r196：优先挑与屏幕同比例的预览尺寸，同比例里取「面积最大」的一档，上限 3840×2160（约 8.3MP）。
+     *
+     * <p>原来给 >1920 的尺寸加罚分，等于把大预览挡在门外。远距离二维码在 1080p 里只剩几个像素，
+     * 换到 1440p 是 1.33 倍线性/1.78 倍面积，4K 预览则是 2 倍线性/4 倍面积——这是纯算法补不回来的
+     * 真实像素。上限用于控制 onPreviewFrame 每帧拷贝 + ZXing 解码的开销（超过 4MP 会降频解码）。</p>
      */
     private Camera.Size choosePreviewSize(List<Camera.Size> sizes) {
         if (sizes == null || sizes.isEmpty()) {
             return null;
         }
-        int vw = surface.getWidth() > 0 ? surface.getWidth() : 1080;
-        int vh = surface.getHeight() > 0 ? surface.getHeight() : 1920;
+        int vw = getResources().getDisplayMetrics().widthPixels;
+        int vh = getResources().getDisplayMetrics().heightPixels;
         double target = (double) Math.max(vw, vh) / Math.min(vw, vh);
-        Camera.Size best = null;
-        double bestDiff = Double.MAX_VALUE;
+        long maxArea = 3840L * 2160L;
+        Camera.Size bestMatch = null;
+        Camera.Size bestAny = null;
+        long bestMatchArea = -1;
+        long bestAnyArea = -1;
         for (Camera.Size s : sizes) {
+            long area = (long) s.width * s.height;
+            if (area > maxArea || Math.max(s.width, s.height) > 3840) {
+                continue;
+            }
+            if (area > bestAnyArea) {
+                bestAnyArea = area;
+                bestAny = s;
+            }
             double ratio = (double) Math.max(s.width, s.height) / Math.min(s.width, s.height);
-            double diff = Math.abs(ratio - target);
-            if (Math.max(s.width, s.height) < 640) {
-                diff += 1.0;
-            }
-            if (Math.max(s.width, s.height) > 1920) {
-                diff += 1.0;
-            }
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                best = s;
+            if (Math.abs(ratio - target) <= 0.15 && area > bestMatchArea) {
+                bestMatchArea = area;
+                bestMatch = s;
             }
         }
-        return best;
+        if (bestMatch != null) {
+            return bestMatch;
+        }
+        if (bestAny != null) {
+            return bestAny;
+        }
+        // 兜底：所有尺寸都超上限时，仍挑面积最大的，避免 previewW/H 为空导致按错误尺寸解码
+        long bestArea = -1;
+        Camera.Size fallback = null;
+        for (Camera.Size s : sizes) {
+            long area = (long) s.width * s.height;
+            if (area > bestArea) {
+                bestArea = area;
+                fallback = s;
+            }
+        }
+        return fallback;
     }
 
-    /** 预览比例与屏幕不一致时给 Surface 加黑边，而不是拉伸画面。 */
+    /** 预览比例与屏幕不一致时加黑边居中，而不是拉伸画面。 */
     private void applySurfaceAspect() {
         if (previewW <= 0 || previewH <= 0) {
             return;
         }
         int vw = getResources().getDisplayMetrics().widthPixels;
-        // 预览被旋转 90/270 显示时，显示宽 = previewH、显示高 = previewW
+        int vh = getResources().getDisplayMetrics().heightPixels;
+        // 预览被旋转 90/270 显示时，显示宽高互换
         boolean swap = displayOrientation == 90 || displayOrientation == 270;
-        float displayRatio = swap
-                ? (float) previewW / (float) previewH
-                : (float) previewH / (float) previewW;
-        int targetH = Math.round(vw * displayRatio);
+        float aspect = swap ? (float) previewH / (float) previewW
+                : (float) previewW / (float) previewH;
+        // r196：先按「宽度铺满」算高度，超出屏幕时再改成「高度铺满」——
+        // 横屏正常态两者一致（1920×1080 正好铺满），异常姿态下也不会把 Surface 撑出屏幕。
+        int w = vw;
+        int h = Math.round(vw / aspect);
+        if (h > vh) {
+            h = vh;
+            w = Math.round(vh * aspect);
+        }
         if (surface.getLayoutParams() instanceof FrameLayout.LayoutParams) {
             FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) surface.getLayoutParams();
-            if (lp.width == vw && lp.height == targetH) {
+            if (lp.width == w && lp.height == h) {
                 return;
             }
-            lp.width = vw;
-            lp.height = targetH;
+            lp.width = w;
+            lp.height = h;
             lp.gravity = Gravity.CENTER;
             surface.setLayoutParams(lp);
         }
@@ -384,15 +433,15 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
-    /** 把倍率提示放到取景框正下方（取景框固定居中，故可按屏幕高/2 + 框半高定位）。 */
+    /** r196：横屏下把倍率提示放到取景框右侧（底部有提示条，放下面会被盖住）。 */
     private void positionZoomTip(int frameSide) {
         if (tvZoom == null) {
             return;
         }
-        int screenH = getResources().getDisplayMetrics().heightPixels;
+        int screenW = getResources().getDisplayMetrics().widthPixels;
         FrameLayout.LayoutParams zp = (FrameLayout.LayoutParams) tvZoom.getLayoutParams();
-        zp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP;
-        zp.topMargin = screenH / 2 + frameSide / 2 + dp(10);
+        zp.gravity = Gravity.LEFT | Gravity.CENTER_VERTICAL;
+        zp.leftMargin = screenW / 2 + frameSide / 2 + dp(14);
         tvZoom.setLayoutParams(zp);
     }
 
@@ -644,15 +693,20 @@ public class QrScanActivity extends BaseActivity implements SurfaceHolder.Callba
             return;
         }
         long now = System.currentTimeMillis();
-        if (now - lastDecodeAt < 250) {
+        // 大预览帧拷贝/解码更重，按像素量降频，避免拖慢预览：
+        // >4MP（4K/1440p）每 700ms 解一次，>2.5MP 每 400ms，其余 250ms。
+        int pixels = previewW * previewH;
+        int minInterval = pixels > 4000000 ? 700 : (pixels > 2500000 ? 400 : 250);
+        if (now - lastDecodeAt < minInterval) {
             return;
         }
         lastDecodeAt = now;
         decoding = true;
-        // 相机复用同一个 buffer，必须拷贝后才能异步解码
-        final byte[] frame = data.clone();
         final int w = previewW > 0 ? previewW : 640;
         final int h = previewH > 0 ? previewH : 480;
+        // 相机复用同一个 buffer；只拷 Y 平面（NV21 前 w*h 字节）即可——
+        // PlanarYUVLuminanceSource 只用亮度，高分辨率下能省掉 1/3 的拷贝量
+        final byte[] frame = Arrays.copyOf(data, Math.min(data.length, w * h));
         try {
             decodePool.execute(new Runnable() {
                 @Override

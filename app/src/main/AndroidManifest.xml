@@ -81,7 +81,7 @@
             android:screenOrientation="sensorLandscape" />
         <activity
             android:name=".ui.activity.QrScanActivity"
-            android:screenOrientation="portrait" />
+            android:screenOrientation="sensorLandscape" />
 
         <service
             android:name=".dlna.DLNACastService"
