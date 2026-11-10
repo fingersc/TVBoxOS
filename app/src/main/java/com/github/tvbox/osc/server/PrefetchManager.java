@@ -62,8 +62,23 @@ public final class PrefetchManager {
      * r201：预取缓冲（播放头之前的就绪切片）允许占用的字节上限。
      *
      * <p>与会话总预算分开：总预算里还要给「正在下/正在发的那一片」留位置。</p>
+     *
+     * <p>r202：8MB → 12MB。取舍是「复用优先」——多留几片，回跳/切播放器时能直接命中，
+     * 不必重新向源站要（实测一次 Exo→IJK 切换白重下了约 61MB）。会话总预算仍是
+     * {@link #SESSION_MEMORY_BUDGET} 16MB 的硬顶，这里只是把「预取可占的部分」放宽。</p>
      */
-    private static final long PREFETCH_MEM_BUDGET = 8L * 1024 * 1024;
+    private static final long PREFETCH_MEM_BUDGET = 12L * 1024 * 1024;
+
+    /**
+     * r202：预取并发上限（与自适应窗口 W <b>解耦</b>）。
+     *
+     * <p>W 的语义是「开几条连接才喂得饱码率」，源站越快 W 越小（实测常掉到 1）。
+     * 但预取要的是「把深度尽快铺满」，用 W 当并发会让深度只能一片一片串行推进：
+     * 深度 4 片 × 每片 3s 下载 = 12s 才能铺满，期间播放头早就把缓冲吃掉了。
+     * 所以预取并发单独给一个值，只受 {@link #MAX_PER_HOST}（要给播放头留一个名额）
+     * 与近期错误情况约束。</p>
+     */
+    private static final int PREFETCH_CONCURRENCY = 3;
     /** 单个切片下落上限（防御异常大文件）。 */
     private static final int MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
 
@@ -111,6 +126,8 @@ public final class PrefetchManager {
         final AtomicLong waitMaxMs = new AtomicLong();
         /** 命中缓存直接回给播放器的字节数。 */
         final AtomicLong servedBytes = new AtomicLong();
+        /** r202：重复下载的字节数（同一片在本会话里被下过两次以上，例如回跳/切播放器）。 */
+        final AtomicLong dupBytes = new AtomicLong();
 
         void addWait(long ms) {
             if (ms <= 0) {
@@ -136,6 +153,7 @@ public final class PrefetchManager {
             dlFail.addAndGet(o.dlFail.get());
             dlBytes.addAndGet(o.dlBytes.get());
             servedBytes.addAndGet(o.servedBytes.get());
+            dupBytes.addAndGet(o.dupBytes.get());
             waitMs.addAndGet(o.waitMs.get());
             long old;
             do {
@@ -159,7 +177,8 @@ public final class PrefetchManager {
                     + " dlMB=" + String.format(java.util.Locale.US, "%.1f", mb)
                     + " waitAvg=" + (r > 0 ? (w / r) : 0) + "ms"
                     + " waitMax=" + waitMaxMs.get() + "ms"
-                    + " servedMB=" + String.format(java.util.Locale.US, "%.1f", servedBytes.get() / 1024.0 / 1024.0);
+                    + " servedMB=" + String.format(java.util.Locale.US, "%.1f", servedBytes.get() / 1024.0 / 1024.0)
+                    + " dupMB=" + String.format(java.util.Locale.US, "%.1f", dupBytes.get() / 1024.0 / 1024.0);
         }
     }
 
@@ -366,6 +385,14 @@ public final class PrefetchManager {
         long segBytesMax = 0;
         /** r201：平均片长（秒），来自播放列表的 EXTINF。 */
         double avgSegSec = 0;
+        /**
+         * r202：哪些片在本会话里已经下载成功过（下标 = 播放列表序号 1..n）。
+         *
+         * <p>用位图而不是挂在 {@link Seg} 上：{@code Seg} 实例会被淘汰删掉
+         * （{@code states.remove}），挂在它上面的「下过没」会随之丢失，
+         * 重复下载就统计不出来了。n 通常一两千，占用可忽略。</p>
+         */
+        final boolean[] doneOnce;
 
         volatile int cursor = 1;
         volatile long lastAccess = System.currentTimeMillis();
@@ -383,6 +410,7 @@ public final class PrefetchManager {
             this.sk = sk;
             this.baseUrl = baseUrl;
             this.segs = plan.segments;
+            this.doneOnce = new boolean[plan.segments.size() + 1];
             this.bitrateMbps = plan.bitrateMbps;
             this.host = hostOf(plan.segments.isEmpty() ? baseUrl : plan.segments.get(0).url);
             Headers.Builder hb = new Headers.Builder();
@@ -722,6 +750,11 @@ public final class PrefetchManager {
                         int n = Math.min(len, st.length - pos);
                         System.arraycopy(src, pos, b, off, n);
                         pos += n;
+                        // r202：边下边发实际送达播放器的字节也要计入 servedBytes。
+                        //   之前只统计「命中整片」路径，于是 dlMB 远大于 servedMB，
+                        //   看起来像「下了一堆没人用」，其实是 stream 路径没记账。
+                        s.stat.servedBytes.addAndGet(n);
+                        globalStat(playerTag).servedBytes.addAndGet(n);
                         return n;
                     }
                     if (st.state == Seg.DONE) {
@@ -838,17 +871,27 @@ public final class PrefetchManager {
     }
 
     /**
-     * r201：预取并发上限 = 自适应窗口 W，但至少给播放头留一个名额
-     * （播放头等的是 1.5s 首字节，不能排在预取后面）。
+     * r201：预取并发上限。
+     *
+     * <p>r202：不再由自适应窗口 W 推导。原来的 {@code cap = W - 1}（下限 1）在源站很快时
+     * 会退化成 {@code cap = 1}——实测 {@code win=1} 恒定，于是深度 4 片只能串行铺，
+     * 缓冲永远补不满。现在预取并发独立取 {@link #PREFETCH_CONCURRENCY}，
+     * 只受单 host 名额（给播放头留一个）与近期错误约束。</p>
      */
     private static int prefetchCap(Session s) {
-        int w = PrefetchController.clamp(s.window, 1, M3u8PrefetchPlan.HARD_MAX_WINDOW);
-        int cap = w - 1;
+        int cap = Math.min(PREFETCH_CONCURRENCY, MAX_PER_HOST - 1);
         if (cap < 1) {
             cap = 1;
         }
-        if (cap > MAX_PER_HOST - 1) {
-            cap = MAX_PER_HOST - 1;
+        // 源站不稳时收敛并发，避免「一片失败带崩一片」
+        int errs = s.recentErrors();
+        if (errs >= 2) {
+            cap = 1;
+        } else if (errs >= 1) {
+            cap = Math.min(cap, 2);
+        }
+        if (s.perIpSuspect) {
+            cap = Math.min(cap, 2);
         }
         return cap;
     }
@@ -940,6 +983,14 @@ public final class PrefetchManager {
             s.stat.dlBytes.addAndGet(data.length);
             globalStat(playerTag).dlOk.incrementAndGet();
             globalStat(playerTag).dlBytes.addAndGet(data.length);
+            // r202：同一片第二次下载（曾被淘汰后又回跳/切播放器要用）记为重复下载，
+            //   用于量化「缓存不跨 seek 复用」到底浪费了多少流量。
+            if (index >= 1 && index < s.doneOnce.length && s.doneOnce[index]) {
+                s.stat.dupBytes.addAndGet(data.length);
+                globalStat(playerTag).dupBytes.addAndGet(data.length);
+            } else if (index >= 1 && index < s.doneOnce.length) {
+                s.doneOnce[index] = true;
+            }
 
             synchronized (s.lock) {
                 st.state = Seg.DONE;
@@ -1117,42 +1168,31 @@ public final class PrefetchManager {
     /**
      * r201：超出内存预算时淘汰。
      *
-     * <p>淘汰顺序（从「最不心疼」到「最心疼」）：</p>
-     * <ol>
-     *   <li><b>已播过的旧片</b>（index &lt; cursor-1）——r194 的老逻辑，没有价值了；</li>
-     *   <li><b>深度窗口之外的预取片</b>（index &gt; cursor+depth）——播放头已经走远，
-     *       或者深度被调小了，这些片留着也没用；</li>
-     *   <li><b>应急：窗口内最远的一片</b>——只有在内存实在压不住时才动它，
-     *       并且把它标成 FAILED（不再重新排队），避免「淘汰→重排→再淘汰」的抖动。</li>
-     * </ol>
-     *
-     * <p>正常情况下第 3 步不会触发：深度是按「实测最大片字节 × 片数 ≤ 预取内存预算」
-     * 算出来的，缓冲本身就有界。</p>
+     * <p>r202：改成<b>「离播放头最远优先」</b>的单级策略（r201 是「先已播、再窗口外、最后窗口内」）。
+     * 理由：旧的「已播过的一律先扔」在回跳/seek 时会立刻把刚播过的片全丢掉，
+     * 而 r202 的取舍是<b>复用优先</b>——回跳、切播放器（Exo↔IJK）都希望附近几片还在内存里。
+     * 按距离淘汰天然满足两点：</p>
+     * <ul>
+     *   <li>播放头<b>前后各留一片近邻</b>，回跳一两片不用回源；</li>
+     *   <li>内存吃紧时先丢最远的（无论是往前预取的尾巴，还是很久以前播过的老片）。</li>
+     * </ul>
      */
     private void evictIfNeeded(Session s) {
-        // ① 预取缓冲单独有预算（8MB）：超了先丢「深度窗口之外」的预取片，
-        //    这部分本来就用不上（播放头已经走过去，或深度被调小了）。
+        // ① 预取缓冲单独有预算（12MB）：超了先丢「播放头之前」里离得最远的那片。
         while (prefetchRetained(s) > PREFETCH_MEM_BUDGET) {
-            if (!evictOutsideWindow(s)) {
-                break; // 窗口内的不动，避免把缓冲自己拆了
+            if (!evictFarthest(s, true)) {
+                break; // 剩下的都在发送/下载中，动不了
             }
         }
-        // ② 会话总预算（16MB）：从「最不心疼」到「最心疼」依次淘汰。
+        // ② 会话总预算（16MB 硬顶）：这时才允许动播放头之前的片（远的先走）。
         while (true) {
             s.totalBytes = totalRetained(s);
             if (s.totalBytes <= SESSION_MEMORY_BUDGET) {
                 return;
             }
-            if (evictPlayed(s)) {
-                continue;
+            if (!evictFarthest(s, false)) {
+                return; // 没有可淘汰的（都在播放头附近，或正在发送/下载）
             }
-            if (evictOutsideWindow(s)) {
-                continue;
-            }
-            if (evictFarthestPrefetch(s)) {
-                continue;
-            }
-            return; // 没有可淘汰的（都在播放头附近，或正在发送/下载）
         }
     }
 
@@ -1173,78 +1213,44 @@ public final class PrefetchManager {
         }
     }
 
-    /** r201：淘汰一片「已播过」的旧片（index < cursor-1）。 */
-    private boolean evictPlayed(Session s) {
-        Iterator<Map.Entry<Integer, Long>> it = s.lru.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<Integer, Long> e = it.next();
-            int idx = e.getKey();
-            if (idx >= s.cursor - 1) {
-                continue; // 播放头附近以及之后的，先留着
-            }
-            Seg st = s.states.get(idx);
-            if (st != null && (st.readers > 0 || st.state == Seg.LOADING)) {
-                continue; // 正在流式发送 / 正在下载，不能动
-            }
-            it.remove();
-            releaseSeg(s, st, idx, false);
-            return true;
-        }
-        return false;
-    }
-
-    /** r201：淘汰深度窗口之外的预取片（index > cursor + depth）。 */
-    private boolean evictOutsideWindow(Session s) {
-        int limit = s.cursor + Math.max(1, s.depth);
+    /**
+     * r202：淘汰「离播放头最远」的一片。
+     *
+     * <p>距离＝{@code |index - cursor|}，播放头前后一视同仁——这样回跳复用与
+     * 预取深度是同一把尺子，不需要两套规则。</p>
+     *
+     * <p>淘汰后若这一片仍落在「会被重新调度」的区间（{@code cursor < idx <= cursor+depth}），
+     * 就标成 FAILED 保留条目，防止「淘汰 → 重排 → 再淘汰」的抖动；
+     * 区间外的直接回 EMPTY 并移出 states（r194 语义，避免无界增长）。</p>
+     *
+     * @param aheadOnly true＝只在 {@code idx > cursor} 的预取片里挑（预取预算超了时用，
+     *                  避免把播放头之前的回跳复用片也一起清掉）
+     */
+    private boolean evictFarthest(Session s, boolean aheadOnly) {
         int worst = -1;
+        int worstDist = -1;
         for (Map.Entry<Integer, Long> e : s.lru.entrySet()) {
             int idx = e.getKey();
-            if (idx <= limit) {
-                continue; // 窗口之内，留着
-            }
-            Seg st = s.states.get(idx);
-            if (st != null && (st.readers > 0 || st.state == Seg.LOADING)) {
+            if (aheadOnly && idx <= s.cursor) {
                 continue;
             }
-            if (idx > worst) {
-                worst = idx;
-            }
-        }
-        if (worst < 0) {
-            return false;
-        }
-        s.lru.remove(worst);
-        releaseSeg(s, s.states.get(worst), worst, false);
-        return true;
-    }
-
-    /**
-     * r201：应急——淘汰离播放头最远的那一片（index 最大者）。
-     *
-     * <p>这片还在深度窗口里，所以淘汰后<b>不会</b>再被重新排队（标成 FAILED），
-     * 避免「淘汰 → 重新下载 → 再淘汰」来回抖动；真到这一步说明内存实在压不住，
-     * 让播放头回源拿这一片更安全。</p>
-     */
-    private boolean evictFarthestPrefetch(Session s) {
-        int worst = -1;
-        for (Map.Entry<Integer, Long> e : s.lru.entrySet()) {
-            int idx = e.getKey();
-            if (idx <= s.cursor) {
-                continue; // 播放头及其之前的不在这里淘汰
-            }
             Seg st = s.states.get(idx);
             if (st != null && (st.readers > 0 || st.state == Seg.LOADING)) {
                 continue; // 正在流式发送 / 正在下载，不能动
             }
-            if (idx > worst) {
+            int dist = Math.abs(idx - s.cursor);
+            if (dist > worstDist || (dist == worstDist && idx > worst)) {
+                worstDist = dist;
                 worst = idx;
             }
         }
         if (worst < 0) {
             return false;
         }
+        boolean inScheduleWindow = worst > s.cursor
+                && worst <= s.cursor + Math.max(1, s.depth);
         s.lru.remove(worst);
-        releaseSeg(s, s.states.get(worst), worst, true);
+        releaseSeg(s, s.states.get(worst), worst, inScheduleWindow);
         return true;
     }
 
