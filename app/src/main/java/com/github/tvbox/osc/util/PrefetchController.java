@@ -14,8 +14,58 @@ package com.github.tvbox.osc.util;
  *   <li>一次最多升一档（升档要慢）；降档立即生效；</li>
  *   <li>近期错误多 → 直接收缩到 1/2；疑似按 IP 限速（4 路聚合收益 < 1.15×）→ 上限 2。</li>
  * </ul>
+ *
+ * <p><b>r201：并发数与预取深度解耦。</b>W 的语义是「同时在飞的连接数」
+ * （喂饱码率所需），而<b>预取深度</b>（播放头之前留多少片的缓冲）是另一件事，
+ * 由 {@link #targetDepth} 单独决定。二者混为一谈会产生一个反直觉的后果：
+ * CDN 越快 ⇒ 单连接吞吐越高 ⇒ {@code W_need} 越小 ⇒ 预取深度越小 ——
+ * 于是「越快的源反而越没有缓冲」。对 ffmpeg/IJK 这类严格串行消费切片的播放器
+ * （读完第 N 片才开始播，播完才请求 N+1），深度不足就等于「总是在片的下载临界点取片」，
+ * 源站一抖就变成一次卡顿。故深度按<b>时间目标</b>（约 {@link #TARGET_BUFFER_SEC} 秒）
+ * 折算成片数，再受内存预算约束。</p>
  */
 public final class PrefetchController {
+
+    /** r201：预取深度目标（秒）——播放头之前希望已就绪的缓冲时长。 */
+    public static final double TARGET_BUFFER_SEC = 30.0;
+    /** r201：预取深度下限（片）。 */
+    public static final int MIN_DEPTH = 1;
+    /** r201：预取深度上限（片）。 */
+    public static final int MAX_DEPTH = 8;
+    /** r201：单片字节未知时的保守估计（用于按内存预算收敛深度）。 */
+    private static final long ASSUMED_SEG_BYTES = 2L * 1024 * 1024;
+
+    /**
+     * r201：计算预取深度（片）——与并发窗口 W 解耦。
+     *
+     * <p>W 回答的是「同时开几条连接才喂得饱码率」；深度回答的是「播放头之前
+     * 应该留多少片已就绪的缓冲」。前者随源站速度变化，后者只跟片长与内存预算有关。
+     * 二者必须分开，否则源站越快 ⇒ W 越小 ⇒ 缓冲越薄 ⇒ 串行消费切片的播放器
+     * （ffmpeg/IJK）永远在片的下载临界点取片。</p>
+     *
+     * @param bitrateMbps    运行中估算码率（Mbps，未知 0）
+     * @param avgSegmentSec  平均片长（秒，未知 0）
+     * @param measuredAvgBytes 已下载片的平均字节（0 = 还没测出来）
+     * @param memBudgetBytes 允许预取缓冲占用的堆字节
+     */
+    public static int targetDepth(double bitrateMbps, double avgSegmentSec,
+                                  long measuredAvgBytes, long memBudgetBytes) {
+        double dur = avgSegmentSec > 0 ? avgSegmentSec : 4.0;
+        int byTime = (int) Math.ceil(TARGET_BUFFER_SEC / dur);
+        int depth = clamp(byTime, MIN_DEPTH, MAX_DEPTH);
+        long segBytes = measuredAvgBytes > 0 ? measuredAvgBytes : 0L;
+        if (segBytes <= 0 && bitrateMbps > 0) {
+            segBytes = (long) (bitrateMbps * 1e6 / 8.0 * dur);
+        }
+        if (segBytes <= 0) {
+            segBytes = ASSUMED_SEG_BYTES;
+        }
+        if (memBudgetBytes > 0) {
+            int byMem = (int) (memBudgetBytes / segBytes);
+            depth = Math.min(depth, Math.max(MIN_DEPTH, byMem));
+        }
+        return clamp(depth, MIN_DEPTH, MAX_DEPTH);
+    }
 
     /** 目标码率的安全系数（按播放倍速分档）。 */
     public static double marginForSpeed(float speed) {
