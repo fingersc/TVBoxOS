@@ -8263,7 +8263,21 @@ public class DetailActivity extends BaseActivity {
         }
         fullWindows = full;
         if (playFragment != null) {
-            playFragment.setAutoSwitchLineEnabled(!fullWindows);
+            // ★ r199：全屏不再关闭自动换源（改动前是 `!fullWindows`，全屏 ⇒ 关闭）。
+            //
+            //   为什么必须放开：那一行是整条换源链路的总闸。allowAutoSwitchLine=false 时
+            //     ① tryNextLineIfEnabled() 直接 return（自动换线失效）；
+            //     ② triggerStallSwitch() 打印 "[PS] stall-switch disabled"（r153 卡顿切源失效）；
+            //     ③ handleResolvePlayUrlTimeout/Failed、handleSwitchLinePlayTimeout、
+            //        handleParseStallCheck 全部汇入 ① ⇒ 起播失败不再自动换线；
+            //     ④ tryNextLine() 里「所有线路耗尽 → 站点兜底换源」也走不到；
+            //     ⑤ startSwitchLinePlayTimeout() 因 !allowAutoSwitchLine 直接 cancelPlayTimeout()
+            //        ⇒ 全屏下起播失败既不换线也没有超时兜底，用户只能黑屏卡死、手动退出全屏。
+            //
+            //   现在恒传 true：是否自动换线只由设置项「自动换线」(HawkConfig.AUTO_SWITCH_LINE)
+            //   决定，判定在 PlayFragment.tryNextLineIfEnabled / triggerStallSwitch 内各一次
+            //   （不在这里重复判，避免出现两份真相）；窗口态不再参与。
+            playFragment.setAutoSwitchLineEnabled(true);
             playFragment.setPreviewMode(!fullWindows);
         }
         // 索引源恒不带播放器（见 applyThumbPreviewStyle 的海报分支），
