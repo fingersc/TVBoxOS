@@ -1272,6 +1272,13 @@ public class PlayFragment extends BaseLazyFragment {
                         playTimeoutBasePosition = getSavedProgress(progressKey);
                         boolean forceExoPlayer = url.startsWith("data:application/dash+xml;base64,")
                                 || url.contains(".mpd") || url.contains("type=mpd");
+                        // r200：给服务端分片度量打上播放器标签（ijk / exo），
+                        //   这样两种播放器用的是同一把尺子，可以直接横向比较。
+                        try {
+                            int pl = mVodPlayerCfg.optInt("pl", Hawk.get(HawkConfig.PLAY_TYPE, 2));
+                            PrefetchManager.get().setPlayerTag(pl == 1 ? "ijk" : "exo");
+                        } catch (Throwable ignored) {
+                        }
                         if (url.startsWith("data:application/dash+xml;base64,")) {
                             PlayerHelper.updateCfg(mVideoView, mVodPlayerCfg, 2);
                             App.getInstance().setDashData(url.split("base64,")[1]);

@@ -25,6 +25,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.orhanobut.hawk.Hawk;
 
@@ -69,6 +70,117 @@ public final class PrefetchManager {
     private static volatile float playbackSpeed = 1.0f;
 
     private static volatile PrefetchManager instance;
+
+    /**
+     * r200：当前播放使用的播放器标签（ijk / exo / ext），用于把分片度量分播放器归集。
+     * 由 {@code PlayFragment.goPlayUrl} 在选定播放器后写入。
+     */
+    private static volatile String playerTag = "?";
+
+    /**
+     * r200：分片度量（服务端口径，Exo / IJK 通用）。
+     *
+     * <p>放在服务端而不是播放器侧的理由：ffmpeg（IJK）用自己的 HTTP 栈发请求，
+     * 不经过 OkHttp 拦截器，客户端日志里<b>完全看不到</b> /seg 请求；
+     * 只有在代理服务端记账，才能对两种播放器用同一把尺子比较。</p>
+     */
+    public static final class SegStat {
+        /** 播放器请求的切片数。 */
+        final AtomicLong req = new AtomicLong();
+        /** 命中内存缓冲，直接 200/206 回整片。 */
+        final AtomicLong hit = new AtomicLong();
+        /** 等到首字节后边下边发（chunked）。 */
+        final AtomicLong stream = new AtomicLong();
+        /** 302 回源（本地拿不到）。 */
+        final AtomicLong redirect = new AtomicLong();
+        /** 预取提交过的下载任务数。 */
+        final AtomicLong dlReq = new AtomicLong();
+        /** 下载成功 / 失败。 */
+        final AtomicLong dlOk = new AtomicLong();
+        final AtomicLong dlFail = new AtomicLong();
+        /** 预取下载的字节数。 */
+        final AtomicLong dlBytes = new AtomicLong();
+        /** 等待首字节的耗时（毫秒）。 */
+        final AtomicLong waitMs = new AtomicLong();
+        final AtomicLong waitMaxMs = new AtomicLong();
+        /** 命中缓存直接回给播放器的字节数。 */
+        final AtomicLong servedBytes = new AtomicLong();
+
+        void addWait(long ms) {
+            if (ms <= 0) {
+                return;
+            }
+            waitMs.addAndGet(ms);
+            long old;
+            do {
+                old = waitMaxMs.get();
+                if (ms <= old) {
+                    break;
+                }
+            } while (!waitMaxMs.compareAndSet(old, ms));
+        }
+
+        void merge(SegStat o) {
+            req.addAndGet(o.req.get());
+            hit.addAndGet(o.hit.get());
+            stream.addAndGet(o.stream.get());
+            redirect.addAndGet(o.redirect.get());
+            dlReq.addAndGet(o.dlReq.get());
+            dlOk.addAndGet(o.dlOk.get());
+            dlFail.addAndGet(o.dlFail.get());
+            dlBytes.addAndGet(o.dlBytes.get());
+            servedBytes.addAndGet(o.servedBytes.get());
+            waitMs.addAndGet(o.waitMs.get());
+            long old;
+            do {
+                old = waitMaxMs.get();
+                if (o.waitMaxMs.get() <= old) {
+                    break;
+                }
+            } while (!waitMaxMs.compareAndSet(old, o.waitMaxMs.get()));
+        }
+
+        /** 一行摘要，便于在日志里横向比较 Exo 与 IJK。 */
+        public String summary() {
+            long r = req.get();
+            long w = waitMs.get();
+            double mb = dlBytes.get() / 1024.0 / 1024.0;
+            return "req=" + r
+                    + " hit=" + hit.get()
+                    + " stream=" + stream.get()
+                    + " redir=" + redirect.get()
+                    + " dl=" + dlOk.get() + "/" + (dlOk.get() + dlFail.get())
+                    + " dlMB=" + String.format(java.util.Locale.US, "%.1f", mb)
+                    + " waitAvg=" + (r > 0 ? (w / r) : 0) + "ms"
+                    + " waitMax=" + waitMaxMs.get() + "ms"
+                    + " servedMB=" + String.format(java.util.Locale.US, "%.1f", servedBytes.get() / 1024.0 / 1024.0);
+        }
+    }
+
+    /** 全局（按播放器标签分桶）的分片度量。 */
+    private static final Map<String, SegStat> globalStats = new ConcurrentHashMap<>();
+
+    /** 取（或建）某个播放器标签对应的全局度量桶。 */
+    private static SegStat globalStat(String tag) {
+        SegStat s = globalStats.get(tag);
+        if (s == null) {
+            synchronized (globalStats) {
+                s = globalStats.get(tag);
+                if (s == null) {
+                    s = new SegStat();
+                    globalStats.put(tag, s);
+                }
+            }
+        }
+        return s;
+    }
+
+    /** r200：设置当前播放器标签（ijk / exo / ext），用于度量分桶。 */
+    public void setPlayerTag(String tag) {
+        if (tag != null && !tag.isEmpty()) {
+            playerTag = tag;
+        }
+    }
 
     public static PrefetchManager get() {
         if (instance == null) {
@@ -222,6 +334,10 @@ public final class PrefetchManager {
         final Map<Integer, Seg> states = new HashMap<>();
         final LinkedHashMap<Integer, Long> lru = new LinkedHashMap<>(16, 0.75f, true);
         final boolean[] recent = new boolean[10];
+        /** r200：本会话的分片度量（会话级，release 时汇总）。 */
+        final SegStat stat = new SegStat();
+        /** r200：本会话度量是否已并入全局桶（避免重复计）。 */
+        volatile boolean statMerged = false;
 
         int window = 2;
         volatile int cursor = 1;
@@ -356,6 +472,9 @@ public final class PrefetchManager {
         if (s != null) {
             abort(s);
             LOG.d("prefetch release " + shortSk(sk));
+            // r200：会话收尾时打一行汇总（并入全局桶的动作在 abort 里做，避免重复计）。
+            LOG.i("[pref] stat tag=" + playerTag + " sk=" + shortSk(sk)
+                    + " END " + s.stat.summary());
         }
     }
 
@@ -381,28 +500,68 @@ public final class PrefetchManager {
             return SegResult.redirect(null);
         }
         s.lastAccess = System.currentTimeMillis();
+        // r200：服务端口径度量（Exo / IJK 同尺子）
+        SegStat g = globalStat(playerTag);
+        s.stat.req.incrementAndGet();
+        g.req.incrementAndGet();
         if (index < 1 || index > s.segs.size()) {
+            s.stat.redirect.incrementAndGet();
+            g.redirect.incrementAndGet();
             return SegResult.redirect(null);
         }
         String mime = mimeFor(s.segs.get(index - 1).url);
         byte[] ready = readyData(s, index);
         if (ready != null) {
             s.cursor = index;
+            s.stat.hit.incrementAndGet();
+            g.hit.incrementAndGet();
+            s.stat.servedBytes.addAndGet(ready.length);
+            g.servedBytes.addAndGet(ready.length);
+            logStatIfDue(s, index);
             return applyRange(mime, ready, rangeHeader);
         }
         if (rangeHeader != null && !rangeHeader.isEmpty()) {
             // 区间请求只从完整缓冲服务（HLS 极少走这条）；未就绪就回源
             s.cursor = index;
             schedule(s, index);
+            s.stat.redirect.incrementAndGet();
+            g.redirect.incrementAndGet();
+            logStatIfDue(s, index);
             return SegResult.redirect(s.segs.get(index - 1).url);
         }
         s.cursor = index;
         schedule(s, index);
+        long t0 = System.currentTimeMillis();
         Seg st = awaitFirstByte(s, index, FIRST_BYTE_WAIT_MS);
+        long waited = System.currentTimeMillis() - t0;
+        s.stat.addWait(waited);
+        g.addWait(waited);
         if (st == null || st.length <= 0) {
+            s.stat.redirect.incrementAndGet();
+            g.redirect.incrementAndGet();
+            logStatIfDue(s, index);
             return SegResult.redirect(s.segs.get(index - 1).url);
         }
+        s.stat.stream.incrementAndGet();
+        g.stream.incrementAndGet();
+        logStatIfDue(s, index);
         return SegResult.stream(mime, new SegStream(s, index, st));
+    }
+
+    /**
+     * r200：每若干片打一行进度度量（不逐片打，避免日志噪声）。
+     * 每行都带播放器标签，Exo / IJK 可以直接对照。
+     */
+    private void logStatIfDue(Session s, int index) {
+        long n = s.stat.req.get();
+        if (n == 0 || n % 20 != 0) {
+            return;
+        }
+        LOG.i("[pref] stat tag=" + playerTag + " sk=" + shortSk(s.sk)
+                + " i=" + index
+                + " win=" + s.window
+                + " bitrate=" + String.format(java.util.Locale.US, "%.2f", s.bitrateMbps)
+                + " " + s.stat.summary());
     }
 
     private static byte[] readyData(Session s, int index) {
@@ -595,6 +754,9 @@ public final class PrefetchManager {
             }
         }
         for (final Integer i : submit) {
+            // r200：预取下载任务计数
+            s.stat.dlReq.incrementAndGet();
+            globalStat(playerTag).dlReq.incrementAndGet();
             try {
                 pool.execute(new Runnable() {
                     @Override
@@ -642,6 +804,11 @@ public final class PrefetchManager {
             long t0 = System.currentTimeMillis();
             byte[] data = fetchStreaming(s, st, seg.url);
             long dt = Math.max(1, System.currentTimeMillis() - t0);
+            // r200：下载侧度量（成功/字节）
+            s.stat.dlOk.incrementAndGet();
+            s.stat.dlBytes.addAndGet(data.length);
+            globalStat(playerTag).dlOk.incrementAndGet();
+            globalStat(playerTag).dlBytes.addAndGet(data.length);
 
             synchronized (s.lock) {
                 st.state = Seg.DONE;
@@ -669,6 +836,8 @@ public final class PrefetchManager {
                 s.lock.notifyAll();
             }
         } catch (Throwable e) {
+            s.stat.dlFail.incrementAndGet();
+            globalStat(playerTag).dlFail.incrementAndGet();
             synchronized (s.lock) {
                 st.attempts++;
                 if (st.attempts < 2 && !s.closed) {
@@ -912,6 +1081,12 @@ public final class PrefetchManager {
     }
 
     private void abort(Session s) {
+        // r200：会话结束（释放 / 被新会话顶掉 / LRU 淘汰）时把度量并进全局桶，
+        //   保证 Exo 与 IJK 的对比数据不会因为会话被顶掉而丢。
+        if (!s.statMerged) {
+            s.statMerged = true;
+            globalStat(playerTag).merge(s.stat);
+        }
         s.closed = true;
         synchronized (s.lock) {
             for (Seg st : s.states.values()) {

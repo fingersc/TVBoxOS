@@ -2,7 +2,11 @@ package com.github.tvbox.osc.util;
 
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -10,8 +14,16 @@ import java.util.regex.Pattern;
  * A′ 方案（本地分片代理 + 跨切片滚动预取）的纯逻辑层。
  *
  * <p>职责：把一条 HLS media playlist 解析成「有序切片列表」，并生成一份把切片行
- * 改写成本地代理地址（{@code /seg?sk=<sessionKey>&i=<序号>}）的新播放列表。
+ * 改写成本地代理地址（{@code /seg.ts?sk=<sessionKey>&i=<序号>}）的新播放列表。
  * 本类<b>不依赖 Android / OkHttp</b>，可在桌面 JVM 上直接单测（见 work\ 下的测试台）。</p>
+ *
+ * <p>r200：切片行带上了<b>源站真实的容器扩展名</b>（{@code .ts/.m4s/.mp4…}）。
+ * 原因：ffmpeg 的 hls demuxer 会检查切片 URL 的<b>路径</b>是否以允许的扩展名结尾，
+ * 不满足就报 {@code is not in allowed_segment_extensions} 并直接拒绝打开（连请求都不发）。
+ * IJK 当前用的 ffmpeg 4.0 是「按内容探测」，所以旧的无扩展名地址还能播；一旦换成
+ * ffmpeg ≥5 的构建就会直接播不了。带上真实扩展名对 Exo/IJK 都无副作用，
+ * 同时还能让 Exo 侧 {@code OkHttpDataSource.isMediaUrl()} 重新认出切片、恢复
+ * {@code [seg]} 吞吐统计。</p>
  *
  * <p>安全边界（宁可不加速也不弄坏播放）：</p>
  * <ul>
@@ -51,7 +63,68 @@ public final class M3u8PrefetchPlan {
 
     private static final Pattern URI_ATTR = Pattern.compile("URI=\"([^\"]*)\"");
 
+    /**
+     * fMP4 家族的后缀：这类切片在本地代理路径上统一改写成 {@code .m4s}。
+     * 依据 ffmpeg hls.c 的 {@code test_segment()}：mpegts 容器接受
+     * {@code ts,m2t,m2ts,mts,mpg,m4s,mpeg,mpegts,html}，mp4/aac 容器在
+     * {@code in_fmt->extensions} 之外还额外接受 {@code ts,...,m4s,...,cmfv,cmfa}
+     * —— 所以 {@code .ts} 与 {@code .m4s} 对两种真实容器都安全，
+     * 而 {@code .mp4} 遇到 TS 内容会被直接拒播。
+     */
+    private static final Set<String> FMP4_SUFFIX = new HashSet<>(Arrays.asList(
+            "m4s", "mp4", "m4v", "m4a", "cmfv", "cmfa", "mov", "3gp", "fmp4", "ismv"));
+
     private M3u8PrefetchPlan() {
+    }
+
+    /**
+     * 依据源站切片地址推导本地代理路径上使用的容器扩展名。
+     *
+     * <p>ffmpeg master 的 hls demuxer 有两道关（{@code libavformat/hls.c} 的
+     * {@code test_segment()}）：切片 URL 的<b>路径</b>要落在
+     * {@code allowed_segment_extensions} 白名单里，且要和探测出的真实容器相容，
+     * 两者按位与才算通过；query 里的字符不算路径，但 ff_match_url_ext 会剥掉
+     * query 后再匹配，所以 {@code /seg.ts?sk=..&i=1} 这种写法可以通过。</p>
+     *
+     * <p>实测（ffmpeg 7.x / master 行为）：{@code .ts} 与 {@code .m4s} 对
+     * TS 与 fMP4 两种真实容器都安全；{@code .mp4} 遇到 TS 内容会被直接拒播
+     * （{@code detected format mpegts extension none mismatches allowed extensions}）。</p>
+     */
+    public static String containerExt(String url) {
+        return containerExt(url, false);
+    }
+
+    /**
+     * @param url            源站切片地址
+     * @param hasInitSection 该 playlist 是否含 {@code #EXT-X-MAP}（fMP4 的权威标志）
+     */
+    public static String containerExt(String url, boolean hasInitSection) {
+        if (url == null) {
+            return hasInitSection ? ".m4s" : ".ts";
+        }
+        String path = url;
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            path = path.substring(0, q);
+        }
+        int h = path.indexOf('#');
+        if (h >= 0) {
+            path = path.substring(0, h);
+        }
+        int slash = path.lastIndexOf('/');
+        String name = slash >= 0 ? path.substring(slash + 1) : path;
+        int dot = name.lastIndexOf('.');
+        if (dot < 0 || dot == name.length() - 1) {
+            // 源站没给后缀：靠 #EXT-X-MAP 判断容器族
+            return hasInitSection ? ".m4s" : ".ts";
+        }
+        String suffix = name.substring(dot + 1).toLowerCase(Locale.US);
+        if (FMP4_SUFFIX.contains(suffix)) {
+            return ".m4s";
+        }
+        // 源站后缀不在 fMP4 族，但 playlist 里有 EXT-X-MAP ⇒ 实际是 fMP4，
+        // 不能用 .ts（mpegts 容器不接受 .mp4 内容，反之亦然）。
+        return hasInitSection ? ".m4s" : ".ts";
     }
 
     /**
@@ -67,13 +140,34 @@ public final class M3u8PrefetchPlan {
         }
         String[] rawLines = content.split("\n", -1);
         List<String> out = new ArrayList<>(rawLines.length + 8);
+        // r200：把本地前缀拆成「路径段」和「索引参数段」，好把容器扩展名插在两者之间。
+        //   形如 "/seg?sk=SK&i=" → localPath="/seg"，localTail="?sk=SK&i="
+        //   最终切片行 = /seg + .ts + ?sk=SK&i=1
+        String localPath = localPrefix;
+        String localTail = "";
+        int q = localPrefix.indexOf('?');
+        if (q >= 0) {
+            localPath = localPrefix.substring(0, q);
+            localTail = localPrefix.substring(q);
+        }
 
         boolean sawExtinf = false;
         boolean sawStreamInf = false;
         boolean sawByteRange = false;
+        boolean sawInitSection = false;
         double pendingDuration = -1;
         double bitrateKbps = 0;
         int index = 0;
+
+        // r200：先扫一遍有没有 #EXT-X-MAP —— 它是 fMP4 的权威标志，
+        //   用来在源站切片没有可识别后缀时也能选对容器扩展名。
+        for (String raw : rawLines) {
+            String t = raw.trim();
+            if (t.startsWith("#EXT-X-MAP")) {
+                sawInitSection = true;
+                break;
+            }
+        }
 
         for (String raw : rawLines) {
             String line = raw.endsWith("\r") ? raw.substring(0, raw.length() - 1) : raw;
@@ -109,7 +203,9 @@ public final class M3u8PrefetchPlan {
             seg.url = abs;
             seg.durationSec = pendingDuration > 0 ? pendingDuration : 0;
             plan.segments.add(seg);
-            out.add(localPrefix + index);
+            // r200：切片行带上源站真实容器扩展名（/seg.ts?sk=..&i=N），
+            //   让新版 ffmpeg 的 hls demuxer（按路径扩展名白名单校验）也能正常打开。
+            out.add(localPath + containerExt(abs, sawInitSection) + localTail + index);
             pendingDuration = -1;
         }
 

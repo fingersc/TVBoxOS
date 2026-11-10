@@ -210,7 +210,8 @@ public class RemoteServer extends NanoHTTPD {
             }
             // ★ A′：本地分片代理。必须在 method 判断之前拦截，GET/HEAD 都走这里，
             //   给了 Range 就回 206，没给就回整片；片不在缓冲/下载失败则 302 回源。
-            if (fileName.equals("/seg")) {
+            //   r200：切片路径带容器扩展名（/seg.ts / /seg.m4s），旧的无扩展名 /seg 仍兼容。
+            if (isSegmentPath(fileName)) {
                 return handleSegment(session);
             }
             if (session.getMethod() == Method.GET) {
@@ -389,6 +390,27 @@ public class RemoteServer extends NanoHTTPD {
         if (params == null) return false;
         if (!params.containsKey("do") && !params.containsKey("go")) return false;
         return fileName.equals("/proxy") || fileName.equals("/");
+    }
+
+    /**
+     * 判断是否本地分片代理路径。
+     *
+     * <p>r200 起切片行带容器扩展名（形如 {@code /seg.ts}、{@code /seg.m4s}），
+     * 这样新版 ffmpeg 的 hls demuxer 才会认；旧的 {@code /seg} 仍兼容，
+     * 以免老会话（以及尚未重写的播放列表）直接 404。</p>
+     */
+    private static boolean isSegmentPath(String fileName) {
+        if (fileName == null) return false;
+        if (fileName.equals("/seg")) return true;
+        if (!fileName.startsWith("/seg.")) return false;
+        String ext = fileName.substring(5);
+        if (ext.isEmpty() || ext.length() > 5) return false;
+        for (int i = 0; i < ext.length(); i++) {
+            char c = ext.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            if (!ok) return false;
+        }
+        return true;
     }
 
     private Response handleSegment(IHTTPSession session) {
