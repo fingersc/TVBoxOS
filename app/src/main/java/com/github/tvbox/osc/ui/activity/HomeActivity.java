@@ -356,17 +356,24 @@ public class HomeActivity extends BaseActivity {
             public void onChanged(AbsSortXml absXml) {
                 if (skipNextUpdate) {
                     skipNextUpdate = false;
+                    LOG.i("[home] sortResult skipped by skipNextUpdate");
                     return;
                 }
                 if (!homeSortLoading && loadingSourceKey == null) {
+                    LOG.i("[home] sortResult ignored (idle) key=" + (absXml == null ? "null" : absXml.sourceKey));
                     return;
                 }
                 if (absXml != null && absXml.sourceKey != null && loadingSourceKey != null && !loadingSourceKey.equals(absXml.sourceKey)) {
+                    LOG.i("[home] sortResult ignored (sourceKey mismatch) want=" + loadingSourceKey + " got=" + absXml.sourceKey);
                     return;
                 }
                 SourceBean home = ApiConfig.get().getHomeSourceBean();
                 showSuccess();
                 clearHomePages();
+                int rawClassCount = (absXml != null && absXml.classes != null && absXml.classes.sortList != null) ? absXml.classes.sortList.size() : -1;
+                LOG.i("[home] sortResult apply key=" + (absXml == null ? "null" : absXml.sourceKey)
+                        + " rawClassCount=" + rawClassCount
+                        + " videoList=" + (absXml == null || absXml.videoList == null ? 0 : absXml.videoList.size()));
                 List<MovieSort.SortData> newSortData;
                 if (absXml != null && absXml.classes != null && absXml.classes.sortList != null) {
                     newSortData = DefaultConfig.adjustSort(ApiConfig.get().getHomeSourceBean().getKey(), absXml.classes.sortList, true);
@@ -374,10 +381,16 @@ public class HomeActivity extends BaseActivity {
                     newSortData = DefaultConfig.adjustSort(ApiConfig.get().getHomeSourceBean().getKey(), new ArrayList<>(), true);
                 }
                 updateSortData(newSortData);
+                LOG.i("[home] sortAdapter size=" + sortAdapter.getData().size());
                 initViewPager(absXml);
                 updateHomeRec(absXml);
                 if (home != null && home.getName() != null && !home.getName().isEmpty()) tvName.setText(home.getName());
                 tvName.clearAnimation();
+                // r208：type-3 首页源返回 0 个分类时给出明确提示，避免「无限转圈/空白」无解释。
+                if (rawClassCount <= 0 && home != null && home.getType() == 3) {
+                    LOG.e("[home] empty sort for type-3 source key=" + home.getKey());
+                    Toast.makeText(HomeActivity.this, "豆瓣影视库暂无分类，长按站点名可重试", Toast.LENGTH_SHORT).show();
+                }
                 homeSortLoading = false;
                 loadingSourceKey = null;
                 previousHomeName = null;
@@ -552,6 +565,7 @@ public class HomeActivity extends BaseActivity {
 
     private void loadHomeSort(boolean keepCurrentContent) {
         SourceBean home = ApiConfig.get().getHomeSourceBean();
+        LOG.i("[home] loadHomeSort keepCurrentContent=" + keepCurrentContent + " home=" + (home == null ? "null" : home.getKey()));
         homeSortLoading = keepCurrentContent;
         if (keepCurrentContent && home != null && home.getName() != null && !home.getName().isEmpty()) {
             previousHomeName = tvName.getText() == null ? null : tvName.getText().toString();

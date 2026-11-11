@@ -882,7 +882,14 @@ public class DetailActivity extends BaseActivity {
         }
         setLoadSir(llLayout);
         if (fullWindows) {
-            setFullPreview(true);
+            // r208：恢复态下此时 playFragment 尚未创建，延后一拍再进全屏，
+            // 让 setFullPreview 的自愈逻辑在视图树就绪后建好 Fragment。
+            llPlayerFragmentContainer.post(new Runnable() {
+                @Override
+                public void run() {
+                    setFullPreview(true);
+                }
+            });
         }
     }
 
@@ -2616,7 +2623,9 @@ public class DetailActivity extends BaseActivity {
             setTextShow(tvSite, "来源：", indicatorName);
             setTextShow(tvType, "类型：", "[" + indicatorName + "] 解析");
             // 地址先置「获取中」：旧源地址留在那里会让人误以为没切
-            setTextShow(tvPlayUrl, "播放地址：", "获取中…");
+            // r208：带上轮转进度，避免用户只看到一句不动的「获取中…」。
+            int triedFailover = switchSession == null ? 0 : switchSession.failoverCount();
+            setTextShow(tvPlayUrl, "播放地址：", "获取中…（已尝试 " + triedFailover + "/" + DETAIL_FALLBACK_MAX_FAILOVER + " 个源）");
             if (video != null && !TextUtils.isEmpty(video.pic)) {
                 com.github.tvbox.osc.util.ImgUtil.load(
                         DefaultConfig.checkReplaceProxy(video.pic), ivThumb,
@@ -5200,8 +5209,24 @@ public class DetailActivity extends BaseActivity {
         boolean keepCurrentDetail = detailFallbackKeepCurrentDetail;
         resetDetailFallback();
         if (!keepCurrentDetail) {
+            // r208：「获取中…」必须有终态，不能停在切源占位文案上。
+            setTvPlayUrl("暂无可用播放地址");
             showDetailEmpty();
         } else {
+            // 保留当前详情：把播放地址还原成当前集的真实 URL（切源前被置成了「获取中…」）。
+            String restoreUrl = "";
+            try {
+                if (vodInfo != null && vodInfo.seriesMap != null && vodInfo.playFlag != null) {
+                    List<VodInfo.VodSeries> series = vodInfo.seriesMap.get(vodInfo.playFlag);
+                    int idx = vodInfo.playIndex;
+                    if (series != null && idx >= 0 && idx < series.size() && series.get(idx) != null) {
+                        restoreUrl = series.get(idx).url;
+                    }
+                }
+            } catch (Throwable th) {
+                th.printStackTrace();
+            }
+            setTvPlayUrl(TextUtils.isEmpty(restoreUrl) ? "暂无可用播放地址" : restoreUrl);
             showSuccess();
         }
     }
@@ -8250,7 +8275,9 @@ public class DetailActivity extends BaseActivity {
     @Override
     public void onBackPressed() {
         if (fullWindows) {
-            if (playFragment.onBackPressed())
+            // r208：playFragment 可能为 null（详情未就绪就进全屏的历史态/恢复态），
+            // 直接解引用会 NPE 崩溃（16:27:24 现场）。判空后安全退出全屏。
+            if (playFragment != null && playFragment.onBackPressed())
                 return;
             exitFullPreview();
             return;
@@ -8394,6 +8421,18 @@ public class DetailActivity extends BaseActivity {
             previewOrientationChanged = false;
         }
         fullWindows = full;
+        // r208：保证「全屏态 ⇒ 播放器 Fragment 已挂载」不变量。
+        // 旧逻辑只在 jumpToPlay() 里懒创建 Fragment，而三个「全屏」入口
+        // （llPlayerFragmentContainerBlock / tvPlay / onCreate 恢复）都只调本方法；
+        // 详情未就绪时 jumpToPlay() 直接 return ⇒ fullWindows=true 但 playFragment=null，
+        // 既黑屏又在返回键时 NPE（r208 崩溃主因）。
+        if (fullWindows && playFragment == null && !indexOnlyDetail && !isFinishing() && !isDestroyed()) {
+            ensurePlayFragment();
+        }
+        if (fullWindows && playFragment == null) {
+            // 索引源（无播放器）或创建失败：退回预览态，绝不进入「没有播放器的假全屏」。
+            fullWindows = false;
+        }
         if (playFragment != null) {
             // ★ r199：全屏不再关闭自动换源（改动前是 `!fullWindows`，全屏 ⇒ 关闭）。
             //
@@ -8479,10 +8518,18 @@ public class DetailActivity extends BaseActivity {
      *
      * <p>拿到日志后直接找 `宽x高` 接近 547x273、`@(0,0~20)` 的那一行，它的 id 就是答案。</p>
      */
+    /** r208：viewtree dump 节流（毫秒），避免切源/布局回调高频触发时刷爆日志被 logd 丢弃。 */
+    private long lastViewTreeDumpMs = 0L;
+
     private void dumpViewTree(final String tag) {
         if (!LOG.isDebugEnabled()) {
             return;
         }
+        long nowDump = android.os.SystemClock.elapsedRealtime();
+        if (nowDump - lastViewTreeDumpMs < 1000L) {
+            return;
+        }
+        lastViewTreeDumpMs = nowDump;
         final View root = getWindow().getDecorView();
         root.postDelayed(new Runnable() {
             @Override

@@ -423,6 +423,8 @@ public class SourceViewModel extends ViewModel {
                     } finally {
                         if (sortJson != null) {
                             final AbsSortXml sortXml = sortJson(sortResult, sortJson);
+                            LOG.i("[home] getSort done key=" + sourceKey + " jsonLen=" + sortJson.length()
+                                    + " classes=" + (sortXml == null || sortXml.classes == null || sortXml.classes.sortList == null ? -1 : sortXml.classes.sortList.size()));
                             attachSortSource(sourceKey, sortXml);
                             if (sortXml != null && Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1) {
                                 AbsXml absXml = json(null, sortJson, sourceBean.getKey());
@@ -445,6 +447,7 @@ public class SourceViewModel extends ViewModel {
                                 cacheSort(sourceKey, sortXml);
                             }
                         } else {
+                            LOG.i("[home] getSort null json key=" + sourceKey);
                             postSortResult(sourceKey, null);
                         }
                         try {
@@ -613,6 +616,7 @@ public class SourceViewModel extends ViewModel {
         }
         SourceBean homeSourceBean = ApiConfig.get().getHomeSourceBean();
         int type = homeSourceBean.getType();
+        LOG.i("[list] getList id=" + sortData.id + " page=" + page + " type=" + type);
         if (type == 3) {
             spThreadPool.execute(new Runnable() {
                 @Override
@@ -639,8 +643,10 @@ public class SourceViewModel extends ViewModel {
                     } finally {
                         executor.shutdown();
                         if (json != null) {
+                            LOG.i("[list] getList done id=" + sortData.id + " page=" + page + " jsonLen=" + json.length());
                             json(listResult, json,homeSourceBean.getKey());
                         } else {
+                            LOG.i("[list] getList empty id=" + sortData.id + " page=" + page);
                             listResult.postValue(null);
                         }
                     }
@@ -855,7 +861,7 @@ public class SourceViewModel extends ViewModel {
                     });
                     String sortJson = null;
                     try {
-                        sortJson = future.get(20, TimeUnit.SECONDS);
+                        sortJson = future.get(5, TimeUnit.SECONDS);
                     } catch (TimeoutException e) {
                         e.printStackTrace();
                         future.cancel(true);

@@ -390,6 +390,8 @@ public class GridFragment extends BaseLazyFragment {
             @Override
             public void onChanged(AbsXml absXml) {
                 isRequesting = false;
+                int got = absXml != null && absXml.movie != null && absXml.movie.videoList != null ? absXml.movie.videoList.size() : 0;
+                LOG.i("[list] grid result page=" + page + " got=" + got);
                 if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
                     if (page == 1) {
                         showSuccess();
@@ -450,6 +452,7 @@ public class GridFragment extends BaseLazyFragment {
         hasActionItems = false;
         scrollTop();
         toggleFilterColor();
+        LOG.i("[list] grid initData id=" + (sortData == null ? "null" : sortData.id) + " page=" + page);
         sourceViewModel.getList(sortData, page);
     }
 
