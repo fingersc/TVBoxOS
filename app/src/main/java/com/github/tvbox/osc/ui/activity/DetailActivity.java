@@ -325,9 +325,6 @@ public class DetailActivity extends BaseActivity {
     private TvRecyclerView mGridView;
     private TvRecyclerView mSeriesGroupView;
     private LinearLayout mEmptyPlayList;
-    /** 列表区加载占位（详情到达前显示，替代会抢先暴露的空态框）。 */
-    private LinearLayout llPlaylistLoading;
-    private TextView tvPlaylistLoadingTip;
     private LinearLayout tvSeriesGroup;
     private SourceViewModel sourceViewModel;
     private Movie.Video mVideo;
@@ -417,8 +414,6 @@ public class DetailActivity extends BaseActivity {
         tvChangeSource = findViewById(R.id.tvChangeSource);
         mEmptyPlayList = findViewById(R.id.mEmptyPlaylist);
         tvEmptyPlaylistTip = findViewById(R.id.tvEmptyPlaylistTip);
-        llPlaylistLoading = findViewById(R.id.llPlaylistLoading);
-        tvPlaylistLoadingTip = findViewById(R.id.tvPlaylistLoadingTip);
         mGridView = findViewById(R.id.mGridView);
         mGridView.setHasFixedSize(false);
         this.mGridViewLayoutMgr = new V7GridLayoutManager(this.mContext, 6);
@@ -1434,7 +1429,6 @@ public class DetailActivity extends BaseActivity {
                         mGridView.setVisibility(View.VISIBLE);
                         tvPlay.setVisibility(View.VISIBLE);
                         mEmptyPlayList.setVisibility(View.GONE);
-                        hidePlaylistLoading();
 
                         VodInfo vodInfoRecord = RoomDataManger.getVodInfo(sourceKey, vodId);
                         boolean sameNameRestored = false;
@@ -1839,7 +1833,6 @@ public class DetailActivity extends BaseActivity {
                         mGridViewFlag.setVisibility(View.GONE);
                         mGridView.setVisibility(View.GONE);
                         tvSeriesGroup.setVisibility(View.GONE);
-                        hidePlaylistLoading();
                         // ★ 索引源永远没有 seriesMap：「立即播放」不能跟着空剧集分支一起藏，
                         //   它是索引源下的"自动找片"入口（tvPlay 点击的 indexOnlyDetail 分支）。
                         //   applyIndexOnlyUi 在本分支之前已执行，indexOnlyDetail 此处已就位。
@@ -1959,73 +1952,6 @@ public class DetailActivity extends BaseActivity {
                 && vodInfo.seriesMap != null && !vodInfo.seriesMap.isEmpty();
     }
 
-    /** 列表区加载占位：显示「正在加载剧集…/正在匹配其它片源…」，同时让出空态框与空网格。 */
-    private void showPlaylistLoading(String tip) {
-        try {
-            if (tvPlaylistLoadingTip != null) {
-                tvPlaylistLoadingTip.setText(tip);
-            }
-            if (llPlaylistLoading != null) {
-                llPlaylistLoading.setVisibility(View.VISIBLE);
-            }
-            if (mEmptyPlayList != null) {
-                mEmptyPlayList.setVisibility(View.GONE);
-            }
-            if (mGridViewFlag != null) {
-                mGridViewFlag.setVisibility(View.GONE);
-            }
-            if (mGridView != null) {
-                mGridView.setVisibility(View.GONE);
-            }
-        } catch (Throwable th) {
-            LOG.e("showPlaylistLoading fail: " + th);
-        }
-    }
-
-    private void hidePlaylistLoading() {
-        try {
-            if (llPlaylistLoading != null) {
-                llPlaylistLoading.setVisibility(View.GONE);
-            }
-        } catch (Throwable th) {
-            LOG.e("hidePlaylistLoading fail: " + th);
-        }
-    }
-
-    // ★ r203：首屏骨架 —— 用 Bundle 里已有的片名/海报先把页面填出来，替代原来的全屏 LoadSir 遮罩。
-    private void showDetailSkeleton() {
-        // 先撤掉可能残留的全屏 Loading/空态，露出真实页面（标题+海报）。
-        showSuccess();
-        try {
-            if (!TextUtils.isEmpty(vod_name)) {
-                tvName.setText(vod_name);
-            }
-            if (ivThumb != null) {
-                if (!TextUtils.isEmpty(vod_picture)) {
-                    com.github.tvbox.osc.util.ImgUtil.load(DefaultConfig.checkReplaceProxy(vod_picture), ivThumb,
-                            AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 300), AutoSizeUtils.mm2px(mContext, 400), vod_name);
-                } else {
-                    ivThumb.setImageDrawable(com.github.tvbox.osc.util.ImgUtil.createFallbackDrawable());
-                }
-            }
-            setTextShow(tvPlayUrl, "播放地址：", "正在加载详情…");
-            // ★ r205：列表区先给「正在加载剧集…」，不再让 mEmptyPlaylist 的空态抢先露出。
-            showPlaylistLoading("正在加载剧集…");
-            try {
-                SourceBean sk = ApiConfig.get().getSource(firstsourceKey);
-                if (sk == null) {
-                    sk = ApiConfig.get().getSource(sourceKey);
-                }
-                if (sk != null) {
-                    setTextShow(tvSite, "来源：", sk.getName());
-                }
-            } catch (Throwable ignored) {
-            }
-        } catch (Throwable th) {
-            LOG.e("showDetailSkeleton fail: " + th);
-        }
-    }
-
     private void armDetailFirstLoadWatchdog() {
         detailFirstLoadPending = true;
         detailFirstLoadRetried = false;
@@ -2051,6 +1977,7 @@ public class DetailActivity extends BaseActivity {
             if (!detailFirstLoadRetried) {
                 detailFirstLoadRetried = true;
                 LOG.e("echo-detail-first-load timeout, retry once: " + sourceKey + " " + vodId);
+                showLoadingTip(detailRetryTip());
                 sourceViewModel.getDetail(sourceKey, vodId, false);
                 llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
             } else {
@@ -2062,6 +1989,33 @@ public class DetailActivity extends BaseActivity {
         }
     };
 
+    /**
+     * 首屏 Loading 文案里的片名（带书名号）；片名缺失时返回空串，由各文案自己退化。
+     */
+    private String detailQuotedName() {
+        return TextUtils.isEmpty(vod_name) ? "" : "《" + vod_name.trim() + "》";
+    }
+
+    private String detailFirstLoadTip() {
+        String name = detailQuotedName();
+        return TextUtils.isEmpty(name) ? "正在加载影片详情" : "正在加载" + name;
+    }
+
+    private String detailRetryTip() {
+        String name = detailQuotedName();
+        return TextUtils.isEmpty(name) ? "网络较慢，正在重新加载详情" : "网络较慢，正在重新加载" + name;
+    }
+
+    private String detailMatchingTip() {
+        String name = detailQuotedName();
+        return TextUtils.isEmpty(name) ? "正在匹配其它片源" : "正在为" + name + "匹配其它片源";
+    }
+
+    private String detailSearchingTip() {
+        String name = detailQuotedName();
+        return TextUtils.isEmpty(name) ? "正在搜索可用片源" : "正在为" + name + "搜索可用片源";
+    }
+
     private void loadDetail(String vid, String key, boolean fallback) {
         if (!fallback) {
             resetDetailFallback();
@@ -2070,17 +2024,10 @@ public class DetailActivity extends BaseActivity {
         sourceKey = key;
         firstsourceKey = key;
         if (TextUtils.isEmpty(vid) || vid.startsWith("msearch:") || ApiConfig.get().getSource(sourceKey) == null) {
-            // ★ 进入即无可用详情（聚合搜索的 msearch: 结果、源已失效/被删等）：
-            //   这里必然要走"切源"流程去找可播放源。而切源链路为了不遮挡正在播放的
-            //   播放器，刻意不显示全屏 Loading（见 startDetailFallback 注释）。
-            //   但此时页面上<b>本来就没有任何内容</b>——既不显示 Loading、页面内的
-            //   "正在切换片源…"提示又写在没有内容的 tvPlayUrl 行上，用户看到的就是
-            //   "只有背景"的空页，直到首个可用源加载完成（实测最长约 9s）。
-            //   故：无内容时补一个加载指示；内容就绪后由 showSuccess() 自动收起。
+            // 进入即无可用详情（聚合搜索的 msearch: 结果、源已失效/被删等）：必然要走切源。
+            // ★ r206：无内容时用全屏 Loading + 一行说明，内容就绪后由 showSuccess() 收起。
             if (!hasRenderedDetail()) {
-                // ★ r205：没有可用详情时也先画骨架（标题/海报/来源 + 列表区加载占位），
-                //   不再用 LoadSir 全屏遮罩，避免整页被盖住像卡死。
-                showDetailSkeleton();
+                showLoadingTip(detailSearchingTip());
             }
             handleNoPlayableDetail();
             return;
@@ -2090,18 +2037,14 @@ public class DetailActivity extends BaseActivity {
                 // 已有内容（少数重复进入路径）：保留内容，不盖遮罩，也不再看门狗。
                 showSuccess();
                 cancelDetailFirstLoadWatchdog();
-                hidePlaylistLoading();
             } else {
-                // ★ r203：首次进入不再用 LoadSir 全屏遮罩，先把「标题 + 海报」骨架画出来，
-                //   详情到达前用户已经能看到页面并可返回，避免整页 Loading 像卡死。
-                showDetailSkeleton();
+                // ★ r206：首次进入使用全屏 Loading，文案写明正在加载哪部片。
+                showLoadingTip(detailFirstLoadTip());
                 armDetailFirstLoadWatchdog();
             }
         } else if (!hasRenderedDetail() && !isLoading()) {
-            // 切源模式但有内容时不打扰；无内容时（如首次拉取候选源、上一轮落空清空页面后）
-            // 必须给指示，否则用户面对空页无从判断应用是否在工作。
-            // ★ r205：改用页面内列表占位，不再盖全屏 LoadSir（否则候选频繁失败时像卡死）。
-            showPlaylistLoading("正在匹配其它片源…");
+            // 切源模式：有内容时不打扰（不遮播放器）；无内容时给全屏说明。
+            showLoadingTip(detailMatchingTip());
         }
         if (fallback && detailFallbackActive) {
             // ★ r165：每次拉取新候选都从「未确认」起步——在其 detailResult 通过同集守卫前不写历史。
@@ -2265,7 +2208,8 @@ public class DetailActivity extends BaseActivity {
      * 分支），是按钮行上的第二个找片入口，删掉就少一条路。
      */
     private void showIndexOnlyPlaceholder() {
-        hidePlaylistLoading();
+        // ★ r206：兜底收起全屏 Loading（正常路径详情到达时已 showSuccess）。
+        showSuccess();
         mGridViewFlag.setVisibility(View.GONE);
         mGridView.setVisibility(View.GONE);
         tvSeriesGroup.setVisibility(View.GONE);
@@ -3988,9 +3932,9 @@ public class DetailActivity extends BaseActivity {
         try {
             if (!isFinishing() && !isDestroyed()) {
                 setTextShow(tvPlayUrl, "播放地址：", "正在切换片源…");
-                // ★ r205：列表区同步给「正在匹配其它片源…」，替代会抢先暴露的「暂无播放数据」空态。
+                // ★ r206：页面上还没有内容时，全屏 Loading 的文案同步成「正在为《片名》匹配其它片源」。
                 if (!hasRenderedDetail()) {
-                    showPlaylistLoading("正在匹配其它片源…");
+                    showLoadingTip(detailMatchingTip());
                 }
             }
         } catch (Throwable th) {

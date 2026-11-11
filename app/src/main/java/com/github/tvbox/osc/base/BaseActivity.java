@@ -11,6 +11,9 @@ import android.os.Bundle;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.widget.TextView;
 
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
@@ -42,6 +45,7 @@ import xyz.doikki.videoplayer.util.CutoutUtil;
 public abstract class BaseActivity extends AppCompatActivity implements CustomAdapt {
     protected Context mContext;
     private LoadService mLoadService;
+    private View mLoadSirTarget;
 
     private static float screenRatio = -100.0f;
     private final Runnable refreshAutoSizeRunnable = new Runnable() {
@@ -198,6 +202,7 @@ public abstract class BaseActivity extends AppCompatActivity implements CustomAd
 
     protected void setLoadSir(View view) {
         if (mLoadService == null) {
+            mLoadSirTarget = view;
             mLoadService = LoadSir.getDefault().register(view, new Callback.OnReloadListener() {
                 @Override
                 public void onReload(View v) {
@@ -207,8 +212,48 @@ public abstract class BaseActivity extends AppCompatActivity implements CustomAd
     }
 
     protected void showLoading() {
-        if (mLoadService != null) {
-            mLoadService.showCallback(LoadingCallback.class);
+        showLoadingTip(null);
+    }
+
+    /**
+     * 显示全屏 Loading，并在转圈图标下方显示一行说明。
+     * tip 为空时只显示转圈，首页/搜索/直播等沿用原样。
+     */
+    protected void showLoadingTip(final String tip) {
+        if (mLoadService == null) {
+            return;
+        }
+        mLoadService.showCallback(LoadingCallback.class);
+        final View target = mLoadSirTarget;
+        if (target == null) {
+            return;
+        }
+        // showCallback 内部是 post 添加回调视图，等它挂上之后再去取文案控件。
+        target.post(new Runnable() {
+            @Override
+            public void run() {
+                applyLoadingTip(target, tip);
+            }
+        });
+    }
+
+    private void applyLoadingTip(View target, String tip) {
+        try {
+            ViewParent parent = target.getParent();
+            if (!(parent instanceof ViewGroup)) {
+                return;
+            }
+            TextView tvTip = ((ViewGroup) parent).findViewById(R.id.tvLoadSirLoadingTip);
+            if (tvTip == null) {
+                return;
+            }
+            if (tip == null || tip.length() == 0) {
+                tvTip.setVisibility(View.GONE);
+            } else {
+                tvTip.setText(tip);
+                tvTip.setVisibility(View.VISIBLE);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

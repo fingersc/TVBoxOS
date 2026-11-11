@@ -3,11 +3,33 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
-    <ProgressBar
-        android:layout_width="@dimen/vs_50"
-        android:layout_height="@dimen/vs_50"
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:indeterminateBehavior="repeat"
-        android:indeterminateDrawable="@drawable/anim_loading"
-        android:indeterminateOnly="true" />
+        android:gravity="center"
+        android:orientation="vertical"
+        android:paddingLeft="@dimen/vs_30"
+        android:paddingRight="@dimen/vs_30">
+
+        <ProgressBar
+            android:layout_width="@dimen/vs_50"
+            android:layout_height="@dimen/vs_50"
+            android:indeterminateBehavior="repeat"
+            android:indeterminateDrawable="@drawable/anim_loading"
+            android:indeterminateOnly="true" />
+
+        <!-- 全屏 Loading 的一行说明：仅详情页等调用 showLoadingTip() 时显示，其它页面保持只转圈 -->
+        <TextView
+            android:id="@+id/tvLoadSirLoadingTip"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/vs_16"
+            android:ellipsize="middle"
+            android:gravity="center"
+            android:maxLines="1"
+            android:textColor="@android:color/white"
+            android:textSize="@dimen/ts_24"
+            android:visibility="gone" />
+    </LinearLayout>
 </FrameLayout>
