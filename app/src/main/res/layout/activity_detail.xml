@@ -266,7 +266,7 @@
             android:layout_gravity="center"
             android:gravity="center_horizontal"
             android:orientation="horizontal"
-            tools:visibility="gone">
+            android:visibility="gone">
 
             <ImageView
                 android:layout_width="@dimen/vs_128"
@@ -284,6 +284,37 @@
                 android:gravity="center"
                 android:text="暂无播放数据"
                 android:textColor="@android:color/white"
+                android:textSize="@dimen/ts_24" />
+        </LinearLayout>
+
+        <!-- 列表区加载占位：详情到达前显示「正在加载剧集…」，避免先闪「暂无播放数据」空态 -->
+        <LinearLayout
+            android:id="@+id/llPlaylistLoading"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <ProgressBar
+                style="?android:attr/progressBarStyleSmall"
+                android:layout_width="45dp"
+                android:layout_height="45dp"
+                android:scaleX="0.75"
+                android:scaleY="0.75"
+                android:indeterminate="true"
+                android:indeterminateDrawable="@drawable/anim_loading" />
+
+            <TextView
+                android:id="@+id/tvPlaylistLoadingTip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="@dimen/vs_12"
+                android:layout_marginLeft="@dimen/vs_12"
+                android:gravity="center"
+                android:text="正在加载剧集…"
+                android:textColor="@color/color_CCFFFFFF"
                 android:textSize="@dimen/ts_24" />
         </LinearLayout>
 
