@@ -296,6 +296,14 @@ public class DetailActivity extends BaseActivity {
     private View llPlayerFragmentContainerBlock;
     private View llPlayerPlace;
     private PlayFragment playFragment = null;
+    /**
+     * r211：本页持有的起播保护窗标记。
+     *
+     * <p>保护窗是进程级单例，而「jumpToPlay」这个 reason 每个详情页都一样，
+     * 光靠 reason 无法在 onDestroy 时区分「这个窗口是我开的」还是「已被下一个页面接管」。
+     * 用 Activity 实例级唯一标记做持有者，销毁时只关自己那一份。</p>
+     */
+    private final String startupGuardOwner = "detail@" + Integer.toHexString(System.identityHashCode(this));
     private View thumbContainer;
     private ImageView ivThumb;
     private TextView tvName;
@@ -1012,7 +1020,7 @@ public class DetailActivity extends BaseActivity {
             App.getInstance().setVodInfo(vodInfo);
             // 方向5：起播在即 → 开起播保护窗。窗口内聚合搜索只暂停「新派发」，
             // 在途请求不动；首帧到达（PlayFragment.markPlaybackStarted）即恢复。
-            SearchSession.getShared().beginStartupGuard("jumpToPlay");
+            SearchSession.getShared().beginStartupGuard("jumpToPlay", startupGuardOwner);
             if (showPreview) {
                 ensurePlayFragment();
                 updatePreviewVodInfo();
@@ -1312,7 +1320,7 @@ public class DetailActivity extends BaseActivity {
                 }
                 // r207：详情网络失败不走“空详情→切源”，先换新连接重试一次。
                 if (absXml != null && "__NET__".equals(absXml.msg)) {
-                    handleDetailNetworkError();
+                    handleDetailNetworkError(absXml);
                     return;
                 }
                 // r203：本页详情请求已有结果（含空结果），首屏看门狗不再需要。
@@ -2049,6 +2057,9 @@ public class DetailActivity extends BaseActivity {
     private void armDetailFirstLoadWatchdog() {
         detailFirstLoadPending = true;
         detailFirstLoadRetried = false;
+        // r211：新一轮首屏加载 ⇒ 清掉「已转切源」记账，否则同一页第二次加载不会再兜底。
+        detailNetFallbackStarted = false;
+        lastNetErrorReplayed = null;
         llLayout.removeCallbacks(detailFirstLoadTimeout);
         llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
     }
@@ -2065,7 +2076,16 @@ public class DetailActivity extends BaseActivity {
      * 这样「旧长连接被静默掐断 / 边缘节点一时不回」这类瞬时故障可以原地恢复，
      * 不会把本来能播的片子当成“这个源没有”而切走。</p>
      */
-    private void handleDetailNetworkError() {
+    private void handleDetailNetworkError(AbsXml absXml) {
+        // r211：同一个 AbsXml 实例被重复投递（LiveData 在页面重建/重新 observe 时会
+        //   把最后一个值再发一次）不能算作「第二次网络失败」，否则 r211 的「立刻切源」
+        //   会被一次重复投递误触发。postDetailNetError 每次都 new 一个实例，
+        //   因此按引用判等即可区分「新的一次失败」与「同一个失败的重放」。
+        if (absXml != null && absXml == lastNetErrorReplayed) {
+            LOG.i("[FB] detailNetError replay ignored src=" + sourceKey + " id=" + vodId);
+            return;
+        }
+        lastNetErrorReplayed = absXml;
         if (detailFallbackActive) {
             // 切源会话中：候选失败按既有候选失败流程走，避免卡死在这一条候选上。
             if (detailFallbackLoadingCandidate) {
@@ -2086,12 +2106,35 @@ public class DetailActivity extends BaseActivity {
             sourceViewModel.getDetail(sourceKey, vodId, false);
             llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
         } else {
-            // 第二次仍网络失败：不在这里立刻切源，等本次 5s 预算到点由看门狗统一收尾。
-            // 避免「两次快速失败（如 TLS 抖动 / 连接被 reset）」就把本来能播的片子切走。
-            LOG.e("echo-detail-net-error twice, wait watchdog: " + sourceKey + " " + vodId);
+            // ★ r211：第二次仍网络失败 ⇒ 立刻收尾，不再空等 5s 看门狗。
+            //
+            //   r207 在这里只打日志、等本次 5s 预算到点由看门狗统一切源，理由是
+            //   「避免两次快速失败（如 TLS 抖动 / 连接被 reset）就把本来能播的片子切走」。
+            //   但那份容错已经由上面的「换新连接重试一次」兑现了：第二次失败时链路上
+            //   <b>没有任何请求在飞</b>，这 5 秒不会有新机会，只是纯粹的等待。
+            //   真机 20:40:54.297「echo-detail-net-error twice」→ 20:40:59.257 才切源，
+            //   白等 4.96s（《敦煌英雄》api_3 两次 ECONNREFUSED，各 28/29ms 就返回了）。
+            //
+            //   仍然保留「不立刻把片子判死」的语义：这里走的是既有切源流程
+            //   （handleNoPlayableDetail → startDetailFallback），不是 showEmpty()，
+            //   全网搜到能播的源照样会切过去并起播。
+            LOG.e("echo-detail-net-error twice, fallback now: " + sourceKey + " " + vodId);
+            detailFirstLoadPending = false;
+            llLayout.removeCallbacks(detailFirstLoadTimeout);
+            if (!detailNetFallbackStarted) {
+                // 幂等：极端情况下（startDetailFallback 因片名缺失/无源早退，detailFallbackActive
+                // 仍为 false）可能再来第三个 __NET__，不能重复弹 Toast / 重复开一轮搜索。
+                detailNetFallbackStarted = true;
+                Toast.makeText(DetailActivity.this, "详情加载失败，正在搜索其它片源…", Toast.LENGTH_SHORT).show();
+                handleNoPlayableDetail();
+            }
         }
     }
 
+    /** r211：首屏二次网络失败已转切源，防止重复触发（见 handleDetailNetworkError）。 */
+    private boolean detailNetFallbackStarted = false;
+    /** r211：上一次处理过的 __NET__ 回包实例，用于识别 LiveData 重复投递（见 handleDetailNetworkError）。 */
+    private AbsXml lastNetErrorReplayed = null;
     private boolean detailFirstLoadPending = false;
     private boolean detailFirstLoadRetried = false;
     private final Runnable detailFirstLoadTimeout = new Runnable() {
@@ -8402,6 +8445,15 @@ public class DetailActivity extends BaseActivity {
     protected void onDestroy() {
         cancelDetailFirstLoadWatchdog();
         resetDetailFallback();
+        // r211：起播保护窗是进程级单例，本页开了就必须本页关。
+        //   不关的话它会继续压着「下一个详情页」的候选派发（20:40 日志白等 2.66s），
+        //   且新页面因 beginStartupGuard 旧实现直接 return 而拿不到自己的窗口。
+        //   放在 resetDetailFallback() 之后：那一步可能补派发，窗口先关更符合语义。
+        try {
+            SearchSession.getShared().cancelStartupGuard(startupGuardOwner);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
         // ★ v4.2.6：详情页销毁 = 这一轮播放彻底结束；没等到首帧的挂起写入直接丢弃，
         //   绝不能等到下一次起播才补写一条早已过期的历史。
         cancelPendingHistWrite();
@@ -8808,7 +8860,9 @@ public class DetailActivity extends BaseActivity {
         playFragment.setStartupGuardListener(new PlayFragment.StartupGuardListener() {
             @Override
             public void onFirstFrame() {
-                SearchSession.getShared().endStartupGuardOnFirstFrame();
+                // r211：只关「本页开的」窗口（带持有者）。旧实现无条件关，
+                //   于是页面 A 的首帧迟到时会把页面 B 刚开的保护窗一起关掉。
+                SearchSession.getShared().endStartupGuardOnFirstFrame(startupGuardOwner);
                 // ★ v99-r60：起播保护窗一关就把攒池的派发补上。
                 //   scheduleDetailFallbackSearch() 在窗口期内是直接返回的，
                 //   若没有人在这里补一次，任务会一直停在「该派发却没派发」的状态，

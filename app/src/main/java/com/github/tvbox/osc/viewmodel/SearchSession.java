@@ -111,6 +111,17 @@ public class SearchSession {
     public static final long STARTUP_GUARD_MAX_MS = 10000L;
 
     /**
+     * r211：起播保护窗的<b>绝对</b>上限（从首次开窗算起，续期不重置）。
+     *
+     * <p>r211 把「已激活时直接 return」改成「重新计时」（见 {@link #beginStartupGuard}），
+     * 目的是让新页面的起播也能拿到自己的窗口。但若无上限，反复点「立即播放」会把窗口
+     * 无限续下去 —— 而窗口期内 {@code FastSearchActivity} 与详情页攒池都<b>不派发</b>，
+     * 搜索会整体停摆。取 2 个基准窗（10s × 2）作为硬顶：够覆盖一次续期，
+     * 且最坏情况也不会比「单窗 10s」明显更久。</p>
+     */
+    public static final long STARTUP_GUARD_HARD_MAX_MS = 20000L;
+
+    /**
      * 进程级单例。
      *
      * <p><b>为什么必须是单例</b>：本项目每个 Activity 都各自
@@ -171,6 +182,10 @@ public class SearchSession {
 
     /** 起播保护窗是否生效中。volatile：供派发循环无锁读取（见 isStartupGuardActive）。 */
     private volatile boolean startupGuardActive = false;
+    /** r211：首次开窗时刻（elapsedRealtime），用于 {@link #STARTUP_GUARD_HARD_MAX_MS} 硬顶判定。 */
+    private long startupGuardFirstAtMs = 0L;
+    /** r211：当前窗口的持有者标记（诊断用），见 {@link #cancelStartupGuard}。 */
+    private String startupGuardOwner = "";
     private final Handler guardHandler = new Handler(Looper.getMainLooper());
     private final Runnable startupGuardExpire = new Runnable() {
         @Override
@@ -515,27 +530,111 @@ public class SearchSession {
     /**
      * 开启起播保护窗：窗口内暂停新任务派发，首帧到达或超时后自动恢复。
      *
+     * <p><b>★ r211：已激活时不再直接 return，而是重新计时。</b>
+     * 旧写法的问题在真机 20:40 日志里可复现：起播保护窗是<b>进程级单例</b>，
+     * 上一个详情页开的窗（10s）在它销毁后仍继续生效，新详情页在窗口内
+     * {@code beginStartupGuard} 会直接 return ⇒ 新页面<b>拿不到自己的窗口</b>，
+     * 它的首帧回调却可能关掉别人的窗口。表现为「刚点开的片子搜索迟迟不派发」。
+     * 现在改为续期，但受 {@link #STARTUP_GUARD_HARD_MAX_MS} 硬顶约束。</p>
+     *
      * @param reason 触发来源（仅诊断用）
      */
     public void beginStartupGuard(final String reason) {
+        beginStartupGuard(reason, reason);
+    }
+
+    /**
+     * r211：带持有者标记的开窗重载。
+     *
+     * <p>{@code owner} 用于让 {@link #cancelStartupGuard(String)} 只关「自己开的」窗口。
+     * 两个详情页都用 {@code reason="jumpToPlay"}，光靠 reason 分不清是谁的窗口，
+     * 因此持有者必须是页面级唯一标记（见 {@code DetailActivity.startupGuardOwner}）。</p>
+     */
+    public void beginStartupGuard(final String reason, final String owner) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        long guardMs = STARTUP_GUARD_MAX_MS;
         synchronized (lock) {
-            if (startupGuardActive) {
-                return;             // 已在窗口内，不重复计时
+            if (startupGuardActive && startupGuardFirstAtMs > 0L) {
+                // r211：续期而不是忽略；但硬顶从「首次开窗」算，不给无限续。
+                long age = now - startupGuardFirstAtMs;
+                if (age >= STARTUP_GUARD_HARD_MAX_MS) {
+                    LOG.sw("[FB] guardBegin ignore reason=" + (reason == null ? "?" : reason)
+                            + " (hard cap " + age + "ms)");
+                    return;
+                }
+                guardMs = Math.min(STARTUP_GUARD_MAX_MS, STARTUP_GUARD_HARD_MAX_MS - age);
+            } else {
+                startupGuardFirstAtMs = now;
             }
             startupGuardActive = true;
+            startupGuardOwner = owner == null ? "" : owner;
         }
         // ★ v99-r61：这个窗口从 v42 起就是静默的，导致真机日志里分不清
         //   「没触发」和「触发了但没留痕」（r60-A 因此无法验证）。
         //   开/关各一条，配合 DetailActivity 的 guardBlocked 才能看出它到底在工作没有。
-        LOG.sw("[FB] guardBegin reason=" + (reason == null ? "?" : reason));
+        // r211：带上续期时长，便于区分「新开窗」与「续期」。
+        LOG.sw("[FB] guardBegin reason=" + (reason == null ? "?" : reason) + " ms=" + guardMs);
         guardHandler.removeCallbacks(startupGuardExpire);
-        guardHandler.postDelayed(startupGuardExpire, STARTUP_GUARD_MAX_MS);
+        guardHandler.postDelayed(startupGuardExpire, guardMs);
         pauseDispatch();
     }
 
-    /** 首帧到达 → 立刻结束保护窗（不等 5s 兜底）。 */
+    /** 首帧到达 → 立刻结束保护窗（不等 10s 兜底）。 */
     public void endStartupGuardOnFirstFrame() {
         releaseStartupGuard("firstFrame");
+    }
+
+    /**
+     * r211：带持有者的首帧关窗。
+     *
+     * <p>只关「自己开的」窗口：页面 A 开窗后被页面 B 续期接管时，A 的首帧回调
+     * 不应该把 B 的保护窗关掉（旧实现无条件关，等于新页面的窗口随时可能被上一页剥夺）。</p>
+     *
+     * @param owner 开窗时登记的持有者标记
+     */
+    public void endStartupGuardOnFirstFrame(String owner) {
+        synchronized (lock) {
+            if (!startupGuardActive) {
+                return;
+            }
+            if (owner != null && !owner.isEmpty() && !owner.equals(startupGuardOwner)) {
+                LOG.sw("[FB] guardFirstFrame skip owner=" + owner + " cur=" + startupGuardOwner);
+                return;
+            }
+        }
+        releaseStartupGuard("firstFrame");
+    }
+
+    /**
+     * r211：页面销毁时主动释放起播保护窗。
+     *
+     * <p><b>为什么需要它</b>：窗口是进程级单例，而 {@code DetailActivity.onDestroy()}
+     * 从不释放它。上一个页面开的 10s 窗口会在它消失后继续压着<b>下一个</b>页面的
+     * 候选派发（20:40 日志：旧页 20:40:52 开窗，《敦煌英雄》20:40:59 的
+     * {@code startSearch} 被 {@code guardBlocked} 压到 20:41:02，白等 2.66s）。</p>
+     *
+     * <p>只释放「本页面自己开的」窗口：若窗口已被后续页面续期接管，标记会变，
+     * 此时不关，避免把新页面的保护窗误关掉。</p>
+     *
+     * @param owner 调用方的持有者标记，需与开窗时的 reason 一致
+     */
+    public void cancelStartupGuard(String owner) {
+        boolean release = false;
+        synchronized (lock) {
+            if (!startupGuardActive) {
+                return;
+            }
+            if (owner != null && !owner.isEmpty() && !owner.equals(startupGuardOwner)) {
+                LOG.sw("[FB] guardCancel skip owner=" + owner + " cur=" + startupGuardOwner);
+                return;
+            }
+            release = true;
+        }
+        if (release) {
+            // 用与 poolFillSkip 的 activityGone 不同的字样，避免日志 grep 时混淆：
+            //   前者是「攒池任务因页面销毁放弃」，这里是「详情页销毁释放起播保护窗」。
+            releaseStartupGuard("detailDestroy");
+        }
     }
 
     /**
@@ -554,6 +653,9 @@ public class SearchSession {
         synchronized (lock) {
             wasActive = startupGuardActive;
             startupGuardActive = false;
+            // r211：硬顶计时与持有者标记随窗口一起归零，否则下一个窗口会继承旧起点。
+            startupGuardFirstAtMs = 0L;
+            startupGuardOwner = "";
             if (!wasActive) {
                 return;
             }
@@ -567,6 +669,8 @@ public class SearchSession {
 
     private void clearStartupGuardLocked() {
         startupGuardActive = false;
+        startupGuardFirstAtMs = 0L;
+        startupGuardOwner = "";
         guardHandler.removeCallbacks(startupGuardExpire);
     }
 
