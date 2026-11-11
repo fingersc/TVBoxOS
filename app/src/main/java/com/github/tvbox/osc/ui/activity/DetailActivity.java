@@ -242,6 +242,9 @@ public class DetailActivity extends BaseActivity {
      */
     private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = SwitchBudget.FIRST_CONSUME_DELAY_MS;
     private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = SwitchBudget.DETAIL_TIMEOUT_MS;
+    // ★ r203：首屏详情看门狗。首次进入详情页时若 10s 内没有任何详情返回，重发一次；
+    //   再过 10s 仍无 → 转入切源搜索。用于兜住「请求永不回调」（如迅雷解析线程死亡）导致的无限 loading。
+    private static final long DETAIL_FIRST_LOAD_TIMEOUT_MS = 10_000L;
     // ===== 方案A：探路请求 =====
     private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
     private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = SwitchBudget.PROBE_TIMEOUT_MS;
@@ -1263,6 +1266,8 @@ public class DetailActivity extends BaseActivity {
                         && !("push_fallback".equals(absXml.sourceKey) && "push_agent".equals(sourceKey))) {
                     return;
                 }
+                // r203：本页详情请求已有结果（含空结果），首屏看门狗不再需要。
+                cancelDetailFirstLoadWatchdog();
                 if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
                     boolean fallbackResult = detailFallbackLoadingCandidate;
                     if (detailFallbackLoadingCandidate) {
@@ -1940,6 +1945,64 @@ public class DetailActivity extends BaseActivity {
                 && vodInfo.seriesMap != null && !vodInfo.seriesMap.isEmpty();
     }
 
+    // ★ r203：首屏骨架 —— 用 Bundle 里已有的片名/海报先把页面填出来，替代原来的全屏 LoadSir 遮罩。
+    private void showDetailSkeleton() {
+        // 先撤掉可能残留的全屏 Loading/空态，露出真实页面（标题+海报）。
+        showSuccess();
+        try {
+            if (!TextUtils.isEmpty(vod_name)) {
+                tvName.setText(vod_name);
+            }
+            if (ivThumb != null) {
+                if (!TextUtils.isEmpty(vod_picture)) {
+                    com.github.tvbox.osc.util.ImgUtil.load(DefaultConfig.checkReplaceProxy(vod_picture), ivThumb,
+                            AutoSizeUtils.mm2px(mContext, 10), AutoSizeUtils.mm2px(mContext, 300), AutoSizeUtils.mm2px(mContext, 400), vod_name);
+                } else {
+                    ivThumb.setImageDrawable(com.github.tvbox.osc.util.ImgUtil.createFallbackDrawable());
+                }
+            }
+            setTextShow(tvPlayUrl, "播放地址：", "正在加载详情…");
+        } catch (Throwable th) {
+            LOG.e("showDetailSkeleton fail: " + th);
+        }
+    }
+
+    private void armDetailFirstLoadWatchdog() {
+        detailFirstLoadPending = true;
+        detailFirstLoadRetried = false;
+        llLayout.removeCallbacks(detailFirstLoadTimeout);
+        llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+    }
+
+    private void cancelDetailFirstLoadWatchdog() {
+        detailFirstLoadPending = false;
+        llLayout.removeCallbacks(detailFirstLoadTimeout);
+    }
+
+    private boolean detailFirstLoadPending = false;
+    private boolean detailFirstLoadRetried = false;
+    private final Runnable detailFirstLoadTimeout = new Runnable() {
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) return;
+            if (!detailFirstLoadPending || hasRenderedDetail()) {
+                detailFirstLoadPending = false;
+                return;
+            }
+            if (!detailFirstLoadRetried) {
+                detailFirstLoadRetried = true;
+                LOG.e("echo-detail-first-load timeout, retry once: " + sourceKey + " " + vodId);
+                sourceViewModel.getDetail(sourceKey, vodId, false);
+                llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+            } else {
+                detailFirstLoadPending = false;
+                LOG.e("echo-detail-first-load timeout twice, fallback: " + sourceKey + " " + vodId);
+                Toast.makeText(DetailActivity.this, "详情加载超时，正在搜索其它片源…", Toast.LENGTH_SHORT).show();
+                handleNoPlayableDetail();
+            }
+        }
+    };
+
     private void loadDetail(String vid, String key, boolean fallback) {
         if (!fallback) {
             resetDetailFallback();
@@ -1962,7 +2025,16 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         if (!fallback) {
-            showLoading();
+            if (hasRenderedDetail()) {
+                // 已有内容（少数重复进入路径）：保留内容，不盖遮罩，也不再看门狗。
+                showSuccess();
+                cancelDetailFirstLoadWatchdog();
+            } else {
+                // ★ r203：首次进入不再用 LoadSir 全屏遮罩，先把「标题 + 海报」骨架画出来，
+                //   详情到达前用户已经能看到页面并可返回，避免整页 Loading 像卡死。
+                showDetailSkeleton();
+                armDetailFirstLoadWatchdog();
+            }
         } else if (!hasRenderedDetail() && !isLoading()) {
             // 切源模式但有内容时不打扰；无内容时（如首次拉取候选源、上一轮落空清空页面后）
             // 必须给指示，否则用户面对空页无从判断应用是否在工作。
@@ -8068,6 +8140,7 @@ public class DetailActivity extends BaseActivity {
 
     @Override
     protected void onDestroy() {
+        cancelDetailFirstLoadWatchdog();
         resetDetailFallback();
         // ★ v4.2.6：详情页销毁 = 这一轮播放彻底结束；没等到首帧的挂起写入直接丢弃，
         //   绝不能等到下一次起播才补写一条早已过期的历史。

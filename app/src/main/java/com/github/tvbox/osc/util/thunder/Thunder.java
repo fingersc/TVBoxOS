@@ -108,16 +108,29 @@ public class Thunder {
         threadPool.execute(new Runnable() {
             @Override
             public void run() {
+                boolean callbackDelivered = false;
+                try {
+                if (urlBean == null || urlBean.infoList == null) {
+                    callback.status(-1, "解析异常");
+                    callbackDelivered = true;
+                    return;
+                }
                 for (int idx=0;idx<urlBean.infoList.size();idx++) {
                     Movie.Video.UrlBean.UrlInfo urlInfo = urlBean.infoList.get(idx);
-                    if (urlInfo != null) {
+                    if (urlInfo != null && urlInfo.beanList != null) {
                         String url="";
                         for (Movie.Video.UrlBean.UrlInfo.InfoBean infoBean : urlInfo.beanList) {
                             boolean isParse=false;
                             url=infoBean.url;
                             if (isMagnet(url) || isThunder(url) || isTorrent(url)) {
-                                if(isThunder(url) )url=XLDownloadManager.getInstance().parserThunderUrl(url);
+                                if (isThunder(url)) url = XLDownloadManager.getInstance().parserThunderUrl(url);
+                                if (TextUtils.isEmpty(url)) {
+                                    continue;
+                                }
                                 String link = isThunder(url) ? XLDownloadManager.getInstance().parserThunderUrl(url) : url;
+                                if (TextUtils.isEmpty(link)) {
+                                    continue;
+                                }
                                 Uri p = Uri.parse(link);
                                 if (p == null) {
                                     continue;
@@ -188,6 +201,9 @@ public class Thunder {
                             }else {
                                 url=infoBean.url;
                                 if(isThunder(url))url=XLDownloadManager.getInstance().parserThunderUrl(url);
+                                if(TextUtils.isEmpty(url)){
+                                    continue;
+                                }
                                 if(isNetworkDownloadTask(url)){
                                     task_url=url;
                                     if(TextUtils.isEmpty(task_url)){
@@ -210,8 +226,22 @@ public class Thunder {
 
                 if (urlMap.size() > 0) {
                     callback.list(urlMap);
+                    callbackDelivered = true;
                 } else {
                     callback.status(-1, "解析异常");
+                    callbackDelivered = true;
+                }
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                } finally {
+                    // ★ r203：无论解析线程里发生什么异常，都必须回调一次，否则 detailResult 永不投递，
+                    //   详情页会永远停留在 loading。
+                    if (!callbackDelivered) {
+                        try {
+                            callback.status(-1, "解析异常");
+                        } catch (Throwable ignored) {
+                        }
+                    }
                 }
             }});
     }

@@ -6,6 +6,8 @@ import android.view.animation.BounceInterpolator;
 import android.widget.ImageView;
 import android.widget.TextView;
 
+import androidx.lifecycle.ViewModelProvider;
+
 import com.chad.library.adapter.base.BaseQuickAdapter;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.ApiConfig;
@@ -19,6 +21,7 @@ import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.ui.adapter.HistoryAdapter;
 import com.github.tvbox.osc.ui.dialog.ConfirmClearDialog;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
+import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
 import com.owen.tvrecyclerview.widget.TvRecyclerView;
@@ -43,6 +46,9 @@ public class HistoryActivity extends BaseActivity {
     private TvRecyclerView mGridView;
     public static HistoryAdapter historyAdapter;
     private boolean delMode = false;
+    // ★ r203：列表卡片获得焦点时预取详情，点开详情页可直接命中内存缓存秒开。
+    private SourceViewModel prefetchViewModel;
+    private String lastPrefetchKey = "";
 
     @Override
     protected int getLayoutResID() {
@@ -90,6 +96,7 @@ public class HistoryActivity extends BaseActivity {
         mGridView.setHasFixedSize(true);
         mGridView.setLayoutManager(new V7GridLayoutManager(this.mContext, isBaseOnWidth() ? 5 : 6));
         historyAdapter = new HistoryAdapter();
+        prefetchViewModel = new ViewModelProvider(this).get(SourceViewModel.class);
         mGridView.setAdapter(historyAdapter);
         tvDelete.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -124,6 +131,7 @@ public class HistoryActivity extends BaseActivity {
             @Override
             public void onItemSelected(TvRecyclerView parent, View itemView, int position) {
                 itemView.animate().scaleX(1.05f).scaleY(1.05f).setDuration(300).setInterpolator(new BounceInterpolator()).start();
+                prefetchHistoryDetail(position);
             }
 
             @Override
@@ -184,6 +192,25 @@ public class HistoryActivity extends BaseActivity {
                 return true;
             }
         });
+    }
+
+    // ★ r203：卡片获得焦点即预取该条详情（节流：同一 key 只发一次）。结果进 SourceViewModel 的
+    //   静态详情缓存，真正点开详情页时 getDetail 直接命中，省掉全屏 loading 等待。
+    private void prefetchHistoryDetail(int position) {
+        try {
+            if (prefetchViewModel == null || historyAdapter == null) return;
+            List<VodInfo> data = historyAdapter.getData();
+            if (position < 0 || position >= data.size()) return;
+            VodInfo vodInfo = data.get(position);
+            if (vodInfo == null || vodInfo.id == null || vodInfo.sourceKey == null) return;
+            if (ApiConfig.get().getSource(vodInfo.sourceKey) == null) return;
+            String key = vodInfo.sourceKey + "|" + vodInfo.id;
+            if (key.equals(lastPrefetchKey)) return;
+            lastPrefetchKey = key;
+            prefetchViewModel.prefetchDetail(vodInfo.sourceKey, vodInfo.id);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
     }
 
     private void initData() {

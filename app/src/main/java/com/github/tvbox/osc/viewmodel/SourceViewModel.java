@@ -217,6 +217,78 @@ public class SourceViewModel extends ViewModel {
         sortCache.remove(sourceKey);
     }
 
+    // ★ r203：跨页详情内存缓存 —— 历史/列表卡片获得焦点时预取详情，点开详情页可直接命中，
+    //   省掉全屏 loading 的等待（该等待本质就是详情接口的端到端耗时）。
+    private static final int DETAIL_MEM_CACHE_MAX = 6;
+    private static final long DETAIL_MEM_CACHE_TTL_MS = 60_000L;
+    private static final Object DETAIL_MEM_CACHE_LOCK = new Object();
+    private static final LinkedHashMap<String, AbsXml> detailMemCache = new LinkedHashMap<String, AbsXml>(8, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Entry<String, AbsXml> eldest) {
+            return size() > DETAIL_MEM_CACHE_MAX;
+        }
+    };
+    private static final LinkedHashMap<String, Long> detailMemCacheTime = new LinkedHashMap<String, Long>(8, 0.75f, true);
+
+    private static String detailMemKey(String sourceKey, String id) {
+        return sourceKey + "|" + id;
+    }
+
+    private static AbsXml getCachedDetail(String sourceKey, String id) {
+        if (TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(id)) return null;
+        synchronized (DETAIL_MEM_CACHE_LOCK) {
+            String k = detailMemKey(sourceKey, id);
+            Long ts = detailMemCacheTime.get(k);
+            if (ts == null) return null;
+            if (System.currentTimeMillis() - ts > DETAIL_MEM_CACHE_TTL_MS) {
+                detailMemCache.remove(k);
+                detailMemCacheTime.remove(k);
+                return null;
+            }
+            AbsXml data = detailMemCache.get(k);
+            if (data == null) {
+                detailMemCacheTime.remove(k);
+            }
+            return data;
+        }
+    }
+
+    /**
+     * r203：缓存可用详情。磁力/种子页面的真实播放链接要等 Thunder 异步解析后才会回填，
+     * 缓存半成品会让用户点开看到「有集名却播不了」，故这类一律跳过。
+     */
+    private static void putCachedDetail(String sourceKey, String id, AbsXml data) {
+        if (TextUtils.isEmpty(sourceKey) || TextUtils.isEmpty(id) || data == null || data.movie == null) return;
+        if (PUSH_AGENT.equals(sourceKey) || PUSH_FALLBACK.equals(sourceKey)) return;
+        if (data.movie.videoList == null || data.movie.videoList.isEmpty()) return;
+        try {
+            if (data.movie.videoList.size() == 1) {
+                Movie.Video v = data.movie.videoList.get(0);
+                if (v != null && v.urlBean != null && v.urlBean.infoList != null) {
+                    for (Movie.Video.UrlBean.UrlInfo ui : v.urlBean.infoList) {
+                        if (ui == null || ui.beanList == null) continue;
+                        for (Movie.Video.UrlBean.UrlInfo.InfoBean ib : ui.beanList) {
+                            if (ib != null && Thunder.isSupportUrl(ib.url)) return;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        synchronized (DETAIL_MEM_CACHE_LOCK) {
+            String k = detailMemKey(sourceKey, id);
+            detailMemCache.put(k, data);
+            detailMemCacheTime.put(k, System.currentTimeMillis());
+        }
+    }
+
+    public static void clearDetailMemCache() {
+        synchronized (DETAIL_MEM_CACHE_LOCK) {
+            detailMemCache.clear();
+            detailMemCacheTime.clear();
+        }
+    }
+
     public static void clearRuntimeCache() {
         sortCache.clear();
         extendCache.clear();
@@ -883,11 +955,35 @@ public class SourceViewModel extends ViewModel {
             out.postValue(createPushDetail(urlid, sourceKey));
             return;
         }
+        final String detailCacheKey = sourceBean.getKey();
+        final String detailCacheId = id;
+        if (!fallback) {
+            // r203：命中焦点预取缓存则直接回填，详情页秒开，不再走全屏 loading。
+            AbsXml cachedDetail = getCachedDetail(detailCacheKey, detailCacheId);
+            if (cachedDetail != null) {
+                LOG.i("echo--getDetail--mem-hit: " + detailCacheKey + " " + detailCacheId);
+                out.postValue(cachedDetail);
+                return;
+            }
+        }
         int type = sourceBean.getType();
         if (type == 3) {
+            // ★ r203：超时从「提交时刻」起算。旧实现把 future.get(30s) 放在 spThreadPool 的
+            //   Runnable 内部 —— 若队列里前面的爬虫任务卡死，本请求根本轮不到执行，
+            //   30s 计时也就永不启动 → detailResult 永不投递 → 详情页无限 loading。
+            final long submitAt = System.currentTimeMillis();
+            final long timeoutMs = (fallback ? 6 : 30) * 1000L;
             spThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
+                    long remaining = timeoutMs - (System.currentTimeMillis() - submitAt);
+                    if (remaining <= 0) {
+                        LOG.i("echo--getDetail--timeout(queue)");
+                        AbsXml empty = new AbsXml();
+                        empty.sourceKey = detailCacheKey;
+                        out.postValue(empty);
+                        return;
+                    }
                     ExecutorService executor = Executors.newSingleThreadExecutor();
                     Future<String> future = executor.submit(new Callable<String>() {
                         @Override
@@ -906,14 +1002,15 @@ public class SourceViewModel extends ViewModel {
 
                     String json = null;
                     try {
-                        json = future.get(fallback ? 6 : 30, TimeUnit.SECONDS);
+                        json = future.get(remaining, TimeUnit.MILLISECONDS);
                     } catch (TimeoutException e) {
                         LOG.i("echo--getDetail--timeout");
                         future.cancel(true);
                     } catch (Exception e) {
                         LOG.i("echo--getDetail--error: " + e.getMessage());
                     } finally {
-                        json(out, json, sourceBean.getKey());
+                        AbsXml parsed = json(out, json, sourceBean.getKey());
+                        putCachedDetail(detailCacheKey, detailCacheId, parsed);
                         executor.shutdown();
                     }
                 }
@@ -948,11 +1045,13 @@ public class SourceViewModel extends ViewModel {
                         public void onSuccess(Response<String> response) {
                             if (type == 0) {
                                 String xml = response.body();
-                                xml(out, xml, sourceBean.getKey());
+                                AbsXml parsed = xml(out, xml, sourceBean.getKey());
+                                putCachedDetail(detailCacheKey, detailCacheId, parsed);
                             } else {
                                 String json = response.body();
                                 logResponseBody(json);
-                                json(out, json, sourceBean.getKey());
+                                AbsXml parsed = json(out, json, sourceBean.getKey());
+                                putCachedDetail(detailCacheKey, detailCacheId, parsed);
                             }
                         }
 
