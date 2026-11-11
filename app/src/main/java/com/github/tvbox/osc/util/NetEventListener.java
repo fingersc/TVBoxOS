@@ -86,6 +86,49 @@ public final class NetEventListener extends EventListener {
         }
     }
 
+    // ==================== r213：详情请求「建连阶段」进度 ====================
+
+    /**
+     * r213：详情请求的建连起点与在途标记。
+     *
+     * <p><b>为什么还需要它</b>：r212 的慢建连补预算挂在 {@link #connectEnd} 上，
+     * 那是「建连<b>成功</b>」的回调。而真正吃光首屏预算的还有另一种形态 ——
+     * <b>建连一直不成功</b>（对端丢包/被墙），{@code connectEnd} 永不回调，
+     * 补预算逻辑形同虚设。23:32 日志实证：{@code ys.cxkjg.cn} 的详情请求
+     * {@code connectFailed … SocketTimeoutException … after 8005ms}，
+     * 首屏 5s 预算早已耗光，页面白等 12.45s。</p>
+     *
+     * <p>所以额外记录「当前有没有一条 tag=detail 的请求正在建连、已建连多久」，
+     * 让看门狗到点时能判断「预算是不是被建连吃掉了」。</p>
+     */
+    private static volatile long detailConnectStartAtMs = 0L;
+    private static volatile boolean detailConnectInProgress = false;
+
+    /**
+     * r213：tag=detail 的请求当前已建连多久；没有在建连则返回 0。
+     *
+     * @return 毫秒；0 表示当前没有 detail 请求处于建连阶段
+     */
+    public static long detailConnectElapsedMs() {
+        if (!detailConnectInProgress) {
+            return 0L;
+        }
+        long start = detailConnectStartAtMs;
+        if (start <= 0L) {
+            return 0L;
+        }
+        long cost = System.currentTimeMillis() - start;
+        return cost > 0L ? cost : 0L;
+    }
+
+    private static boolean isDetailCall(Call call) {
+        try {
+            return "detail".equals(call.request().tag());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     /** 一个 Call 的分段计时。字段语义与旧的实例字段一一对应，只是不再跨请求共享。 */
     private static final class Mark {
         long dnsStart;
@@ -143,6 +186,11 @@ public final class NetEventListener extends EventListener {
     @Override
     public void connectStart(Call call, InetSocketAddress inetSocketAddress, Proxy proxy) {
         mark(call).connectStart = now();
+        // r213：记下「详情请求正在建连」的起点，供首屏看门狗判断预算是否被建连吃掉
+        if (isDetailCall(call)) {
+            detailConnectStartAtMs = now();
+            detailConnectInProgress = true;
+        }
     }
 
     @Override
@@ -151,6 +199,9 @@ public final class NetEventListener extends EventListener {
         if (cost >= SLOW_MS) {
             // v99-r91：地址直接用回调参数，不再借用实例字段（旧版借的那份可能是别的请求的）
             LOG.i("[net] connect " + inetSocketAddress + " " + cost + "ms " + protocol);
+        }
+        if (isDetailCall(call)) {
+            detailConnectInProgress = false;
         }
         // r212：把建连耗时交给详情页（它据此判断「慢建连」要不要补足首屏预算）
         reportConnectCost(call, cost);
@@ -167,6 +218,11 @@ public final class NetEventListener extends EventListener {
                               Protocol protocol, IOException ioe) {
         long cost = now() - mark(call).connectStart;
         LOG.i("[net] connectFailed " + inetSocketAddress + " after " + cost + "ms " + ioe);
+        // r213：单条路由失败不代表整次建连结束 —— 双栈场景下 OkHttp 会换下一条路由再试，
+        //   紧跟着还会有 connectStart，把标记重新置起来。这里先清掉，避免「已失败还显示在建连」。
+        if (isDetailCall(call)) {
+            detailConnectInProgress = false;
+        }
         // v97-r2：连不上就作废该 host 的探测缓存，下次重新解析/重新探测（IPTV CDN 节点会变）
         // v99-r98：图片/封面请求失败不在此列 —— 它走的是另一套 DNS，且失败多为"坏 IP"，
         //          不应把播放器对同一 host 记录下来的"好节点"一起作废。
@@ -220,11 +276,19 @@ public final class NetEventListener extends EventListener {
     @Override
     public void callFailed(Call call, IOException ioe) {
         LOG.i("[net] callFailed " + call.request().url().host() + " " + ioe);
+        // r213：请求终结一定要把「详情正在建连」标记清掉，否则某条 detail 请求
+        //   被取消后标记会永久挂着，之后任何页面都会误判「建连耗时极长」而补预算。
+        if (isDetailCall(call)) {
+            detailConnectInProgress = false;
+        }
         marks.remove(call);
     }
 
     @Override
     public void callEnd(Call call) {
+        if (isDetailCall(call)) {
+            detailConnectInProgress = false;
+        }
         marks.remove(call);
     }
 

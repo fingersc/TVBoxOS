@@ -2318,6 +2318,24 @@ public class DetailActivity extends BaseActivity {
                 return;
             }
             if (!detailFirstLoadRetried) {
+                // r213：补上 r212-B 漏掉的第二种形态 —— 「建连一直不成功」。
+                //   r212 把补预算挂在 connectEnd（建连成功）上，而 ys.cxkjg.cn 那种对端
+                //   丢包/被墙的情况永远不会有 connectEnd，5s 预算照样被建连吃光
+                //   （23:32 日志：connectFailed ... SocketTimeoutException ... after 8005ms，
+                //   页面白等 12.45s）。这里在看门狗到点时再看一眼「还在不在建连、建了多久」。
+                //   注意首屏看门狗只管「本页首屏」，进了切源会话就交给切源状态机，不再补。
+                if (!detailFirstLoadBudgetExtended && !detailFallbackActive) {
+                    long connectingMs = NetEventListener.detailConnectElapsedMs();
+                    if (connectingMs >= DETAIL_SLOW_CONNECT_MS) {
+                        long grant = Math.min(connectingMs, DETAIL_SLOW_CONNECT_GRANT_MAX_MS);
+                        detailFirstLoadBudgetExtended = true;
+                        detailFirstLoadConnectCostMs = connectingMs;
+                        LOG.i("[FB] firstLoadBudget extend(connecting) +" + grant + "ms src="
+                                + sourceKey + " id=" + vodId);
+                        scheduleDetailFirstLoadWatchdog(grant);
+                        return;
+                    }
+                }
                 detailFirstLoadRetried = true;
                 LOG.e("echo-detail-first-load timeout, retry once (fresh conn): " + sourceKey + " " + vodId);
                 showLoadingTip(detailRetryTip());

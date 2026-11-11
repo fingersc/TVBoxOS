@@ -312,14 +312,22 @@ public class SourceViewModel extends ViewModel {
     /**
      * r212：这次失败是不是「我们自己 cancel 掉的」。
      *
-     * <p>OkHttp 被 {@code Call.cancel()} 后回调的是 {@code java.io.IOException: Canceled}；
-     * OkGo 会把它包进 {@link Response#getException()}。这种失败不含任何网络状况信息，
-     * 不能用于「这个源连不上」的判断。</p>
+     * <p>OkHttp 被 {@code Call.cancel()} 后回调的异常有两种形态，r213 起都要认：</p>
+     * <ul>
+     *   <li>{@code java.io.IOException: Canceled} —— 未建连 / 正在等响应时取消；</li>
+     *   <li>{@code java.net.SocketException: Socket closed} —— <b>连接已建立</b>
+     *       （尤其 h2 流已开）时取消，socket 被直接关掉。23:32 日志实证：
+     *       详情重试 cancelTag("detail") 后，旧请求报的是
+     *       {@code connectFailed ... SocketException: Socket closed}，不是 Canceled。</li>
+     * </ul>
+     *
+     * <p>这种失败不含任何网络状况信息，不能用于「这个源连不上」的判断 —— 否则
+     * r211 的「第二次失败立即切源」会被我们自己造成的取消误触发，重试等于没做。</p>
      *
      * <p><b>为什么只按消息判定、不按类型</b>：{@code SocketTimeoutException} 是
      * {@code InterruptedIOException} 的子类，按类型判会把真正的读超时一起当成「取消」
      * 吞掉 —— 那会让 r207「网络失败先换连接重试一次」对超时完全失效。所以这里只认
-     * okhttp 取消时写死的那句 {@code "Canceled"}，宁可漏判（漏判只是回到 r211 行为）。</p>
+     * 取消时写死的那两句消息，宁可漏判（漏判只是回到 r211 行为）。</p>
      */
     private static boolean isCanceledError(Response<String> response) {
         try {
@@ -332,7 +340,8 @@ public class SourceViewModel extends ViewModel {
                 return false;
             }
             String lower = msg.toLowerCase();
-            return lower.contains("canceled") || lower.contains("cancelled");
+            return lower.contains("canceled") || lower.contains("cancelled")
+                    || lower.contains("socket closed");
         } catch (Throwable ignored) {
             return false;
         }
