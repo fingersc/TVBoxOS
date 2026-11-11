@@ -434,6 +434,22 @@ public class OkGoHelper {
         return defaultClient;
     }
 
+    /**
+     * 清空空闲连接。
+     *
+     * <p>用途：详情接口疑似挂在一条被网络设备静默掐断的旧长连接上时，先把空闲连接全部关掉，
+     * 让下一次请求必须重新建连。只影响空闲连接，正在传输的请求不受影响。</p>
+     */
+    public static void evictIdleConnections() {
+        try {
+            OkHttpClient client = getDefaultClient();
+            if (client != null) {
+                client.connectionPool().evictAll();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static OkHttpClient getNoRedirectClient() {
         return noRedirectClient;
     }

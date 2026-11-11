@@ -62,6 +62,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
+import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.FilmIdentity;
 import com.github.tvbox.osc.util.ShowTitleKey;
@@ -242,9 +243,10 @@ public class DetailActivity extends BaseActivity {
      */
     private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = SwitchBudget.FIRST_CONSUME_DELAY_MS;
     private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = SwitchBudget.DETAIL_TIMEOUT_MS;
-    // ★ r203：首屏详情看门狗。首次进入详情页时若 10s 内没有任何详情返回，重发一次；
-    //   再过 10s 仍无 → 转入切源搜索。用于兜住「请求永不回调」（如迅雷解析线程死亡）导致的无限 loading。
-    private static final long DETAIL_FIRST_LOAD_TIMEOUT_MS = 10_000L;
+    // ★ r203：首屏详情看门狗。首次进入详情页时若 5s 内没有任何详情返回，换新连接重发一次；
+    //   再过 5s 仍无 → 转入切源搜索。详情只是小段文本，单次预算 5s、合计 10s
+    //   （与视频起播的大数据量预算区分开）。用于兜住「请求永不回调」导致的无限 loading。
+    private static final long DETAIL_FIRST_LOAD_TIMEOUT_MS = 5_000L;
     // ===== 方案A：探路请求 =====
     private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
     private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = SwitchBudget.PROBE_TIMEOUT_MS;
@@ -1273,6 +1275,16 @@ public class DetailActivity extends BaseActivity {
                         && !("push_fallback".equals(absXml.sourceKey) && "push_agent".equals(sourceKey))) {
                     return;
                 }
+                // r207：页面已渲染且不在切源会话中时，迟到的重复/失败结果一律忽略，
+                //   避免旧请求 5s/20s 后的迟到回调把已显示的详情覆盖或把页面切走。
+                if (!detailFallbackActive && hasRenderedDetail()) {
+                    return;
+                }
+                // r207：详情网络失败不走“空详情→切源”，先换新连接重试一次。
+                if (absXml != null && "__NET__".equals(absXml.msg)) {
+                    handleDetailNetworkError();
+                    return;
+                }
                 // r203：本页详情请求已有结果（含空结果），首屏看门狗不再需要。
                 cancelDetailFirstLoadWatchdog();
                 if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
@@ -1964,6 +1976,40 @@ public class DetailActivity extends BaseActivity {
         llLayout.removeCallbacks(detailFirstLoadTimeout);
     }
 
+    /**
+     * r207：详情请求网络失败（超时/断连/TLS 失败）时调用。
+     *
+     * <p>不立刻切源：先清空空闲连接、用新连接重试一次（5s 预算），仍失败才按既定策略切源。
+     * 这样「旧长连接被静默掐断 / 边缘节点一时不回」这类瞬时故障可以原地恢复，
+     * 不会把本来能播的片子当成“这个源没有”而切走。</p>
+     */
+    private void handleDetailNetworkError() {
+        if (detailFallbackActive) {
+            // 切源会话中：候选失败按既有候选失败流程走，避免卡死在这一条候选上。
+            if (detailFallbackLoadingCandidate) {
+                handleNoPlayableDetail();
+            }
+            return;
+        }
+        if (hasRenderedDetail()) {
+            return;
+        }
+        if (!detailFirstLoadRetried) {
+            detailFirstLoadRetried = true;
+            detailFirstLoadPending = true;
+            showLoadingTip(detailRetryTip());
+            OkGoHelper.evictIdleConnections();
+            LOG.e("echo-detail-net-error, retry with fresh connection: " + sourceKey + " " + vodId);
+            llLayout.removeCallbacks(detailFirstLoadTimeout);
+            sourceViewModel.getDetail(sourceKey, vodId, false);
+            llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+        } else {
+            // 第二次仍网络失败：不在这里立刻切源，等本次 5s 预算到点由看门狗统一收尾。
+            // 避免「两次快速失败（如 TLS 抖动 / 连接被 reset）」就把本来能播的片子切走。
+            LOG.e("echo-detail-net-error twice, wait watchdog: " + sourceKey + " " + vodId);
+        }
+    }
+
     private boolean detailFirstLoadPending = false;
     private boolean detailFirstLoadRetried = false;
     private final Runnable detailFirstLoadTimeout = new Runnable() {
@@ -1976,8 +2022,9 @@ public class DetailActivity extends BaseActivity {
             }
             if (!detailFirstLoadRetried) {
                 detailFirstLoadRetried = true;
-                LOG.e("echo-detail-first-load timeout, retry once: " + sourceKey + " " + vodId);
+                LOG.e("echo-detail-first-load timeout, retry once (fresh conn): " + sourceKey + " " + vodId);
                 showLoadingTip(detailRetryTip());
+                OkGoHelper.evictIdleConnections();
                 sourceViewModel.getDetail(sourceKey, vodId, false);
                 llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
             } else {

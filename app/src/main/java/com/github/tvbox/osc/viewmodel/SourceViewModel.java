@@ -289,6 +289,19 @@ public class SourceViewModel extends ViewModel {
         }
     }
 
+    /**
+     * r207：详情“网络失败”出口。
+     *
+     * <p>不能复用空结果：空结果表示“源里确实没有这部片”，会立刻触发切源；
+     * 网络失败只是这一次没拿到，交给详情页换新连接重试一次，仍失败才切源。</p>
+     */
+    private void postDetailNetError(MutableLiveData<AbsXml> out, String sourceKey) {
+        AbsXml error = new AbsXml();
+        error.sourceKey = sourceKey;
+        error.msg = "__NET__";
+        out.postValue(error);
+    }
+
     public static void clearRuntimeCache() {
         sortCache.clear();
         extendCache.clear();
@@ -1058,7 +1071,12 @@ public class SourceViewModel extends ViewModel {
                         @Override
                         public void onError(Response<String> response) {
                             super.onError(response);
-                            json(out, "", sourceBean.getKey());
+                            // r207：详情网络失败与“源里没有这部片”必须区分，后者才立刻切源。
+                            if (out == detailResult) {
+                                postDetailNetError(out, sourceBean.getKey());
+                            } else {
+                                json(out, "", sourceBean.getKey());
+                            }
                         }
                     });
         } else {
