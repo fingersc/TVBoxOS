@@ -10,6 +10,7 @@ import android.graphics.PointF;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
@@ -62,6 +63,7 @@ import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.HistoryHelper;
 import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
+import com.github.tvbox.osc.util.NetEventListener;
 import com.github.tvbox.osc.util.OkGoHelper;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.FilmIdentity;
@@ -260,6 +262,32 @@ public class DetailActivity extends BaseActivity {
     //   再过 5s 仍无 → 转入切源搜索。详情只是小段文本，单次预算 5s、合计 10s
     //   （与视频起播的大数据量预算区分开）。用于兜住「请求永不回调」导致的无限 loading。
     private static final long DETAIL_FIRST_LOAD_TIMEOUT_MS = 5_000L;
+    /**
+     * r212：慢建连判定阈值。建连（DNS 之后 TCP+TLS）超过它就认为「预算被建连吃掉」，
+     * 给首屏补足等额预算。
+     *
+     * <p>取 1.5s 的依据：22:18 日志里正常源建连 0.3–0.5s，出问题的两个 Cloudflare 采集站
+     * 是 2.2s / 3.0s（TLS 单项 1.8–2.0s），中间有明显空档。</p>
+     */
+    private static final long DETAIL_SLOW_CONNECT_MS = 1_500L;
+    /** r212：慢建连补足额上限。防止极慢建连把首屏拖成十几秒。 */
+    private static final long DETAIL_SLOW_CONNECT_GRANT_MAX_MS = 4_000L;
+    /**
+     * r212：首屏预算的<b>绝对</b>天花板（从进页起算）。
+     *
+     * <p>补足只发生在「慢建连」时，而重试会重新挂一次 5s 预算。若两轮都碰上慢建连，
+     * 不设顶最长会到 ~14.5s。取 14s 兜住：既容纳「一次 5s + 一次补足 + 一次 5s 重试」，
+     * 又保证死在死源上也不至于无限等下去。</p>
+     */
+    private static final long DETAIL_FIRST_LOAD_TOTAL_MAX_MS = 14_000L;
+    /**
+     * r212：换新连接重试前的等待。
+     *
+     * <p>{@code cancel()} 之后 socket 关闭是异步的；不等这一拍就发新请求，
+     * 新连接可能仍走旧 socket 或干脆复用同一条 h2 连接。150ms 只占首屏预算的一小部分，
+     * 且已计入预算（见 {@link #retryDetailWithFreshConnection}）。</p>
+     */
+    private static final long DETAIL_FRESH_CONN_DELAY_MS = 150L;
     // ===== 方案A：探路请求 =====
     private static final String DETAIL_FALLBACK_PROBE_TAG = "detail_fallback_probe";
     private static final long DETAIL_FALLBACK_PROBE_TIMEOUT_MS = SwitchBudget.PROBE_TIMEOUT_MS;
@@ -398,6 +426,9 @@ public class DetailActivity extends BaseActivity {
     @Override
     protected void init() {
         EventBus.getDefault().register(this);
+        // r212：建连耗时监听必须在 initData()（发首屏详情请求）之前注册，
+        //   否则第一次首屏的 connectEnd 会漏掉。注销见 onDestroy。
+        NetEventListener.setConnectCostListener(detailConnectCostListener);
         com.github.tvbox.osc.util.PerfTrace.begin("detail.initView");
         initView();
         com.github.tvbox.osc.util.PerfTrace.end("detail.initView");
@@ -2060,8 +2091,137 @@ public class DetailActivity extends BaseActivity {
         // r211：新一轮首屏加载 ⇒ 清掉「已转切源」记账，否则同一页第二次加载不会再兜底。
         detailNetFallbackStarted = false;
         lastNetErrorReplayed = null;
+        // r212：预算扩展只在「一次进页」里给一次，重试不再续 —— 否则死源会被越拖越久。
+        detailFirstLoadBudgetExtended = false;
+        detailFirstLoadConnectCostMs = 0L;
+        detailFirstLoadStartedAtMs = SystemClock.elapsedRealtime();
+        scheduleDetailFirstLoadWatchdog(DETAIL_FIRST_LOAD_TIMEOUT_MS);
+    }
+
+    /**
+     * r212：挂/改首屏看门狗，预算按「从现在起还剩多少」计算。
+     *
+     * <p>与直接 {@code postDelayed} 的区别：这里记下绝对到期时刻
+     * ({@link #detailFirstLoadDeadlineMs})，慢建连补预算时要按「剩余」加，
+     * 不能简单地把时长再拍一遍（那会变成 5s + 5s + 补的，越补越长）。
+     * 同时受 {@link #DETAIL_FIRST_LOAD_TOTAL_MAX_MS} 绝对天花板约束。</p>
+     */
+    private void scheduleDetailFirstLoadWatchdog(long budgetMs) {
+        long now = SystemClock.elapsedRealtime();
+        long deadline = now + Math.max(0L, budgetMs);
+        if (detailFirstLoadStartedAtMs > 0L) {
+            long hardDeadline = detailFirstLoadStartedAtMs + DETAIL_FIRST_LOAD_TOTAL_MAX_MS;
+            if (deadline > hardDeadline) {
+                deadline = hardDeadline;
+            }
+        }
+        detailFirstLoadDeadlineMs = deadline;
         llLayout.removeCallbacks(detailFirstLoadTimeout);
-        llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+        llLayout.postDelayed(detailFirstLoadTimeout, Math.max(0L, deadline - now));
+    }
+
+    /**
+     * r212：把「建连耗时」折算成首屏预算的补足额。
+     *
+     * <p>首屏 5s 是从进页起算的，而请求要先过 DNS+TCP+TLS。实测 Cloudflare 后的采集站
+     * TLS 1.8–2.0s、建连 2.2–3.0s（22:18 日志 {@code api.wujinapi.com} /
+     * {@code api.zuidapi.com}），留给源站响应只剩 0.9–2.8s，本来能通的源会被判超时切走。</p>
+     *
+     * <p><b>为什么要收敛</b>：无条件补足会让真死源等更久。这里只在
+     * 「建连 ≥ {@link #DETAIL_SLOW_CONNECT_MS}」时补，补足额 = 建连耗时，
+     * 上限 {@link #DETAIL_SLOW_CONNECT_GRANT_MAX_MS}，且<b>一次进页只补一次</b>：
+     * 慢但能通的源拿回公平窗口，死源最多多等 4s（实测两者相加仍是
+     * {@code 5s+2.2s} 与 {@code 5s+5s} 两档，不会叠加）。</p>
+     *
+     * <p>回调来自 OkHttp 线程，这里只做主线程投递，判定放到主线程做。</p>
+     */
+    private void onDetailConnectCost(String tag, long costMs) {
+        if (!"detail".equals(tag)) {
+            return;                 // 只认首屏/切源候选的详情请求，补拉用的是 prefetch_detail
+        }
+        // 回调来自 OkHttp 工作线程；llLayout 是判定与改预算的唯一入口，未就绪直接丢弃
+        if (llLayout == null) {
+            return;
+        }
+        final long cost = costMs;
+        llLayout.post(new Runnable() {
+            @Override
+            public void run() {
+                applyDetailConnectBudget(cost);
+            }
+        });
+    }
+
+    private void applyDetailConnectBudget(long costMs) {
+        if (!detailFirstLoadPending || detailFirstLoadBudgetExtended) {
+            return;
+        }
+        if (isFinishing() || isDestroyed() || hasRenderedDetail()) {
+            return;
+        }
+        if (costMs < DETAIL_SLOW_CONNECT_MS) {
+            return;
+        }
+        long remain = detailFirstLoadDeadlineMs - SystemClock.elapsedRealtime();
+        if (remain <= 0L) {
+            return;                 // 已经到点了，让看门狗按原逻辑收尾
+        }
+        long grant = Math.min(costMs, DETAIL_SLOW_CONNECT_GRANT_MAX_MS);
+        detailFirstLoadBudgetExtended = true;
+        detailFirstLoadConnectCostMs = costMs;
+        LOG.i("[FB] firstLoadBudget extend connect=" + costMs + "ms +" + grant
+                + "ms remain=" + remain + "ms src=" + sourceKey + " id=" + vodId);
+        scheduleDetailFirstLoadWatchdog(remain + grant);
+    }
+
+    /**
+     * r212：真的换一条连接重试首屏详情。
+     *
+     * <p><b>为什么旧实现等于没换</b>：{@code evictIdleConnections()} 只清<b>空闲</b>连接，
+     * 而超时那一刻旧请求<b>仍在飞</b>（连接被占着，不是空闲）；即便拿到空闲连接，
+     * HTTP/2 允许同一条连接多路复用，新请求也会挂回同一条。22:18 日志实证：
+     * 首发 22:19:15.519 建连 2201ms 后挂住，`retry once (fresh conn)` 发出的第二个请求
+     * <b>全程没有新的 tls/connect 日志</b>，最后两条 call 在同一毫秒被同一个
+     * {@code cancelTag("detail")} 一起收走 —— 它们本就在同一条连接上。</p>
+     *
+     * <p>因此顺序必须是：<b>先取消在飞请求</b>（让连接变空闲）→ 清空闲连接池
+     * （真正断开）→ 隔一小拍再发（等 cancel 的 socket 关闭落地），发前再清一次。</p>
+     */
+    private void retryDetailWithFreshConnection(final String reason) {
+        // r212：切源会话一旦开始，候选请求也打 "detail" 标签；此时再 cancelTag("detail")
+        //   会把正在飞的候选一起掐掉。首屏重试只属于「还没进切源」的阶段，这里加一道闸。
+        if (detailFallbackActive) {
+            LOG.i("[FB] detailRetry skipped: fallback active reason=" + reason
+                    + " src=" + sourceKey + " id=" + vodId);
+            // 交还给切源状态机：它有自己的候选超时/停摆看门狗，首屏看门狗不该再挂着
+            detailFirstLoadPending = false;
+            llLayout.removeCallbacks(detailFirstLoadTimeout);
+            return;
+        }
+        try {
+            OkGo.getInstance().cancelTag("detail");
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+        OkGoHelper.evictIdleConnections();
+        LOG.e("echo-detail-retry(" + reason + "), cancel in-flight then fresh conn: "
+                + sourceKey + " " + vodId);
+        // 预算里额外算上这一拍的等待，避免「等 150ms」被算进源站的响应时间
+        scheduleDetailFirstLoadWatchdog(DETAIL_FIRST_LOAD_TIMEOUT_MS + DETAIL_FRESH_CONN_DELAY_MS);
+        llLayout.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                if (!detailFirstLoadPending || hasRenderedDetail()) {
+                    return;
+                }
+                // cancel 的 socket 关闭是异步的：这一拍之后连接大多已回到空闲池，再清一次才算断开
+                OkGoHelper.evictIdleConnections();
+                sourceViewModel.getDetail(sourceKey, vodId, false);
+            }
+        }, DETAIL_FRESH_CONN_DELAY_MS);
     }
 
     private void cancelDetailFirstLoadWatchdog() {
@@ -2100,11 +2260,7 @@ public class DetailActivity extends BaseActivity {
             detailFirstLoadRetried = true;
             detailFirstLoadPending = true;
             showLoadingTip(detailRetryTip());
-            OkGoHelper.evictIdleConnections();
-            LOG.e("echo-detail-net-error, retry with fresh connection: " + sourceKey + " " + vodId);
-            llLayout.removeCallbacks(detailFirstLoadTimeout);
-            sourceViewModel.getDetail(sourceKey, vodId, false);
-            llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+            retryDetailWithFreshConnection("netError");
         } else {
             // ★ r211：第二次仍网络失败 ⇒ 立刻收尾，不再空等 5s 看门狗。
             //
@@ -2135,6 +2291,22 @@ public class DetailActivity extends BaseActivity {
     private boolean detailNetFallbackStarted = false;
     /** r211：上一次处理过的 __NET__ 回包实例，用于识别 LiveData 重复投递（见 handleDetailNetworkError）。 */
     private AbsXml lastNetErrorReplayed = null;
+    /** r212：首屏看门狗的绝对到期时刻（elapsedRealtime）；慢建连补预算按它算剩余。 */
+    private long detailFirstLoadDeadlineMs = 0L;
+    /** r212：本次进页首屏起点（elapsedRealtime），用于 {@link #DETAIL_FIRST_LOAD_TOTAL_MAX_MS} 硬顶。 */
+    private long detailFirstLoadStartedAtMs = 0L;
+    /** r212：本轮首屏是否已因「慢建连」补过预算（一次进页只补一次）。 */
+    private boolean detailFirstLoadBudgetExtended = false;
+    /** r212：本轮首屏观测到的建连耗时（诊断用）。 */
+    private long detailFirstLoadConnectCostMs = 0L;
+    /** r212：建连耗时监听（OkHttp 线程回调 → 投递到主线程判定）。 */
+    private final NetEventListener.ConnectCostListener detailConnectCostListener =
+            new NetEventListener.ConnectCostListener() {
+                @Override
+                public void onConnectCost(String tag, long costMs) {
+                    onDetailConnectCost(tag, costMs);
+                }
+            };
     private boolean detailFirstLoadPending = false;
     private boolean detailFirstLoadRetried = false;
     private final Runnable detailFirstLoadTimeout = new Runnable() {
@@ -2149,9 +2321,7 @@ public class DetailActivity extends BaseActivity {
                 detailFirstLoadRetried = true;
                 LOG.e("echo-detail-first-load timeout, retry once (fresh conn): " + sourceKey + " " + vodId);
                 showLoadingTip(detailRetryTip());
-                OkGoHelper.evictIdleConnections();
-                sourceViewModel.getDetail(sourceKey, vodId, false);
-                llLayout.postDelayed(detailFirstLoadTimeout, DETAIL_FIRST_LOAD_TIMEOUT_MS);
+                retryDetailWithFreshConnection("timeout");
             } else {
                 detailFirstLoadPending = false;
                 LOG.e("echo-detail-first-load timeout twice, fallback: " + sourceKey + " " + vodId);
@@ -8445,6 +8615,8 @@ public class DetailActivity extends BaseActivity {
     protected void onDestroy() {
         cancelDetailFirstLoadWatchdog();
         resetDetailFallback();
+        // r212：注销建连耗时监听（static 持有，不注销会泄漏 Activity）
+        NetEventListener.clearConnectCostListener(detailConnectCostListener);
         // r211：起播保护窗是进程级单例，本页开了就必须本页关。
         //   不关的话它会继续压着「下一个详情页」的候选派发（20:40 日志白等 2.66s），
         //   且新页面因 beginStartupGuard 旧实现直接 return 而拿不到自己的窗口。

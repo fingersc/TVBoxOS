@@ -39,6 +39,53 @@ public final class NetEventListener extends EventListener {
     /** 被 cancel 的 Call 不会回调 callEnd，兜底上限，防止计时表无界增长。 */
     private static final int MARKS_MAX = 512;
 
+    /**
+     * r212：建连耗时上报。
+     *
+     * <p>详情页的首屏预算（5s）是<b>从进页起算</b>的，而请求要先经过 DNS + TCP + TLS。
+     * 实测 Cloudflare 后的采集站 TLS 握手可达 1.8–2.0s、建连 2.2–3.0s（22:18 日志的
+     * {@code api.wujinapi.com} / {@code api.zuidapi.com}），留给源站响应的时间只剩
+     * 0.9–2.8s —— 本来能通的源会被判超时切走。详情页据此给「慢建连」补足预算。</p>
+     *
+     * <p>static 是有意的：{@link NetEventListener} 按 client 各建了一个实例，
+     * 而详情请求只走默认 client；用 static 才能让详情页不依赖拿到具体实例。</p>
+     */
+    public interface ConnectCostListener {
+        /**
+         * @param tag    请求 tag（OkGo 的 {@code .tag(...)}；详情请求是 {@code "detail"}）
+         * @param costMs TCP+TLS 建连耗时
+         */
+        void onConnectCost(String tag, long costMs);
+    }
+
+    private static volatile ConnectCostListener connectCostListener;
+
+    /** 注册建连耗时监听（同一时刻只保留一个：详情页是前台单例）。 */
+    public static void setConnectCostListener(ConnectCostListener listener) {
+        connectCostListener = listener;
+    }
+
+    /** 注销；只有当前登记的就是该 listener 时才清，避免误清后来者。 */
+    public static void clearConnectCostListener(ConnectCostListener listener) {
+        if (listener != null && connectCostListener == listener) {
+            connectCostListener = null;
+        }
+    }
+
+    private static void reportConnectCost(Call call, long costMs) {
+        ConnectCostListener l = connectCostListener;
+        if (l == null) {
+            return;
+        }
+        try {
+            Object tag = call.request().tag();
+            if (tag instanceof String) {
+                l.onConnectCost((String) tag, costMs);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 一个 Call 的分段计时。字段语义与旧的实例字段一一对应，只是不再跨请求共享。 */
     private static final class Mark {
         long dnsStart;
@@ -105,6 +152,8 @@ public final class NetEventListener extends EventListener {
             // v99-r91：地址直接用回调参数，不再借用实例字段（旧版借的那份可能是别的请求的）
             LOG.i("[net] connect " + inetSocketAddress + " " + cost + "ms " + protocol);
         }
+        // r212：把建连耗时交给详情页（它据此判断「慢建连」要不要补足首屏预算）
+        reportConnectCost(call, cost);
         // v97：连接成功即证明该地址/该族可用，回填给双栈优选做粘性排序
         try {
             DualStackResolver.recordSuccess(call.request().url().host(),

@@ -309,6 +309,35 @@ public class SourceViewModel extends ViewModel {
         out.postValue(error);
     }
 
+    /**
+     * r212：这次失败是不是「我们自己 cancel 掉的」。
+     *
+     * <p>OkHttp 被 {@code Call.cancel()} 后回调的是 {@code java.io.IOException: Canceled}；
+     * OkGo 会把它包进 {@link Response#getException()}。这种失败不含任何网络状况信息，
+     * 不能用于「这个源连不上」的判断。</p>
+     *
+     * <p><b>为什么只按消息判定、不按类型</b>：{@code SocketTimeoutException} 是
+     * {@code InterruptedIOException} 的子类，按类型判会把真正的读超时一起当成「取消」
+     * 吞掉 —— 那会让 r207「网络失败先换连接重试一次」对超时完全失效。所以这里只认
+     * okhttp 取消时写死的那句 {@code "Canceled"}，宁可漏判（漏判只是回到 r211 行为）。</p>
+     */
+    private static boolean isCanceledError(Response<String> response) {
+        try {
+            Throwable th = response == null ? null : response.getException();
+            if (th == null) {
+                return false;
+            }
+            String msg = th.getMessage();
+            if (msg == null) {
+                return false;
+            }
+            String lower = msg.toLowerCase();
+            return lower.contains("canceled") || lower.contains("cancelled");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static void clearRuntimeCache() {
         sortCache.clear();
         extendCache.clear();
@@ -1158,6 +1187,15 @@ public class SourceViewModel extends ViewModel {
                         @Override
                         public void onError(Response<String> response) {
                             super.onError(response);
+                            // r212：主动 cancel 掉的请求不是网络故障。
+                            //   详情页「换新连接重试」会先 cancelTag("detail") 掐掉在飞的那条，
+                            //   它必然回调一次 IOException: Canceled。若当成网络失败上报，
+                            //   详情页会把它算作「第二次失败」而立刻切源 —— 重试等于没做。
+                            //   onDestroy 退出页面时的 cancelTag("detail") 同理，也不该留痕迹。
+                            if (isCanceledError(response)) {
+                                LOG.i("echo--getDetail--canceled-ignored: " + sourceBean.getKey() + " " + id);
+                                return;
+                            }
                             // r207：详情网络失败与“源里没有这部片”必须区分，后者才立刻切源。
                             if (out == detailResult) {
                                 postDetailNetError(out, sourceBean.getKey());
