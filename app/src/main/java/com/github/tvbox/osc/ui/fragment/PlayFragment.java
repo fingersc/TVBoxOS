@@ -671,7 +671,9 @@ public class PlayFragment extends BaseLazyFragment {
 
             @Override
             public void errReplay() {
-                errorWithRetry("视频播放出错", false);
+                // ★ r204 方案 A：这是播放器层 STATE_ERROR（解码失败/拉流中断），
+                //   唯一允许“换播放器重试同一 URL”的入口。
+                errorWithRetryOnPlayerError("视频播放出错", false);
             }
 
             @Override
@@ -1189,12 +1191,25 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     void errorWithRetry(String err, boolean finish) {
+        errorWithRetry(err, finish, false);
+    }
+
+    /**
+     * ★ r204 方案 A：只有“播放器自身报错”（STATE_ERROR → errReplay）才允许把 Exo 切到 IJK。
+     * 起播超时 / 嗅探失败 / 解析错误一律只换线路、换源，不再换播放器。
+     */
+    void errorWithRetryOnPlayerError(String err, boolean finish) {
+        errorWithRetry(err, finish, true);
+    }
+
+    private void errorWithRetry(String err, boolean finish, boolean allowSwitchPlayer) {
         if (isPlaybackStarted()) {
             cancelPlayTimeout();
             hideTipOnUiThread();
             return;
         }
-        if (!autoRetry()) {
+        boolean retried = allowSwitchPlayer ? autoRetry() : autoRetryLineOnly();
+        if (!retried) {
             stopMusicSessionForFailedPlayback();
             if (!isAdded()) return;
             requireActivity().runOnUiThread(new Runnable() {
@@ -2356,6 +2371,32 @@ public class PlayFragment extends BaseLazyFragment {
             LOG.i("echo-autoRetry current url failed after player switch, try next line");
             return tryNextLineIfEnabled();
         }
+        return tryNextLineIfEnabled();
+    }
+
+    /**
+     * ★ r204 方案 A：只换线路/换源，绝不切换播放器。
+     *
+     * <p>与 {@link #autoRetry()} 共用 60s 重试预算重置与 loadFoundVideoUrls 续播逻辑，
+     * 但跳过“switchPlayer + 重播同一 URL”那一步。适用于：起播超时、嗅探失败、
+     * 解析错误——这些都属于“这个站/这条线路这次没播成”，换播放器解决不了，
+     * 只会白等一轮（日志 924 实测 Exo→IJK 重播 12 秒后仍失败）。
+     */
+    boolean autoRetryLineOnly() {
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastRetryTime > 60_000) {
+            LOG.i("echo-reset-autoRetryCount");
+            autoRetryCount = 0;
+            allowSwitchPlayer = true;
+            hasAutoSwitchedPlayer = false;
+            triedLineFlags.clear();
+        }
+        lastRetryTime = currentTime;
+        if (loadFoundVideoUrls != null && loadFoundVideoUrls.size() > 0) {
+            autoRetryFromLoadFoundVideoUrls();
+            return true;
+        }
+        LOG.i("echo-autoRetry line-only (policy A: no player switch)");
         return tryNextLineIfEnabled();
     }
 
@@ -3997,20 +4038,16 @@ public class PlayFragment extends BaseLazyFragment {
             hideTipOnUiThread();
             return;
         }
-        LOG.i("echo-switchLinePlay timeout, try next line");
+        // ★ r204 方案 A：起播超时按「这个站/这条线路这次没播成」处理，只换线/换源，
+        //   不再先把 Exo 切到 IJK 重播同一 URL。换播放器只保留给播放器自身
+        //   STATE_ERROR（errReplay → errorWithRetryOnPlayerError）。
+        LOG.i("echo-switchLinePlay timeout, try next line only (policy A)");
         // ★ 与 resolveTimeout / resolveFailed / parseStall 三个入口对齐：
         //   起播超时同样是「这个站这次没播成」，不记的话 SourceQualityStore 会
         //   少掉一大半失败样本，站点质量分被系统性高估 → 切源优先挑到的仍是慢站。
         recordPlaybackFailure("switchLineTimeout");
         stopParse();
-        if (hasAutoSwitchedPlayer) {
-            if (!tryNextLineIfEnabled()) {
-                stopMusicSessionForFailedPlayback();
-                setTip("播放超时", false, true);
-            }
-            return;
-        }
-        if (!autoRetry()) {
+        if (!tryNextLineIfEnabled()) {
             stopMusicSessionForFailedPlayback();
             setTip("播放超时", false, true);
         }
