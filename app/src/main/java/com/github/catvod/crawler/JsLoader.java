@@ -45,6 +45,32 @@ public class JsLoader {
         recentKey = "";
     }
 
+    /**
+     * r210：只清掉某一个 key 的 JS spider 实例（不动其它源、不动已加载的 jar class）。
+     * <p>用于「构造成功但 jsObject 为空」的烂实例：这种实例被缓存在 {@link #spiders} 里，
+     * 不摘掉的话重试永远拿回同一个空结果（首页分类栏只剩「主页」就是这么来的）。
+     */
+    public synchronized void remove(String key) {
+        if (key == null || key.isEmpty()) {
+            return;
+        }
+        Spider spider = spiders.remove(key);
+        if (spider != null) {
+            try {
+                spider.cancelByTag();
+            } catch (Throwable ignored) {
+            }
+            try {
+                spider.destroy();
+            } catch (Throwable ignored) {
+            }
+            LOG.i("echo-getSpider removed " + key);
+        }
+        if (key.equals(recentKey)) {
+            recentKey = "";
+        }
+    }
+
     public static void stopAll() {
         for (Spider spider : spiders.values()){
             spider.cancelByTag();

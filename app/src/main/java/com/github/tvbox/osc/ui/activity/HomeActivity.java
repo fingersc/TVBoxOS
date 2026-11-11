@@ -348,6 +348,8 @@ public class HomeActivity extends BaseActivity {
 
 
     private boolean skipNextUpdate = false;
+    /** r210：type-3 首页源「分类为空」时自动重试的记账，避免反复空结果把重试打成死循环。 */
+    private String emptySortRetriedKey = null;
 
     private void initViewModel() {
         sourceViewModel = new ViewModelProvider(this).get(SourceViewModel.class);
@@ -386,10 +388,40 @@ public class HomeActivity extends BaseActivity {
                 updateHomeRec(absXml);
                 if (home != null && home.getName() != null && !home.getName().isEmpty()) tvName.setText(home.getName());
                 tvName.clearAnimation();
-                // r208：type-3 首页源返回 0 个分类时给出明确提示，避免「无限转圈/空白」无解释。
+                if (rawClassCount > 0) {
+                    // 取到分类了：清掉自动重试记账，下次再空还能再试一次
+                    emptySortRetriedKey = null;
+                }
+                // r208/r210：type-3 首页源（豆瓣影视库）返回 0 个分类时给出明确提示。
+                //   r210 已在 SourceViewModel 侧加了「重试 + 上次成功分类快照」兜底，
+                //   走到这里说明连快照都没有（首次安装 / 从未成功过），此时必须让用户知道
+                //   左侧只剩「主页」不是加载中，而是分类没取到，并给出可操作动作。
                 if (rawClassCount <= 0 && home != null && home.getType() == 3) {
                     LOG.e("[home] empty sort for type-3 source key=" + home.getKey());
-                    Toast.makeText(HomeActivity.this, "豆瓣影视库暂无分类，长按站点名可重试", Toast.LENGTH_SHORT).show();
+                    // r210：自动再试一次。type-3 的分类由 JS 现场求值，冷启动第一次失败很常见
+                    //   （JS 文件刚下载完还没热、或首次求值超时）。这里静默重取一轮，
+                    //   成功则分类栏自然补齐，失败才真的让用户看到「只有主页」。
+                    final String retryKey = home.getKey();
+                    final boolean alreadyRetried = retryKey.equals(emptySortRetriedKey);
+                    if (!alreadyRetried) {
+                        emptySortRetriedKey = retryKey;
+                        Toast.makeText(HomeActivity.this, "影视库分类没取到，正在重试…", Toast.LENGTH_SHORT).show();
+                        mHandler.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (isActivityUnavailable()) return;
+                                SourceBean cur = ApiConfig.get().getHomeSourceBean();
+                                if (cur == null || !retryKey.equals(cur.getKey())) return;
+                                LOG.i("[home] empty sort auto-retry key=" + retryKey);
+                                // 用 refreshHomeSort 而不是 refreshHome(false)：它会先清掉这个源的
+                                // 内存 sort 缓存，否则重取很可能又拿回同一个空结果。
+                                refreshHomeSort();
+                            }
+                        }, 3000);
+                    } else {
+                        // 重试也失败：这才是需要用户介入的终态
+                        Toast.makeText(HomeActivity.this, "影视库分类没取到，长按站点名可重新加载", Toast.LENGTH_LONG).show();
+                    }
                 }
                 homeSortLoading = false;
                 loadingSourceKey = null;

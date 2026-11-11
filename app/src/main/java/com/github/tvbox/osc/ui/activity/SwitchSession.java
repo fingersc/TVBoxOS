@@ -74,6 +74,16 @@ final class SwitchSession {
         return failoverCount;
     }
 
+    /** r209：供「相位停摆」看门狗读取当前相位（此前无 getter，兜底逻辑无法判断卡在哪一步）。 */
+    synchronized Phase phase() {
+        return phase;
+    }
+
+    /** r209：当前相位已持续多久（ms），用于停摆判定。 */
+    synchronized long phaseAgeMs() {
+        return phaseStartedAt == 0L ? 0L : (android.os.SystemClock.elapsedRealtime() - phaseStartedAt);
+    }
+
     synchronized boolean canFailover(int max) {
         return failoverCount < max;
     }

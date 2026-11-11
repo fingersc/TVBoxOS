@@ -83,6 +83,13 @@ public class SourceViewModel extends ViewModel {
     private static final String PUSH_FALLBACK = "push_fallback";
     private static final String PUSH_HEADERS_MARKER = "@Headers=";
     /**
+     * r210：type-3 首页源（豆瓣影视库）的「上一次成功分类」快照前缀。
+     * <p>这类源的分类由 JS 的 {@code home()} 提供；该 JS 文件要联网下载并现场求值，
+     * 冷启动时一旦抖动就会返回空，左侧分类栏随即退化成只有「主页」。
+     * 成功取到分类时落盘一份，取不到时用它兜底，保证分类栏至少不是空的。
+     */
+    private static final String SORT_SNAPSHOT_PREFIX = "home_sort_snapshot_";
+    /**
      * ★ v99-r43：detail 请求显式要全量集数。
      *
      * <p><b>为什么</b>：MacCMS 的 {@code ac=detail} 有默认 {@code limit}（实测 20/30），
@@ -400,61 +407,65 @@ public class SourceViewModel extends ViewModel {
             Runnable waitResponse = new Runnable() {
                 @Override
                 public void run() {
-                    ExecutorService executor = Executors.newSingleThreadExecutor();
-                    Future<String> future = executor.submit(new Callable<String>() {
-                        @Override
-                        public String call() throws Exception {
-                            Spider sp = ApiConfig.get().getCSP(sourceBean);
-                            String json = sp.homeContent(true);
-                            return json;
+                    // r210：type-3 首页源的分类来自 JS 的 home()，要联网取 JS 再现场求值，
+                    //   冷启动抖动一次就会返回空 —— 左侧分类栏随之退化成只有「主页」。
+                    //   这里失败后重试一次；仍拿不到就用「上次成功的分类快照」兜底。
+                    String sortJson = fetchType3SortJson(sourceBean, 2);
+                    String usedJson = sortJson;
+                    AbsSortXml sortXml = TextUtils.isEmpty(sortJson) ? null : sortJson(sortResult, sortJson);
+                    if (sortXmlClassCount(sortXml) <= 0) {
+                        String snapshot = Hawk.get(SORT_SNAPSHOT_PREFIX + sourceKey, "");
+                        if (!TextUtils.isEmpty(snapshot)) {
+                            AbsSortXml snapXml = sortJson(sortResult, snapshot);
+                            if (sortXmlClassCount(snapXml) > 0) {
+                                usedJson = snapshot;
+                                sortXml = snapXml;
+                                LOG.i("[home] getSort use snapshot key=" + sourceKey
+                                        + " classes=" + sortXmlClassCount(snapXml));
+                            }
                         }
-                    });
-                    String sortJson = null;
-                    try {
-                        sortJson = future.get(30, TimeUnit.SECONDS);
-                    } catch (TimeoutException e) {
-                        LOG.i("echo--getSort-timeout--" + sourceBean.getKey());
-                        e.printStackTrace();
-                        future.cancel(true);
-                    } catch (InterruptedException | ExecutionException e) {
-                        Throwable cause = e.getCause();
-                        LOG.i("echo--getSort-error--" + sourceBean.getKey() + "--" + e.getClass().getSimpleName() + "--" + (cause != null ? cause.getClass().getSimpleName() + ":" + cause.getMessage() : e.getMessage()));
-                        e.printStackTrace();
-                    } finally {
-                        if (sortJson != null) {
-                            final AbsSortXml sortXml = sortJson(sortResult, sortJson);
-                            LOG.i("[home] getSort done key=" + sourceKey + " jsonLen=" + sortJson.length()
-                                    + " classes=" + (sortXml == null || sortXml.classes == null || sortXml.classes.sortList == null ? -1 : sortXml.classes.sortList.size()));
-                            attachSortSource(sourceKey, sortXml);
-                            if (sortXml != null && Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1) {
-                                AbsXml absXml = json(null, sortJson, sourceBean.getKey());
-                                if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
-                                    sortXml.videoList = absXml.movie.videoList;
-                                    postSortResult(sourceKey, sortXml);
-                                    cacheSort(sourceKey, sortXml);
-                                } else {
-                                    getHomeRecList(sourceBean, null, new HomeRecCallback() {
-                                        @Override
-                                        public void done(List<Movie.Video> videos) {
-                                            sortXml.videoList = videos;
-                                            postSortResult(sourceKey, sortXml);
-                                            cacheSort(sourceKey, sortXml);
-                                        }
-                                    });
-                                }
+                        if (sortXmlClassCount(sortXml) <= 0) {
+                            // 连快照都没有：把这次用过的 spider 实例摘掉，让「首页自动重试」
+                            //   （HomeActivity 的 refreshHomeSort）下一轮拿到全新实例，
+                            //   而不是又一次在同一个坏实例上求值出空。
+                            try {
+                                ApiConfig.get().removeSpider(sourceKey);
+                            } catch (Throwable th) {
+                                th.printStackTrace();
+                            }
+                        }
+                    }
+                    if (sortXml != null && sortXmlClassCount(sortXml) > 0) {
+                        final AbsSortXml sortXmlFinal = sortXml;
+                        final String usedJsonFinal = usedJson;
+                        LOG.i("[home] getSort done key=" + sourceKey + " jsonLen=" + usedJsonFinal.length()
+                                + " classes=" + sortXmlClassCount(sortXmlFinal));
+                        // 落盘一份成功分类，供下次冷启动抖动时兜底
+                        Hawk.put(SORT_SNAPSHOT_PREFIX + sourceKey, usedJsonFinal);
+                        attachSortSource(sourceKey, sortXmlFinal);
+                        if (Hawk.get(HawkConfig.HOME_REC, HawkConfig.DEFAULT_HOME_REC) == 1) {
+                            AbsXml absXml = json(null, usedJsonFinal, sourceBean.getKey());
+                            if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
+                                sortXmlFinal.videoList = absXml.movie.videoList;
+                                postSortResult(sourceKey, sortXmlFinal);
+                                cacheSort(sourceKey, sortXmlFinal);
                             } else {
-                                postSortResult(sourceKey, sortXml);
-                                cacheSort(sourceKey, sortXml);
+                                getHomeRecList(sourceBean, null, new HomeRecCallback() {
+                                    @Override
+                                    public void done(List<Movie.Video> videos) {
+                                        sortXmlFinal.videoList = videos;
+                                        postSortResult(sourceKey, sortXmlFinal);
+                                        cacheSort(sourceKey, sortXmlFinal);
+                                    }
+                                });
                             }
                         } else {
-                            LOG.i("[home] getSort null json key=" + sourceKey);
-                            postSortResult(sourceKey, null);
+                            postSortResult(sourceKey, sortXmlFinal);
+                            cacheSort(sourceKey, sortXmlFinal);
                         }
-                        try {
-                            executor.shutdown();
-                        } catch (Throwable th) {
-                            th.printStackTrace();
-                        }
+                    } else {
+                        LOG.i("[home] getSort null json key=" + sourceKey);
+                        postSortResult(sourceKey, null);
                     }
                 }
             };
@@ -607,6 +618,76 @@ public class SourceViewModel extends ViewModel {
             postSortResult(sourceKey, null);
         }
     }
+    /**
+     * r210：type-3 首页分类取数（带重试）。
+     * <p>每次尝试用独立的单线程 executor 与独立超时，互不影响；返回 null 表示所有尝试都没拿到。
+     * <p>第一次拿到空串/null 时先清一次 spider 缓存再重试：{@link com.github.catvod.crawler.JsLoader}
+     * 会把「构造成功但 jsObject 为空」的烂实例缓存住，不清掉重试也只会拿回同一个空结果。
+     */
+    private String fetchType3SortJson(SourceBean sourceBean, int attempts) {
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            final long timeoutSec = attempt == 1 ? 15 : 8;
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            Future<String> future = executor.submit(new Callable<String>() {
+                @Override
+                public String call() throws Exception {
+                    Spider sp = ApiConfig.get().getCSP(sourceBean);
+                    return sp.homeContent(true);
+                }
+            });
+            String json = null;
+            boolean timedOut = false;
+            try {
+                json = future.get(timeoutSec, TimeUnit.SECONDS);
+                if (!TextUtils.isEmpty(json)) {
+                    return json;
+                }
+                LOG.i("[home] getSort empty attempt=" + attempt + " key=" + sourceBean.getKey());
+            } catch (TimeoutException e) {
+                timedOut = true;
+                LOG.i("echo--getSort-timeout--" + sourceBean.getKey() + "--attempt" + attempt);
+                future.cancel(true);
+            } catch (InterruptedException | ExecutionException e) {
+                Throwable cause = e.getCause();
+                LOG.i("echo--getSort-error--" + sourceBean.getKey() + "--" + e.getClass().getSimpleName() + "--"
+                        + (cause != null ? cause.getClass().getSimpleName() + ":" + cause.getMessage() : e.getMessage()));
+            } finally {
+                try {
+                    executor.shutdownNow();
+                } catch (Throwable th) {
+                    th.printStackTrace();
+                }
+            }
+            if (attempt < attempts) {
+                // 拿到空串/异常（不是超时）：多半是 JS spider 实例坏掉了（jsObject 为空），
+                // 摘掉这一个 key 的实例让它下次重新下载/求值；超时则不动，可能只是慢。
+                if (!timedOut && TextUtils.isEmpty(json)) {
+                    try {
+                        ApiConfig.get().removeSpider(sourceBean.getKey());
+                        LOG.i("[home] getSort retry with dropped spider key=" + sourceBean.getKey());
+                    } catch (Throwable th) {
+                        th.printStackTrace();
+                    }
+                }
+                try {
+                    Thread.sleep(800);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** r210：分类条数；0 表示 JS 一个分类都没给出（需要快照兜底或空态提示）。 */
+    private int sortXmlClassCount(AbsSortXml sortXml) {
+        if (sortXml == null || sortXml.classes == null || sortXml.classes.sortList == null) {
+            return 0;
+        }
+        return sortXml.classes.sortList.size();
+    }
+
     // categoryContent
     public void getList(MovieSort.SortData sortData, int page) {
         if (sortData == null) {

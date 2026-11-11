@@ -243,6 +243,19 @@ public class DetailActivity extends BaseActivity {
      */
     private static final long DETAIL_FALLBACK_FIRST_CONSUME_DELAY_MS = SwitchBudget.FIRST_CONSUME_DELAY_MS;
     private static final long DETAIL_FALLBACK_DETAIL_TIMEOUT_MS = SwitchBudget.DETAIL_TIMEOUT_MS;
+    /**
+     * r209：切源相位「停摆」看门狗窗口。
+     *
+     * <p>实测（星际穿越 11-11 18:35 日志）：候选轮转途中 {@code resetDetailFallback(true)} 把
+     * {@code detailFallbackActive} 清成 false，随后 {@code loadDetail} 既不挂单候选超时、
+     * 又以 fallback=false 命中详情内存缓存，缓存响应被观察者静默丢弃 ——
+     * 状态机停在 {@code detailFallbackLoadingCandidate=true} + phase=MATCHING，
+     * 没有任何超时接管，「播放地址：获取中…」一直不收敛（41.9s 直到用户退出）。</p>
+     *
+     * <p>这里按「最后一次进展」计时：只要超过该窗口既没有新候选、也没有详情回调，
+     * 就认定停摆，强制自愈并走超时续切，保证「获取中」一定会收敛。</p>
+     */
+    private static final long DETAIL_FALLBACK_STALL_MS = 12_000L;
     // ★ r203：首屏详情看门狗。首次进入详情页时若 5s 内没有任何详情返回，换新连接重发一次；
     //   再过 5s 仍无 → 转入切源搜索。详情只是小段文本，单次预算 5s、合计 10s
     //   （与视频起播的大数据量预算区分开）。用于兜住「请求永不回调」导致的无限 loading。
@@ -1274,17 +1287,27 @@ public class DetailActivity extends BaseActivity {
         sourceViewModel.detailResult.observe(this, new Observer<AbsXml>() {
             @Override
             public void onChanged(AbsXml absXml) {
+                // r209：切源详情链路的观测量——每次回调都记录关键状态，便于定位「停摆/静默丢弃」。
+                LOG.i("[FB] detailResult<- src=" + sourceKey + " active=" + detailFallbackActive
+                        + " candidate=" + detailFallbackLoadingCandidate
+                        + " rendered=" + hasRenderedDetail()
+                        + " got=" + (absXml == null ? "null"
+                        : (absXml.movie == null || absXml.movie.videoList == null ? "noVideo" : "v" + absXml.movie.videoList.size()))
+                        + " msg=" + (absXml == null ? "" : absXml.msg));
                 if (detailFallbackActive && !detailFallbackLoadingCandidate) {
+                    LOG.i("[FB] detailResult skip reason=waiting-candidate");
                     return;
                 }
                 if (absXml != null && !TextUtils.isEmpty(absXml.sourceKey)
                         && !TextUtils.equals(absXml.sourceKey, sourceKey)
                         && !("push_fallback".equals(absXml.sourceKey) && "push_agent".equals(sourceKey))) {
+                    LOG.i("[FB] detailResult skip reason=sourceKey-mismatch got=" + absXml.sourceKey);
                     return;
                 }
                 // r207：页面已渲染且不在切源会话中时，迟到的重复/失败结果一律忽略，
                 //   避免旧请求 5s/20s 后的迟到回调把已显示的详情覆盖或把页面切走。
                 if (!detailFallbackActive && hasRenderedDetail()) {
+                    LOG.i("[FB] detailResult skip reason=rendered-not-fallback");
                     return;
                 }
                 // r207：详情网络失败不走“空详情→切源”，先换新连接重试一次。
@@ -1294,6 +1317,8 @@ public class DetailActivity extends BaseActivity {
                 }
                 // r203：本页详情请求已有结果（含空结果），首屏看门狗不再需要。
                 cancelDetailFirstLoadWatchdog();
+                // r209：详情已有结果，停摆看门狗由后续分支按需重挂（loadNext 会再挂）。
+                cancelDetailFallbackStallWatchdog();
                 if (absXml != null && absXml.movie != null && absXml.movie.videoList != null && absXml.movie.videoList.size() > 0) {
                     boolean fallbackResult = detailFallbackLoadingCandidate;
                     if (detailFallbackLoadingCandidate) {
@@ -1574,8 +1599,9 @@ public class DetailActivity extends BaseActivity {
                         //   本次跨域换算若因「主线程禁止同步联网」被放弃（见
                         //   tryResolveCrossDomainNow），落点就只剩"按序兜底"这一猜，
                         //   需要在 jumpToPlay() 之后交给异步通道补正。
-                        //   ⚠ 旧源集名必须**在此刻**抓：紧接的 resetDetailFallbackKeepCache()
-                        //   会走 resetDetailFallback(true) 把 detailFallbackEpisode 快照清空。
+                        //   ⚠ 旧源集名必须**在此刻**抓：r210 把本轮复位点挪到了同集守卫之后
+                        //   （见下方 detailFallbackConfirmed=true 处），那里会走 resetDetailFallback(true)
+                        //   把 detailFallbackEpisode 快照清空，所以这里必须先取走。
                         final String backfillFromName =
                                 (detailFallbackEpisode != null && !TextUtils.isEmpty(detailFallbackEpisode.name))
                                         ? detailFallbackEpisode.name
@@ -1583,10 +1609,14 @@ public class DetailActivity extends BaseActivity {
                         // 读后即清：避免陈旧标志外溢到下一次落点
                         final boolean backfillNeeded = crossDomainSyncSkipped;
                         crossDomainSyncSkipped = false;
-                        // 切源成功：保留候选池与仍在跑的批处理，只复位本轮状态机。
-                        // 用 resetDetailFallback() 会 cancelTag 把批处理掐死，
-                        // 导致缓存永远只有第一个源 → 下次点击只能切回它。
-                        resetDetailFallbackKeepCache();
+                        // ★ r210：本轮复位不能放在这里。
+                        //   下面是「候选详情已带回剧集」的渲染准备段，但候选是否真的可用还没定论——
+                        //   同集守卫在后面（detailFallbackConfirmed=true 处）才判定。旧实现在这里就调
+                        //   resetDetailFallbackKeepCache()，守卫一旦拒绝（alignNoEpisode），会话标志
+                        //   detailFallbackActive 已被清成 false：下一个候选既不挂单候选超时、也不以
+                        //   fallback 身份请求（直接命中内存缓存），回包再被观察者静默丢弃 →
+                        //   「获取中…」永久停摆（星际穿越 2026-11-11 18:35，MATCHING 卡 41.9s）。
+                        //   复位统一挪到守卫通过之后，见 detailFallbackConfirmed=true 处。
 
                         // 线路回退：remapPlayIndexFromNote 可能改写 playFlag、或该线路列表为 null，
                         // 这里兜底回退到第一条有效线路，避免 seriesMap.get() 返回 null 导致 NPE
@@ -1603,6 +1633,9 @@ public class DetailActivity extends BaseActivity {
                         }
                         if (playingSeriesList == null || playingSeriesList.isEmpty()) {
                             // 整部影片没有任何有效线路：走空态，不要继续往下走
+                            // r210：这条 early-return 在「复位点后移」之后也要自己收尾，
+                            //   否则会话标志会挂着一个已经不可能有结果的候选。
+                            resetDetailFallbackKeepCache();
                             showEmpty();
                             return;
                         }
@@ -1729,9 +1762,46 @@ public class DetailActivity extends BaseActivity {
                             //   身份判据用 FilmIdentity.isSameFilmStrict：年份/导演都未知时
                             //   不自动切（用户 m02771 拍板），同名翻拍用硬冲突拉黑。
                             if (movieSingleCase) {
-                                sameEpisodeConfirmed = confirmMovieSingleIdentity(
-                                        expectedName, currentEpisode.name,
-                                        sourceKey, vodId, vodInfo, fallbackResult);
+                                // r209：电影单片的候选集名与目标集名一致（或候选本身就是同格式标签）时，
+                                //   直接确证「同一部电影」，不再走年份/导演身份自举——否则首个候选只记种子、
+                                //   必然返回 false，整类电影（如《星际穿越》expected=HD中字 actual=HD中字）
+                                //   会被 alignNoEpisode 逐个拒光，卡在「获取中」。身份比对只在标签不同时使用。
+                                boolean movieLabelMatched = TextUtils.equals(expectedName, currentEpisode.name)
+                                        || (expectedIsMovie && EpisodeNameMatcher.isMovieFormatName(currentEpisode.name));
+                                if (movieLabelMatched) {
+                                    // 标签一致只免掉「身份不足就不切」这一条；已知的硬冲突（年份不同/导演交叉不上，
+                                    //   即同名翻拍片）仍然拒绝——否则《倩女幽魂》1987 与 2011 会被当成同一部。
+                                    int refY = detailFallbackRefVideo == null ? 0 : detailFallbackRefVideo.year;
+                                    String refD = detailFallbackRefVideo == null
+                                            ? "" : (detailFallbackRefVideo.director == null ? "" : detailFallbackRefVideo.director);
+                                    if (refY <= 0 && TextUtils.isEmpty(refD) && movieIdentityBootstrapSet) {
+                                        refY = movieIdentityBootstrapYear;
+                                        refD = movieIdentityBootstrapDirector;
+                                    }
+                                    int tgtY = vodInfo == null ? 0 : vodInfo.year;
+                                    String tgtD = vodInfo == null
+                                            ? "" : (vodInfo.director == null ? "" : vodInfo.director);
+                                    boolean labelConflict = (refY > 0 || !TextUtils.isEmpty(refD))
+                                            && FilmIdentity.isSameFilmConflict(refY, refD, tgtY, tgtD);
+                                    if (labelConflict) {
+                                        sameEpisodeConfirmed = false;
+                                        detailFallbackDeadKeys.add(getDetailFallbackKey(sourceKey, vodId));
+                                        LOG.sw("[FB] movieSingleSameLabelConflict expected=" + expectedName
+                                                + " actual=" + currentEpisode.name
+                                                + " refY=" + refY + " tgtY=" + tgtY
+                                                + " refDirector=" + refD + " tgtDirector=" + tgtD
+                                                + " -> false");
+                                    } else {
+                                        sameEpisodeConfirmed = true;
+                                        LOG.sw("[FB] movieSingleSameLabel expected=" + expectedName
+                                                + " actual=" + currentEpisode.name
+                                                + " refY=" + refY + " tgtY=" + tgtY + " -> true");
+                                    }
+                                } else {
+                                    sameEpisodeConfirmed = confirmMovieSingleIdentity(
+                                            expectedName, currentEpisode.name,
+                                            sourceKey, vodId, vodInfo, fallbackResult);
+                                }
                             } else {
                                 // ★ r141：同集确认升级为「列表级」。
                                 //   原名级 isSameEpisodeStrict 只比日期/期号/显式分段，认不出
@@ -1779,6 +1849,11 @@ public class DetailActivity extends BaseActivity {
                             loadNextDetailFallbackSource();
                             return;
                         }
+                        // ★ r210：守卫已通过，这一刻才算「本轮切源真正成功」——此时才复位本轮状态机。
+                        //   保留候选池与仍在跑的批处理（用 resetDetailFallback() 会 cancelTag 把批处理掐死，
+                        //   导致缓存永远只有第一个源 → 下次点击只能切回它）。
+                        //   放在守卫之前会让被拒候选把会话标志清掉，制造「获取中…」永久停摆。
+                        resetDetailFallbackKeepCache();
                         // ★ r165：本候选已通过同集确认守卫（或被判定无需守卫），允许其后续
                         //   insertVod 正常写历史/合并同名记录（此时 playNote 才是可信落点）。
                         detailFallbackConfirmed = true;
@@ -2100,13 +2175,25 @@ public class DetailActivity extends BaseActivity {
             // 切源模式：有内容时不打扰（不遮播放器）；无内容时给全屏说明。
             showLoadingTip(detailMatchingTip());
         }
-        if (fallback && detailFallbackActive) {
+        // r209：切源候选的看门狗不能依赖 detailFallbackActive——实测该标志会被
+        //   resetDetailFallback(true) 在候选轮转途中清成 false，导致此处不挂超时、
+        //   getDetail 也以 fallback=false 命中内存缓存，响应随后被静默丢弃，状态机永久停在
+        //   MATCHING「获取中」。改为只按 fallback 判定（fallback 由轮转方显式传入）。
+        if (fallback) {
+            // r209：这里是「切源候选请求」的唯一出口，会话标志也在这里兜底自愈。
+            //   实测 resetDetailFallback(true)（切源成功收尾）会把 detailFallbackActive 清成 false，
+            //   若它恰好发生在候选派发前后，本请求就会以「非切源」身份发出并被内存缓存命中，
+            //   回包再被观察者按「页面已渲染且不在切源会话中」静默丢弃 —— 表现就是永久「获取中」。
+            if (!detailFallbackActive && !isFinishing() && !isDestroyed()) {
+                LOG.sw("[FB] selfHeal active=false -> true at loadDetail id=" + vodId + " src=" + key);
+                detailFallbackActive = true;
+            }
             // ★ r165：每次拉取新候选都从「未确认」起步——在其 detailResult 通过同集守卫前不写历史。
             detailFallbackConfirmed = false;
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
             llLayout.postDelayed(detailFallbackDetailTimeout, DETAIL_FALLBACK_DETAIL_TIMEOUT_MS);
         }
-        sourceViewModel.getDetail(sourceKey, vodId, fallback && detailFallbackActive);
+        sourceViewModel.getDetail(sourceKey, vodId, fallback);
         boolean isVodCollect = RoomDataManger.isVodCollect(sourceKey, vodId);
         if (isVodCollect) {
             tvCollect.setText("取消收藏");
@@ -2594,6 +2681,8 @@ public class DetailActivity extends BaseActivity {
         markSwitchFrom();
         setSwitchPhase(SwitchSession.Phase.LOADING_DETAIL);
         loadDetail(nextId, nextSource, true);
+        // r209：同 loadNextDetailFallbackSource，派发后即挂停摆看门狗。
+        armDetailFallbackStallWatchdog();
         return true;
     }
 
@@ -5162,6 +5251,7 @@ public class DetailActivity extends BaseActivity {
                 Movie.Video video = detailFallbackCacheVideo(detailFallbackAnchorTitle, nextSource, videoId);
                 detailFallbackLoadingCandidate = true;
                 detailFallbackDetailTimedOut = false;
+                // r209：active 的自愈统一放在 loadDetail(fallback=true) 入口（单一漏斗），此处不再重复。
                 if (video != null) {
                     vod_name = video.name == null ? "" : video.name;
                     vod_picture = video.pic == null ? "" : video.pic;
@@ -5173,6 +5263,8 @@ public class DetailActivity extends BaseActivity {
                         + " failover=" + switchSession.failoverCount());
                 markSwitchFrom();
                 loadDetail(videoId, nextSource, true);
+                // r209：派发候选后即挂停摆看门狗——若详情既不回来也没有超时接管，12s 后自愈续切。
+                armDetailFallbackStallWatchdog();
                 return;
             }
         }
@@ -5302,6 +5394,72 @@ public class DetailActivity extends BaseActivity {
 
     private String getDetailFallbackKey(String key, String id) {
         return (key == null ? "" : key) + "|" + (id == null ? "" : id);
+    }
+
+    // ================= r209：切源相位停摆看门狗 =================
+    /**
+     * 每次派发候选时重置停摆计时。与单候选 6s 详情超时互补：
+     * 单候选超时负责「正常慢」，停摆看门狗负责「状态被中途清掉、谁都没在等」。
+     */
+    private void armDetailFallbackStallWatchdog() {
+        if (llLayout == null) {
+            return;
+        }
+        llLayout.removeCallbacks(detailFallbackStallTimeout);
+        llLayout.postDelayed(detailFallbackStallTimeout, DETAIL_FALLBACK_STALL_MS);
+    }
+
+    private void cancelDetailFallbackStallWatchdog() {
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackStallTimeout);
+        }
+    }
+
+    /**
+     * 停摆兜底：候选已置 in-flight，但既没有详情回调、也没有单候选超时接管。
+     *
+     * <p>先自愈（把被 {@code resetDetailFallback(true)} 清掉的 active 补回），
+     * 再按「详情超时」处理——记软失败、占一次续切预算、换下一个候选；
+     * 若当前并没有 in-flight 候选，则直接收尾，避免「获取中」无限悬挂。</p>
+     */
+    private void finishDetailFallbackOnStall() {
+        if (!detailFallbackActive && !detailFallbackLoadingCandidate) {
+            return;
+        }
+        LOG.sw("[FB] stall watchdog fire phase=" + switchSession.phase()
+                + " phaseAge=" + switchSession.phaseAgeMs()
+                + " active=" + detailFallbackActive
+                + " candidate=" + detailFallbackLoadingCandidate
+                + " src=" + sourceKey + " id=" + vodId
+                + " soft=" + detailFallbackSoftTriedKeys.size());
+        if (!detailFallbackActive) {
+            detailFallbackActive = true;
+        }
+        if (!detailFallbackLoadingCandidate) {
+            // 搜索/收集仍在跑：后面还会有新候选进来，重新计时，不提前收尾。
+            if (detailFallbackSearching || detailFallbackSearchCollecting) {
+                armDetailFallbackStallWatchdog();
+                return;
+            }
+            // 没有在等的候选、也没有在跑的搜索：本轮确实推不动了，
+            //   收尾成终态（不再无限「获取中」）。
+            finishDetailFallbackWithoutResult();
+            return;
+        }
+        detailFallbackLoadingCandidate = false;
+        detailFallbackDetailTimedOut = true;
+        String timedOutSource = detailFallbackTimedOutSource;
+        if (TextUtils.isEmpty(timedOutSource)) {
+            timedOutSource = sourceKey;
+        }
+        detailFallbackSoftTriedKeys.add(timedOutSource);
+        detailFallbackTimedOutKey = null;
+        detailFallbackTimedOutSource = null;
+        OkGo.getInstance().cancelTag("detail");
+        if (!consumeFailoverBudget("stall")) {
+            return;
+        }
+        loadNextDetailFallbackSource();
     }
 
     /**
@@ -5981,6 +6139,11 @@ public class DetailActivity extends BaseActivity {
             resetMovieIdentityBootstrap();
         }
         detailFallbackActive = false;
+        // r210：会话结束点必须可观测。排查「获取中…」停摆时，这一行是判定「谁把 active 清掉」的唯一依据：
+        //   keepCache=true 只应出现在守卫通过之后；若日志里它在 MATCHING/候选在飞时出现，就是复位点又提前了。
+        LOG.i("[FB] resetSession keepCache=" + keepCache + " candidate=" + detailFallbackLoadingCandidate
+                + " searching=" + detailFallbackSearching + " collecting=" + detailFallbackSearchCollecting
+                + " confirmed=" + detailFallbackConfirmed);
         // 切源这一轮结束（成功 / 放弃 / 出错），提示弹窗必须同步收起
         dismissSwitchingSourceToast();
         // 本轮切源结束：不再由本轮驱动取源。
@@ -6055,6 +6218,8 @@ public class DetailActivity extends BaseActivity {
         if (llLayout != null) {
             llLayout.removeCallbacks(detailFallbackTimeout);
             llLayout.removeCallbacks(detailFallbackDetailTimeout);
+            // r209：停摆看门狗也属于「本轮」的定时器，随轮次收尾一并摘掉。
+            llLayout.removeCallbacks(detailFallbackStallTimeout);
             llLayout.removeCallbacks(detailFallbackEarlyConsume);
             llLayout.removeCallbacks(detailFallbackBusyRefill);
             // 后台攒池的启动定时器<b>只在「彻底复位」时摘</b>（防退出页面后还在起跑 / 落盘）。
@@ -6676,6 +6841,17 @@ public class DetailActivity extends BaseActivity {
         @Override
         public void run() {
             finishDetailFallbackDetailOnTimeout();
+        }
+    };
+    /**
+     * r209：切源相位停摆看门狗。与 {@link #detailFallbackDetailTimeout} 的区别：
+     * 后者按「单个候选的详情请求」计时，前者按「整轮切源是否还在推进」计时，
+     * 用于兜住「候选已置 in-flight 但既无响应也无超时」的静默停摆。
+     */
+    private final Runnable detailFallbackStallTimeout = new Runnable() {
+        @Override
+        public void run() {
+            finishDetailFallbackOnStall();
         }
     };
 

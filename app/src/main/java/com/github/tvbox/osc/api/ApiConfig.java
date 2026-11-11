@@ -1908,4 +1908,27 @@ public class ApiConfig {
         currentLiveSpider = "";
         clearLoader();
     }
+
+    /**
+     * r210：只丢掉某个站点 key 的 JS spider 实例，其它源不受影响。
+     * <p>用于 type-3 首页源「构造成功但 JS 求值为空」的烂实例：这种实例被 {@link JsLoader} 缓存住，
+     * 不摘掉重试也只会拿回同一个空结果，左侧分类栏就一直只剩「主页」。
+     * <p>刻意<b>不</b>清 jar/py loader：那会把其它正在用的源一起销毁（切源会话会瞬间全挂）。
+     */
+    public void removeSpider(String key) {
+        if (key == null || key.isEmpty()) {
+            return;
+        }
+        try {
+            jsLoader.remove(key);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+        if (key.equals(currentPyKey)) {
+            currentPyKey = "";
+        }
+        synchronized (warmedSearchSpiderKeys) {
+            warmedSearchSpiderKeys.remove(key);
+        }
+    }
 }
