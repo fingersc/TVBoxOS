@@ -2366,11 +2366,17 @@ public class DetailActivity extends BaseActivity {
         return TextUtils.isEmpty(name) ? "网络较慢，正在重新加载详情" : "网络较慢，正在重新加载" + name;
     }
 
-    private String detailMatchingTip() {
-        String name = detailQuotedName();
-        return TextUtils.isEmpty(name) ? "正在匹配其它片源" : "正在为" + name + "匹配其它片源";
-    }
-
+    /**
+     * r214：页面无内容时的「正在找片源」文案。
+     *
+     * <p>此处刻意<b>不</b>说「其它片源」。能用到这句话的唯一前提是
+     * {@link #hasRenderedDetail()} 为 false，即本页<b>从来没有过可播内容</b>
+     * （典型：豆瓣影视库这类索引源，{@code seriesMap} 恒空，点「立即播放」直接找源）。
+     * 「其它」暗含「已有一个在播」，而这一刻连第一个都还没有，措辞与事实相反。
+     *
+     * <p>旧实现另有一个 {@code detailMatchingTip()}（「正在匹配其它片源」），与本方法
+     * 只差措辞、语义完全重合；r214 起统一收口到本方法，避免两套说法并存。</p>
+     */
     private String detailSearchingTip() {
         String name = detailQuotedName();
         return TextUtils.isEmpty(name) ? "正在搜索可用片源" : "正在为" + name + "搜索可用片源";
@@ -2404,7 +2410,9 @@ public class DetailActivity extends BaseActivity {
             }
         } else if (!hasRenderedDetail() && !isLoading()) {
             // 切源模式：有内容时不打扰（不遮播放器）；无内容时给全屏说明。
-            showLoadingTip(detailMatchingTip());
+            // r214：文案统一走 detailSearchingTip（不再说「其它片源」——能到这里说明本页
+            //   从来没有过可播内容，「其它」没有指代对象）。
+            showLoadingTip(detailSearchingTip());
         }
         // r209：切源候选的看门狗不能依赖 detailFallbackActive——实测该标志会被
         //   resetDetailFallback(true) 在候选轮转途中清成 false，导致此处不挂超时、
@@ -4308,9 +4316,12 @@ public class DetailActivity extends BaseActivity {
         try {
             if (!isFinishing() && !isDestroyed()) {
                 setTextShow(tvPlayUrl, "播放地址：", "正在切换片源…");
-                // ★ r206：页面上还没有内容时，全屏 Loading 的文案同步成「正在为《片名》匹配其它片源」。
+                // ★ r206：页面上还没有内容时，全屏 Loading 的文案同步成「正在为《片名》搜索可用片源」。
+                //   r214：原文案是「匹配其它片源」，但这条分支只在 hasRenderedDetail()==false 时进入
+                //   —— 本页从来没有过可播内容，「其它」没有指代对象（豆瓣影视库点「立即播放」就是
+                //   第一次找源）。统一收口到 detailSearchingTip()，与 loadDetail 的 fallback 分支一致。
                 if (!hasRenderedDetail()) {
-                    showLoadingTip(detailMatchingTip());
+                    showLoadingTip(detailSearchingTip());
                 }
             }
         } catch (Throwable th) {
