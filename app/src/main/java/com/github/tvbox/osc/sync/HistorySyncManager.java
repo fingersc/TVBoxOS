@@ -181,7 +181,10 @@ public final class HistorySyncManager {
         String migrateOwner = AccountContext.ownerKey();
         if (migrateOwner != null && migrateOwner.length() > 0) {
             SyncState.migrateLegacyKeys(migrateOwner);
-            reconcilePushedHlc(migrateOwner);
+            // ★ r216：reconcilePushedHlc 原来在这里同步跑 —— 它会**打开 Room**（登录态下这是
+            //   冷启动主线程唯一一次 DB 打开）并做 3 次 MAX 聚合。它只服务"启动时判断本机
+            //   有没有未推送的写入"，与首屏无关，因此挪到同步线程、在引擎开跑之前补做
+            //   （见 ensureReconciled()）。语义不变：脏标记仍在任何上传之前被补齐。
         }
         // v98 P2：冷启动那一次交给调度器（1 秒内必跑一次）；此后的周期轮询
         //         由调度器按自适应间隔接管，App 不再自己持有 30 分钟的定时器。
@@ -189,6 +192,54 @@ public final class HistorySyncManager {
         //   让首页「最近观看」尽快出现（PROGRESS/COLLECT 交给紧随其后的下一轮）。
         firstRoundPending = true;
         SyncScheduler.requestWithin(migrateOwner, "boot", 1000L);
+    }
+
+    /** r216：本进程是否已做过「已推送水位对账」。 */
+    private static volatile boolean reconciled;
+
+    /**
+     * r216：把 {@link #reconcilePushedHlc(String)} 从启动主线程挪到同步线程。
+     *
+     * <p>调用点在 {@code SyncEngine.runSafe} 之前、且每个进程只跑一次。要求：调用时
+     * {@link AccountContext} 已恢复到该账号（同步线程里 owner/key 都是当前账号的快照，
+     * 由 {@code sync()} 在开线程前取好，所以这里直接读 {@link AccountContext#ownerKey()}）。</p>
+     */
+    static void ensureReconciled() {
+        if (reconciled) {
+            return;
+        }
+        String owner = AccountContext.ownerKey();
+        if (owner == null || owner.length() == 0) {
+            // 游客没有 DB 隔离库可对账，标记掉避免每轮重试
+            reconciled = true;
+            return;
+        }
+        reconciled = true;
+        reconcilePushedHlc(owner);
+    }
+
+    /**
+     * r216：账号切换后允许对新账号重做一次对账。
+     *
+     * <p>{@link #ensureReconciled()} 是"每进程一次"，但切到另一个账号后，那个账号的
+     * {@code SyncState} 可能缺脏标记（上次进程被杀在 markDirty 落盘之前），所以切号时要复位。</p>
+     */
+    public static void resetReconciled() {
+        reconciled = false;
+    }
+
+    /**
+     * r216：强制下一轮同步走「完整轮」（覆盖全部 scope）。
+     *
+     * <p>冷启动首轮是"轻量轮"（只跑 SETTINGS + HISTORY），PROGRESS/COLLECT 交给紧随其后的
+     * 补跑。公共设备模式要在冷启动时"先同步再回退"，如果只跑了轻量轮就回退，剩下的
+     * PROGRESS/COLLECT 就落到一个已经解绑的账号上，只能等他下次登录才补。
+     * 因此预回退那一轮必须先清掉这个标记。</p>
+     */
+    public static void forceFullRoundNextSync() {
+        synchronized (LOCK) {
+            firstRoundPending = false;
+        }
     }
 
     /** 按账号命名空间取 Hawk 键（游客用原键）。 */
@@ -663,6 +714,9 @@ public final class HistorySyncManager {
                 long up = 0L;
                 boolean notModified = false;
                 try {
+                    // ★ r216：把「已推送水位对账」放在引擎开跑之前、同步线程里做（每进程一次）。
+                    //   它需要打开 Room；放在这里既不占启动主线程，又保证脏标记在任何上传前补齐。
+                    ensureReconciled();
                     // ★ v99-r8：云端已改为「按 scope 分文件」（schema 3），旧引擎 doSync 只认
                     //   单文件 data.bin，回退过去会读到过期数据 ⇒ 这里强制走新引擎，
                     //   SYNC_ENGINE_V2 开关不再生效（doSync 代码保留仅供查阅，不再调用）。

@@ -434,9 +434,30 @@ public class HomeActivity extends BaseActivity {
     private boolean dataInitOk = false;
     private boolean jarInitOk = false;
     private boolean searchSpiderWarmStarted = false;
+    /** r216：公共设备回退门控只消费一次（见 {@link #initData()} 开头）。 */
+    private boolean sharedGatePassed = false;
     private TipDialog mConfigErrorDialog;
 
     private void initData() {
+        // ★ r216：公共设备模式的首屏门控。
+        //   开关开启且上次留下登录态时，冷启动需要"先同步、再回退游客"，而配置来源是 Hawk
+        //   （API 地址、首页站源都在账号设置快照里）—— 必须等回退完成、游客快照恢复之后再
+        //   加载配置，否则首屏会按上一个账号的设置跑一遍。
+        //   绝大多数情况（开关关 / 已是游客 / 无待上传改动）这里立即返回 false，零延迟。
+        if (!sharedGatePassed) {
+            sharedGatePassed = true;
+            if (com.github.tvbox.osc.sync.PublicDeviceGuard.awaitBootCheck(new Runnable() {
+                @Override
+                public void run() {
+                    if (!isActivityUnavailable()) {
+                        initData();
+                    }
+                }
+            })) {
+                showLoadingTip("正在同步账号数据…");
+                return;
+            }
+        }
         if (dataInitOk && jarInitOk) {
             loadHomeSort(false);
             if (hasPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)) {

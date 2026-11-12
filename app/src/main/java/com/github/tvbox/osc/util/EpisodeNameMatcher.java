@@ -2853,15 +2853,66 @@ public final class EpisodeNameMatcher {
     private static final int POS_BASE = 1000;
 
     // ---- r121 持久化：把日期表落到磁盘，关闭 TVBox 重开复用；历史删除时经 clearDateTable 清理 ----
-    private static java.io.File dateTableFile;
+    private static volatile java.io.File dateTableFile;
 
-    /** 应用启动时调用：设置持久化文件并载入历史日期表（异常静默，不影响启动）。 */
+    /**
+     * r216：日期表改为「惰性载入」。
+     *
+     * <p>原来 {@code App.onCreate} 在主线程同步读这个 TSV 并逐行 {@code tblPut}，属于纯磁盘 IO，
+     * 而它只服务「综艺跨源期号↔日期匹配」这条冷路径 —— 与首屏无关。现在启动时只记路径，
+     * 真正读盘交给后台线程预热（{@link #warmUpAsync()}）或首次使用时同步补
+     * （{@link #ensureDateTables()}）。</p>
+     *
+     * <p>语义不变：所有读表/写表入口都先确保表已载入，绝不会出现"只看到半张表"或
+     * "表还没载入就把文件覆盖成空"的情况。</p>
+     */
+    private static volatile boolean dateTableLoaded;
+    /** 载入进行中标记：防止 loadDateTables → tblPut → ensureDateTables 自递归。 */
+    private static volatile boolean dateTableLoading;
+    private static final Object DATE_TABLE_LOAD_LOCK = new Object();
+
+    /** 应用启动时调用：只设置持久化文件路径，<b>不读盘</b>（r216）。 */
     public static void initDateTablePersistence(String path) {
         if (TextUtils.isEmpty(path)) return;
         try {
             dateTableFile = new java.io.File(path);
-            loadDateTables();
         } catch (Throwable ignored) {
+        }
+    }
+
+    /** r216：启动后台线程预热（读盘 + 建表），异常静默。 */
+    public static void warmUp() {
+        try {
+            ensureDateTables();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * r216：确保日期表已从磁盘载入（幂等、线程安全）。
+     *
+     * <p>后台预热没跑完就被用到时，这里<b>等它跑完</b>（而不是直接返回）：否则读线程会看到
+     * "载入了一半"的表，最坏情况是 {@code hasDateTable} 判成 false 触发"同步首建"，
+     * 把正在载入的历史表清掉重建，再被后续载入的旧条目混进来。</p>
+     *
+     * <p>重入是安全的：{@code loadDateTables → tblPut → ensureDateTables} 是同一线程，
+     * 此时 {@code dateTableLoading} 为 true，直接返回，不会自锁。</p>
+     */
+    public static void ensureDateTables() {
+        if (dateTableLoaded) return;
+        // ★ 路径还没设置（BOOT_IO 线程尚未跑到 initDateTablePersistence）时**不能**标记已载入，
+        //   否则这一次"空载"会被永久记住，磁盘上的历史表再也不会被读进来。
+        if (dateTableFile == null) return;
+        synchronized (DATE_TABLE_LOAD_LOCK) {
+            if (dateTableLoaded || dateTableLoading) return;
+            dateTableLoading = true;
+            try {
+                loadDateTables();
+            } catch (Throwable ignored) {
+            } finally {
+                dateTableLoaded = true;
+                dateTableLoading = false;
+            }
         }
     }
 
@@ -2962,12 +3013,16 @@ public final class EpisodeNameMatcher {
     /** ★ r163.1：该剧是否已有可用日期表（用于「有表则异步刷新、无表才同步首建」）。 */
     public static boolean hasDateTable(String showKey) {
         if (TextUtils.isEmpty(showKey)) return false;
+        ensureDateTables();   // r216：惰性载入
         java.util.Map<String, Integer> m = TBL_ORD_TO_DATE.get(showKey.trim());
         return m != null && !m.isEmpty();
     }
 
     private static void persistDateTablesNow() {
         if (dateTableFile == null) return;
+        // r216：表还没从磁盘载入时**不能**写 —— 否则会把"空表"覆盖回文件，把持久化的历史表擦掉。
+        // 载入进行中同理（tblPut 入口会先 ensureDateTables，所以"已载入"是写入的前提）。
+        if (!dateTableLoaded) return;
         synchronized (PERSIST_LOCK) {
         java.io.BufferedWriter w = null;
         try {
@@ -3261,6 +3316,7 @@ public final class EpisodeNameMatcher {
      *   不改表内容口径。
      */
     private static void doBuildDateTableWithLists(String key, java.util.List<List<String>> lists) {
+        ensureDateTables();   // r216：惰性载入 —— 建表前必须已把磁盘上的历史表读进内存，否则会把旧表当"空"重建并覆盖
         String s = buildListsSignature(lists);
         if (lists.size() < 2) return;
         if (s.equals(TBL_BUILT_SIG.get(key))) return;
@@ -3322,6 +3378,8 @@ public final class EpisodeNameMatcher {
 
     /** ★ r140：pos>0 表示该日期有多集时的「同日位置」，日期→期号写入独立键空间，避免同日不同期被判矛盾。 */
     private static void tblPut(String showKey, int ord, int date, int part, boolean strong, int pos) {
+        // r216：惰性载入兜底。载入过程本身也会走 tblPut，此时 dateTableLoading=true 直接跳过，不会自递归。
+        ensureDateTables();
         int p = normalizePart(part);
         String ok = tblOrdKey(ord, p);
         String dk = pos > 0 ? tblDateKey(date, POS_BASE + pos) : tblDateKey(date, p);
@@ -3393,6 +3451,7 @@ public final class EpisodeNameMatcher {
     /** 查该剧「期号→日期」；part 未命中再回落无分段/上。未命中 -1。 */
     public static int lookupDateOfOrdinal(String showKey, int ord, int part) {
         if (TextUtils.isEmpty(showKey) || ord < 0) return -1;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> om = TBL_ORD_TO_DATE.get(showKey.trim());
         if (om == null) return -1;
         Integer v = om.get(tblOrdKey(ord, normalizePart(part)));
@@ -3424,6 +3483,7 @@ public final class EpisodeNameMatcher {
     /** 查该剧「日期→期号」；未命中 -1。 */
     public static int lookupOrdinalOfDate(String showKey, int date, int part) {
         if (TextUtils.isEmpty(showKey) || date <= 0) return -1;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
         if (dm == null) return -1;
         Integer v = dm.get(tblDateKey(date, normalizePart(part)));
@@ -3449,6 +3509,7 @@ public final class EpisodeNameMatcher {
     /** ★ r140：查「日期 + 同日位置」对应的期号（一天多集：20261022-01 → 第1期）。 */
     public static int lookupOrdinalOfDatePos(String showKey, int date, int pos) {
         if (TextUtils.isEmpty(showKey) || date <= 0 || pos <= 0) return -1;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
         if (dm == null) return -1;
         Integer v = dm.get(tblDateKey(date, POS_BASE + pos));
@@ -3476,6 +3537,7 @@ public final class EpisodeNameMatcher {
      */
     public static int lookupPartOfDateOrdinal(String showKey, int date, int ord) {
         if (TextUtils.isEmpty(showKey) || date <= 0 || ord <= 0) return PART_NONE;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
         if (dm == null) return PART_NONE;
         int found = PART_NONE;
@@ -3491,6 +3553,7 @@ public final class EpisodeNameMatcher {
     /** ★ r140：反查某期号在对应日期的「同日位置」（第2期 → 2），供纯期号→日期式目标定位用。 */
     public static int lookupPosOfOrdinal(String showKey, int ord, int date) {
         if (TextUtils.isEmpty(showKey) || ord <= 0 || date <= 0) return -1;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
         if (dm == null) return -1;
         for (Map.Entry<String, Integer> e : dm.entrySet()) {
@@ -3509,6 +3572,7 @@ public final class EpisodeNameMatcher {
      */
     private static int partFromPos(String showKey, int date, int pos) {
         if (TextUtils.isEmpty(showKey) || date <= 0 || pos <= 0) return -1;
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> dm = TBL_DATE_TO_ORD.get(showKey.trim());
         if (dm == null) return -1;
         java.util.Set<Integer> ords = new java.util.HashSet<>();
@@ -3532,6 +3596,9 @@ public final class EpisodeNameMatcher {
     /** 清空某剧日期表（历史记录删除时调用）。 */
     public static void clearDateTable(String showKey) {
         if (TextUtils.isEmpty(showKey)) return;
+        // r216：必须先确保表已载入 —— 否则"删了内存里不存在的条目"，且 persist 因未载入被跳过，
+        //   下次惰性载入又会把这条从磁盘读回来（等于删除无效）。
+        ensureDateTables();
         String key = showKey.trim();
         clearShowTableState(key);
         TBL_BUILT_SIG.remove(key);
@@ -3542,6 +3609,7 @@ public final class EpisodeNameMatcher {
 
     /** 清空全部剧的日期表（"清空历史记录"时调用，随历史一并清理）。 */
     public static void clearAllDateTables() {
+        ensureDateTables();   // r216：先载入再清，才能把"清空"落盘
         TBL_ORD_TO_DATE.clear();
         TBL_DATE_TO_ORD.clear();
         TBL_CONFLICT.clear();
@@ -4066,6 +4134,7 @@ public final class EpisodeNameMatcher {
         if (curOrdinal <= 0 || targetNames == null || targetNames.isEmpty()) {
             return -1;
         }
+        ensureDateTables();   // r216：惰性载入
         Map<String, Integer> om = showKey == null ? null : TBL_ORD_TO_DATE.get(showKey.trim());
         if (om == null || om.isEmpty()) {
             return -1;
@@ -4214,6 +4283,7 @@ public final class EpisodeNameMatcher {
         if (date <= 0) {
             return -1;
         }
+        ensureDateTables();   // r216：惰性载入
         int p = normalizePart(part);
         int exact = lookupOrdinalOfDate(showKey, date, p);
         if (exact > 0) {

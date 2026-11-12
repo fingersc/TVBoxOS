@@ -45,28 +45,54 @@ public class App extends MultiDexApplication {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        com.github.tvbox.osc.util.BootTrace.mark("appStart");
         initParams();
-        // 综艺跨源集匹配：装配直连查询（含磁盘缓存）与节目名→slug 映射（失败静默，不影响启动）。
-        // 默认链路 = 本地同域匹配 → 跨域直连 → 按序兜底；离线字典默认关闭，
-        // 如需长期无网部署可调用 EpisodeResolveInitializer.setOfflineDictEnabled(true)。
-        EpisodeResolveInitializer.init(this);
-        // r121：载入持久化的「期号↔日期」日期表（关闭重开后复用；文件不存在则空载，静默）。
+        com.github.tvbox.osc.util.BootTrace.mark("paramsDone");
+        // r216：日期表的**路径**在这里就设好（只是 new 一个 File，零 IO），
+        //   真正读盘交给下面的后台线程。路径必须先于任何 UI 动作就位，
+        //   否则"清空历史"这类操作会在路径还没设好时被跳过、随后又被磁盘表读回来。
         try {
             com.github.tvbox.osc.util.EpisodeNameMatcher.initDateTablePersistence(
                     new java.io.File(getFilesDir(), "ep_date_table.tsv").getAbsolutePath());
         } catch (Throwable ignored) {
         }
-        // 后台补齐"新上线综艺"的节目名→slug 映射（缓存 24h 内不联网；失败静默）
-        try {
-            final java.util.concurrent.ExecutorService pool =
-                    java.util.concurrent.Executors.newSingleThreadExecutor();
-            EpisodeResolveInitializer.refreshSlugMapAsync(pool);
-            pool.shutdown();
-        } catch (Throwable ignored) {
-        }
+        // ★ r216：与首屏无关的磁盘 IO 全部移出主线程（P1）。
+        //   · EpisodeResolveInitializer.init：综艺跨源匹配的磁盘缓存/映射表；
+        //   · EpisodeNameMatcher 日期表：原来是主线程同步读整个 TSV；
+        //   · EpgUtil：assets/epg_data.json 有 104KB，只服务直播台标/EPG；
+        //   · FileUtils.cleanPlayerCache：递归删 ijk/thunder 缓存目录。
+        //   这几项都只服务冷路径，且类内部都做了"没准备好就退化"的处理。
+        BOOT_IO.execute(new Runnable() {
+            @Override
+            public void run() {
+                // 综艺跨源集匹配：装配直连查询（含磁盘缓存）与节目名→slug 映射（失败静默）。
+                try {
+                    EpisodeResolveInitializer.init(App.this);
+                } catch (Throwable ignored) {
+                }
+                // r121：载入持久化的「期号↔日期」日期表（r216：惰性载入，这里只预热）
+                try {
+                    com.github.tvbox.osc.util.EpisodeNameMatcher.warmUp();
+                } catch (Throwable ignored) {
+                }
+                // 直播台标/EPG（r216：改由后台预热，getEpgInfo 有同步兜底）
+                try {
+                    EpgUtil.warmUp();
+                } catch (Throwable ignored) {
+                }
+                com.github.tvbox.osc.util.BootTrace.mark("bootIoDone");
+                // 后台补齐"新上线综艺"的节目名→slug 映射（缓存 24h 内不联网；失败静默）
+                try {
+                    final java.util.concurrent.ExecutorService pool =
+                            java.util.concurrent.Executors.newSingleThreadExecutor();
+                    EpisodeResolveInitializer.refreshSlugMapAsync(pool);
+                    pool.shutdown();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
         // OKGo
         OkGoHelper.init(); //台标获取
-        EpgUtil.init();
         // 初始化Web服务器
         ControlManager.init(this);
         //初始化数据库
@@ -75,6 +101,11 @@ public class App extends MultiDexApplication {
         HistorySyncManager.start();
         // v76：老用户升级后把当前登录账号播种进账号清单
         com.github.tvbox.osc.sync.AccountStore.migrateIfNeeded();
+        // ★ r216：公共设备开关 —— 必须在 start() 之后（此时才知道上次登录的是谁）、
+        //   在首屏加载配置之前（否则会先按上一个账号的设置加载一遍）。
+        //   不开开关时这一行只有一次 Hawk 读，零副作用。
+        com.github.tvbox.osc.sync.PublicDeviceGuard.onProcessStart();
+        com.github.tvbox.osc.util.BootTrace.mark("accountReady");
         LoadSir.beginBuilder()
                 .addCallback(new EmptyCallback())
                 .addCallback(new LoadingCallback())
@@ -85,8 +116,36 @@ public class App extends MultiDexApplication {
                 .setSupportSubunits(Subunits.MM);
         PlayerHelper.init();
         QuickJSLoader.init();
-        FileUtils.cleanPlayerCache();
+        // ★ r216：播放器缓存清理是纯磁盘垃圾回收，放到后台并排在其它后台任务之后，
+        //   避免与首屏解析/渲染抢磁盘 IO。
+        BOOT_IO.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    FileUtils.cleanPlayerCache();
+                } catch (Throwable ignored) {
+                }
+                com.github.tvbox.osc.util.BootTrace.mark("cacheCleaned");
+            }
+        });
+        com.github.tvbox.osc.util.BootTrace.mark("appDone");
     }
+
+    /**
+     * ★ r216：启动期后台 IO 线程。
+     *
+     * <p>单线程 + 顺序执行：这些任务都是磁盘 IO，并发起来只会互相拖慢（盒子上的 flash
+     * 随机读性能有限），串行反而更快，也不会和首屏的配置解析抢带宽。</p>
+     */
+    private static final java.util.concurrent.ExecutorService BOOT_IO =
+            java.util.concurrent.Executors.newSingleThreadExecutor(new java.util.concurrent.ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "tvbox-boot-io");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
 
     private void initParams() {
         // Hawk

@@ -100,6 +100,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
     private TextView tvFastSearchText;
     private TextView tvm3u8AdText;
     private TextView tvm3u8PrefetchText;
+    /** r216：公共设备开关（与「分片预取」同一行左右两格）。 */
+    private TextView tvPublicDeviceText;
     private TextView tvAutoSwitchLineText;
     private TextView tvRecStyleText;
     private TextView tvIjkCachePlay;
@@ -149,6 +151,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         SETTING_NAMES.put(HawkConfig.SHOW_PREVIEW, "窗口预览");
         SETTING_NAMES.put(HawkConfig.M3U8_PURIFY, "去广告");
         SETTING_NAMES.put(HawkConfig.M3U8_PREFETCH, "分片预取");
+        SETTING_NAMES.put(HawkConfig.PUBLIC_DEVICE, "公共设备");
         SETTING_NAMES.put(HawkConfig.AUTO_SWITCH_LINE, "自动换线");
         SETTING_NAMES.put(HawkConfig.DOH_URL, "安全DNS");
         SETTING_NAMES.put(HawkConfig.PARSE_WEBVIEW, "嗅探Webview");
@@ -178,6 +181,7 @@ public class ModelSettingFragment extends BaseLazyFragment {
         DEFAULTS.put(HawkConfig.FAST_SEARCH_MODE, true);
         DEFAULTS.put(HawkConfig.M3U8_PURIFY, false);
         DEFAULTS.put(HawkConfig.M3U8_PREFETCH, true);
+        DEFAULTS.put(HawkConfig.PUBLIC_DEVICE, false);
         DEFAULTS.put(HawkConfig.DANMU_OPEN, true);      // = DanmuHelper.isOpen() 的默认
         DEFAULTS.put(HawkConfig.AUTO_SWITCH_LINE, true);
         DEFAULTS.put(HawkConfig.HOME_REC_STYLE, false);
@@ -869,6 +873,17 @@ public class ModelSettingFragment extends BaseLazyFragment {
                 tvm3u8PrefetchText.setText(!on ? "开启" : "关闭");
             }
         });
+        // r216：公共设备开关 —— 开启后「下一次冷启动」先把改动同步完再回退到游客。
+        // 只改草稿，保存后才生效；打开它不会立刻退出当前账号。
+        findViewById(R.id.publicDevice).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                FastClickCheckUtil.check(v);
+                boolean on = cur(HawkConfig.PUBLIC_DEVICE, false);
+                draftPut(HawkConfig.PUBLIC_DEVICE, !on);
+                tvPublicDeviceText.setText(!on ? "开启" : "关闭");
+            }
+        });
         findViewById(R.id.danmuOpen).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -946,6 +961,8 @@ public class ModelSettingFragment extends BaseLazyFragment {
         tvm3u8AdText.setText(cur(HawkConfig.M3U8_PURIFY, false) ? "开启" : "关闭");
         tvm3u8PrefetchText = findViewById(R.id.m3u8PrefetchText);
         tvm3u8PrefetchText.setText(cur(HawkConfig.M3U8_PREFETCH, true) ? "开启" : "关闭");
+        tvPublicDeviceText = findViewById(R.id.publicDeviceText);
+        tvPublicDeviceText.setText(cur(HawkConfig.PUBLIC_DEVICE, false) ? "开启" : "关闭");
         tvDanmuOpenText = findViewById(R.id.danmuOpenText);
         tvDanmuOpenText.setText(cur(HawkConfig.DANMU_OPEN, DanmuHelper.isOpen()) ? "开启" : "关闭");
         tvDanmuApiText = findViewById(R.id.danmuApiText);
@@ -1472,6 +1489,9 @@ public class ModelSettingFragment extends BaseLazyFragment {
 
     private void restartApp() {
         if (mContext == null || !isAdded() || getActivity() == null) return;
+        // r216：这是"清空缓存"触发的自重启，不是用户离开电视 —— 写一次性豁免，
+        // 让下一次冷启动跳过「公共设备」回退，账号保持登录。
+        com.github.tvbox.osc.sync.PublicDeviceGuard.markKeepOnce();
         Intent intent = mContext.getPackageManager().getLaunchIntentForPackage(mContext.getPackageName());
         if (intent != null) {
             intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);

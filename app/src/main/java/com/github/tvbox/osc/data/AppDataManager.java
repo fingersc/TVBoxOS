@@ -222,7 +222,18 @@ public class AppDataManager {
         }
     }
 
-    public static AppDataBase get() {
+    /**
+     * r216：加 {@code synchronized}。
+     *
+     * <p>原先没有锁，而 {@link #switchOwner(String)} / {@link #deleteOwnerDb(String)} 都是
+     * {@code synchronized}。现在首次打开数据库可能同时发生在主线程（UI 查询）与同步线程
+     * （冷启动对账），两个线程并发首开会出现"各建一个 Room 实例、后建覆盖先建"，
+     * 前一个实例的连接就泄漏了（且它的 {@code close()} 永远不会被调用）。</p>
+     *
+     * <p>锁与 {@code switchOwner} 是同一把（类锁）⇒ "关闭旧库 + 换后缀"与"打开新库"天然串行，
+     * 不会出现打开到一半被换掉的情况。</p>
+     */
+    public static synchronized AppDataBase get() {
         if (manager == null) {
             throw new RuntimeException("AppDataManager is no init");
         }

@@ -66,6 +66,22 @@ public class HawkConfig {
     public static final String M3U8_PURIFY = "m3u8_purify";
     /** 分片并行下载（A′：本地分片代理 + 跨切片滚动预取），默认开启。 */
     public static final String M3U8_PREFETCH = "m3u8_prefetch";
+    /**
+     * r216：公共设备模式（设备级设置，默认关）。
+     *
+     * <p>开启后「下一次冷启动」时，若上次留下的是登录态，则先把该账号未上传的改动同步完，
+     * 再把账号回退到游客 —— 电视是共用的，避免上一个人的观看历史/进度记到他的账号里。</p>
+     *
+     * <p><b>刻意不进 {@code SyncSettings.SYNC_KEYS}、不进 {@code SettingsProfile}</b>：
+     * 它描述的是"这台电视是公共的"，不是账号偏好。若进了账号快照，切到游客时会被游客
+     * 快照覆盖（甚至被静默关掉），保护逻辑会自毁；同步到手机上也毫无意义。</p>
+     */
+    public static final String PUBLIC_DEVICE = "public_device";
+    /**
+     * r216：一次性豁免键 —— 设置页「清空缓存」触发的自重启（{@code System.exit}）也算冷启动，
+     * 但它不是"用户离开电视"，不该把账号踢掉。写入后由下一次冷启动消费一次。
+     */
+    public static final String PUBLIC_DEVICE_KEEP_ONCE = "public_device_keep_once";
     public static final String AUTO_SWITCH_LINE = "auto_switch_line";
     public static final String SCREEN_DISPLAY = "screen_display";
     public static final String LIVE_WEB_HEADER = "live_web_header";

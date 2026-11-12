@@ -62,6 +62,9 @@ public final class AccountSwitcher {
                         try {
                             HistorySyncManager.bumpGeneration();
                             AccountContext.login(owner, name, key);
+                            // r216：换了账号 ⇒ 让同步线程对新账号重做一次「已推送水位对账」
+                            //（原实现在启动主线程对新登录账号跑；挪到同步线程后需在此复位）
+                            HistorySyncManager.resetReconciled();
                             // v98 P1：目标账号的旧散键状态迁到 SyncState（每账号只做一次）
                             SyncState.migrateLegacyKeys(owner);
                             AccountStore.add(name, owner);
@@ -112,6 +115,17 @@ public final class AccountSwitcher {
 
     /** 切换到游客（不删除任何账号，也不清存储配置）。 */
     public static void switchToGuest(final Callback cb) {
+        switchToGuest(cb, true);
+    }
+
+    /**
+     * r216：切换到游客，可选择是否顺带请求界面重载。
+     *
+     * <p>{@code reloadUi=false} 供「冷启动回退」使用：调用方紧接着会自己重新走一遍
+     * {@code HomeActivity.initData()}，此时再让 {@link ConfigCenter} 排一次重载只是重复劳动
+     * （且首屏还没就绪，动作会被推迟到下一个门控点，白白多绕一圈）。</p>
+     */
+    public static void switchToGuest(final Callback cb, final boolean reloadUi) {
         if (AccountContext.isGuest()) {
             post(cb, true, "当前已是游客模式");
             return;
@@ -122,16 +136,20 @@ public final class AccountSwitcher {
                 HistorySyncManager.awaitIdle(1500);
                 final String previous = AccountContext.ownerKey();
                 SyncScheduler.cancel(previous);
-                SettingsProfile.save(previous == null ? "" : previous);
+                // 快照在后台线程存（SettingsProfile.save → HlcClock 会打开 Room，
+                // 不适合放到主线程的切库动作里）。下面 doLogoutToGuest 传 saveProfile=false。
+                try {
+                    saveProfileBeforeLogout();
+                } catch (Throwable t) {
+                    LOG.e("[Account] save profile before guest switch failed", t);
+                }
                 MAIN.post(new Runnable() {
                     @Override
                     public void run() {
                         try {
-                            HistorySyncManager.bumpGeneration();
-                            AccountContext.logout();
-                            SettingsProfile.load("");
-                            ConfigCenter.requestReload("guest");
-                            ConfigCenter.requestPrewarmLive("guest");
+                            // 快照已在后台线程存过（见上方 SettingsProfile.save），
+                            // 这里不再重复打开 Room。
+                            doLogoutToGuest(reloadUi, false);
                         } catch (Throwable t) {
                             LOG.e("[Account] switch guest failed", t);
                         }
@@ -140,6 +158,90 @@ public final class AccountSwitcher {
                 });
             }
         }, "tvbox-account-guest").start();
+    }
+
+    /**
+     * r216：<b>主线程同步版</b>的「回退到游客」。
+     *
+     * <p>给冷启动回退用：此时进程刚起来，没有正在跑的界面动作，也等不起一个后台线程往返。
+     * 次序与 {@link #switchToGuest(Callback, boolean)} 一致（只去掉"等同步收尾"那一步 ——
+     * 调用方必须自己保证同步已经结束或已被作废）：</p>
+     *
+     * <ol>
+     *   <li>{@link #saveProfileBeforeLogout()}：保住该账号的设置快照（调用方应先在后台线程做完）；</li>
+     *   <li>{@link SyncScheduler#cancel(String)}：撤掉该账号排队中的任务；</li>
+     *   <li>{@link HistorySyncManager#bumpGeneration()}：让可能还在途的同步作废（不写错库）；</li>
+     *   <li>{@link AccountContext#logout()}：清登录态 + 切回游客库；</li>
+     *   <li>{@link SettingsProfile#load(String)}：恢复游客的设置快照。</li>
+     * </ol>
+     *
+     * <p>必须、且只允许在主线程调用（{@code AccountContext.logout} 会切 Room 库）。</p>
+     */
+    public static void logoutToGuestNow() {
+        doLogoutToGuest(false, true);
+    }
+
+    /**
+     * r216：回退到游客，但<b>不再保存设置快照</b>。
+     *
+     * <p>只给"已经在后台线程调用过 {@link #saveProfileBeforeLogout()}"的路径用 ——
+     * 避免在主线程上因为 {@code SettingsProfile.save} → {@code HlcClock.next()} 而打开 Room。</p>
+     */
+    public static void logoutToGuestNowSkipSave() {
+        doLogoutToGuest(false, false);
+    }
+
+    /**
+     * r216：把当前账号的设置存成快照。
+     *
+     * <p>内部会经 {@code HlcClock.next()} 打开 Room 并与 DB 对账，属于会阻塞的活；
+     * 冷启动回退时由调用方放在<b>后台线程</b>执行，不要直接在主线程调。</p>
+     */
+    public static void saveProfileBeforeLogout() {
+        String owner = AccountContext.ownerKey();
+        if (owner == null || owner.length() == 0) {
+            return;
+        }
+        SettingsProfile.save(owner);
+    }
+
+    /**
+     * 回退到游客的实体动作（主线程）。
+     *
+     * @param reloadUi     是否顺带请求界面重载，见 {@link #switchToGuest(Callback, boolean)}
+     * @param saveProfile  是否在这里补存设置快照。<b>只有"调用方已经在后台线程存过"时才传 false</b>
+     *                     —— 这个调用会在主线程上打开 Room（{@code SettingsProfile.save} →
+     *                     {@code HlcClock.next}），冷启动路径要避开它。
+     */
+    private static void doLogoutToGuest(boolean reloadUi, boolean saveProfile) {
+        if (AccountContext.isGuest()) {
+            return;
+        }
+        final String previous = AccountContext.ownerKey();
+        if (saveProfile) {
+            try {
+                SettingsProfile.save(previous == null ? "" : previous);
+            } catch (Throwable t) {
+                LOG.e("[Account] save profile before logout failed", t);
+            }
+        }
+        try {
+            SyncScheduler.cancel(previous);
+        } catch (Throwable ignored) {
+        }
+        HistorySyncManager.bumpGeneration();
+        AccountContext.logout();
+        // 换了账号 ⇒ 对账要为新账号重做一次（进程级"只做一次"的标记必须复位）
+        HistorySyncManager.resetReconciled();
+        // 账号级 HLC 时钟也是每账号一份：切号必须让它重新加载，否则会沿用上一个账号的
+        // 水位（Hawk 键 sync_hlc.<owner>），游客下分配出的时间戳会带着别人的历史。
+        HlcClock.reset();
+        SettingsProfile.load("");
+        if (reloadUi) {
+            ConfigCenter.requestReload("guest");
+            ConfigCenter.requestPrewarmLive("guest");
+        }
+        LOG.i("[Account] rolled back to guest (reloadUi=" + reloadUi + ")");
     }
 
     /** 移除本机账号：删清单、设置快照、数据库文件；云端数据不动。 */
@@ -160,6 +262,7 @@ public final class AccountSwitcher {
                             if (owner.equals(AccountContext.ownerKey())) {
                                 HistorySyncManager.bumpGeneration();
                                 AccountContext.logout();
+                                HistorySyncManager.resetReconciled();
                                 SettingsProfile.load("");
                             }
                             AccountStore.remove(owner);
