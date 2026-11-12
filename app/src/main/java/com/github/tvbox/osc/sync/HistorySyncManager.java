@@ -573,6 +573,191 @@ public final class HistorySyncManager {
         SyncScheduler.requestNow(owner(), "exit", false, cb);
     }
 
+    // ---------------------------------------------------------------- r217：切号前同步
+
+    /**
+     * ★ r217：切号前同步的结果。
+     */
+    public static final class SwitchSync {
+        /** true = 已确认「同步到位」，可以切库。 */
+        public boolean ok;
+        /** ok=false 时的原因（可以直接展示给用户）。 */
+        public String message;
+        /** 实际跑了几轮（0 = 本来就不脏，零请求）。 */
+        public int rounds;
+    }
+
+    /** 切号前最多跑几轮：第一轮正常推，后续轮补推「同步期间新写入 / 瞬时失败」。 */
+    private static final int SWITCH_SYNC_MAX_ROUNDS = 3;
+
+    /**
+     * ★ r217：切库前把当前账号的数据同步「到位」——<b>阻塞</b>，只允许在后台线程调用。
+     *
+     * <p><b>为什么必须做</b>：切号会关闭旧账号的数据库（{@link
+     * com.github.tvbox.osc.data.AppDataManager#switchOwner(String)}），此后旧账号未上传的改动
+     * 只能等下次在本机重新登录才补传。用户要求「同步到位才切库」，因此这里同步跑完整一轮
+     * （所有已启用 scope），并用 {@link #fullyPushed(String)} 校验，而不是"跑一次就算"。</p>
+     *
+     * <p><b>为什么直接调引擎、不走 {@link SyncScheduler}</b>：切号线程本来就在后台，不需要
+     * 再转一次主线程回调；绕过调度层也顺带绕开了「最小间隔 / 仅 Wi-Fi」两道自动同步门禁
+     * ——切号是用户明确动作，与「立即同步」同语义。</p>
+     *
+     * <p><b>失败语义</b>：返回 {@code ok=false} 时调用方必须<b>中止切库</b>（可以提示用户后
+     * 强制切换，但那是用户的明确选择）。本机数据与脏标记不会被清除，下次登录该账号会补传。</p>
+     *
+     * @param owner      要同步的账号（通常是当前账号；传空串表示游客，直接返回 ok）
+     * @param deadlineMs 活性兜底（毫秒）：只在轮次之间检查，超时按失败处理
+     */
+    public static SwitchSync syncBeforeSwitch(String owner, long deadlineMs) {
+        SwitchSync r = new SwitchSync();
+        if (owner == null || owner.isEmpty()) {
+            r.ok = true;                       // 游客：没有云端数据可同步
+            return r;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            // 保护性判断：本方法会阻塞（网络 + Room），绝不能在主线程跑
+            LOG.e("[Account] syncBeforeSwitch on main thread, refuse", null);
+            r.ok = false;
+            r.message = "内部错误：同步不能在主线程执行";
+            return r;
+        }
+        if (!hasConfig()) {
+            // 没配置网盘：不脏就算到位；脏则无法确认，交给上层提示
+            r.ok = fullyPushed(owner);
+            if (!r.ok) {
+                r.message = "尚未配置 WebDAV 存储，无法确认同步完成";
+            }
+            return r;
+        }
+        final byte[] key = AccountContext.key();
+        if (key == null) {
+            r.ok = false;
+            r.message = "登录状态异常，请重新登录";
+            return r;
+        }
+        final long end = android.os.SystemClock.elapsedRealtime() + Math.max(5000L, deadlineMs);
+        // 1) 把「周期落盘没标脏」的本地写入补标脏（30s 进度落盘 markDirty=false 的缺口）
+        reconcilePushedHlc(owner);
+        // 2) 让已经在跑的那一轮收尾，再抢执行权，避免两轮并发写库
+        boolean taken = false;
+        while (android.os.SystemClock.elapsedRealtime() < end) {
+            synchronized (LOCK) {
+                if (!syncing) {
+                    syncing = true;
+                    taken = true;
+                }
+            }
+            if (taken) {
+                break;
+            }
+            awaitIdle(200L);
+        }
+        if (!taken) {
+            r.ok = false;
+            r.message = "已有同步任务长时间未结束，请稍后重试";
+            return r;
+        }
+        String lastMsg = null;
+        try {
+            // 切号这一轮必须是完整轮：轻量首轮只跑 SETTINGS+HISTORY，会漏掉 PROGRESS/COLLECT
+            forceFullRoundNextSync();
+            for (int round = 1; round <= SWITCH_SYNC_MAX_ROUNDS; round++) {
+                if (fullyPushed(owner)) {
+                    r.ok = true;
+                    return r;
+                }
+                if (android.os.SystemClock.elapsedRealtime() >= end) {
+                    break;
+                }
+                r.rounds = round;
+                SyncEngine.Outcome o = SyncEngine.runSafe(owner, key, generation,
+                        /* forceUpload= */ true, /* lightFirstRound= */ false);
+                if (o == null) {
+                    lastMsg = "同步未返回结果";
+                    break;
+                }
+                lastMsg = o.message;
+                if (o.aborted) {
+                    LOG.i("[Account] pre-switch sync aborted (generation changed)");
+                    r.ok = false;
+                    r.message = "同步被账号切换中断";
+                    return r;
+                }
+                if (!o.ok) {
+                    LOG.i("[Account] pre-switch sync round=" + round
+                            + " failed: " + o.message);
+                    // 认证失败重试没有意义，直接交给上层提示
+                    if (o.message != null && o.message.contains("认证失败")) {
+                        break;
+                    }
+                }
+            }
+            r.ok = fullyPushed(owner);
+            if (!r.ok) {
+                r.message = (lastMsg == null || lastMsg.length() == 0)
+                        ? "仍有未上传的改动" : lastMsg;
+            }
+            return r;
+        } catch (Throwable t) {
+            LOG.e("[Account] pre-switch sync failed", t);
+            r.ok = false;
+            r.message = "同步失败：" + t.getClass().getSimpleName();
+            return r;
+        } finally {
+            syncing = false;
+            // 期间挂起的「立即同步 / 退出前同步」回调必须有响应，不能一直吊着
+            drainWaiters(r.ok, r.ok ? "同步完成"
+                    : (r.message == null ? "同步未完成" : r.message));
+        }
+    }
+
+    /**
+     * ★ r217：「同步到位」的唯一判定口径。
+     *
+     * <p>逐条与 {@code SyncEngine.finish()} 的清脏条件对齐：</p>
+     * <ol>
+     *   <li>该 scope 的 dirty 必须已被清掉；</li>
+     *   <li>非 SETTINGS 的 scope 还要满足「本机 DB 最大 HLC ≤ 已推送水位」——
+     *       否则同步期间/之后的新写入会落在 dirty 之外，切库后就永远传不上去；</li>
+     *   <li>被用户关闭的 scope 不参与判定（关掉的同步范围不能反过来卡死切号）。</li>
+     * </ol>
+     *
+     * <p>非当前账号只能看脏标记（读不到它的库），用于「移除账号」前的提示。</p>
+     */
+    public static boolean fullyPushed(String owner) {
+        if (owner == null || owner.isEmpty()) {
+            return true;
+        }
+        try {
+            SyncScopes scopes = SyncScopes.load();
+            if (!scopes.anyEnabled()) {
+                return true;   // 四个 scope 全关：没有任何需要同步的范围
+            }
+            boolean currentOwner = owner.equals(AccountContext.ownerKey());
+            SyncState st = SyncState.load(owner);
+            for (SyncScope s : SyncScope.values()) {
+                if (!scopes.isEnabled(s)) {
+                    continue;
+                }
+                if (st.isDirty(s)) {
+                    return false;
+                }
+                if (s == SyncScope.SETTINGS || !currentOwner) {
+                    continue;  // 设置是 Hawk 快照无 DB HLC；非当前账号读不到它的库
+                }
+                Hlc local = localMaxHlc(s);
+                Hlc pushed = st.pushedHlc(s);
+                if (local.compareIgnoringDev(pushed) > 0) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Throwable t) {
+            LOG.e("[Account] fullyPushed check failed", t);
+            return false;
+        }
+    }
+
     // ---------------------------------------------------------------- 主流程
 
     /**

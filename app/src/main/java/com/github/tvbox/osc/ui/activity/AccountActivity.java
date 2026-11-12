@@ -22,6 +22,7 @@ import com.github.tvbox.osc.sync.Crypto;
 import com.github.tvbox.osc.sync.HistorySyncManager;
 import com.github.tvbox.osc.sync.QrLoginBridge;
 import com.github.tvbox.osc.sync.SyncScopes;
+import com.github.tvbox.osc.sync.SyncState;
 import com.github.tvbox.osc.sync.WebDavClient;
 import com.github.tvbox.osc.ui.dialog.LoginQrDialog;
 import com.github.tvbox.osc.ui.dialog.SwitchAccountDialog;
@@ -385,23 +386,20 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         etPass.setText("");
         etPassConfirm.setText("");
         toast("已登录：" + user);
-        setBusy(true, "正在登录…");
+        if (switching) {
+            // r217：正在切号/同步时不允许并发登录，避免两套编排抢状态（同时要清掉 busy，否则按钮永久置灰）
+            setBusy(false, null);
+            toast("正在处理上一个账号切换，请稍候再试");
+            return;
+        }
         // v76：登录即「切换/加入账号」——保存当前（游客）设置快照、切库、拉取云端
-        AccountSwitcher.switchTo(Crypto.userKey(user), user, key,
-                new AccountSwitcher.Callback() {
-                    @Override
-                    public void onDone(boolean ok, String message) {
-                        setBusy(false, null);
-                        if (ok) {
-                            hideAddForm();
-                        }
-                        refreshAll();
-                        tvSyncStatus.setText(message);
-                        if (!ok && message != null) {
-                            toast(message);
-                        }
-                    }
-                });
+        // r217：与手动切号走同一条编排（含"同步到位才切库"闸门与失败二次确认）
+        switchToAccount(user, Crypto.userKey(user), key, false, new Runnable() {
+            @Override
+            public void run() {
+                hideAddForm();
+            }
+        });
     }
 
     private void resetActivateUi() {
@@ -559,20 +557,8 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
                 toast("当前已是游客模式");
                 return;
             }
-            if (switching) {
-                return;
-            }
-            switching = true;
-            setBusy(true, "正在切换到游客…");
-            AccountSwitcher.switchToGuest(new AccountSwitcher.Callback() {
-                @Override
-                public void onDone(boolean ok, String message) {
-                    switching = false;
-                    setBusy(false, null);
-                    refreshAll();
-                    tvSyncStatus.setText(message);
-                }
-            });
+            // r217：切到游客同样要先同步到位（失败会弹二次确认）
+            switchToGuest(false);
             return;
         }
         if (owner.equals(AccountContext.ownerKey())) {
@@ -614,56 +600,210 @@ public class AccountActivity extends BaseActivity implements View.OnClickListene
         tvSyncStatus.setText(HistorySyncManager.syncStatusText());
     }
 
-    private void doSwitchAccount(final String name, final String owner, byte[] key) {
+    private void doSwitchAccount(final String name, final String owner, final byte[] key) {
+        // r217：先同步当前账号，到位才切库；失败弹二次确认（仍要切换 / 取消）
+        switchToAccount(name, owner, key, false, null);
+    }
+
+    // ---------------------------------------------------------------- r217：切号 / 移除编排
+
+    /** 切到某个账号。{@code skipPreSync=true} = 用户已确认"仍要切换"。 */
+    private void switchToAccount(final String name, final String owner, final byte[] key,
+                                 final boolean skipPreSync, final Runnable onSuccess) {
         if (switching) {
             return;
         }
         switching = true;
-        setBusy(true, "正在切换到：" + name + "…");
-        AccountSwitcher.switchTo(owner, name, key, new AccountSwitcher.Callback() {
+        setBusy(true, skipPreSync ? "正在切换到：" + name + "…" : "正在同步当前账号…");
+        AccountSwitcher.switchTo(owner, name, key, true, skipPreSync,
+                new AccountSwitcher.Callback() {
+                    @Override
+                    public void onDone(boolean ok, String message) {
+                        switching = false;
+                        setBusy(false, null);
+                        if (ok && onSuccess != null) {
+                            onSuccess.run();
+                        }
+                        refreshAll();
+                        focusCurrentCard();
+                        tvSyncStatus.setText(message);
+                        toast(message);
+                    }
+
+                    @Override
+                    public void onStage(final String text) {
+                        main.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (switching) {
+                                    setBusy(true, text);
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onSyncBlocked(final String reason) {
+                        switching = false;
+                        setBusy(false, null);
+                        refreshAll();
+                        showSyncBlocked("仍要切换",
+                                "当前账号的改动还没同步完成：" + reason
+                                        + "\n未上传的改动仍保留在本机，下次登录该账号会自动补传。"
+                                        + "仍要切换到「" + name + "」吗？",
+                                new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        switchToAccount(name, owner, key, true, onSuccess);
+                                    }
+                                });
+                    }
+                });
+    }
+
+    /** 切到游客。{@code skipPreSync=true} = 用户已确认"仍要切换"。 */
+    private void switchToGuest(final boolean skipPreSync) {
+        if (switching) {
+            return;
+        }
+        switching = true;
+        setBusy(true, skipPreSync ? "正在切换到游客…" : "正在同步当前账号…");
+        AccountSwitcher.switchToGuest(new AccountSwitcher.Callback() {
             @Override
             public void onDone(boolean ok, String message) {
                 switching = false;
                 setBusy(false, null);
                 refreshAll();
-                // ★ v99-r27：卡片列表刚被重建，焦点已丢失 ⇒ 主动落到新的当前账号卡片上，
-                //   否则要退出再进才能看到它的高亮（盒子端实测反馈）。
-                if (currentAccountCard != null) {
-                    final View card = currentAccountCard;
-                    card.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (card.isShown() && !card.isFocused()) {
-                                card.requestFocus();
-                            }
-                        }
-                    });
-                }
                 tvSyncStatus.setText(message);
                 toast(message);
+            }
+
+            @Override
+            public void onStage(final String text) {
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (switching) {
+                            setBusy(true, text);
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onSyncBlocked(final String reason) {
+                switching = false;
+                setBusy(false, null);
+                refreshAll();
+                showSyncBlocked("仍要切换到游客",
+                        "当前账号的改动还没同步完成：" + reason
+                                + "\n未上传的改动仍保留在本机，下次登录该账号会自动补传。"
+                                + "仍要切换到游客吗？",
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                switchToGuest(true);
+                            }
+                        });
+            }
+        }, true, skipPreSync);
+    }
+
+    /** 移除本机账号。{@code skipPreSync=true} = 用户已确认"仍要移除"。 */
+    private void removeAccount(final String owner, final boolean skipPreSync) {
+        AccountSwitcher.remove(owner, skipPreSync, new AccountSwitcher.Callback() {
+            @Override
+            public void onDone(boolean ok, String message) {
+                refreshAll();
+                tvSyncStatus.setText(message);
+                toast(message);
+            }
+
+            @Override
+            public void onSyncBlocked(final String reason) {
+                refreshAll();
+                showSyncBlocked("仍要移除",
+                        "当前账号的改动还没同步完成：" + reason
+                                + "\n移除账号会删除本机数据，这些改动将无法恢复。仍要移除吗？",
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                removeAccount(owner, true);
+                            }
+                        });
             }
         });
     }
 
+    /** 切号成功后焦点回到新的当前账号卡片（v99-r27 既有行为，抽出来复用）。 */
+    private void focusCurrentCard() {
+        if (currentAccountCard == null) {
+            return;
+        }
+        final View card = currentAccountCard;
+        card.post(new Runnable() {
+            @Override
+            public void run() {
+                if (card.isShown() && !card.isFocused()) {
+                    card.requestFocus();
+                }
+            }
+        });
+    }
+
+    /** 「同步未完成」二次确认：左键 = 仍然继续（强切/强删），右键 = 取消。 */
+    private void showSyncBlocked(String confirmText, String tip, final Runnable force) {
+        final TipDialog[] holder = new TipDialog[1];
+        holder[0] = new TipDialog(this, tip, confirmText, "取消", new TipDialog.OnListener() {
+            @Override
+            public void left() {
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
+                force.run();
+            }
+
+            @Override
+            public void right() {
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
+            }
+
+            @Override
+            public void cancel() {
+                if (holder[0] != null) {
+                    holder[0].dismiss();
+                }
+            }
+        });
+        holder[0].show();
+    }
+
     private void confirmRemoveAccount(final String name, final String owner) {
+        // r217：该账号还有未上传的改动时，先在确认文案里说清楚（移除当前账号会先同步，
+        //       非当前账号没有密钥、无法替它同步，只能提示）
+        boolean unsynced = false;
+        try {
+            // 只读 Hawk 脏标记（抽屉里不查库，避免主线程碰 Room）；HLC 级别的精确判定留给闸门
+            unsynced = SyncState.load(owner).anyDirty();
+        } catch (Throwable ignored) {
+        }
+        String tip = "移除本机账号「" + name + "」？\n"
+                + "本机保存的历史/收藏/设置会被删除，云端数据不受影响。";
+        if (unsynced) {
+            tip += "\n注意：该账号还有未同步的改动，移除后将无法恢复。";
+        }
         // 用数组持有弹窗：匿名监听器在 new TipDialog(...) 的实参里，直接引用 dialog 会「可能未初始化」
         final TipDialog[] holder = new TipDialog[1];
-        holder[0] = new TipDialog(this,
-                "移除本机账号「" + name + "」？\n本机保存的历史/收藏/设置会被删除，云端数据不受影响。",
+        holder[0] = new TipDialog(this, tip,
                 "移除", "取消", new TipDialog.OnListener() {
             @Override
             public void left() {
                 if (holder[0] != null) {
                     holder[0].dismiss();
                 }
-                AccountSwitcher.remove(owner, new AccountSwitcher.Callback() {
-                    @Override
-                    public void onDone(boolean ok, String message) {
-                        refreshAll();
-                        tvSyncStatus.setText(message);
-                        toast(message);
-                    }
-                });
+                removeAccount(owner, false);
             }
 
             @Override

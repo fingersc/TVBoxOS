@@ -19,8 +19,30 @@ public final class AccountSwitcher {
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
+    /**
+     * ★ r217：切号前同步的活性兜底（毫秒）。
+     *
+     * <p><b>不是「为了不阻塞切换」的预算</b> —— 超时的结果是拦住切号并询问用户，
+     * 不是放行。它只用来防止一次死活完不成的同步把账号页永久卡住。</p>
+     */
+    private static final long SWITCH_SYNC_DEADLINE_MS = 90_000L;
+
     public interface Callback {
         void onDone(boolean ok, String message);
+
+        /**
+         * ★ r217：切号/移除前的同步没有完成，动作已中止（<b>没有</b>切库、<b>没有</b>删库）。
+         *
+         * <p>默认实现把"被拦下"转成一次失败回调；账号页会覆盖它，弹二次确认，
+         * 用户明确选择「仍要切换 / 仍要移除」后再走 {@code skipPreSync} 重载。</p>
+         */
+        default void onSyncBlocked(String reason) {
+            onDone(false, "同步未完成：" + reason);
+        }
+
+        /** ★ r217：阶段提示（"正在同步当前账号…" / "正在切换…"），可能在后台线程回调。 */
+        default void onStage(String text) {
+        }
     }
 
     private AccountSwitcher() {
@@ -29,7 +51,7 @@ public final class AccountSwitcher {
     /** 切换到指定账号（调用方必须已通过密码或扫码完成认证）。 */
     public static void switchTo(final String owner, final String name, final byte[] key,
                                 final Callback cb) {
-        switchTo(owner, name, key, true, cb);
+        switchTo(owner, name, key, true, false, cb);
     }
 
     /**
@@ -38,6 +60,16 @@ public final class AccountSwitcher {
      */
     public static void switchTo(final String owner, final String name, final byte[] key,
                                 final boolean waitForSync, final Callback cb) {
+        switchTo(owner, name, key, waitForSync, false, cb);
+    }
+
+    /**
+     * ★ r217：{@code skipPreSync=true} = 用户已在「同步未完成」弹窗里明确选择"仍要切换"，
+     * 跳过切号前的同步闸门直接切库（旧账号未上传的改动留在本机，下次登录该账号补传）。
+     */
+    public static void switchTo(final String owner, final String name, final byte[] key,
+                                final boolean waitForSync, final boolean skipPreSync,
+                                final Callback cb) {
         if (owner == null || owner.isEmpty() || key == null) {
             post(cb, false, "账号信息不完整，请重新认证");
             return;
@@ -49,9 +81,13 @@ public final class AccountSwitcher {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                // 等当前账号的同步收尾（最多 1.5 秒），避免切换瞬间把旧数据写进新库
-                HistorySyncManager.awaitIdle(1500);
                 final String previous = AccountContext.ownerKey();
+                if (skipPreSync) {
+                    // 强制切换：给在途同步最多 1.5 秒收尾，随后 bumpGeneration 会让它作废
+                    HistorySyncManager.awaitIdle(1500);
+                } else if (!preSwitchSync(previous, cb)) {
+                    return;   // 同步没到位：不切库，等用户决定
+                }
                 // v98 P2：取消旧账号排队中的同步任务 —— 它一旦跑起来就会用新账号的库
                 SyncScheduler.cancel(previous);
                 SettingsProfile.save(previous == null ? "" : previous);
@@ -126,6 +162,16 @@ public final class AccountSwitcher {
      * （且首屏还没就绪，动作会被推迟到下一个门控点，白白多绕一圈）。</p>
      */
     public static void switchToGuest(final Callback cb, final boolean reloadUi) {
+        switchToGuest(cb, reloadUi, false);
+    }
+
+    /**
+     * ★ r217：{@code skipPreSync=true} 语义同
+     * {@link #switchTo(String, String, byte[], boolean, boolean, Callback)}：
+     * 用户已确认"仍要切换"，不再等待同步。
+     */
+    public static void switchToGuest(final Callback cb, final boolean reloadUi,
+                                     final boolean skipPreSync) {
         if (AccountContext.isGuest()) {
             post(cb, true, "当前已是游客模式");
             return;
@@ -133,8 +179,12 @@ public final class AccountSwitcher {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                HistorySyncManager.awaitIdle(1500);
                 final String previous = AccountContext.ownerKey();
+                if (skipPreSync) {
+                    HistorySyncManager.awaitIdle(1500);
+                } else if (!preSwitchSync(previous, cb)) {
+                    return;   // 同步没到位：不切库，等用户决定
+                }
                 SyncScheduler.cancel(previous);
                 // 快照在后台线程存（SettingsProfile.save → HlcClock 会打开 Room，
                 // 不适合放到主线程的切库动作里）。下面 doLogoutToGuest 传 saveProfile=false。
@@ -246,6 +296,19 @@ public final class AccountSwitcher {
 
     /** 移除本机账号：删清单、设置快照、数据库文件；云端数据不动。 */
     public static void remove(final String owner, final Callback cb) {
+        remove(owner, false, cb);
+    }
+
+    /**
+     * ★ r217：移除账号前先同步。
+     *
+     * <p>删本地库（{@link AppDataManager#deleteOwnerDb(String)}）会把这台设备上尚未上传的
+     * 改动一起删掉，这是不可逆的。所以对<b>当前账号</b>先过一次同步闸门，
+     * 失败则中止删除，等用户明确选择「仍要移除」再走 {@code skipPreSync=true}。</p>
+     *
+     * <p>非当前账号没有密钥，无法替它同步；脏标记只用于确认框里的提示。</p>
+     */
+    public static void remove(final String owner, final boolean skipPreSync, final Callback cb) {
         if (owner == null || owner.isEmpty()) {
             post(cb, false, "游客不能移除");
             return;
@@ -254,6 +317,10 @@ public final class AccountSwitcher {
             @Override
             public void run() {
                 HistorySyncManager.awaitIdle(1200);
+                boolean current = owner.equals(AccountContext.ownerKey());
+                if (current && !skipPreSync && !preSwitchSync(owner, cb)) {
+                    return;   // 同步没到位：不删库
+                }
                 SyncScheduler.cancel(owner);
                 MAIN.post(new Runnable() {
                     @Override
@@ -286,6 +353,56 @@ public final class AccountSwitcher {
                 });
             }
         }, "tvbox-account-remove").start();
+    }
+
+    /**
+     * ★ r217：切库/删库前的同步闸门。
+     *
+     * <p>拦截时通过 {@link Callback#onSyncBlocked(String)} 通知调用方，由 UI 弹二次确认；
+     * 用户确认后调用方用 {@code skipPreSync=true} 重入同一条路径。</p>
+     *
+     * @return true = 已同步到位，可以继续；false = 已回调 onSyncBlocked，调用方必须中止
+     */
+    private static boolean preSwitchSync(final String owner, final Callback cb) {
+        if (owner == null || owner.isEmpty()) {
+            return true;   // 游客：没有云端数据可同步
+        }
+        postStage(cb, "正在同步当前账号…");
+        HistorySyncManager.SwitchSync r =
+                HistorySyncManager.syncBeforeSwitch(owner, SWITCH_SYNC_DEADLINE_MS);
+        LOG.i("[Account] pre-switch sync ok=" + r.ok + " rounds=" + r.rounds
+                + " msg=" + r.message);
+        if (r.ok) {
+            postStage(cb, "正在切换…");
+            return true;
+        }
+        postSyncBlocked(cb, r.message == null || r.message.length() == 0
+                ? "仍有未上传的改动" : r.message);
+        return false;
+    }
+
+    private static void postStage(final Callback cb, final String text) {
+        if (cb == null) {
+            return;
+        }
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                cb.onStage(text);
+            }
+        });
+    }
+
+    private static void postSyncBlocked(final Callback cb, final String reason) {
+        if (cb == null) {
+            return;
+        }
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                cb.onSyncBlocked(reason);
+            }
+        });
     }
 
     private static void post(final Callback cb, final boolean ok, final String msg) {

@@ -233,11 +233,12 @@ public final class QrLoginBridge {
                 // v76：统一走账号切换编排（保存当前设置快照 / 切库 / 恢复目标快照 / 拉一次）
                 final long tSwitch = System.currentTimeMillis();
                 // r197：扫码路径不等首轮同步——切换完成即回「已登录」，同步后台继续（false = 不等同步）
+                // r217：切号前的同步闸门仍然是阻塞的；被拦下时走 Callback 默认实现 -> onDone(false)
                 AccountSwitcher.switchTo(owner, name, accountKey, false, new AccountSwitcher.Callback() {
                     @Override
                     public void onDone(boolean ok, String message) {
                         LOG.i("[Sync] qr switch done ok=" + ok + " ("
-                                + (System.currentTimeMillis() - tSwitch) + "ms)");
+                                + (System.currentTimeMillis() - tSwitch) + "ms) msg=" + message);
                         if (ok) {
                             notifyLoginOk(name);
                         } else {
