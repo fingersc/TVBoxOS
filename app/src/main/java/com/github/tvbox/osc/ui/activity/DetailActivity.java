@@ -562,7 +562,16 @@ public class DetailActivity extends BaseActivity {
         llPlayerFragmentContainerBlock.setOnClickListener(v -> {
             enterFullPreview();
             if (firstReverse) {
-                jumpToPlay();
+                // ★ r215：已经在播/已在缓冲时不要再 jumpToPlay()。
+                //   那条路径会 setData() → play(false)，把整轮播放推倒重来，
+                //   表现就是「刚进全屏立刻黑屏 loading，过一会才重新开播」。
+                //   firstReverse 只在点过「倒序」后置真且只消费一次，所以这是低频路径。
+                if (!isPlayFragmentAlive()) {
+                    LOG.sw("[FB] jumpToPlay trigger=firstReverseBlock playing=false");
+                    jumpToPlay();
+                } else {
+                    LOG.sw("[FB] skip jumpToPlay trigger=firstReverseBlock playing=true");
+                }
                 firstReverse=false;
             }
         });
@@ -583,7 +592,13 @@ public class DetailActivity extends BaseActivity {
                 if (showPreview) {
                     enterFullPreview();
                     if(firstReverse){
-                        jumpToPlay();
+                        // ★ r215：同上 —— 已在播就不要重设数据重播。
+                        if (!isPlayFragmentAlive()) {
+                            LOG.sw("[FB] jumpToPlay trigger=firstReversePlay playing=false");
+                            jumpToPlay();
+                        } else {
+                            LOG.sw("[FB] skip jumpToPlay trigger=firstReversePlay playing=true");
+                        }
                         firstReverse=false;
                     }
                 } else {
@@ -1038,6 +1053,12 @@ public class DetailActivity extends BaseActivity {
         com.github.tvbox.osc.util.PerfTrace.begin("detail.jumpToPlay");
         List<VodInfo.VodSeries> jumpList = getPlayingSeriesList();
         if (vodInfo != null && !jumpList.isEmpty()) {
+            // ★ r215 诊断：谁在什么时候把播放推倒重来 —— 配合 PlayFragment 的 [FB] playRound。
+            LOG.sw("[FB] jumpToPlay flag=" + vodInfo.playFlag
+                    + " index=" + vodInfo.playIndex
+                    + " full=" + fullWindows
+                    + " preview=" + showPreview
+                    + " playing=" + isPlayFragmentAlive());
             preFlag = vodInfo.playFlag;
             //更新播放地址
             VodInfo.VodSeries jumpSeries = jumpList.get(clampIndex(vodInfo.playIndex, jumpList));
@@ -9047,6 +9068,22 @@ public class DetailActivity extends BaseActivity {
         if (fullWindows && newConfig.orientation != previewOrientation) {
             previewOrientation = newConfig.orientation;
             previewOrientationChanged = true;
+        }
+    }
+
+    /**
+     * ★ r215：本页播放器是否「已经连上源」（在播或在缓冲）。
+     *
+     * <p>用于全屏点击入口的 firstReverse 分支：已有会话时只切全屏布局，
+     * 不再 {@code jumpToPlay()}（那会 setData → play(false) 整轮重来 → 黑屏 loading）。</p>
+     *
+     * <p>没有任何播放器时返回 false，行为与 r215 之前完全一致。</p>
+     */
+    private boolean isPlayFragmentAlive() {
+        try {
+            return playFragment != null && playFragment.isPlayingNow();
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 

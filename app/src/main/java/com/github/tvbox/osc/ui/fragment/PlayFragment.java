@@ -166,6 +166,21 @@ public class PlayFragment extends BaseLazyFragment {
      * 继续拉长只会让用户多盯黑屏。</p>
      */
     private static final long SWITCH_LINE_PLAY_TIMEOUT_MS = 10 * 1000L;
+
+    /**
+     * ★ r215：「已建连但一直没出画面」的容忍轮数。
+     *
+     * <p><b>为什么需要</b>：把 {@code STATE_BUFFERING} 也算成「连上了」（见
+     * {@link #isPlaybackAlive(int)}）之后，起播看门狗到点会放过它。若源正好停在
+     * BUFFERING 且永远不出画面，这条看门狗就再也不判失败了；而卡顿看门狗的
+     * {@code stallGateOpen} 只在 {@code STATE_PLAYING} 才置真，同样不生效 ——
+     * 两条兜底同时失效，用户会无限黑屏。所以必须给一个<b>有界</b>容忍。</p>
+     *
+     * <p><b>取值 1</b>：最多再等一个 {@link #SWITCH_LINE_PLAY_TIMEOUT_MS} 窗口，
+     * 总计 ≤20s。慢源全屏后重新缓冲通常在几秒内恢复，1 轮足够；
+     * 取 2 会把最坏等待拉到 30s，反而比 r190 调短超时的初衷更差。</p>
+     */
+    private static final int MAX_BUFFERING_GRACE = 1;
     /**
      * 解析停滞宽限：页面 onPageFinished 之后再等这么久，仍无视频地址就判停滞。
      *
@@ -2243,6 +2258,13 @@ public class PlayFragment extends BaseLazyFragment {
     private boolean allowAutoSwitchLine = true;
     private boolean playbackStarted = false;
     /**
+     * ★ r215：本轮起播已经用掉几次「已建连但没出画面」的容忍（上限 {@link #MAX_BUFFERING_GRACE}）。
+     *
+     * <p>每次 {@link #play(boolean)} 开新一轮、以及首帧真正到达时清零 ——
+     * 否则切到新源后会继承上一个源用掉的额度，等于永久少一次兜底。</p>
+     */
+    private int bufferingGraceCount;
+    /**
      * ★ v4.2.8：本轮播放是否<b>真的出过首帧</b>（只增不减，{@link #pauseForHidden()} 不清）。
      *
      * <p>与 {@link #playbackStarted} 的区别：后者会被 {@code pauseForHidden()} / 换源重置清零，
@@ -3201,6 +3223,14 @@ public class PlayFragment extends BaseLazyFragment {
 
     public void play(boolean reset) {
         if(mVodInfo==null)return;
+        // ★ r215 诊断：每次「新一轮起播」都留痕，用于事后判定是谁把播放推倒重来的
+        //   （全屏 firstReverse / 选集 / 切源 / 自动换线 / 在线回填）。
+        LOG.sw("[FB] playRound reset=" + reset
+                + " flag=" + mVodInfo.playFlag
+                + " index=" + mVodInfo.playIndex
+                + " reuse=" + (reusePlayerOnSwitch && !releasePlayerOnSwitch)
+                + " started=" + playbackStarted
+                + " state=" + (mVideoView == null ? -1 : mVideoView.getCurrentPlayState()));
         // ★ v99-r44：用户主动重播（replay/errReplay 走 reset=true）必须清掉同 key 节流账，
         //   否则「同一集再播一次」的结果会被当成重复而丢弃。
         if (reset) {
@@ -3243,6 +3273,8 @@ public class PlayFragment extends BaseLazyFragment {
         stallGateOpen = false;
         firstFrameAtMs = 0L;
         stallSwitchAllowed = true;
+        // ★ r215：新一轮起播重置容忍额度（不继承上一个源用掉的次数）。
+        bufferingGraceCount = 0;
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3531,6 +3563,25 @@ public class PlayFragment extends BaseLazyFragment {
         }
     }
 
+    /**
+     * ★ r215：宿主查询「现在已经有画面在播」。
+     *
+     * <p>供 DetailActivity 的全屏点击入口使用：已经有画面时只切布局，
+     * 不要再走 {@code jumpToPlay() → setData() → play(false)} 把整轮播放重来一遍
+     * （那会黑屏 loading 并重新解析地址，用户看到的正是「刚进全屏就黑屏，过一会才重播」）。</p>
+     *
+     * <p>口径用 {@link #isPlaybackStarted()}（含 BUFFERING 的「已建连」语义）：
+     * 无论已经出画面还是在缓冲，都不该为了「切个全屏」把整轮播放推倒重来 ——
+     * 重新 setData 只会让本来快好的缓冲从零开始，正是用户不能接受的那次黑屏。</p>
+     */
+    public boolean isPlayingNow() {
+        try {
+            return isPlaybackStarted();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public void pauseForHidden() {
         cancelDeferredPause();
         cancelPlayTimeout();
@@ -3565,6 +3616,8 @@ public class PlayFragment extends BaseLazyFragment {
     void markPlaybackStarted() {
         playbackStarted = true;
         everPlayedThisCycle = true;
+        // ★ r215：真出画面了 ⇒ 容忍额度作废（本轮已成功，不该再占着额度）。
+        bufferingGraceCount = 0;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
         // ★ v4.2.6：首帧到达才让详情页落历史 —— 详情页的 jumpToPlay() 现在只挂起写入，
@@ -3993,15 +4046,62 @@ public class PlayFragment extends BaseLazyFragment {
      */
     private static final long STALL_SEEK_GRACE_MS = 2000L;
 
-    boolean isPlaybackStarted() {
+    /**
+     * ★ r215：严格口径 —— 与 r215 之前 {@code isPlaybackStarted()} 的返回值完全等价。
+     *
+     * <p>「真出过画面」或「播放器已就绪/在播」。<b>不含 {@code STATE_BUFFERING}</b>。
+     * 起播看门狗的「已成功，不必判失败」分支必须用它，才能保证除 BUFFERING 之外的
+     * 所有情形行为与改动前逐字一致。</p>
+     */
+    boolean isPlaybackStrictlyStarted() {
         if (playbackStarted) return true;
         if (mVideoView == null) return false;
         int state = mVideoView.getCurrentPlayState();
         return isStartedPlayState(state) || hasPlaybackProgress(mVideoView.getCurrentPosition()) || mVideoView.isPlaying();
     }
 
+    boolean isPlaybackStarted() {
+        if (isPlaybackStrictlyStarted()) return true;
+        if (mVideoView == null) return false;
+        // ★ r215：比严格口径多认一个 BUFFERING（已建连、正在取流）。
+        return isPlaybackAlive(mVideoView.getCurrentPlayState());
+    }
+
+    /**
+     * ★ r215：**严格口径** —— 「确实已就绪/已出画面」，不含 {@code STATE_BUFFERING}。
+     *
+     * <p>本方法在 r215 中<b>一行未改</b>，继续服务两类「必须真有画面」的语义：</p>
+     * <ul>
+     *   <li><b>同步侧</b>：{@code markPlaybackStarted()} 据此落历史、关起播保护窗 ——
+     *       BUFFERING 时还没出首帧，若算作已起播，「点了播放但没出画面就退出」会落假历史；</li>
+     *   <li><b>会话记账</b>：{@code switchingPlayback} 状态机据此判定本轮是否真的播起来了。</li>
+     * </ul>
+     *
+     * <p>播放侧「要不要因为超时而放弃这个源」请用 {@link #isPlaybackAlive(int)}
+     * （宽一档、含 BUFFERING），两者的区别见那里的说明。</p>
+     */
     boolean isStartedPlayState(int state) {
         return state == VideoView.STATE_PREPARED || state == VideoView.STATE_BUFFERED || state == VideoView.STATE_PLAYING;
+    }
+
+    /**
+     * ★ r215：播放侧的「已建连」判定 —— 比 {@link #isStartedPlayState(int)} 宽一档。
+     *
+     * <p><b>为什么必须和同步侧分开</b>：{@code STATE_BUFFERING} 意味着解码器已 prepare、
+     * 正在向源站取流 —— 连接是成功的，只是还没吐够数据出画面。把它判成「这个源播不成」
+     * 就会在用户已经看到画面、只是进全屏触发了一轮重新缓冲时，被起播看门狗当成失败而换源，
+     * 表现就是「全屏后立刻黑屏 loading，过一会又重播」。</p>
+     *
+     * <p><b>但它不能拿来落历史</b>：那时还没出首帧。所以本方法只允许用在
+     * 超时/报错这类「要不要放弃这个源」的判断上，不要外溢到同步语义。</p>
+     *
+     * <p><b>有界容忍</b>：只放宽判定还不够 —— 若源停在 BUFFERING 且永不出画面，
+     * 超时看门狗会一直放过、长卡顿看门狗又因 {@code stallGateOpen} 未开而不生效，
+     * 用户会永远盯黑屏。因此 {@link #handleSwitchLinePlayTimeout()} 里配了
+     * {@link #MAX_BUFFERING_GRACE} 次上限，等满仍不出画面就照常换源。</p>
+     */
+    boolean isPlaybackAlive(int state) {
+        return isStartedPlayState(state) || state == VideoView.STATE_BUFFERING;
     }
 
     boolean hasPlaybackProgress(long progress) {
@@ -4032,10 +4132,28 @@ public class PlayFragment extends BaseLazyFragment {
 
     void handleSwitchLinePlayTimeout() {
         int state = mVideoView == null ? -1 : mVideoView.getCurrentPlayState();
-        LOG.i("echo-switchLinePlay timeout state: " + state + ", started: " + playbackStarted);
-        if (isPlaybackStarted()) {
+        LOG.i("echo-switchLinePlay timeout state: " + state + ", started: " + playbackStarted
+                + ", alive: " + isPlaybackAlive(state) + ", grace: " + bufferingGraceCount);
+        LOG.sw("[FB] switchTimeout state=" + state
+                + " started=" + playbackStarted
+                + " alive=" + isPlaybackAlive(state)
+                + " grace=" + bufferingGraceCount + "/" + MAX_BUFFERING_GRACE
+                + " flag=" + (mVodInfo == null ? "" : mVodInfo.playFlag));
+        // ① 严格口径：本轮真的出过画面 / 播放器已就绪在播 ⇒ 与 r215 之前逐字一致地放过。
+        //    （这里不能用含 BUFFERING 的宽口径，否则会把「只在缓冲」也当成已成功。）
+        if (isPlaybackStrictlyStarted()) {
             cancelPlayTimeout();
             hideTipOnUiThread();
+            return;
+        }
+        // ② 还没出过画面，但播放器已经建连并在缓冲（PREPARED/BUFFERED/BUFFERING）⇒
+        //    给一次有界容忍再等一轮。BUFFERING 表示「连上了但在取流」，
+        //    不能等同于「这个源播不成」；但也不能无限等，见 MAX_BUFFERING_GRACE。
+        if (isPlaybackAlive(state) && bufferingGraceCount < MAX_BUFFERING_GRACE) {
+            bufferingGraceCount++;
+            LOG.i("echo-switchLinePlay extend(buffering) " + bufferingGraceCount
+                    + "/" + MAX_BUFFERING_GRACE + " state=" + state);
+            startSwitchLinePlayTimeout();
             return;
         }
         // ★ r204 方案 A：起播超时按「这个站/这条线路这次没播成」处理，只换线/换源，
