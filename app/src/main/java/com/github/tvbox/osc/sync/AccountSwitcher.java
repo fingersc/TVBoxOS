@@ -78,6 +78,7 @@ public final class AccountSwitcher {
             post(cb, true, "已经是当前账号");
             return;
         }
+        final long t0 = android.os.SystemClock.elapsedRealtime();
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -88,12 +89,15 @@ public final class AccountSwitcher {
                 } else if (!preSwitchSync(previous, cb)) {
                     return;   // 同步没到位：不切库，等用户决定
                 }
+                // ★ r220：pre = 切号前的同步闸门耗时（网络 + 抢锁），这是切号体验的大头之一
+                final long preMs = android.os.SystemClock.elapsedRealtime() - t0;
                 // v98 P2：取消旧账号排队中的同步任务 —— 它一旦跑起来就会用新账号的库
                 SyncScheduler.cancel(previous);
                 SettingsProfile.save(previous == null ? "" : previous);
                 MAIN.post(new Runnable() {
                     @Override
                     public void run() {
+                        final long localStart = android.os.SystemClock.elapsedRealtime();
                         String message = "已切换到：" + name;
                         try {
                             HistorySyncManager.bumpGeneration();
@@ -123,12 +127,20 @@ public final class AccountSwitcher {
                         ConfigCenter.requestReload("switch");
                         ConfigCenter.requestPrewarmLive("switch");
                         final String msg = message;
+                        // ★ r220：local = 切库 + Hawk + AccountStore + SettingsProfile 的主线程开销
+                        final long localMs = android.os.SystemClock.elapsedRealtime() - localStart;
+                        final long postStart = android.os.SystemClock.elapsedRealtime();
                         // v98 P2：切换账号是「必须立刻拉一次」的场景，
                         //        走调度器的立即档（不再借用历史页 pullNow 的 20 秒节流）
                         if (waitForSync) {
                             SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
                                 @Override
                                 public void onDone(boolean ok, String text) {
+                                    LOG.i("[Account] switch timing pre=" + preMs
+                                            + "ms local=" + localMs
+                                            + "ms post=" + (android.os.SystemClock.elapsedRealtime() - postStart)
+                                            + "ms total=" + (android.os.SystemClock.elapsedRealtime() - t0)
+                                            + "ms syncOk=" + ok);
                                     post(cb, true, ok ? msg : msg + "；同步未完成，稍后会自动重试");
                                 }
                             });
@@ -136,6 +148,10 @@ public final class AccountSwitcher {
                             // r197：扫码登录——账号切好就先回调（电视立刻显示已登录），
                             //        首轮同步放后台跑，不再让用户盯着「正在登录」等网盘往返。
                             post(cb, true, msg);
+                            LOG.i("[Account] switch timing pre=" + preMs
+                                    + "ms local=" + localMs
+                                    + "ms post=0ms total=" + (android.os.SystemClock.elapsedRealtime() - t0)
+                                    + "ms syncOk=deferred");
                             SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
                                 @Override
                                 public void onDone(boolean ok, String text) {

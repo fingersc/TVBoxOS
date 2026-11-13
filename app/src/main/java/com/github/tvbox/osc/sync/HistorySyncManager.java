@@ -680,8 +680,23 @@ public final class HistorySyncManager {
         }
         String lastMsg = null;
         try {
-            // 切号这一轮必须是完整轮：轻量首轮只跑 SETTINGS+HISTORY，会漏掉 PROGRESS/COLLECT
-            forceFullRoundNextSync();
+            // ★ r220：这里**不能**再调 forceFullRoundNextSync()。
+            //
+            //   那一行是历史遗留：它清的是**全局一次性**标志 firstRoundPending
+            //   （见 startSync 里 `lightFirstRound = firstRoundPending; firstRoundPending = false;`），
+            //   而该标志不区分账号。于是「旧账号的切号前同步」会顺手把「新账号的首轮」也变成完整轮。
+            //
+            //   实测代价（1406 日志，同一进程）：
+            //     14:13:15.098  [Account] pre-switch sync ok=true rounds=0      ← 旧账号零请求（本就干净）
+            //     14:13:16.758  [sync] owner=2ad88a… reason=manual req=13 down=3972 up=4068 dur=1616ms
+            //                                                        ↑ 新账号首轮被强制成 4 个 scope 全跑
+            //   即：这次切号 1.6 秒的等待，全部来自「本应走轻量轮、只拉 SETTINGS+HISTORY」的那一步。
+            //
+            //   而它对本轮**毫无作用** —— 下面那次 SyncEngine.runSafe 已经显式传了
+            //   lightFirstRound=false，本轮本来就是完整轮。删除它只回收副作用，不改变本轮的完整性。
+            //
+            //   注意：PublicDeviceGuard 里那两处 forceFullRoundNextSync() 必须保留 ——
+            //   预回退前的同步确实需要完整轮（否则 PROGRESS/COLLECT 会落到已解绑的账号上）。
             for (int round = 1; round <= SWITCH_SYNC_MAX_ROUNDS; round++) {
                 if (fullyPushed(owner)) {
                     r.ok = true;
@@ -691,6 +706,7 @@ public final class HistorySyncManager {
                     break;
                 }
                 r.rounds = round;
+                final long roundStart = android.os.SystemClock.elapsedRealtime();
                 // ★ r218：两个开关分开用 ——
                 //   forceUpload=true 只负责「能推上去」（绕过熔断 / 绕过 30 天未上线只下不上），
                 //   切号前必须保留；forcePut=false 则保留「ETag 未变免 GET」「内容一致免 PUT」
@@ -698,11 +714,16 @@ public final class HistorySyncManager {
                 SyncEngine.Outcome o = SyncEngine.runSafe(owner, key, generation,
                         /* forceUpload= */ true, /* forcePut= */ false,
                         /* lightFirstRound= */ false);
+                long roundDur = android.os.SystemClock.elapsedRealtime() - roundStart;
                 if (o == null) {
                     lastMsg = "同步未返回结果";
                     break;
                 }
                 lastMsg = o.message;
+                // ★ r220：把每轮的真实开销记下来（含请求数）—— 切号提速只有靠这个数字验收。
+                LOG.i("[Account] pre-switch sync round=" + round + " light=false"
+                        + " req=" + o.requests + " down=" + o.bytesDown + " up=" + o.bytesUp
+                        + " ok=" + o.ok + " dur=" + roundDur + "ms");
                 if (o.aborted) {
                     LOG.i("[Account] pre-switch sync aborted (generation changed)");
                     r.ok = false;
