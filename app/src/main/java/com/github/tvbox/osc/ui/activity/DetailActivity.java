@@ -1944,6 +1944,18 @@ public class DetailActivity extends BaseActivity {
                                         currentEpisode.name, vodInfoRecord,
                                         PlayProgressManager.collectAllEpisodeNames(vodInfo),
                                         PlayProgressManager.collectEpisodeCoords(vodInfo, vodInfo.playFlag));
+                            } else {
+                                // ★ r218d：不再静默跳过。
+                                //   真机 1525：切到 Clun📚在线_创享/161859 时**一行 migrate 都没有**，
+                                //   紧接着 progressRead rec=0 ⇒ 用户看到「切源后从头播」。
+                                //   原实现在 positionTrusted=false 时整段跳过且不打日志，无法排查。
+                                LOG.sw("[FB] migrateSkip reason=untrustedPos"
+                                        + " expected=" + expectedName
+                                        + " actual=" + currentEpisode.name
+                                        + " from=" + (vodInfoRecord == null ? "" :
+                                            vodInfoRecord.sourceKey + "/" + vodInfoRecord.id)
+                                        + " -> " + sourceKey + "/" + vodId);
+                                migrateProgressByNameOnly(sourceKey, vodId, vodInfo, vodInfoRecord);
                             }
                         } else if (fallbackFromValid) {
                             if (positionTrusted) {
@@ -1951,6 +1963,11 @@ public class DetailActivity extends BaseActivity {
                                         currentEpisode.name, null,
                                         PlayProgressManager.collectAllEpisodeNames(vodInfo),
                                         PlayProgressManager.collectEpisodeCoords(vodInfo, vodInfo.playFlag));
+                            } else {
+                                LOG.sw("[FB] migrateSkip reason=untrustedPos(noRecord)"
+                                        + " expected=" + expectedName
+                                        + " actual=" + currentEpisode.name
+                                        + " -> " + sourceKey + "/" + vodId);
                             }
                         }
                         
@@ -8458,16 +8475,29 @@ public class DetailActivity extends BaseActivity {
         //     （真机：同一部片 28134 的进度散在 feifancj / 730acd68 / 73b5c89a 三个源）
         PlayProgressManager.trimByVod(oldRecord.sourceKey, oldRecord.id,
                 com.github.tvbox.osc.sync.HistorySyncManager.KEEP_PROGRESS_EPISODES);
-        // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标）。
-        //   旧实现沿用旧源的 flag/下标 ⇒ 搬过去的行在新源**永远读不到**
-        //   （真机 2026-10-26：同片连切 4 站，migrateVod 的 moved 逐跳
-        //   1→2→2→9→10，库里堆出 9 条坐标错乱的行，有效进度被 trimByVod
-        //   的 10 条配额挤掉 ⇒ 表现为「切源后进度归零」）。
-        int movedRows = PlayProgressManager.migrateByVod(oldRecord.sourceKey, oldRecord.id,
-                newSourceKey, newVodId, newEpNames, newEpCoords);
-        LOG.sw("[FB] migrateVod " + oldRecord.sourceKey + "/" + oldRecord.id
-                + " -> " + newSourceKey + "/" + newVodId + " moved=" + movedRows
-                + " eps=" + (newEpNames == null ? 0 : newEpNames.size()));
+        // ★★ r218d：**先把「当前在播这一集」的权威进度写进新源，再做整片搬移**。顺序是关键。
+        //
+        //   <p><b>真机事故（1442 日志）：45 分 42 秒的进度被 33 秒的陈旧行顶掉。</b></p>
+        //   <pre>
+        //     14:42:40.484  migrate ... oldTime=2742095 newVal=0        ← 新源此刻确实为空
+        //     14:42:40.584  migrateVod ... moved=1 eps=1                ← 搬了 1 行，但搬的是 33540 那条
+        //     14:42:40.592  migrateResult oldTime=2742095 existed=33540 wrote=0 keep=existing
+        //     14:42:43.515  progressRead ... rec=33540                   ← 起播从 33 秒开始
+        //   </pre>
+        //
+        //   <p><b>机理</b>：{@link PlayProgressManager#migrateByVod} 遍历的是旧源<b>整部片的所有行</b>
+        //   （不分线路）。目标源只有一集（电影，{@code eps=1}）时，{@code toEpNames} 只有一个集名，
+        //   旧源里任何一条**集名精确命中**的行都能把那个唯一坐标占满 —— 哪怕它是很旧的小值。
+        //   而真正在播的那条（{@code HD中字}）因为集名认不出（{@code findIndex} 失败、
+        //   且 {@code rows.size()!=1} 兜底不生效）反而 {@code toCoords.get(...)==null} 被跳过。
+        //   最后 {@code migrateByVod} 末尾的 {@code deleteByVod} 把旧源<b>全部</b>行删掉
+        //   ⇒ 权威值 2742095 既没搬过去、原件也没了，只剩那条陈旧 33540。</p>
+        //
+        //   <p><b>为什么「先写」就能解决，而且不用改任何写入语义</b>：权威行先落库后会带上
+        //   最新 HLC，随后 {@code migrateByVod} 内既有的判据
+        //   {@code exist != null && compareHlc(exist, row) >= 0 → continue}
+        //   就会自然跳过陈旧行。不需要新增 save 变体、不碰 HLC 分配、不碰同步水位。</p>
+        boolean wrotePrimary = false;
         if (oldTime > 0) {
             // ★ v99-r71：取证日志 —— 与 PlayFragment.getSavedProgress 的 progressRead 成对。
             //   两边 key 必须完全一致（源/片id/线路/集下标/集名），任何一处不一致都会导致
@@ -8479,20 +8509,36 @@ public class DetailActivity extends BaseActivity {
             com.github.tvbox.osc.cache.PlayProgress nowRow = PlayProgressManager.getRecord(
                     newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
             long nowVal = nowRow == null ? 0 : nowRow.position;
-            boolean wrote = false;
             if (oldRow != null && oldRow.position > 0
                     && (nowRow == null || nowRow.position <= 0
                         || PlayProgressManager.compareHlc(oldRow, nowRow) > 0)) {
                 PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
-                wrote = true;
+                wrotePrimary = true;
             }
+        }
+        // ★ v99-r77：坐标换算到新源（线路 + 该线路内的集下标）。
+        //   旧实现沿用旧源的 flag/下标 ⇒ 搬过去的行在新源**永远读不到**
+        //   （真机 2026-10-26：同片连切 4 站，migrateVod 的 moved 逐跳
+        //   1→2→2→9→10，库里堆出 9 条坐标错乱的行，有效进度被 trimByVod
+        //   的 10 条配额挤掉 ⇒ 表现为「切源后进度归零」）。
+        int movedRows = PlayProgressManager.migrateByVod(oldRecord.sourceKey, oldRecord.id,
+                newSourceKey, newVodId, newEpNames, newEpCoords);
+        LOG.sw("[FB] migrateVod " + oldRecord.sourceKey + "/" + oldRecord.id
+                + " -> " + newSourceKey + "/" + newVodId + " moved=" + movedRows
+                + " eps=" + (newEpNames == null ? 0 : newEpNames.size()));
+        if (oldTime > 0) {
             // ★ r130：迁移结果可观测——此前只有 oldTime/newVal(=迁移前新源的旧值，通常 0)，
             //   无法判断"这条进度到底写没写进新源"。配合 PlayFragment 的 [FB] progressRead
             //   即可验证"写进去了 / 起播读到了"，把"切源后进度丢失"变成可量化的指标。
+            // ★ r218d：existed 改成「搬移之后」再读，反映的是最终落库值；
+            //   wrote 反映的是权威行有没有写成功（不再受 migrateByVod 抢先写入的影响）。
+            com.github.tvbox.osc.cache.PlayProgress afterRow = PlayProgressManager.getRecord(
+                    newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            long existedAfter = afterRow == null ? 0 : afterRow.position;
             LOG.sw("[FB] migrateResult oldTime=" + oldTime
-                    + " existed=" + nowVal
-                    + " wrote=" + (wrote ? oldTime : 0)
-                    + " keep=" + (wrote ? "new" : "existing")
+                    + " existed=" + existedAfter
+                    + " wrote=" + (wrotePrimary ? oldTime : 0)
+                    + " keep=" + (wrotePrimary ? "new" : "existing")
                     + " ep=" + newSeriesName);
             // ★ v99-r75：旧源这一条已复制到新源 ⇒ 删掉，避免同一部片在多个源各留一份。
             //   （打墓碑 + markDirty ⇒ 同步侧能正确知道"这条被迁走了"）
@@ -8516,6 +8562,90 @@ public class DetailActivity extends BaseActivity {
 }
 
     
+    /**
+     * ★ r218d：{@code positionTrusted == false} 时的<b>零猜测</b>降级迁移。
+     *
+     * <p><b>为什么需要它</b>：真机 1525 日志里，切到 {@code Clun📚在线_创享/161859} 时
+     * {@code positionTrustedAcrossDomain} 判假，原实现整段静默跳过（一行日志都没有），
+     * 紧接着 {@code progressRead rec=0} ⇒ 用户看到「切源后从头播」。
+     * 这是确定的损失，比「落点可能不准」更糟。</p>
+     *
+     * <p><b>为什么只按集名、不做任何位置推断</b>：{@code positionTrusted=false} 恰恰说明
+     * 「这两个集名跨域不可比」。此时若按下标、按序号、按最近邻去猜，就会重演历史上
+     * 那些「第2期上被写成第1期下」的错配。本方法只做一件事：</p>
+     * <ul>
+     *   <li>拿旧源记录里<b>实际在播那一集的集名</b>（{@code oldRecord.playNote}）；</li>
+     *   <li>在新源<b>当前线路</b>的集名列表里找<b>完全同名</b>的那一条；</li>
+     *   <li>找到 → 把旧源该集的时间写过去；找不到 → 什么都不做（不猜）。</li>
+     * </ul>
+     *
+     * <p>「完全同名」用 {@code TextUtils.equals}，不走 {@code EpisodeNameMatcher}：
+     * 匹配器的跨域换算正是被判不可信的那个东西，这里再用它等于绕回原点。</p>
+     *
+     * <p>写入用 {@link PlayProgressManager#save}，因此同样受「位置没变不生成新 HLC」
+     * 与 HLC 择优保护；不会覆盖新源里更新的记录。</p>
+     */
+    private void migrateProgressByNameOnly(String newSourceKey, String newVodId,
+                                           VodInfo newVodInfo, VodInfo oldRecord) {
+        try {
+            if (oldRecord == null || newVodInfo == null
+                    || TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId)) {
+                return;
+            }
+            String oldFlag = oldRecord.playFlag;
+            String oldSeriesName = oldRecord.playNote;
+            if (TextUtils.isEmpty(oldSeriesName)) {
+                List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null
+                        ? null : oldRecord.seriesMap.get(oldFlag);
+                if (oldList != null && oldRecord.playIndex >= 0 && oldRecord.playIndex < oldList.size()) {
+                    oldSeriesName = oldList.get(oldRecord.playIndex).name;
+                }
+            }
+            if (TextUtils.isEmpty(oldSeriesName)) {
+                return;
+            }
+            // 只在新源「当前线路」里找完全同名的集（不跨线路、不跨域换算）
+            List<VodInfo.VodSeries> newList = newVodInfo.seriesMap == null
+                    ? null : newVodInfo.seriesMap.get(newVodInfo.playFlag);
+            if (newList == null || newList.isEmpty()) {
+                return;
+            }
+            int hit = -1;
+            for (int i = 0; i < newList.size(); i++) {
+                VodInfo.VodSeries s = newList.get(i);
+                if (s != null && TextUtils.equals(s.name, oldSeriesName)) {
+                    hit = i;
+                    break;
+                }
+            }
+            if (hit < 0) {
+                LOG.sw("[FB] migrateByName miss ep=" + oldSeriesName
+                        + " flag=" + newVodInfo.playFlag
+                        + " list=" + newList.size() + " => 不猜，保持原样");
+                return;
+            }
+            long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id,
+                    oldFlag, oldRecord.playIndex, oldSeriesName);
+            if (oldTime <= 0) {
+                return;
+            }
+            long newVal = PlayProgressManager.get(newSourceKey, newVodId,
+                    newVodInfo.playFlag, hit, oldSeriesName);
+            if (newVal > 0) {
+                // 新源这一集已有记录 ⇒ 交给既有 HLC 语义，不在这里做强覆盖
+                LOG.sw("[FB] migrateByName skip ep=" + oldSeriesName
+                        + " existed=" + newVal + " => 已有记录");
+                return;
+            }
+            PlayProgressManager.save(newSourceKey, newVodId,
+                    newVodInfo.playFlag, hit, oldSeriesName, oldTime);
+            LOG.sw("[FB] migrateByName hit ep=" + oldSeriesName + " index=" + hit
+                    + " -> " + newSourceKey + "/" + newVodId + " => " + oldTime);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
     /**
      * 同一源内跨线路迁移播放时间（如 hhyun -> hhm3u8）。
      * sourceKey/vodId 不变，仅 playFlag 变化，把旧线路对应集的时间复制到新线路对应集。
