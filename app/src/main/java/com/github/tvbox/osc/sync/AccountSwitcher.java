@@ -133,7 +133,14 @@ public final class AccountSwitcher {
                         // v98 P2：切换账号是「必须立刻拉一次」的场景，
                         //        走调度器的立即档（不再借用历史页 pullNow 的 20 秒节流）
                         if (waitForSync) {
-                            SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
+                            // ★ r221：切号后首轮只要「务必推上去」，不要「无视内容比对强推」。
+                            //   原来传 force=true 会经由 runSafe 的 5 参重载把 forcePut 也置真，
+                            //   于是「ETag 未变免 GET」「内容一致免 PUT」两条捷径全被禁用。
+                            //   实测 2148：`same-miss scope=SETTINGS content=true ... forcePut=true`
+                            //   —— 内容明明一致却仍被强制 PUT。改走 6 参、forcePut=false 后，
+                            //   这类 scope 直接跳过。与 r218 给切号前那轮做的拆分口径一致。
+                            SyncScheduler.requestNow(owner, "switch", true, false,
+                                    new HistorySyncManager.Callback() {
                                 @Override
                                 public void onDone(boolean ok, String text) {
                                     LOG.i("[Account] switch timing pre=" + preMs
@@ -152,7 +159,10 @@ public final class AccountSwitcher {
                                     + "ms local=" + localMs
                                     + "ms post=0ms total=" + (android.os.SystemClock.elapsedRealtime() - t0)
                                     + "ms syncOk=deferred");
-                            SyncScheduler.requestNow(owner, "switch", true, new HistorySyncManager.Callback() {
+                            // ★ r221：同上的拆分。扫码登录这轮同样只需要「推上去」，
+                            //   不需要强制重写内容一致的 scope。
+                            SyncScheduler.requestNow(owner, "switch", true, false,
+                                    new HistorySyncManager.Callback() {
                                 @Override
                                 public void onDone(boolean ok, String text) {
                                     LOG.i("[Sync] qr background sync done ok=" + ok);
@@ -195,12 +205,17 @@ public final class AccountSwitcher {
         new Thread(new Runnable() {
             @Override
             public void run() {
+                // ★ r221：补上切游客的分段计时 —— 此前只有「切到某账号」打 switch timing，
+                //   切游客那条路径完全没有，没法对比两边耗时。
+                final long t0 = android.os.SystemClock.elapsedRealtime();
                 final String previous = AccountContext.ownerKey();
                 if (skipPreSync) {
                     HistorySyncManager.awaitIdle(1500);
                 } else if (!preSwitchSync(previous, cb)) {
                     return;   // 同步没到位：不切库，等用户决定
                 }
+                final long preMs = android.os.SystemClock.elapsedRealtime() - t0;
+                final long localStart = android.os.SystemClock.elapsedRealtime();
                 SyncScheduler.cancel(previous);
                 // 快照在后台线程存（SettingsProfile.save → HlcClock 会打开 Room，
                 // 不适合放到主线程的切库动作里）。下面 doLogoutToGuest 传 saveProfile=false。
@@ -219,6 +234,10 @@ public final class AccountSwitcher {
                         } catch (Throwable t) {
                             LOG.e("[Account] switch guest failed", t);
                         }
+                        LOG.i("[Account] switch timing pre=" + preMs
+                                + "ms local=" + (android.os.SystemClock.elapsedRealtime() - localStart)
+                                + "ms post=0ms total=" + (android.os.SystemClock.elapsedRealtime() - t0)
+                                + "ms syncOk=n/a(guest)");
                         post(cb, true, "已切换到游客模式");
                     }
                 });

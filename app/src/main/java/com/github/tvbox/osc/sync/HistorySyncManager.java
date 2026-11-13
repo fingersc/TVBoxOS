@@ -69,21 +69,6 @@ public final class HistorySyncManager {
 
     private static volatile boolean syncing;
     private static boolean started;
-    /**
-     * ★ v4.2.2（B）：冷启动那一轮是否只跑 SETTINGS + HISTORY。
-     *
-     * <p>首页「最近观看」只依赖 HISTORY（SETTINGS 提供账号档位，必须先行）。
-     * 首轮把 PROGRESS/COLLECT 推迟，可少 2 个条件 GET，首屏「那张卡片」出现得更早；
-     * 被推迟的 scope 脏标记保持不变，紧随其后的一轮补跑照常上传，不丢数据。</p>
-     */
-    private static volatile boolean firstRoundPending;
-    /**
-     * ★ v4.2.2（B）：首轮轻量同步结束后，下一轮「补跑」是否跳过 min-gap。
-     *
-     * <p>只放宽最小间隔，<b>「仅 Wi-Fi」门禁照旧生效</b> —— 补跑绝不能烧移动流量。
-     * 用完即复位，避免长期绕过间隔。</p>
-     */
-    private static volatile boolean continuePending;
     /** 页面主动拉取的节流时间戳（避免来回切页面刷请求）。 */
     private static long lastPullAt;
     /** 账号切换代数：切换时 +1，在途同步发现代数变了就放弃写库（防串库）。 */
@@ -188,9 +173,8 @@ public final class HistorySyncManager {
         }
         // v98 P2：冷启动那一次交给调度器（1 秒内必跑一次）；此后的周期轮询
         //         由调度器按自适应间隔接管，App 不再自己持有 30 分钟的定时器。
-        // ★ v4.2.2（B）：并把这一轮标记为「首轮轻量同步」——只处理 SETTINGS + HISTORY，
-        //   让首页「最近观看」尽快出现（PROGRESS/COLLECT 交给紧随其后的下一轮）。
-        firstRoundPending = true;
+        // ★ r221：不再标记「首轮轻量」—— 冷启动这一轮直接跑完整 4 个 scope。
+        //   没变动的 scope 由引擎自己的三层跳过处理（0 请求），不必靠「整段不跑」省时间。
         SyncScheduler.requestWithin(migrateOwner, "boot", 1000L);
     }
 
@@ -250,17 +234,17 @@ public final class HistorySyncManager {
     }
 
     /**
-     * r216：强制下一轮同步走「完整轮」（覆盖全部 scope）。
+     * r221：<b>已降级为空操作</b>，仅为兼容既有调用点（{@code PublicDeviceGuard} 两处）而保留。
      *
-     * <p>冷启动首轮是"轻量轮"（只跑 SETTINGS + HISTORY），PROGRESS/COLLECT 交给紧随其后的
-     * 补跑。公共设备模式要在冷启动时"先同步再回退"，如果只跑了轻量轮就回退，剩下的
-     * PROGRESS/COLLECT 就落到一个已经解绑的账号上，只能等他下次登录才补。
-     * 因此预回退那一轮必须先清掉这个标记。</p>
+     * <p>历史背景：r216 时期冷启动首轮是"轻量轮"（只跑 SETTINGS + HISTORY），PROGRESS/COLLECT
+     * 交给紧随其后的补跑。公共设备模式要在冷启动时"先同步再回退"，若只跑了轻量轮就回退，
+     * 剩下的 PROGRESS/COLLECT 会落到一个已解绑的账号上 —— 所以那一轮必须先清掉轻量标记。</p>
+     *
+     * <p>r221 起轻量轮机制整体取消，<b>每一轮都是完整轮</b>，本标记不存在了，
+     * 因此这个方法不再需要做任何事。保留签名是为了不牵动调用点。</p>
      */
     public static void forceFullRoundNextSync() {
-        synchronized (LOCK) {
-            firstRoundPending = false;
-        }
+        // 空实现：r221 起所有轮次均为完整轮，无「轻量首轮」需要覆盖。
     }
 
     /** 按账号命名空间取 Hawk 键（游客用原键）。 */
@@ -680,23 +664,16 @@ public final class HistorySyncManager {
         }
         String lastMsg = null;
         try {
-            // ★ r220：这里**不能**再调 forceFullRoundNextSync()。
+            // ★ r220/r221：「首轮轻量」机制已整体取消，这里不再需要任何「强制完整轮」的调用。
             //
-            //   那一行是历史遗留：它清的是**全局一次性**标志 firstRoundPending
-            //   （见 startSync 里 `lightFirstRound = firstRoundPending; firstRoundPending = false;`），
-            //   而该标志不区分账号。于是「旧账号的切号前同步」会顺手把「新账号的首轮」也变成完整轮。
+            //   r220 删掉了这里原有的 forceFullRoundNextSync() —— 它清的是**全局一次性**
+            //   标志 firstRoundPending，不区分账号，于是「旧账号的切号前同步」会顺手把
+            //   「新账号的首轮」也变成完整轮。而它对本轮毫无作用（本轮本来就要求完整轮）。
             //
-            //   实测代价（1406 日志，同一进程）：
-            //     14:13:15.098  [Account] pre-switch sync ok=true rounds=0      ← 旧账号零请求（本就干净）
-            //     14:13:16.758  [sync] owner=2ad88a… reason=manual req=13 down=3972 up=4068 dur=1616ms
-            //                                                        ↑ 新账号首轮被强制成 4 个 scope 全跑
-            //   即：这次切号 1.6 秒的等待，全部来自「本应走轻量轮、只拉 SETTINGS+HISTORY」的那一步。
-            //
-            //   而它对本轮**毫无作用** —— 下面那次 SyncEngine.runSafe 已经显式传了
-            //   lightFirstRound=false，本轮本来就是完整轮。删除它只回收副作用，不改变本轮的完整性。
-            //
-            //   注意：PublicDeviceGuard 里那两处 forceFullRoundNextSync() 必须保留 ——
-            //   预回退前的同步确实需要完整轮（否则 PROGRESS/COLLECT 会落到已解绑的账号上）。
+            //   r221 更进一步：轻量轮机制被整体删除（用户要求消除「PROGRESS/COLLECT 还没到位」
+            //   的窗口），现在**每一轮都是完整轮**，forceFullRoundNextSync() 已降级为空操作。
+            //   「没变动就跳过」由引擎内部三层判据负责（0 请求 / 免 GET / 免 PUT），
+            //   与轮次是否「轻量」无关。
             for (int round = 1; round <= SWITCH_SYNC_MAX_ROUNDS; round++) {
                 if (fullyPushed(owner)) {
                     r.ok = true;
@@ -712,8 +689,7 @@ public final class HistorySyncManager {
                 //   切号前必须保留；forcePut=false 则保留「ETag 未变免 GET」「内容一致免 PUT」
                 //   两条省流量捷径，避免干净账号被强制全量重写一遍（r217 用 true 是过头的）。
                 SyncEngine.Outcome o = SyncEngine.runSafe(owner, key, generation,
-                        /* forceUpload= */ true, /* forcePut= */ false,
-                        /* lightFirstRound= */ false);
+                        /* forceUpload= */ true, /* forcePut= */ false);
                 long roundDur = android.os.SystemClock.elapsedRealtime() - roundStart;
                 if (o == null) {
                     lastMsg = "同步未返回结果";
@@ -827,6 +803,26 @@ public final class HistorySyncManager {
      * @param cb         完成回调
      */
     static void sync(final boolean manual, final boolean background, final boolean force, final Callback cb) {
+        // ★ r221：旧签名保持原语义 —— force 同时作用于「强推」与「强制 PUT」。
+        sync(manual, background, force, force, cb);
+    }
+
+    /**
+     * ★ r221：{@code forceUpload}（强推：绕过熔断 / 绕过「30 天未上线只下不上」）与
+     * {@code forcePut}（无视内容比对强制 PUT）分开。
+     *
+     * <p>为什么需要拆：{@link SyncEngine#runSafe(String, byte[], int, boolean, boolean)} 的 5 参重载
+     * 内部把 {@code forcePut} 直接绑成 {@code forceUpload}。切号<b>前</b>那一轮 r218 已经改成直调
+     * 6 参、{@code forcePut=false}；切号<b>后</b>那一轮仍是 {@code force=true} 一路传下来，
+     * 于是「ETag 未变免 GET」「内容一致免 PUT」两条捷径同时失效 ——
+     * 实测 2148 日志 {@code same-miss scope=SETTINGS content=true ... forcePut=true}，
+     * 内容完全一致却仍被强制 PUT，白花一个往返。</p>
+     *
+     * <p>安全性：{@code forcePut=false} 只是「允许内容比对决定要不要写」，内容不同仍然 PUT；
+     * 内容相同则云端那份本来就是自己上次上传的，跳过是幂等的。不涉及任何数据取舍。</p>
+     */
+    static void sync(final boolean manual, final boolean background, final boolean forceUpload,
+                     final boolean forcePut, final Callback cb) {
         final String owner = AccountContext.ownerKey();
         if (AccountContext.isGuest()) {
             post(cb, false, "游客模式：登录后才能同步");
@@ -864,14 +860,6 @@ public final class HistorySyncManager {
             return;
         }
         if (!manual) {
-            // ★ v4.2.2（B）：首轮轻量同步的「补跑」跳过 min-gap —— 它紧跟首轮 0ms 排队，
-            //   若被 30s 间隔挡住，被推迟的 PROGRESS/COLLECT 就要再等半分钟才上传。
-            //   「仅 Wi-Fi」门禁不跳过（见下方），补跑同样不能烧移动流量。
-            boolean continuation;
-            synchronized (LOCK) {
-                continuation = continuePending;
-                continuePending = false;
-            }
             long last = lastSyncAt();
             // r18：切后台的补传走更短的最小间隔（见 MIN_GAP_BACKGROUND_MS）。
             long gap = background ? MIN_GAP_BACKGROUND_MS : MIN_GAP_MS;
@@ -883,9 +871,7 @@ public final class HistorySyncManager {
                 // 首次学习偏移 / 时钟回拨：保守视为“刚同步过”，只等一个正常 gap，绝不放大。
                 elapsed = 0;
             }
-            if (continuation) {
-                LOG.i("[sync] continuation round, skip min-gap elapsed=" + elapsed + "ms");
-            } else if (elapsed < gap) {
+            if (elapsed < gap) {
                 syncing = false;
                 // ★ v99-r39：按「真实剩余时间」重排，而不是套用 retry-dirty 的固定 60 秒档。
                 //   距上次同步只差几秒时却被推到 60 秒后，退出播放那一刻的进度就传不上去了。
@@ -899,13 +885,6 @@ public final class HistorySyncManager {
             }
             if (Hawk.get(HawkConfig.SYNC_WIFI_ONLY, false) && !isWifi()) {
                 syncing = false;
-                // ★ v4.2.2（B）：补跑被门禁挡下时把标记还回去，避免「首轮推迟的 scope」
-                //   在这一次被吃掉标记后，又要按普通 30s 间隔再等一轮。
-                if (continuation) {
-                    synchronized (LOCK) {
-                        continuePending = true;
-                    }
-                }
                 SyncScheduler.skipped(owner, "wifi-only");
                 return;
             }
@@ -913,26 +892,11 @@ public final class HistorySyncManager {
             //         只有回退到旧 doSync 时才需要在这里挡一道。
             if (!Hawk.get(HawkConfig.SYNC_ENGINE_V2, true) && SyncState.load(owner).inBackoff()) {
                 syncing = false;
-                if (continuation) {
-                    synchronized (LOCK) {
-                        continuePending = true;
-                    }
-                }
                 SyncScheduler.skipped(owner, "backoff");
                 return;
             }
         }
         final long t0 = System.currentTimeMillis();
-        // ★ v4.2.2（B）：首轮轻量同步标记。只有「冷启动那一次」为真，用完立即复位，
-        //   保证紧随其后的补跑（fg / retry-pull / dirty）走完整 4 个 scope。
-        final boolean lightFirstRound;
-        synchronized (LOCK) {
-            lightFirstRound = firstRoundPending;
-            firstRoundPending = false;
-        }
-        if (lightFirstRound) {
-            LOG.i("[sync] light first round (SETTINGS+HISTORY only)");
-        }
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -960,7 +924,8 @@ public final class HistorySyncManager {
                     //   （"exception X is never thrown in body of corresponding try statement"）。
                     //   改为：只 catch Throwable 兜底，具体的错误语义由 Outcome.message 承载。
                     {
-                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, force, lightFirstRound);
+                        SyncEngine.Outcome r = SyncEngine.runSafe(owner, key, gen, forceUpload,
+                                /* forcePut= */ forcePut);
                         ok = r.ok;
                         msg = r.message == null ? "同步完成" : r.message;
                         engineHandled = true;
@@ -1000,14 +965,7 @@ public final class HistorySyncManager {
                 } else {
                     SyncScheduler.onSyncResult(owner, ok && (up > 0 || !notModified), up > 0);
                 }
-                // ★ v4.2.2（B）：首轮轻量同步收尾后，立刻排一轮补跑把 PROGRESS/COLLECT 处理掉。
-                //   放在 onSyncResult 之后：补跑是独立的一次调度，不与首轮合并。
-                //   只在首轮「成功」时补跑：失败时交给调度器的退避/补排，避免失败即立刻重试。
-                if (lightFirstRound && ok && !aborted) {
-                    continuePending = true;
-                    LOG.i("[sync] light first round done, schedule continuation");
-                    SyncScheduler.requestWithin(owner, "light-cont", 0L);
-                }
+                // ★ r221：轻量轮与「补跑」已取消 —— 本轮就是完整轮，不再排 light-cont。
             }
         }, "tvbox-sync").start();
     }

@@ -66,49 +66,32 @@ public final class SyncEngine {
      * @param forceUpload 强制上传（手动同步 / 切换账号后）
      */
     public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload) throws Exception {
-        return run(owner, key, gen, forceUpload, forceUpload, false);
+        return run(owner, key, gen, forceUpload, forceUpload);
     }
 
     /**
-     * ★ v4.2.2（B）：冷启动首轮「轻量同步」。
+     * ★ r221：<b>取消「首轮轻量同步」</b>，一律跑完整轮。
      *
-     * <p>首页「最近观看」只需要 HISTORY（+ 账号档位所在的 SETTINGS），而 PROGRESS/COLLECT
-     * 每个 scope 都要一次条件 GET、脏时还要 PUT，把首屏等待从 ~2s 拉长到 2.5s+。
-     * {@code lightFirstRound=true} 时本轮只处理 SETTINGS + HISTORY，其余 scope 保持脏标记，
-     * 由调用方紧接着排一轮补跑。</p>
+     * <p>旧设计（v4.2.2 B）把冷启动/扫码登录的首轮限制成 SETTINGS + HISTORY，
+     * PROGRESS/COLLECT 交给紧随其后的一轮「补跑」。用户实测反馈：不想要补跑那段
+     * 「进度/收藏还没到位」的窗口。</p>
      *
-     * <p>注意：<b>不会</b>因此少传数据 —— 被跳过的 scope 的 {@code processedOk} 为 false，
-     * {@link #finish} 不会清它们的 dirty，补跑那轮照常上传。</p>
-     */
-    public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload,
-                              boolean lightFirstRound) throws Exception {
-        return run(owner, key, gen, forceUpload, forceUpload, lightFirstRound);
-    }
-
-    /**
-     * ★ r218：把「强制上传」拆成两个独立开关，语义不再混在一起。
-     *
-     * <p><b>为什么要拆</b>：{@code forceUpload} 原先同时承担了两种完全不同的职责——</p>
+     * <p><b>为什么合并成一轮不会变慢</b>：本引擎对「没变动」的 scope 有三层跳过，
+     * 全量轮同样生效，且优先级更高——</p>
      * <ol>
-     *   <li><b>安全兜底</b>（必须保留）：绕过熔断（{@code inBackoff}）与「30 天未上线只下不上」
-     *       （{@code downloadOnly}）。切号/退出前同步如果丢了这两条，弱网或长期未登录时
-     *       数据就永远推不上去。</li>
-     *   <li><b>省流量优化</b>（可以关掉）：跳过「脏 + 云端 ETag 未变 ⇒ 云端就是我上次传的那份」
-     *       的零下载捷径（{@code skipFetch}），以及「合并后内容与云端一致 ⇒ 跳过 PUT」的
-     *       {@code same} 分支。</li>
+     *   <li>不脏 + 目录 PROPFIND 给的 ETag 与本地一致 ⇒ <b>0 请求</b>（见循环开头）；</li>
+     *   <li>脏 + ETag 未变 + 有指纹 ⇒ 不发 GET；指纹相同则 0 请求，不同则直接 PUT；</li>
+     *   <li>其余才走一次条件 GET（304 时零正文）。</li>
      * </ol>
+     * <p>因此合并后的额外成本是<b>最坏情况</b>而非常数：PROGRESS/COLLECT 若不脏且 ETag 未变，
+     * 一个请求都不发；若脏，本来也要传，只是从「下一轮」挪到「本轮」，总请求数反而少一次
+     * 重复的 PROPFIND。</p>
      *
-     * <p>切号前的闸门需要第 1 类、但不需要第 2 类：它只想「把该传的传上去」，并不想因此
-     * 多付一次完整 GET，更不想在内容其实一致时白写一次 PUT（r217 之前的行为）。</p>
-     *
-     * <p><b>不会因此死锁</b>：{@code same} 分支虽然跳过 PUT，但仍然
-     * {@code bumpPushedHlc(merged.hlcMax...)}，所以下一轮 {@code fullyPushed()} 会变真。</p>
-     *
-     * @param forceUpload 绕过熔断 / 绕过「只下不上」——安全兜底
-     * @param forcePut    忽略「ETag 未变免 GET」「内容一致免 PUT」——省流量优化开关
+     * <p>收益：不存在「补跑」这个第二段，也就没有「补跑被 Wi-Fi 门禁 / 熔断 / 进程进后台
+     * 丢弃 ⇒ PROGRESS 要等到 30s 后那一轮」的窗口。</p>
      */
     public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload,
-                              boolean forcePut, boolean lightFirstRound) throws Exception {
+                              boolean forcePut) throws Exception {
         SyncState st = SyncState.load(owner);
         // ★ P0-2：记下「本次同步开始前」的脏标记。SyncState 是整对象读改写，
         //   收尾时若直接 clearDirty()+save()，会把期间用户新标的脏一起洗掉（lost update）。
@@ -223,12 +206,8 @@ public final class SyncEngine {
             if (!enabled.isEnabled(sc)) {
                 continue;
             }
-            // ★ v4.2.2（B）：首轮轻量同步只跑 SETTINGS + HISTORY，其余 scope 留到补跑那轮。
-            //   processedOk 保持 false ⇒ finish 不清它的 dirty ⇒ 补跑照常上传，不会丢改动。
-            if (lightFirstRound && sc != SyncScope.SETTINGS && sc != SyncScope.HISTORY) {
-                LOG.i("[Sync] light first round: defer scope=" + sc);
-                continue;
-            }
+            // ★ r221：轻量轮已取消 —— 每个 scope 都按自己的脏标记 + ETag 决定是否真的发请求，
+            //   「没变动」由下面几层跳过统一处理，不再靠「整段不跑某个 scope」来省时间。
             try {
             HistorySyncManager.checkGeneration(gen);
             String path = AccountPaths.scopeFile(accountName, sc);
@@ -1038,20 +1017,14 @@ public final class SyncEngine {
      * <p>上层（HSM）因此不需要再自己 {@code noteFailure()}，避免双重计数。</p>
      */
     public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload) {
-        return runSafe(owner, key, gen, forceUpload, forceUpload, false);
+        return runSafe(owner, key, gen, forceUpload, forceUpload);
     }
 
-    /** ★ v4.2.2（B）：带 {@code lightFirstRound} 的版本，见 {@link #run(String, byte[], int, boolean, boolean)}。 */
+    /** ★ r221：带 {@code forcePut} 的版本，语义见 {@link #run(String, byte[], int, boolean, boolean)}。 */
     public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload,
-                                  boolean lightFirstRound) {
-        return runSafe(owner, key, gen, forceUpload, forceUpload, lightFirstRound);
-    }
-
-    /** ★ r218：带 {@code forcePut} 的版本，语义见 {@link #run(String, byte[], int, boolean, boolean, boolean)}。 */
-    public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload,
-                                  boolean forcePut, boolean lightFirstRound) {
+                                  boolean forcePut) {
         try {
-            return run(owner, key, gen, forceUpload, forcePut, lightFirstRound);
+            return run(owner, key, gen, forceUpload, forcePut);
         } catch (HistorySyncManager.SwitchAborted e) {
             // 切换账号作废：不计失败
             // ★ v99-r11-fix：通过返回值告知上层"这是作废、不是失败"（runSafe 不抛异常）

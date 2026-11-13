@@ -160,7 +160,25 @@ public final class SyncScheduler {
      * 传 {@code true} 保持原行为。</p>
      */
     public static void requestNow(String owner, String reason, boolean force, HistorySyncManager.Callback cb) {
-        schedule(owner, reason, PRI_NOW, 0L, force, cb);
+        // ★ r221：旧签名保持原语义 —— force 同时作用于「强推」与「强制 PUT」。
+        schedule(owner, reason, PRI_NOW, 0L, force, force, false, cb);
+    }
+
+    /**
+     * ★ r221：把「立即档要推上去」（{@code forceUpload}）与「无视内容比对强推」（{@code forcePut}）分开。
+     *
+     * <p>r218 已经给切号<b>前</b>那一轮做了这个拆分（直调 6 参 {@code runSafe}），但切号<b>后</b>
+     * 那一轮仍走 {@link #requestNow(String, String, boolean, HistorySyncManager.Callback)}，
+     * 于是 {@code force=true} 连带 {@code forcePut=true}，把两条捷径一起禁掉 ——
+     * 实测 2148 日志 {@code same-miss scope=SETTINGS content=true ... forcePut=true}：
+     * 内容明明一致却仍被强制 PUT。</p>
+     *
+     * <p>切号后的首轮只需要保证「不被熔断/只下不上挡住」，内容比对完全可以照常生效：
+     * 内容不同照样 PUT，内容相同就跳过（跳过是幂等的，云端那份就是我们自己的）。</p>
+     */
+    public static void requestNow(String owner, String reason, boolean forceUpload, boolean forcePut,
+                                  HistorySyncManager.Callback cb) {
+        schedule(owner, reason, PRI_NOW, 0L, forceUpload, forcePut, false, cb);
     }
 
     /**
@@ -341,13 +359,13 @@ public final class SyncScheduler {
 
     private static void schedule(String owner, String reason, int pri, long capMs,
                                  HistorySyncManager.Callback cb) {
-        schedule(owner, reason, pri, capMs, false, false, cb);
+        schedule(owner, reason, pri, capMs, false, false, false, cb);
     }
 
     /** ★ v99-r20：{@code force} 见 {@link #requestNow(String, String, boolean, HistorySyncManager.Callback)}。 */
     private static void schedule(String owner, String reason, int pri, long capMs, boolean force,
                                  HistorySyncManager.Callback cb) {
-        schedule(owner, reason, pri, capMs, force, false, cb);
+        schedule(owner, reason, pri, capMs, force, force, false, cb);
     }
 
     /**
@@ -356,20 +374,29 @@ public final class SyncScheduler {
      */
     private static void schedule(String owner, String reason, int pri, long capMs, boolean force,
                                  boolean background, HistorySyncManager.Callback cb) {
+        schedule(owner, reason, pri, capMs, force, force, background, cb);
+    }
+
+    /** ★ r221：{@code forceUpload} 与 {@code forcePut} 分开传（见 5 参 requestNow）。 */
+    private static void schedule(String owner, String reason, int pri, long capMs,
+                                 boolean forceUpload, boolean forcePut, boolean background,
+                                 HistorySyncManager.Callback cb) {
         if (owner == null || owner.isEmpty()) {
             return;
         }
         long now = System.currentTimeMillis();
         synchronized (LOCK) {
             Task pending = TASKS.get(owner);
-            // ★ v4.2.7：boot / light-cont 是「刚启动就马上要跑」的短延迟任务（1000ms / 0ms），
+            // ★ v4.2.7：boot 是「刚启动就马上要跑」的短延迟任务（1000ms），
             //   不能被后到的脏数据请求顶掉 —— PRI_DIRTY(1) 比 PRI_IDLE(2) 优先，一旦替换，
             //   启动轮就直接被换成 60 秒后的脏任务。立即档（手动同步 / 退出 App / 切账号）
-            //   仍然可以替换它们。
+            //   仍然可以替换它。
             //
             //   背景：v4.2.7 去掉了 onForeground() 对脏任务的 0ms 抢跑，而这条抢跑原本
             //   顺带救了「启动 1 秒内就标脏」这种情形（把 boot 任务提前到 0ms）。没有它
             //   以后必须显式保证 boot 不被顶掉，否则启动同步会被推迟到 60 秒。
+            //   ★ r221：light-cont 已不再产生（轻量轮取消），protectBootTask 里对它的
+            //   判定成为无害死分支。
             boolean keepBoot = pending != null && protectBootTask(pending.reason, pri);
             if (keepBoot || !shouldReplace(pending == null ? -1 : pending.pri, pri)) {
                 // 已有更早的任务在排队 ⇒ 合并掉这次请求（防抖的关键：不推后在途任务）。
@@ -401,7 +428,7 @@ public final class SyncScheduler {
                 TASKS.remove(owner);
             }
             long delay = delayFor(pri, SyncState.load(owner).intervalIdx, playing, capMs);
-            Task t = new Task(owner, reason, pri, force, cb);
+            Task t = new Task(owner, reason, pri, forceUpload, forcePut, cb);
             // ★ v4.2.8：替换在途任务时也要继承它的 background —— 实测有另一条丢法：
             //   onBackground()（reason=bg, pri=2）先排上，300ms 内 markDirty 的 dirty(pri=1)
             //   把它替换成新任务，background 就没了（真机日志 2026-11-07 20:33:44.550/595,
@@ -458,11 +485,14 @@ public final class SyncScheduler {
     /**
      * ★ v4.2.7：在途任务是否是「刚启动就马上要跑」的短延迟任务，且本次请求允许它保留。
      *
-     * <p>{@code boot}（冷启动 1000ms）与 {@code light-cont}（首轮轻量同步后的补跑 0ms）
-     * 都属于启动链路的短延迟任务。后到的脏数据请求（{@code PRI_DIRTY}=1）优先级高于
-     * 轮询（{@code PRI_IDLE}=2），若不特殊保护就会被替换成 60 秒后的任务，把启动同步
-     * 整轮推迟 —— v4.2.7 去掉了 {@code onForeground()} 对脏任务的 0ms 抢跑后，
-     * 这条抢跑原本顺带救过这种情形，必须显式补上。</p>
+     * <p>{@code boot}（冷启动 1000ms）属于启动链路的短延迟任务。后到的脏数据请求
+     * （{@code PRI_DIRTY}=1）优先级高于轮询（{@code PRI_IDLE}=2），若不特殊保护就会被
+     * 替换成 60 秒后的任务，把启动同步整轮推迟 —— v4.2.7 去掉了 {@code onForeground()}
+     * 对脏任务的 0ms 抢跑后，这条抢跑原本顺带救过这种情形，必须显式补上。</p>
+     *
+     * <p>★ r221：{@code light-cont} 已不再产生（首轮轻量同步机制整体取消，每一轮都是
+     * 完整轮，不再有「补跑」）。这里仍保留对它的判定，纯粹是为了兼容可能存在的历史
+     * 排队任务，属无害死分支。</p>
      *
      * <p>立即档（{@code PRI_NOW}：手动同步 / 退出 App / 切账号）仍然可以替换它们。</p>
      */
@@ -550,6 +580,14 @@ public final class SyncScheduler {
         final int pri;
         /** ★ v99-r20：是否无视内容比对强推（仅 requestNow 显式传入；final —— 不需要跨请求传播）。 */
         final boolean force;
+        /**
+         * ★ r221：是否「无视内容比对强制 PUT」。
+         *
+         * <p>与 {@link #force}（强推：绕过熔断 / 绕过「只下不上」）分开：切号后的首轮需要前者、
+         * 不需要后者。为 {@code false} 时引擎的「ETag 未变免 GET」「内容一致免 PUT」两条捷径
+         * 照常生效 —— 内容不同仍然 PUT，只是不再无脑重写。同 {@code force} 一样是 final。</p>
+         */
+        final boolean forcePut;
         final HistorySyncManager.Callback cb;
         long runAt;
 
@@ -566,11 +604,13 @@ public final class SyncScheduler {
          */
         boolean background;
 
-        Task(String owner, String reason, int pri, boolean force, HistorySyncManager.Callback cb) {
+        Task(String owner, String reason, int pri, boolean force, boolean forcePut,
+             HistorySyncManager.Callback cb) {
             this.owner = owner;
             this.reason = reason;
             this.pri = pri;
             this.force = force;
+            this.forcePut = forcePut;
             this.cb = cb;
         }
 
@@ -591,7 +631,7 @@ public final class SyncScheduler {
             //
             // ★ r19：必须读独立字段而不是 reason —— 被 pull-forward 提前的任务
             // reason 仍是 "dirty"，读 reason 会让 10s 档永远不生效。
-            HistorySyncManager.sync(pri == PRI_NOW, background, force, cb);
+            HistorySyncManager.sync(pri == PRI_NOW, background, force, forcePut, cb);
         }
     }
 }
