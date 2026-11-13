@@ -1937,6 +1937,21 @@ public class DetailActivity extends BaseActivity {
                             pendingSwitchSourceName = null;
                         }
 
+                        // ★ r222：迁移块入口无条件打点 —— 保证「有进必有痕」。
+                        //   真机 2148 有两个「切源后 rec=0」却连 migrateSkip 都没有的实例
+                        //   （21:50:10 起义、21:51:15 现在就出发），无法判断是没进迁移段、
+                        //   还是进了但静默返回。这行把「进没进 + 三个判据取值」先钉死。
+                        LOG.sw("[FB] migrateEnter src=" + sourceKey + "/" + vodId
+                                + " flag=" + vodInfo.playFlag + " index=" + vodInfo.playIndex
+                                + " newEp=" + (currentEpisode == null ? "null" : currentEpisode.name)
+                                + " expected=" + expectedName
+                                + " sameNameRestored=" + sameNameRestored
+                                + " fallbackFromValid=" + fallbackFromValid
+                                + " positionTrusted=" + positionTrusted
+                                + " fallbackResult=" + fallbackResult
+                                + " vodInfoRecord=" + (vodInfoRecord == null ? "null"
+                                    : vodInfoRecord.sourceKey + "/" + vodInfoRecord.id
+                                      + " note=" + vodInfoRecord.playNote));
                         // 跨源换源：把旧源记住的剧集内播放时间迁移到当前源对应集数，避免切源后时间记忆丢失
                         if (sameNameRestored) {
                             if (positionTrusted) {
@@ -8464,6 +8479,8 @@ public class DetailActivity extends BaseActivity {
                                               java.util.Map<String, PlayProgressManager.EpCoord> newEpCoords) {
     try {
         if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId) || TextUtils.isEmpty(newSeriesName)) {
+            LOG.sw("[FB] migrateSkip reason=emptyArg -> " + newSourceKey + "/" + newVodId
+                    + " ep=" + newSeriesName + " flag=" + newFlag + " index=" + newIndex);
             return;
         }
         long newVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
@@ -8496,6 +8513,9 @@ public class DetailActivity extends BaseActivity {
             }
         }
         if (TextUtils.isEmpty(oldSeriesName)) {
+            LOG.sw("[FB] migrateSkip reason=oldEpNameEmpty old=" + oldRecord.sourceKey + "/" + oldRecord.id
+                    + " flag=" + oldFlag + " index=" + oldRecord.playIndex
+                    + " -> " + newSourceKey + "/" + newVodId);
             return;
         }
         // ★★ v99-r74：换片（点了另一部同名片）时**不迁移进度**。
@@ -8641,6 +8661,8 @@ public class DetailActivity extends BaseActivity {
         try {
             if (newVodInfo == null
                     || TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId)) {
+                LOG.sw("[FB] migrateByName no-op reason=emptyArg -> " + newSourceKey + "/" + newVodId
+                        + " newVodInfo=" + (newVodInfo == null ? "null" : "ok"));
                 return;
             }
             // ★ r218e：锚点可以来自两处 —— 库记录，或切源前抓的实时快照。
@@ -8681,6 +8703,8 @@ public class DetailActivity extends BaseActivity {
             List<VodInfo.VodSeries> newList = newVodInfo.seriesMap == null
                     ? null : newVodInfo.seriesMap.get(newVodInfo.playFlag);
             if (newList == null || newList.isEmpty()) {
+                LOG.sw("[FB] migrateByName no-op reason=newListEmpty flag=" + newVodInfo.playFlag
+                        + " ep=" + oldSeriesName + " -> " + newSourceKey + "/" + newVodId);
                 return;
             }
             int hit = -1;
@@ -8700,6 +8724,8 @@ public class DetailActivity extends BaseActivity {
             long oldTime = PlayProgressManager.get(oldSourceKey, oldVodId,
                     oldFlag, oldIndex, oldSeriesName);
             if (oldTime <= 0) {
+                LOG.sw("[FB] migrateByName no-op reason=oldZero ep=" + oldSeriesName
+                        + " from=" + oldSourceKey + "/" + oldVodId + "/" + oldFlag + "/" + oldIndex);
                 return;
             }
             long newVal = PlayProgressManager.get(newSourceKey, newVodId,
@@ -8742,6 +8768,8 @@ public class DetailActivity extends BaseActivity {
             }
             if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId)
                     || TextUtils.isEmpty(newSeriesName)) {
+                LOG.sw("[FB] migrateByName no-op reason=emptyArg -> " + newSourceKey + "/" + newVodId
+                        + " ep=" + newSeriesName);
                 return;
             }
             // 同源同片同集：没有"迁移"可言
@@ -8749,6 +8777,12 @@ public class DetailActivity extends BaseActivity {
                     && TextUtils.equals(fallbackFromVodId, newVodId)
                     && TextUtils.equals(fallbackFromFlag, newFlag)
                     && fallbackFromIndex == newIndex) {
+                // ★ r222：这条原是静默 return，真机 2148（21:51:15 现在就出发 / 21:51:44 暗黑新娘）
+                //   只看到 migrateSkip noRecord arg 却没有任何后续 ⇒ 无法判断是不是这里命中。
+                //   注意判据**只比源/片/线路/下标，不比集名**：集名相同但属于不同源时必须照常迁移。
+                LOG.sw("[FB] migrateByName no-op reason=sameCoord from="
+                        + fallbackFromSourceKey + "/" + fallbackFromVodId + "/" + fallbackFromFlag + "/" + fallbackFromIndex
+                        + " -> " + newSourceKey + "/" + newVodId + "/" + newFlag + "/" + newIndex);
                 return;
             }
             long oldTime = PlayProgressManager.get(fallbackFromSourceKey, fallbackFromVodId,
