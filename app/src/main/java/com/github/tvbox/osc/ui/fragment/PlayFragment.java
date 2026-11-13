@@ -183,39 +183,20 @@ public class PlayFragment extends BaseLazyFragment {
     private static final int MAX_BUFFERING_GRACE = 1;
 
     /*
-     * ★ r218（决策 B，r218a 暂停）：原本想给「本轮连播放地址都还没下发」用一个更短的 6s 预算。
+     * ★ r218b（方案 A）：r218 的「PREPARING 3s 短容忍」与「dither 500ms 复查」已全部撤除。
      *
-     * 为什么撤回：真机 1406/1414 日志证明 SWITCH_LINE_PLAY_TIMEOUT_MS 只在 playUrl() 之后
-     * 武装（即地址已拿到），而「连地址都没有」由 RESOLVE_PLAY_URL_TIMEOUT_MS（15s）与
-     * parseStall（5s）兜底。换句话说更短的预算落不到目标场景，只会把「地址已下发、播放器
-     * 起播慢」的正常轮次砍短（实测 17 次成功起播里 2 次首帧 > 9.4s，均属临界生存）。
+     * 真机 1442 日志（r218a 构建）实测：两者串联后每次超时都是
+     *   10s(到) → +3s(PREPARING) → +0.5s(dither) → 判死  = 13.5s
+     * 四次超时（ffm3u8 / gsm3u8 / 1080zyk / ukm3u8）一次都没救下源，净亏 7 秒。
+     * 而 1112 那次 dither 真的救下 9474ms 首帧 —— 区别是那一次 state 在窗口内变化过。
+     * 结论：这两个分支无法区分「慢但在连」与「彻底不通」，只能一律延后 3.5s，纯亏损。
+     * 已恢复 r217 的「10s 到点即判」；要容忍慢源应直接调 SWITCH_LINE_PLAY_TIMEOUT_MS，
+     * 不再靠不可判定的中间态分支堆时间。
      *
-     * 决策 B 的正确定位点是 RESOLVE_PLAY_URL_TIMEOUT_MS，但那会把「解析 6~15s 才成功」的
-     * 慢源一并砍掉，属于需要重新拍板的取舍，故本版不动。
+     * 决策 B（「无地址」用更短预算）同样作废：SWITCH_LINE_PLAY_TIMEOUT_MS 只在 playUrl()
+     * 之后武装（地址已拿到），而「连地址都没有」由 RESOLVE_PLAY_URL_TIMEOUT_MS（15s）与
+     * parseStall（5s）兜底，更短的预算落不到目标场景。正确定位点是 RESOLVE_PLAY_URL_TIMEOUT_MS。
      */
-
-    /**
-     * ★ r218（决策 D）：{@code STATE_PREPARING} 的<b>短</b>容忍。
-     *
-     * <p>为什么不直接把它并进 {@link #isPlaybackAlive(int)}：1112 日志里 5 次
-     * {@code switchTimeout} 全部是 {@code state=1}（PREPARING）且上游是
-     * {@code SSL handshake aborted} —— 根本没连上、只是卡在 PREPARING。整档纳入 alive
-     * 会让每条死线都多拿一整轮 10s 宽限，用户放弃死源从 10s 变成 20s（实测会白等 40s+）。</p>
-     *
-     * <p>但「已 setDataSource、正在初始化/读 manifest」确实可能已在建连，所以给 3s 短宽限：
-     * 真慢但已连上的源够出首帧，死源只多等 3s。额度同样是 1 次，且首帧到达即作废。</p>
-     */
-    private static final long PREPARING_GRACE_MS = 3 * 1000L;
-    private static final int MAX_PREPARING_GRACE = 1;
-
-    /**
-     * ★ r218（决策 E）：判定换线前的最后一次复查窗口。
-     *
-     * <p>真机 1112：{@code switchTimeout 23:13:16.093} 判死，<b>0.418 秒后</b>
-     * {@code 23:13:16.511 [vod] first frame} —— 老源自己出画面了，但换源已经启动。
-     * 给 500ms 复查一次即可吃掉这类临界抖动，代价是死源晚 0.5s 放弃。</p>
-     */
-    private static final long DITHER_GRACE_MS = 500L;
 
     /**
      * ★ r218（决策 B）：解析层「探到地址却迟迟不 {@code [vod] start}」的宽限。
@@ -620,7 +601,7 @@ public class PlayFragment extends BaseLazyFragment {
                     hideTipOnUiThread();
                 } else if (playState == VideoView.STATE_ERROR) {
                     // 播放器层报错（解码失败 / 拉流中断），记为一次失败尝试
-                    recordPlaybackFailure("playerError");
+                    recordPlaybackFailureOnce("playerError");
                 }
                 if (switchingPlayback) {
                     if (playState == VideoView.STATE_PLAYBACK_COMPLETED) {
@@ -2316,20 +2297,21 @@ public class PlayFragment extends BaseLazyFragment {
      */
     private int bufferingGraceCount;
     /**
-     * ★ r218：本轮 PREPARING 短容忍已用次数（上限 {@link #MAX_PREPARING_GRACE}）。
-     * 与 {@link #bufferingGraceCount} 同生命周期：{@link #play(boolean)} 与首帧到达都清零。
-     */
-    private int preparingGraceCount;
-    /**
      * ★ r218：本轮是否已经把播放地址交给播放器（即打过 {@code [vod] start}）。
-     * 用来决定抖动复查是否值得做（地址都没下发时不可能有首帧，白等没意义），
-     * 并在日志里标明本轮到底走到过哪一步。
+     * 仅用于日志排查（{@code switchTimeout} 那行标出本轮走到过哪一步）；
+     * 判死逻辑本身已不再依赖它（r218b 撤掉了 dither 复查）。
      */
     private boolean roundUrlDelivered;
-    /** ★ r218：本轮是否已经做过一次 500ms 抖动复查（只做一次，避免变成无限等）。 */
-    private boolean ditherDone;
-    /** ★ r218：本轮首次探到播放地址的时刻（{@code elapsedRealtime}）；0 = 还没探到。 */
+    /** ★ r218b：本轮首次探到播放地址的时刻（{@code elapsedRealtime}）；0 = 还没探到。 */
     private long urlFoundAtMs;
+    /**
+     * ★ r218b：本次换源尝试内「已经记过一次失败」的源 key。
+     *
+     * <p>只由 {@link #play(boolean)} 重置（新一轮换源），不清空于换线 ——
+     * 目的正是让「同源换线后的第二次失败」被识别为重复并跳过。
+     * 见 {@link #recordPlaybackFailureOnce(String)}。</p>
+     */
+    private String lastFailedSourceKey;
     /**
      * ★ v4.2.8：本轮播放是否<b>真的出过首帧</b>（只增不减，{@link #pauseForHidden()} 不清）。
      *
@@ -3341,11 +3323,11 @@ public class PlayFragment extends BaseLazyFragment {
         stallSwitchAllowed = true;
         // ★ r215：新一轮起播重置容忍额度（不继承上一个源用掉的次数）。
         bufferingGraceCount = 0;
-        // ★ r218：本轮预算/抖动/地址标记也随新一轮清零。
-        preparingGraceCount = 0;
+        // ★ r218：本轮地址标记随新一轮清零（仅日志用；判死逻辑见 r218b 注释）。
         roundUrlDelivered = false;
-        ditherDone = false;
         urlFoundAtMs = 0L;
+        // ★ r218b：新一轮换源开始 ⇒ 失败去重窗口重置（跨尝试照常记账）。
+        lastFailedSourceKey = null;
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3733,9 +3715,6 @@ public class PlayFragment extends BaseLazyFragment {
         everPlayedThisCycle = true;
         // ★ r215：真出画面了 ⇒ 容忍额度作废（本轮已成功，不该再占着额度）。
         bufferingGraceCount = 0;
-        // ★ r218：PREPARING 短容忍同样作废；抖动复查也没必要了（已成功）。
-        preparingGraceCount = 0;
-        ditherDone = true;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
         // ★ v4.2.6：首帧到达才让详情页落历史 —— 详情页的 jumpToPlay() 现在只挂起写入，
@@ -3810,11 +3789,38 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     /**
-     * 播放失败/超时/取消时调用：把本次尝试记为失败。
+     * ★ r218b：同一次换源尝试内，一个源只记<b>一次</b>失败。
      *
-     * @param reason 失败原因（仅用于排查）
+     * <p><b>问题</b>：真机 1442 日志里同一源被记两次——</p>
+     * <pre>
+     *   14:44:16.055  jumpToPlay flag=feifan        ← 一次换源开始
+     *   14:44:21.388  [PQ] fail 4d6422f0... reason=parseStall          (5.0s)
+     *   14:44:21.391  echo-autoRetry switch line: feifan -> ffm3u8     ← 同源换线
+     *   14:44:43.137  [PQ] fail 4d6422f0... reason=switchLineTimeout   (21.7s)
+     * </pre>
+     * <p>本场 {@code 4d6422f0}、{@code api_10}、{@code api_6} 各被记 2 次。这两次其实是
+     * <b>同一个源在同一次尝试里先后两次失败</b>（先解析不出地址、换线后起播超时），
+     * 对 {@code SourceQualityStore} 却等于「这个源失败了两回」，成功率被系统性低估 ——
+     * 慢源因此被双重惩罚，切源时更容易被排到后面，形成「越慢越不用、越不用越慢」。</p>
+     *
+     * <p><b>口径</b>：以「一次换源尝试」为窗口。{@link #play(boolean)}（即
+     * {@code jumpToPlay} → 新一轮）重置；同一次尝试内的第二次及以后只打
+     * {@code [PQ] dedupe} 日志、不进统计。跨尝试（用户又切回这个源）照常记。</p>
+     *
+     * <p><b>为什么不在 {@code settlePlayQualityIfPending} 里做</b>：那里是所有结算的唯一入口，
+     * 包括成功（{@code recordPlaybackReady}）。成功必须每次都能记（同源重试成功是有价值的信息），
+     * 只有「同一尝试内的连续失败」才需要去重，因此放在失败专用的入口上。</p>
      */
-    void recordPlaybackFailure(String reason) {
+    void recordPlaybackFailureOnce(String reason) {
+        String key = playReqSourceKey;
+        if (!TextUtils.isEmpty(key) && TextUtils.equals(key, lastFailedSourceKey)) {
+            LOG.i("[PQ] dedupe " + key + " reason=" + reason
+                    + "（同一换源尝试内已记过一次失败）");
+            // 计时器仍要清掉，否则下一次 startPlayQualityTimer 会把它当「未结算」再补一次
+            discardPlayQualityTimer();
+            return;
+        }
+        lastFailedSourceKey = key;
         settlePlayQualityIfPending(false, 0, reason);
     }
 
@@ -3859,7 +3865,7 @@ public class PlayFragment extends BaseLazyFragment {
      *   <tr><td>出首帧（播放器回调）</td><td>{@link #recordPlaybackReady}</td>
      *       <td><b>playOk</b> + 首帧耗时</td></tr>
      *   <tr><td>解析失败 / 起播超时 / 播放器报错</td>
-     *       <td>{@link #recordPlaybackFailure}</td><td><b>playFail</b>（不计耗时）</td></tr>
+     *       <td>{@link #recordPlaybackFailureOnce(String)}</td><td><b>playFail</b>（不计耗时）</td></tr>
      *   <tr><td>还没起播就被切走，且没等够</td>
      *       <td>{@code settlePlayQualityIfPending(false, 0, "superseded", true)}</td>
      *       <td><b>不记账</b>（用户主动放弃，见 {@link #PLAY_QUALITY_ABANDON_MIN_MS}）</td></tr>
@@ -3868,7 +3874,7 @@ public class PlayFragment extends BaseLazyFragment {
      * </table>
      *
      * <p><b>「解析成功但一直转圈」算不算 fail？</b>算 —— 但它不是由本方法判定的，
-     * 而是由调用方在<b>超时后</b>主动调 {@link #recordPlaybackFailure}：
+     * 而是由调用方在<b>超时后</b>主动调 {@link #recordPlaybackFailureOnce(String)}：
      * 播放页对「拿到地址却迟迟不出首帧」有起播超时兜底
      * （{@code cancelPlayTimeout} 一族），超时即按失败结算，
      * 于是「解析成功但转圈到超时」记 playFail，与「解析直接失败」同等对待。
@@ -4228,7 +4234,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     void handleResolvePlayUrlTimeout() {
         LOG.i("echo-resolvePlayUrl timeout, try next line");
-        recordPlaybackFailure("resolveTimeout");
+        recordPlaybackFailureOnce("resolveTimeout");
         if (sourceViewModel != null) sourceViewModel.cancelPlayRequest();
         stopParse();
         if (!tryNextLineIfEnabled()) {
@@ -4239,7 +4245,7 @@ public class PlayFragment extends BaseLazyFragment {
 
     void handleResolvePlayUrlFailed(String err) {
         LOG.i("echo-resolvePlayUrl failed, try next line: " + err);
-        recordPlaybackFailure("resolveFailed");
+        recordPlaybackFailureOnce("resolveFailed");
         if (sourceViewModel != null) sourceViewModel.cancelPlayRequest();
         stopParse();
         if (tryNextLineIfEnabled()) return;
@@ -4251,16 +4257,11 @@ public class PlayFragment extends BaseLazyFragment {
     void handleSwitchLinePlayTimeout() {
         int state = mVideoView == null ? -1 : mVideoView.getCurrentPlayState();
         LOG.i("echo-switchLinePlay timeout state: " + state + ", started: " + playbackStarted
-                + ", alive: " + isPlaybackAlive(state) + ", grace: " + bufferingGraceCount
-                + ", pgrace: " + preparingGraceCount + ", url: " + roundUrlDelivered
-                + ", dither: " + ditherDone);
+                + ", alive: " + isPlaybackAlive(state) + ", grace: " + bufferingGraceCount);
         LOG.sw("[FB] switchTimeout state=" + state
                 + " started=" + playbackStarted
                 + " alive=" + isPlaybackAlive(state)
-                + " url=" + roundUrlDelivered
                 + " grace=" + bufferingGraceCount + "/" + MAX_BUFFERING_GRACE
-                + " pgrace=" + preparingGraceCount + "/" + MAX_PREPARING_GRACE
-                + " dither=" + ditherDone
                 + " flag=" + (mVodInfo == null ? "" : mVodInfo.playFlag));
         // ① 严格口径：本轮真的出过画面 / 播放器已就绪在播 ⇒ 与 r215 之前逐字一致地放过。
         //    （这里不能用含 BUFFERING 的宽口径，否则会把「只在缓冲」也当成已成功。）
@@ -4279,26 +4280,19 @@ public class PlayFragment extends BaseLazyFragment {
             rearmSwitchLinePlayTimeout(SWITCH_LINE_PLAY_TIMEOUT_MS);
             return;
         }
-        // ②.5 ★ r218（决策 D）：STATE_PREPARING 只给 3s 短容忍，不并入 isPlaybackAlive。
-        //   理由见 PREPARING_GRACE_MS 的注释：1112 的 4 次死源超时全是 state=1，
-        //   整档纳入 alive 会让它们各多等一整轮 10s。
-        if (state == VideoView.STATE_PREPARING && preparingGraceCount < MAX_PREPARING_GRACE) {
-            preparingGraceCount++;
-            LOG.i("echo-switchLinePlay extend(preparing) " + preparingGraceCount
-                    + "/" + MAX_PREPARING_GRACE + " state=" + state);
-            rearmSwitchLinePlayTimeout(PREPARING_GRACE_MS);
-            return;
-        }
-        // ②.8 ★ r218（决策 E）：地址已下发、但到点仍没出画面 ⇒ 最后 500ms 复查一次。
-        //   只为吃掉「超时后零点几秒老源自己出首帧」这种临界抖动（1112：0.418s）。
-        //   只在 roundUrlDelivered 为真时做 —— 地址都没下发时不可能有首帧，白等没意义。
-        if (roundUrlDelivered && !ditherDone) {
-            ditherDone = true;
-            LOG.i("echo-switchLinePlay dither recheck " + DITHER_GRACE_MS
-                    + "ms state=" + state);
-            rearmSwitchLinePlayTimeout(DITHER_GRACE_MS);
-            return;
-        }
+        // ★ r218b（方案 A）：撤掉 r218 的「PREPARING 3s 短容忍」与「dither 500ms 复查」。
+        //
+        //   真机 1442 日志（r218a 构建）实测：两者串联后，每次超时都是
+        //   10s(到) → +3s(PREPARING) → +0.5s(dither) → 判死，共 13.5s；
+        //   四次超时（ffm3u8 / gsm3u8 / 1080zyk / ukm3u8）**一次都没救下源**，
+        //   净亏 7 秒。对比 1112 那次 dither 真的救下 9474ms 首帧，
+        //   区别在于那一次 state 在窗口内变化过（说明源还活着），
+        //   而这两次 state 从 10s 到 13s 一动不动（CDN 完全无响应）。
+        //
+        //   结论：这两个分支无法可靠区分「慢但在连」与「彻底不通」，
+        //   只能一律延后 3.5s，属于纯亏损。按方案 A 全部撤回，
+        //   恢复 r217 的「10s 到点即判」；真要容忍慢源应调 SWITCH_LINE_PLAY_TIMEOUT_MS 本身，
+        //   而不是靠不可判定的中间态分支堆时间。
         // ★ r204 方案 A：起播超时按「这个站/这条线路这次没播成」处理，只换线/换源，
         //   不再先把 Exo 切到 IJK 重播同一 URL。换播放器只保留给播放器自身
         //   STATE_ERROR（errReplay → errorWithRetryOnPlayerError）。
@@ -4306,7 +4300,7 @@ public class PlayFragment extends BaseLazyFragment {
         // ★ 与 resolveTimeout / resolveFailed / parseStall 三个入口对齐：
         //   起播超时同样是「这个站这次没播成」，不记的话 SourceQualityStore 会
         //   少掉一大半失败样本，站点质量分被系统性高估 → 切源优先挑到的仍是慢站。
-        recordPlaybackFailure("switchLineTimeout");
+        recordPlaybackFailureOnce("switchLineTimeout");
         stopParse();
         if (!tryNextLineIfEnabled()) {
             stopMusicSessionForFailedPlayback();
@@ -4366,7 +4360,7 @@ public class PlayFragment extends BaseLazyFragment {
         }
         LOG.i("echo-parseStall no video url after " + PARSE_STALL_TIMEOUT_MS
                 + "ms, try next line");
-        recordPlaybackFailure("parseStall");
+        recordPlaybackFailureOnce("parseStall");
         stopParse();
         if (!tryNextLineIfEnabled()) {
             stopMusicSessionForFailedPlayback();

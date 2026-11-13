@@ -159,16 +159,12 @@ public class DetailActivity extends BaseActivity {
      * 已经跑通过的并发量，不引入新的带宽风险；变快的部分全部来自「不再等最慢的源」。</p>
      */
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
-    /**
-     * ★ r218：切源时把攒池并发提到 {@link #DETAIL_FALLBACK_MAX_SEARCH} 的持续时间，到时回落后台档。
-     *
-     * <p><b>为什么需要回落</b>：{@code ensurePoolFilling()} 里的调档分支只有
-     * {@code if (concurrency > detailFallbackPoolConcurrency)}，即<b>只升不降</b>。
-     * 一次切源把档位顶到 20 之后，本次会话后面所有「详情进页后台攒池」都会以 20 并发跑，
-     * 而 99 个源 × 20 并发在弱网上就是成片的 {@code SSL handshake aborted}（1113 日志实测），
-     * 反过来又拖慢播放分片下载。这里给切源的提档加一个 5s 的时效。</p>
+    /*
+     * ★ r218b：r218 曾在这里加过 POOL_SWITCH_BOOST_MS（切源提档 5s 后回落）与配套 Runnable。
+     * 真机 1442 日志证明它从未生效（boost-timeout 0 次），原因见
+     * detailFallbackPoolConcurrency 字段上的注释 —— 已被 resetDetailFallbackKeepCache()
+     * 与 finishDetailFallbackSearchOnTimeout() 抢先降档，属死代码，已整体删除。
      */
-    private static final long POOL_SWITCH_BOOST_MS = 5000L;
     private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = SwitchBudget.SEARCH_TIMEOUT_MS;
     /**
      * ★ v99-r57：正在加载候选详情（{@code detailFallbackLoadingCandidate}）时的补位并发上限。
@@ -4348,11 +4344,9 @@ public class DetailActivity extends BaseActivity {
                 + " reuse=" + (reuseFilling ? 1 : 0));
         // 提速到前台档（已在跑则只提档不重建队列）；ensurePoolFilling 内部会处理派发与硬闸
         ensurePoolFilling(DETAIL_FALLBACK_MAX_SEARCH, "switch");
-        // ★ r218：提档是有时效的 —— 5s 后回落后台档，见 POOL_SWITCH_BOOST_MS 的说明。
-        if (llLayout != null) {
-            llLayout.removeCallbacks(detailFallbackPoolBoostRevert);
-            llLayout.postDelayed(detailFallbackPoolBoostRevert, POOL_SWITCH_BOOST_MS);
-        }
+        // ★ r218b：原「5s 后回落」已删（从未生效的死代码，详见 detailFallbackPoolConcurrency 的注释）。
+        //   档位回落本来就有两个执行者：resetDetailFallbackKeepCache()（切源成功后）
+        //   与 finishDetailFallbackSearchOnTimeout()（8s 前台窗口结束）。
         // 方案A：探路。队列已复用时不探 —— 队列本身正在覆盖全部源，
         // 再朝同一个站单独打一枪等于把它搜两次。
         if (!reuseFilling) {
@@ -7055,24 +7049,22 @@ public class DetailActivity extends BaseActivity {
     /** 当前并发档位：20（前台）/ 8（加载详情中）/ {@link #DETAIL_FALLBACK_POOL_CONC_BACKGROUND}（后台）。 */
     private int detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
     /**
-     * ★ r218：切源提档的回落动作（{@link #POOL_SWITCH_BOOST_MS} 后执行）。
+     * ★ r218b：r218 的「切源提档 5s 后回落」已删除 —— 它从未生效过，是死代码。
      *
-     * <p>只降档、不重排队列：{@code detailFallbackPoolFilling}、任务令牌、派发游标都不动，
-     * 避免把在途请求变成「没身份证明的陌生人」—— 那正是 r57「池子锁死 30」的成因。</p>
+     * <p>真机 1442 日志（r218a 构建）：{@code poolFillSpeed reason=switch conc=5->20} 出现 2 次，
+     * 而 {@code reason=boost-timeout} <b>0 次</b>。原因在日志里一眼可见：</p>
+     * <pre>
+     *   14:42:38.441  poolFillSpeed reason=switch conc=5->20
+     *   14:42:40.468  resetKeepCache task=t1 conc=5      ← 2 秒后就被别人降回 5
+     * </pre>
+     * <p>{@link #resetDetailFallbackKeepCache()} 会直接把 {@code detailFallbackPoolConcurrency}
+     * 赋成后台档，比我挂的 5s 定时器更早、也更彻底；于是回落 Runnable 里
+     * {@code if (concurrency <= BACKGROUND) return;} 永远命中，连日志都不打。</p>
+     *
+     * <p>也就是说「提档有时效」这件事本来就已经由 {@code resetKeepCache} 与
+     * {@code finishDetailFallbackSearchOnTimeout()} 两处覆盖，不需要第三个执行者。
+     * 删掉它不会让 20 并发无限延续 —— 那两条路径都会把档位降回后台档。</p>
      */
-    private final Runnable detailFallbackPoolBoostRevert = new Runnable() {
-        @Override
-        public void run() {
-            if (detailFallbackPoolConcurrency <= DETAIL_FALLBACK_POOL_CONC_BACKGROUND) {
-                return;
-            }
-            LOG.sw("[FB] poolFillSpeed reason=boost-timeout conc="
-                    + detailFallbackPoolConcurrency + "->" + DETAIL_FALLBACK_POOL_CONC_BACKGROUND
-                    + " task=t" + detailFallbackPoolTaskId);
-            detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
-            scheduleDetailFallbackSearch();
-        }
-    };
     /**
      * 8s {@link #DETAIL_FALLBACK_SEARCH_TIMEOUT_MS} 前台窗口是否已关闭。
      *
