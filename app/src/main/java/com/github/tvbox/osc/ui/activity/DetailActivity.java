@@ -4435,8 +4435,26 @@ public class DetailActivity extends BaseActivity {
             return;
         }
         int idx = Math.max(0, Math.min(playing.playIndex, list.size() - 1));
-        fallbackFromSourceKey = sourceKey == null ? "" : sourceKey;
-        fallbackFromVodId = vodId == null ? "" : vodId;
+        // ★ r218f：源/片必须取自 **playing 对象自己**，不能取 DetailActivity 的 sourceKey/vodId 字段。
+        //
+        //   真机 1642 铁证：16:42:51 从 api_3/108350（进度 1288323ms）切到 Clun📚在线_创享/161859，
+        //   日志打出 `migrateSkip reason=noRecord arg -> Clun.../161859 ep=第1集`
+        //   随后 `migrateByName no-op reason=oldZero ep=第01集 from=Clun📚在线_创享/161859`。
+        //   注意那行的矛盾：源是 **Clun（新）**、集名 `第01集` 却是 **api_3（旧）** 的写法。
+        //
+        //   成因：本方法在 detailResult 里被调用时（DetailActivity:1713），
+        //   `sourceKey`/`vodId` 字段**已被 loadDetail 改成新源**，而 `playing`（previewVodInfo）
+        //   仍是旧源对象。旧实现取字段 ⇒ 快照 = 新源 + 旧 flag/index/集名，
+        //   拿这个错误 key 去查旧进度必然读到 0，于是「没有可迁移的值」→ 从头播。
+        //
+        //   改为优先用 playing 自己的 sourceKey/id（VodInfo 自带，切源前的对象上就是旧源），
+        //   字段只作兜底。三处调用点（1713 / 2805 / 6644）语义因此统一为「谁在播就记谁」。
+        String playSrc = playing.sourceKey;
+        String playVodId = playing.id;
+        fallbackFromSourceKey = !TextUtils.isEmpty(playSrc)
+                ? playSrc : (sourceKey == null ? "" : sourceKey);
+        fallbackFromVodId = !TextUtils.isEmpty(playVodId)
+                ? playVodId : (vodId == null ? "" : vodId);
         fallbackFromFlag = playing.playFlag;
         fallbackFromIndex = idx;
         fallbackFromName = list.get(idx).name == null ? "" : list.get(idx).name;
