@@ -1969,6 +1969,25 @@ public class DetailActivity extends BaseActivity {
                                         + " actual=" + currentEpisode.name
                                         + " -> " + sourceKey + "/" + vodId);
                             }
+                        } else {
+                            // ★ r218e：第三条路径 —— 两个守卫<b>同时为假</b>时原实现整段静默跳过。
+                            //
+                            //   真机 1608 铁证：16:11:08 从 api_3/108350（进度 1902803ms ≈ 31分42秒）
+                            //   切到 Clun📚在线_创享/161859，日志里**一行 migrate 都没有**
+                            //   （连 migrateSkip 都没有），紧接着 progressRead rec=0 ⇒ 从头播。
+                            //   同场 11 次 switchStart 里只有 9 行 migrate，缺的两次就是这条路径。
+                            //
+                            //   这里至少把「为什么没迁」记下来，并尝试零猜测按集名兜底：
+                            //   只要 fallbackFrom* 快照可用就有锚（不看 sameNameRestored）。
+                            LOG.sw("[FB] migrateSkip reason=noAnchor"
+                                    + " sameNameRestored=" + sameNameRestored
+                                    + " fallbackFromValid=" + fallbackFromValid
+                                    + " vodInfoRecord=" + (vodInfoRecord == null ? "null"
+                                        : vodInfoRecord.sourceKey + "/" + vodInfoRecord.id)
+                                    + " expected=" + expectedName
+                                    + " actual=" + currentEpisode.name
+                                    + " -> " + sourceKey + "/" + vodId);
+                            migrateProgressByNameOnly(sourceKey, vodId, vodInfo, vodInfoRecord);
                         }
                         
                         int flagScrollTo = 0;
@@ -8431,6 +8450,20 @@ public class DetailActivity extends BaseActivity {
         }
         long newVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
         if (oldRecord == null) {
+            // ★ r218e：这里原来是**裸 return**（零日志），是「切源后从头播」的最后一处静默出口。
+            //
+            //   真机 1608 铁证：16:11:08 从 api_3/108350（进度 1902803ms ≈ 31分42秒）切到
+            //   Clun📚在线_创享/161859，日志里既没有 `migrate` 也没有 `migrateSkip`，
+            //   紧接 progressRead rec=0 ⇒ 从头播。
+            //   根因：`fallbackFromValid` 分支传的就是 `oldRecord = null`
+            //   （详情页没有该片历史记录时只能靠快照），于是撞上这句裸 return。
+            //
+            //   能走到这里说明**落点已被 positionTrusted 判为可信**，因此直接按快照坐标搬时间，
+            //   不再退回按集名匹配 —— 后者会因「第01集 ↔ 第1集」这类写法差异而 miss。
+            LOG.sw("[FB] migrateSkip reason=noRecord arg -> " + newSourceKey + "/" + newVodId
+                    + " ep=" + newSeriesName + " fallbackFromValid=" + fallbackFromValid
+                    + " fromEp=" + fallbackFromName);
+            migrateProgressFromSnapshot(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
             return;
         }
         String oldFlag = oldRecord.playFlag;
@@ -8588,20 +8621,42 @@ public class DetailActivity extends BaseActivity {
     private void migrateProgressByNameOnly(String newSourceKey, String newVodId,
                                            VodInfo newVodInfo, VodInfo oldRecord) {
         try {
-            if (oldRecord == null || newVodInfo == null
+            if (newVodInfo == null
                     || TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId)) {
                 return;
             }
-            String oldFlag = oldRecord.playFlag;
-            String oldSeriesName = oldRecord.playNote;
-            if (TextUtils.isEmpty(oldSeriesName)) {
-                List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null
-                        ? null : oldRecord.seriesMap.get(oldFlag);
-                if (oldList != null && oldRecord.playIndex >= 0 && oldRecord.playIndex < oldList.size()) {
-                    oldSeriesName = oldList.get(oldRecord.playIndex).name;
+            // ★ r218e：锚点可以来自两处 —— 库记录，或切源前抓的实时快照。
+            //   后者在 noAnchor 路径（两个守卫同时为假）是唯一的确定性锚，必须用上。
+            String oldSourceKey = null;
+            String oldVodId = null;
+            int oldIndex = -1;
+            String oldFlag = null;
+            String oldSeriesName = null;
+            if (oldRecord != null) {
+                oldSourceKey = oldRecord.sourceKey;
+                oldVodId = oldRecord.id;
+                oldFlag = oldRecord.playFlag;
+                oldIndex = oldRecord.playIndex;
+                oldSeriesName = oldRecord.playNote;
+                if (TextUtils.isEmpty(oldSeriesName)) {
+                    List<VodInfo.VodSeries> oldList = oldRecord.seriesMap == null
+                            ? null : oldRecord.seriesMap.get(oldFlag);
+                    if (oldList != null && oldIndex >= 0 && oldIndex < oldList.size()) {
+                        oldSeriesName = oldList.get(oldIndex).name;
+                    }
                 }
+            } else if (fallbackFromValid) {
+                oldSourceKey = fallbackFromSourceKey;
+                oldVodId = fallbackFromVodId;
+                oldFlag = fallbackFromFlag;
+                oldIndex = fallbackFromIndex;
+                oldSeriesName = fallbackFromName;
             }
-            if (TextUtils.isEmpty(oldSeriesName)) {
+            if (TextUtils.isEmpty(oldSourceKey) || TextUtils.isEmpty(oldVodId)
+                    || TextUtils.isEmpty(oldSeriesName)) {
+                LOG.sw("[FB] migrateByName no-op reason=noAnchor"
+                        + " old=" + oldSourceKey + "/" + oldVodId + " ep=" + oldSeriesName
+                        + " -> " + newSourceKey + "/" + newVodId);
                 return;
             }
             // 只在新源「当前线路」里找完全同名的集（不跨线路、不跨域换算）
@@ -8624,8 +8679,8 @@ public class DetailActivity extends BaseActivity {
                         + " list=" + newList.size() + " => 不猜，保持原样");
                 return;
             }
-            long oldTime = PlayProgressManager.get(oldRecord.sourceKey, oldRecord.id,
-                    oldFlag, oldRecord.playIndex, oldSeriesName);
+            long oldTime = PlayProgressManager.get(oldSourceKey, oldVodId,
+                    oldFlag, oldIndex, oldSeriesName);
             if (oldTime <= 0) {
                 return;
             }
@@ -8641,6 +8696,61 @@ public class DetailActivity extends BaseActivity {
                     newVodInfo.playFlag, hit, oldSeriesName, oldTime);
             LOG.sw("[FB] migrateByName hit ep=" + oldSeriesName + " index=" + hit
                     + " -> " + newSourceKey + "/" + newVodId + " => " + oldTime);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
+    /**
+     * ★ r218e：没有库记录、只有「切源前实时快照」时，按快照坐标把进度搬过去。
+     *
+     * <p><b>适用前提</b>：调用方已确认 {@code positionTrusted == true}（落点可信）。
+     * 因此这里可以放心用快照里的 源/片/线路/下标/集名 五元组去读旧值，
+     * 不必再做集名匹配 —— 那正是「第01集 ↔ 第1集」这类写法差异会 miss 的地方。</p>
+     *
+     * <p><b>安全边界</b>（对齐既有语义，不新增强覆盖）：</p>
+     * <ul>
+     *   <li>快照无效 / 旧值为 0 ⇒ 什么都不做，只打日志；</li>
+     *   <li>新源该集已有记录 ⇒ 交给既有 HLC 语义，不覆盖；</li>
+     *   <li>写入走 {@link PlayProgressManager#save}，同样受「位置不变不生成新 HLC」保护。</li>
+     * </ul>
+     */
+    private void migrateProgressFromSnapshot(String newSourceKey, String newVodId,
+                                             String newFlag, int newIndex, String newSeriesName) {
+        try {
+            if (!fallbackFromValid) {
+                LOG.sw("[FB] migrateByName no-op reason=noSnapshot -> " + newSourceKey + "/" + newVodId);
+                return;
+            }
+            if (TextUtils.isEmpty(newSourceKey) || TextUtils.isEmpty(newVodId)
+                    || TextUtils.isEmpty(newSeriesName)) {
+                return;
+            }
+            // 同源同片同集：没有"迁移"可言
+            if (TextUtils.equals(fallbackFromSourceKey, newSourceKey)
+                    && TextUtils.equals(fallbackFromVodId, newVodId)
+                    && TextUtils.equals(fallbackFromFlag, newFlag)
+                    && fallbackFromIndex == newIndex) {
+                return;
+            }
+            long oldTime = PlayProgressManager.get(fallbackFromSourceKey, fallbackFromVodId,
+                    fallbackFromFlag, fallbackFromIndex, fallbackFromName);
+            if (oldTime <= 0) {
+                LOG.sw("[FB] migrateByName no-op reason=oldZero ep=" + fallbackFromName
+                        + " from=" + fallbackFromSourceKey + "/" + fallbackFromVodId);
+                return;
+            }
+            long newVal = PlayProgressManager.get(newSourceKey, newVodId, newFlag, newIndex, newSeriesName);
+            if (newVal > 0) {
+                LOG.sw("[FB] migrateByName skip ep=" + newSeriesName
+                        + " existed=" + newVal + " => 已有记录，交给 HLC 语义");
+                return;
+            }
+            PlayProgressManager.save(newSourceKey, newVodId, newFlag, newIndex, newSeriesName, oldTime);
+            LOG.sw("[FB] migrateByName hit(snapshot) from=" + fallbackFromSourceKey + "/" + fallbackFromVodId
+                    + " ep=" + fallbackFromName + "(" + fallbackFromIndex + ")"
+                    + " -> " + newSourceKey + "/" + newVodId + "/" + newFlag + "/" + newIndex
+                    + "/" + newSeriesName + " => " + oldTime);
         } catch (Throwable th) {
             th.printStackTrace();
         }

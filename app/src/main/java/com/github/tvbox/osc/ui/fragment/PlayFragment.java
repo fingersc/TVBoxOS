@@ -2314,6 +2314,22 @@ public class PlayFragment extends BaseLazyFragment {
      * —— r218b 的实测教训，见 {@link #recordPlaybackFailureOnce(String)}。</p>
      */
     private String lastFailedSourceKey;
+    /** ★ r218e：上次记失败的时刻（{@code elapsedRealtime}），配合 {@link #FAIL_DEDUPE_WINDOW_MS}。 */
+    private long lastFailedAtMs;
+    /**
+     * ★ r218e：同源同片同集「失败去重」的时间窗。
+     *
+     * <p><b>为什么必须加</b>：r218c 的窗口只在<b>成功</b>时关闭，没有时间上限。真机 1608 日志
+     * 的提示语暴露了这一点——「该源该片该集<b>自上次成功以来</b>已记过一次失败」。
+     * 若用户 20 分钟后切回同一个源、仍然是同一集、仍然从头到尾播不成，
+     * 那么第二次、第三次尝试都会被吞掉，{@code SourceQualityStore} 对该源只留 1 笔失败，
+     * 成功率被系统性<b>高估</b>（慢源反而更容易被优先选中）。</p>
+     *
+     * <p><b>取值 60s</b>：一次切源里「换线 → 再失败」的实测间隔是 10 秒量级
+     * （1608：16:09:27.930 → 16:09:38.114，10.2s；1442：21.4s），60s 足够覆盖
+     * 同一次尝试内的全部连续失败，又不会把「二十多分钟后重新点开」的独立失败误吞。</p>
+     */
+    private static final long FAIL_DEDUPE_WINDOW_MS = 60 * 1000L;
     /**
      * ★ v4.2.8：本轮播放是否<b>真的出过首帧</b>（只增不减，{@link #pauseForHidden()} 不清）。
      *
@@ -3841,14 +3857,19 @@ public class PlayFragment extends BaseLazyFragment {
             settlePlayQualityIfPending(false, 0, reason);
             return;
         }
-        if (TextUtils.equals(key, lastFailedSourceKey)) {
+        long now = SystemClock.elapsedRealtime();
+        boolean sameWindow = TextUtils.equals(key, lastFailedSourceKey)
+                && lastFailedAtMs > 0
+                && (now - lastFailedAtMs) < FAIL_DEDUPE_WINDOW_MS;
+        if (sameWindow) {
             LOG.i("[PQ] dedupe " + key + " reason=" + reason
-                    + "（该源该片该集自上次成功以来已记过一次失败）");
+                    + "（同源同片同集 " + (now - lastFailedAtMs) + "ms 内已记过一次失败）");
             // 计时器仍要清掉，否则下一次 startPlayQualityTimer 会把它当「未结算」再补一次
             discardPlayQualityTimer();
             return;
         }
         lastFailedSourceKey = key;
+        lastFailedAtMs = now;
         settlePlayQualityIfPending(false, 0, reason);
     }
 
