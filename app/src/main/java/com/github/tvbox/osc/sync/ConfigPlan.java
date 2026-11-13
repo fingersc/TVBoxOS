@@ -78,6 +78,19 @@ public final class ConfigPlan {
     public boolean prewarmLive;
     public boolean refreshHistory;
 
+    /**
+     * ★ r218：本次计划是否跳过 {@link ConfigCenter} 的 60s 节流窗口。
+     *
+     * <p>节流本来是给「同步写回设置」设计的：弱网下同一批键可能被反复合并触发，
+     * 60s 一次足够。但<b>账号切换</b>换掉的是整套配置命名空间（接口地址、首页源、
+     * 直播源一起换），它不是「又一次设置变更」，跟节流窗口共享只会导致「切过去了
+     * 但首页还是上一个账号的」——实测真机最长拖到 44s，极端情况到进程结束都没生效。</p>
+     *
+     * <p>置真后仍受 {@code uiReady} / {@code homeReady} 两道门控约束（首页不在前台时
+     * 依旧推迟），只是不再被时间窗口挡住。</p>
+     */
+    public boolean bypassThrottle;
+
     /** 按固定顺序展开全部动作键，供 {@link #diff} 的前后两帧快照使用。 */
     public static String[] keys() {
         String[] out = new String[KEY_COUNT];
@@ -137,6 +150,7 @@ public final class ConfigPlan {
         refreshHome |= o.refreshHome;
         prewarmLive |= o.prewarmLive;
         refreshHistory |= o.refreshHistory;
+        bypassThrottle |= o.bypassThrottle;
     }
 
     public void set(int action) {
@@ -214,6 +228,9 @@ public final class ConfigPlan {
         }
         if (refreshHistory) {
             sb.append("history ");
+        }
+        if (bypassThrottle) {
+            sb.append("!throttle ");
         }
         if (isEmpty()) {
             sb.append("none");

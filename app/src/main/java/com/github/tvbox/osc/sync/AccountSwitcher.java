@@ -371,7 +371,7 @@ public final class AccountSwitcher {
         HistorySyncManager.SwitchSync r =
                 HistorySyncManager.syncBeforeSwitch(owner, SWITCH_SYNC_DEADLINE_MS);
         LOG.i("[Account] pre-switch sync ok=" + r.ok + " rounds=" + r.rounds
-                + " msg=" + r.message);
+                + " msg=" + (r.message == null ? "" : r.message));
         if (r.ok) {
             postStage(cb, "正在切换…");
             return true;

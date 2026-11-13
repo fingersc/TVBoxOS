@@ -181,6 +181,51 @@ public class PlayFragment extends BaseLazyFragment {
      * 取 2 会把最坏等待拉到 30s，反而比 r190 调短超时的初衷更差。</p>
      */
     private static final int MAX_BUFFERING_GRACE = 1;
+
+    /**
+     * ★ r218（决策 B）：「本轮连播放地址都还没下发」时用的短预算。
+     *
+     * <p>真机 1113 日志：{@code playRound 00:20:29.145 → parseStall 5.011s → 换线 →
+     * switchLinePlay 10.058s → 全部线路耗尽 → 换源}，首帧要到 00:20:49.109，用户干等 21 秒；
+     * 而那个源的 CDN 连接直到 00:20:45.043 才以 {@code 10672ms} 失败告终 —— 这段时间纯属白等。</p>
+     *
+     * <p>区别对待：<b>地址已下发</b>（{@code [vod] start}）说明至少要连 CDN 了，给满
+     * {@link #SWITCH_LINE_PLAY_TIMEOUT_MS}；<b>地址都没下发</b>（全程 {@code STATE_IDLE}）
+     * 说明解析/嗅探卡住，6s 足够判死，把「源整体不可达」的最坏等待从 ~15s 压到 ~11s。</p>
+     */
+    private static final long SWITCH_LINE_NO_URL_TIMEOUT_MS = 6 * 1000L;
+
+    /**
+     * ★ r218（决策 D）：{@code STATE_PREPARING} 的<b>短</b>容忍。
+     *
+     * <p>为什么不直接把它并进 {@link #isPlaybackAlive(int)}：1112 日志里 5 次
+     * {@code switchTimeout} 全部是 {@code state=1}（PREPARING）且上游是
+     * {@code SSL handshake aborted} —— 根本没连上、只是卡在 PREPARING。整档纳入 alive
+     * 会让每条死线都多拿一整轮 10s 宽限，用户放弃死源从 10s 变成 20s（实测会白等 40s+）。</p>
+     *
+     * <p>但「已 setDataSource、正在初始化/读 manifest」确实可能已在建连，所以给 3s 短宽限：
+     * 真慢但已连上的源够出首帧，死源只多等 3s。额度同样是 1 次，且首帧到达即作废。</p>
+     */
+    private static final long PREPARING_GRACE_MS = 3 * 1000L;
+    private static final int MAX_PREPARING_GRACE = 1;
+
+    /**
+     * ★ r218（决策 E）：判定换线前的最后一次复查窗口。
+     *
+     * <p>真机 1112：{@code switchTimeout 23:13:16.093} 判死，<b>0.418 秒后</b>
+     * {@code 23:13:16.511 [vod] first frame} —— 老源自己出画面了，但换源已经启动。
+     * 给 500ms 复查一次即可吃掉这类临界抖动，代价是死源晚 0.5s 放弃。</p>
+     */
+    private static final long DITHER_GRACE_MS = 500L;
+
+    /**
+     * ★ r218（决策 B）：解析层「探到地址却迟迟不 {@code [vod] start}」的宽限。
+     *
+     * <p>原来 {@code handleParseStallCheck()} 只要 {@code loadFoundCount>0} 就直接 return，
+     * 于是「探到一堆不可播地址」时 parseStall 永久失效，只剩 10s 的 switchLinePlay 兜底。
+     * 改为：首次探到地址起算，给 3s 去真正 start；超时仍未 start 就照常判停滞。</p>
+     */
+    private static final long URL_FOUND_GRACE_MS = 3000L;
     /**
      * 解析停滞宽限：页面 onPageFinished 之后再等这么久，仍无视频地址就判停滞。
      *
@@ -1332,6 +1377,8 @@ public class PlayFragment extends BaseLazyFragment {
                         }
                         startSwitchLinePlayTimeout();
                         LOG.i("[vod] start reuse=" + reusePlayer + " url=" + url);
+                        // ★ r218：地址已下发 ⇒ 本轮用完整预算（10s），而不是 6s 的「没地址」预算。
+                        roundUrlDelivered = true;
                         vodFirstFrameLogged = false;
                         if (reusePlayer) {
                             mVideoView.skipPositionWhenPlay((int) playTimeoutBasePosition);
@@ -2264,6 +2311,20 @@ public class PlayFragment extends BaseLazyFragment {
      * 否则切到新源后会继承上一个源用掉的额度，等于永久少一次兜底。</p>
      */
     private int bufferingGraceCount;
+    /**
+     * ★ r218：本轮 PREPARING 短容忍已用次数（上限 {@link #MAX_PREPARING_GRACE}）。
+     * 与 {@link #bufferingGraceCount} 同生命周期：{@link #play(boolean)} 与首帧到达都清零。
+     */
+    private int preparingGraceCount;
+    /**
+     * ★ r218：本轮是否已经把播放地址交给播放器（即打过 {@code [vod] start}）。
+     * 用来决定用 {@link #SWITCH_LINE_PLAY_TIMEOUT_MS} 还是 {@link #SWITCH_LINE_NO_URL_TIMEOUT_MS}。
+     */
+    private boolean roundUrlDelivered;
+    /** ★ r218：本轮是否已经做过一次 500ms 抖动复查（只做一次，避免变成无限等）。 */
+    private boolean ditherDone;
+    /** ★ r218：本轮首次探到播放地址的时刻（{@code elapsedRealtime}）；0 = 还没探到。 */
+    private long urlFoundAtMs;
     /**
      * ★ v4.2.8：本轮播放是否<b>真的出过首帧</b>（只增不减，{@link #pauseForHidden()} 不清）。
      *
@@ -3275,6 +3336,11 @@ public class PlayFragment extends BaseLazyFragment {
         stallSwitchAllowed = true;
         // ★ r215：新一轮起播重置容忍额度（不继承上一个源用掉的次数）。
         bufferingGraceCount = 0;
+        // ★ r218：本轮预算/抖动/地址标记也随新一轮清零。
+        preparingGraceCount = 0;
+        roundUrlDelivered = false;
+        ditherDone = false;
+        urlFoundAtMs = 0L;
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3533,9 +3599,24 @@ public class PlayFragment extends BaseLazyFragment {
             cancelPlayTimeout();
             return;
         }
+        // ★ r218（决策 B）：地址都没下发 ⇒ 6s 预算；已下发 ⇒ 完整 10s。
+        final long budget = roundUrlDelivered ? SWITCH_LINE_PLAY_TIMEOUT_MS
+                                              : SWITCH_LINE_NO_URL_TIMEOUT_MS;
+        rearmSwitchLinePlayTimeout(budget);
+    }
+
+    /**
+     * ★ r218：按指定预算重排起播看门狗。
+     *
+     * <p>内部重排（BUFFERING 容忍 / PREPARING 短容忍 / 抖动复查）必须走这里，<b>不能</b>再调
+     * {@link #startSwitchLinePlayTimeout()} —— 那个会按 {@code roundUrlDelivered} 重算预算，
+     * 把「BUFFERING 一整轮 10s 容忍」错算成 6s。</p>
+     */
+    private void rearmSwitchLinePlayTimeout(long budgetMs) {
         cancelPlayTimeout();
-        LOG.i("echo-switchLinePlay start timeout");
-        mHandler.sendEmptyMessageDelayed(MSG_SWITCH_LINE_PLAY_TIMEOUT, SWITCH_LINE_PLAY_TIMEOUT_MS);
+        LOG.i("echo-switchLinePlay start timeout budget=" + budgetMs
+                + " url=" + roundUrlDelivered);
+        mHandler.sendEmptyMessageDelayed(MSG_SWITCH_LINE_PLAY_TIMEOUT, budgetMs);
     }
 
     void cancelSwitchLinePlayTimeout() {
@@ -3582,6 +3663,26 @@ public class PlayFragment extends BaseLazyFragment {
         }
     }
 
+    /**
+     * ★ r218：切源/换集<b>开始</b>时调用 —— 放弃本轮，但保留播放器。
+     *
+     * <p><b>为什么必须做</b>：真机 1113 日志
+     * {@code 00:20:43.503 switchStart manual=1} → {@code 00:20:44.293 switchTimeout
+     * state=0 flag=ukm3u8} → {@code 00:20:44.300 switchStart manual=0} ——
+     * 用户手动切源后 0.79 秒，<b>上一轮</b>的起播看门狗照常到点，又跑了一次
+     * 「全部线路耗尽 → 自动换源」，把手动那轮在途的 detailResult 抢走。
+     * 换个时机就是「刚切过去又被切走」。</p>
+     *
+     * <p><b>不做什么</b>：不 {@code release()} 播放器（那是 {@link #pauseForHidden()} 的事）、
+     * 不记 PQ（用户主动切源既不是成功也不是失败）、不清 {@code playbackStarted}
+     * （新的一轮 {@link #play(boolean)} 会自己重置）。</p>
+     */
+    public void abandonCurrentRound() {
+        cancelPlayTimeout();
+        stopParse();
+        discardPlayQualityTimer();
+    }
+
     public void pauseForHidden() {
         cancelDeferredPause();
         cancelPlayTimeout();
@@ -3618,6 +3719,9 @@ public class PlayFragment extends BaseLazyFragment {
         everPlayedThisCycle = true;
         // ★ r215：真出画面了 ⇒ 容忍额度作废（本轮已成功，不该再占着额度）。
         bufferingGraceCount = 0;
+        // ★ r218：PREPARING 短容忍同样作废；抖动复查也没必要了（已成功）。
+        preparingGraceCount = 0;
+        ditherDone = true;
         cancelPlayTimeout();
         recordPlaybackReady("firstFrame");
         // ★ v4.2.6：首帧到达才让详情页落历史 —— 详情页的 jumpToPlay() 现在只挂起写入，
@@ -4133,11 +4237,16 @@ public class PlayFragment extends BaseLazyFragment {
     void handleSwitchLinePlayTimeout() {
         int state = mVideoView == null ? -1 : mVideoView.getCurrentPlayState();
         LOG.i("echo-switchLinePlay timeout state: " + state + ", started: " + playbackStarted
-                + ", alive: " + isPlaybackAlive(state) + ", grace: " + bufferingGraceCount);
+                + ", alive: " + isPlaybackAlive(state) + ", grace: " + bufferingGraceCount
+                + ", pgrace: " + preparingGraceCount + ", url: " + roundUrlDelivered
+                + ", dither: " + ditherDone);
         LOG.sw("[FB] switchTimeout state=" + state
                 + " started=" + playbackStarted
                 + " alive=" + isPlaybackAlive(state)
+                + " url=" + roundUrlDelivered
                 + " grace=" + bufferingGraceCount + "/" + MAX_BUFFERING_GRACE
+                + " pgrace=" + preparingGraceCount + "/" + MAX_PREPARING_GRACE
+                + " dither=" + ditherDone
                 + " flag=" + (mVodInfo == null ? "" : mVodInfo.playFlag));
         // ① 严格口径：本轮真的出过画面 / 播放器已就绪在播 ⇒ 与 r215 之前逐字一致地放过。
         //    （这里不能用含 BUFFERING 的宽口径，否则会把「只在缓冲」也当成已成功。）
@@ -4153,7 +4262,27 @@ public class PlayFragment extends BaseLazyFragment {
             bufferingGraceCount++;
             LOG.i("echo-switchLinePlay extend(buffering) " + bufferingGraceCount
                     + "/" + MAX_BUFFERING_GRACE + " state=" + state);
-            startSwitchLinePlayTimeout();
+            rearmSwitchLinePlayTimeout(SWITCH_LINE_PLAY_TIMEOUT_MS);
+            return;
+        }
+        // ②.5 ★ r218（决策 D）：STATE_PREPARING 只给 3s 短容忍，不并入 isPlaybackAlive。
+        //   理由见 PREPARING_GRACE_MS 的注释：1112 的 4 次死源超时全是 state=1，
+        //   整档纳入 alive 会让它们各多等一整轮 10s。
+        if (state == VideoView.STATE_PREPARING && preparingGraceCount < MAX_PREPARING_GRACE) {
+            preparingGraceCount++;
+            LOG.i("echo-switchLinePlay extend(preparing) " + preparingGraceCount
+                    + "/" + MAX_PREPARING_GRACE + " state=" + state);
+            rearmSwitchLinePlayTimeout(PREPARING_GRACE_MS);
+            return;
+        }
+        // ②.8 ★ r218（决策 E）：地址已下发、但到点仍没出画面 ⇒ 最后 500ms 复查一次。
+        //   只为吃掉「超时后零点几秒老源自己出首帧」这种临界抖动（1112：0.418s）。
+        //   只在 roundUrlDelivered 为真时做 —— 地址都没下发时不可能有首帧，白等没意义。
+        if (roundUrlDelivered && !ditherDone) {
+            ditherDone = true;
+            LOG.i("echo-switchLinePlay dither recheck " + DITHER_GRACE_MS
+                    + "ms state=" + state);
+            rearmSwitchLinePlayTimeout(DITHER_GRACE_MS);
             return;
         }
         // ★ r204 方案 A：起播超时按「这个站/这条线路这次没播成」处理，只换线/换源，
@@ -4191,8 +4320,24 @@ public class PlayFragment extends BaseLazyFragment {
         //   正好是 PARSE_STALL_TIMEOUT_MS，崩溃日志里它在 tryNextLine 之前最后一条）。
         if (mVideoView == null) return;
         // 已经探到可播地址 → 解析成功，本次检查作废
+        //
+        // ★ r218（决策 B）：探到地址 ≠ 真的能播。原实现只要 loadFoundCount>0 就无条件作废，
+        //   于是「探到一堆不可播地址、始终没走到 [vod] start」时 parseStall 永久失效，
+        //   只剩 10s 的 switchLinePlay 兜底（1113 日志第二轮就是这样白等 10s）。
+        //   改为：从「本轮首次探到地址」起算，给 URL_FOUND_GRACE_MS 去真正 start；
+        //   超时仍未 start 就照常判停滞。注意时刻只在**首次**赋值，不随每次探到刷新，
+        //   否则「反复探到不可播地址」会把判定无限延后。
         if (loadFoundCount.get() > 0) {
-            return;
+            long nowMs = SystemClock.elapsedRealtime();
+            if (urlFoundAtMs <= 0L) {
+                urlFoundAtMs = nowMs;
+                return;
+            }
+            if (nowMs - urlFoundAtMs < URL_FOUND_GRACE_MS) {
+                return;
+            }
+            LOG.i("echo-parseStall url found but no [vod] start for "
+                    + (nowMs - urlFoundAtMs) + "ms, try next line");
         }
         // 已经起播 → 正常播放中，绝不能打断
         if (isPlaybackStarted()) {

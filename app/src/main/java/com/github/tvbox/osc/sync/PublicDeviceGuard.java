@@ -68,8 +68,6 @@ public final class PublicDeviceGuard {
     private static volatile boolean checkFinished;
     /** 本次冷启动是否需要回退。 */
     private static volatile boolean rollbackPending;
-    /** 回退前是否必须先跑一轮同步（有未上传改动且配了网盘）。 */
-    private static volatile boolean needSyncFirst;
     /** 回退流程是否已经在跑（避免被重复发起）。 */
     private static volatile boolean rollbackStarted;
     /** 在等首屏的界面回调（回退完成后一起放行）。 */
@@ -137,38 +135,41 @@ public final class PublicDeviceGuard {
             // 等哪天用户重新打开开关时把"下一次冷启动"白白吃掉。
             boolean keepOnce = consumeKeepOnce();
             if (!isEnabled()) {
-                finish(false, false);
+                finish(false);
                 return;
             }
             if (AccountContext.isGuest()) {
                 // 上次结束时已经是游客（或从未登录），没什么可回退的
-                finish(false, false);
+                finish(false);
                 return;
             }
             if (keepOnce) {
-                finish(false, false);
+                finish(false);
                 return;
             }
-            boolean needSync = HistorySyncManager.needsSyncBeforeExit();
-            if (needSync) {
-                // 有未上传改动且配了网盘 ⇒ 先同步再回退。
-                // ★ 必须在这里（而不是等门控）清掉「首轮轻量」标记：start() 已经排了
-                //   一个 +1s 的 boot 任务，若它先跑起来就是"只跑 SETTINGS+HISTORY"的轻量轮，
-                //   PROGRESS/COLLECT 会留在一个即将被解绑的账号上。
-                HistorySyncManager.forceFullRoundNextSync();
-            }
-            LOG.i(TAG + " pending rollback, needSyncFirst=" + needSync);
-            finish(true, needSync);
+            // ★ r218：「要不要先同步」不再在这里判。
+            //   r216 用的是 needsSyncBeforeExit()（只看 dirty 布尔位），比 r217 切号闸门的
+            //   fullyPushed()（dirty + HLC 水位）弱一档 —— 播放中「30s 周期落盘不置脏」的写入
+            //   会被漏掉，于是在没有真正同步的情况下就把账号回退掉。
+            //   新口径需要先对账（开 Room + MAX 聚合），因此判定挪到 runRollbackThen() 的
+            //   后台线程里做（见 decideNeedSyncFirst()），主线程只负责「要不要门控首屏」。
+            //   代价：首屏释放要多等一次后台对账（实测 ~10~50ms），可接受。
+            //
+            //   这里仍然清掉「首轮轻量」标记：boot 任务（start() 里排的 +1s）可能先跑起来，
+            //   若它是轻量轮就只跑 SETTINGS+HISTORY，PROGRESS/COLLECT 会留在一个即将被解绑的
+            //   账号上。这一步纯内存、零 Room，放在主线程安全。
+            HistorySyncManager.forceFullRoundNextSync();
+            LOG.i(TAG + " pending rollback (needSync decided on worker)");
+            finish(true);
         } catch (Throwable t) {
             LOG.e(TAG + " onProcessStart failed", t);
-            finish(false, false);
+            finish(false);
         }
     }
 
-    private static void finish(boolean pending, boolean needSync) {
+    private static void finish(boolean pending) {
         synchronized (LOCK) {
             rollbackPending = pending;
-            needSyncFirst = needSync;
             checkFinished = true;
         }
     }
@@ -288,13 +289,66 @@ public final class PublicDeviceGuard {
             }
         }, BOOT_SYNC_BUDGET_MS);
 
-        if (!needSyncFirst) {
-            // 没有未上传改动 / 没配网盘 ⇒ 不等任何网络（零请求）
-            LOG.i(TAG + " nothing to sync, rollback now (no network)");
+        // ★ r218：「要不要先同步」的判定挪到后台线程（需要开 Room 对账 + 查 DB MAX HLC）。
+        //   口径与 r217 切号闸门一致：fullyPushed() = 全场 dirty==false 且 localMaxHlc ≤ pushedHlc。
+        //   判定完再回到主线程决定「直接回退」还是「先同步」。
+        try {
+            WORK.execute(new Runnable() {
+                @Override
+                public void run() {
+                    final boolean needSync = decideNeedSyncFirst();
+                    MAIN.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (needSync) {
+                                startPreRollbackSync(settled, proceed);
+                            } else {
+                                // 已核实「真的没有未上传改动」⇒ 不等任何网络（零请求）
+                                LOG.i(TAG + " nothing to sync (verified), rollback now (no network)");
+                                proceed.run();
+                            }
+                        }
+                    });
+                }
+            });
+        } catch (Throwable t) {
+            // 线程池都不可用（几乎不可能）：保守起见直接回退，绝不卡首屏
+            LOG.e(TAG + " decide rejected, rollback now", t);
             proceed.run();
-            return;
         }
+    }
 
+    /**
+     * ★ r218：后台线程判定「回退前是否必须先同步」。
+     *
+     * <p>必须先 {@link HistorySyncManager#reconcileNow(String)} 对账，再用
+     * {@link HistorySyncManager#fullyPushed(String)} —— 只看 dirty 布尔位会漏掉
+     * 「播放中 30s 周期落盘 markDirty=false」这一类写入（r216 的旧口径缺口）。</p>
+     *
+     * <p>判不出来（异常）时返回 {@code true}，即按「要同步」处理：宁可多等最多 5s，
+     * 也不要在可能有未上传数据时静默回退。</p>
+     */
+    private static boolean decideNeedSyncFirst() {
+        try {
+            String owner = AccountContext.ownerKey();
+            if (owner == null || owner.length() == 0) {
+                return false;   // 游客：没有云端数据可同步
+            }
+            if (!HistorySyncManager.hasConfig()) {
+                return false;   // 没配网盘：同步不可能成功，不必白等
+            }
+            HistorySyncManager.reconcileNow(owner);
+            boolean pushed = HistorySyncManager.fullyPushed(owner);
+            LOG.i(TAG + " reconciled, fullyPushed=" + pushed);
+            return !pushed;
+        } catch (Throwable t) {
+            LOG.e(TAG + " decideNeedSyncFirst failed -> sync anyway", t);
+            return true;
+        }
+    }
+
+    /** 主线程：跑预回退同步（带空转探测与预算兜底）。 */
+    private static void startPreRollbackSync(final boolean[] settled, final Runnable proceed) {
         // 空转探测：sync() 可能因为"最小间隔未到 / 仅 Wi-Fi"直接返回且不回调。
         // 那时等满 5 秒毫无意义 —— 1.2 秒后确认没有任何同步在跑就立刻回退。
         MAIN.postDelayed(new Runnable() {

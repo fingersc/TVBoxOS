@@ -229,6 +229,27 @@ public final class HistorySyncManager {
     }
 
     /**
+     * ★ r218：立刻对指定账号跑一次「已推送水位对账」，把「周期落盘没标脏」的本地写入补标脏。
+     *
+     * <p>给 {@link PublicDeviceGuard} 的公共设备冷启动回退用：那里的判定必须在
+     * {@link #fullyPushed(String)} 之前完成对账，否则只看 dirty 布尔位会漏掉
+     * 「播放中 30s 周期落盘」这类没置脏的写入（r216 的旧口径缺口）。</p>
+     *
+     * <p><b>会打开 Room 并与 DB 做 MAX 聚合，只允许在后台线程调用</b>；
+     * 与 {@link #ensureReconciled()} 的「每进程一次」互不影响（这里不碰 reconciled 标志）。</p>
+     */
+    public static void reconcileNow(String owner) {
+        if (owner == null || owner.length() == 0) {
+            return;   // 游客没有隔离库可对账
+        }
+        try {
+            reconcilePushedHlc(owner);
+        } catch (Throwable t) {
+            LOG.e("[Sync] reconcileNow failed", t);
+        }
+    }
+
+    /**
      * r216：强制下一轮同步走「完整轮」（覆盖全部 scope）。
      *
      * <p>冷启动首轮是"轻量轮"（只跑 SETTINGS + HISTORY），PROGRESS/COLLECT 交给紧随其后的
@@ -670,8 +691,13 @@ public final class HistorySyncManager {
                     break;
                 }
                 r.rounds = round;
+                // ★ r218：两个开关分开用 ——
+                //   forceUpload=true 只负责「能推上去」（绕过熔断 / 绕过 30 天未上线只下不上），
+                //   切号前必须保留；forcePut=false 则保留「ETag 未变免 GET」「内容一致免 PUT」
+                //   两条省流量捷径，避免干净账号被强制全量重写一遍（r217 用 true 是过头的）。
                 SyncEngine.Outcome o = SyncEngine.runSafe(owner, key, generation,
-                        /* forceUpload= */ true, /* lightFirstRound= */ false);
+                        /* forceUpload= */ true, /* forcePut= */ false,
+                        /* lightFirstRound= */ false);
                 if (o == null) {
                     lastMsg = "同步未返回结果";
                     break;

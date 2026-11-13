@@ -66,7 +66,7 @@ public final class SyncEngine {
      * @param forceUpload 强制上传（手动同步 / 切换账号后）
      */
     public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload) throws Exception {
-        return run(owner, key, gen, forceUpload, false);
+        return run(owner, key, gen, forceUpload, forceUpload, false);
     }
 
     /**
@@ -82,6 +82,33 @@ public final class SyncEngine {
      */
     public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload,
                               boolean lightFirstRound) throws Exception {
+        return run(owner, key, gen, forceUpload, forceUpload, lightFirstRound);
+    }
+
+    /**
+     * ★ r218：把「强制上传」拆成两个独立开关，语义不再混在一起。
+     *
+     * <p><b>为什么要拆</b>：{@code forceUpload} 原先同时承担了两种完全不同的职责——</p>
+     * <ol>
+     *   <li><b>安全兜底</b>（必须保留）：绕过熔断（{@code inBackoff}）与「30 天未上线只下不上」
+     *       （{@code downloadOnly}）。切号/退出前同步如果丢了这两条，弱网或长期未登录时
+     *       数据就永远推不上去。</li>
+     *   <li><b>省流量优化</b>（可以关掉）：跳过「脏 + 云端 ETag 未变 ⇒ 云端就是我上次传的那份」
+     *       的零下载捷径（{@code skipFetch}），以及「合并后内容与云端一致 ⇒ 跳过 PUT」的
+     *       {@code same} 分支。</li>
+     * </ol>
+     *
+     * <p>切号前的闸门需要第 1 类、但不需要第 2 类：它只想「把该传的传上去」，并不想因此
+     * 多付一次完整 GET，更不想在内容其实一致时白写一次 PUT（r217 之前的行为）。</p>
+     *
+     * <p><b>不会因此死锁</b>：{@code same} 分支虽然跳过 PUT，但仍然
+     * {@code bumpPushedHlc(merged.hlcMax...)}，所以下一轮 {@code fullyPushed()} 会变真。</p>
+     *
+     * @param forceUpload 绕过熔断 / 绕过「只下不上」——安全兜底
+     * @param forcePut    忽略「ETag 未变免 GET」「内容一致免 PUT」——省流量优化开关
+     */
+    public static Outcome run(String owner, byte[] key, int gen, boolean forceUpload,
+                              boolean forcePut, boolean lightFirstRound) throws Exception {
         SyncState st = SyncState.load(owner);
         // ★ P0-2：记下「本次同步开始前」的脏标记。SyncState 是整对象读改写，
         //   收尾时若直接 clearDirty()+save()，会把期间用户新标的脏一起洗掉（lost update）。
@@ -230,12 +257,12 @@ public final class SyncEngine {
             String[] etagOut = new String[1];
             byte[] remoteBytes;
             SyncPayload remote;
-            boolean skipFetch = dirty && !forceUpload && !downloadOnly
+            boolean skipFetch = dirty && !forcePut && !downloadOnly
                     && knownEtag != null && knownEtag.length() > 0
                     && knownEtag.equals(st.getEtag(sc))
                     && st.remoteHash(sc) != null;
             // 诊断：云端 ETag 未变却没指纹 ⇒ 只能老实 GET 一次（正常情况下每次 ETag 变化后只发生一次）。
-            if (!skipFetch && dirty && !forceUpload && !downloadOnly
+            if (!skipFetch && dirty && !forcePut && !downloadOnly
                     && knownEtag != null && knownEtag.length() > 0
                     && knownEtag.equals(st.getEtag(sc)) && st.remoteHash(sc) == null) {
                 LOG.i("[Sync] no-fingerprint scope=" + sc + " etag=" + shortEtag(knownEtag)
@@ -421,7 +448,7 @@ public final class SyncEngine {
                     && Hlc.of(merged.hlcMaxPhysical, merged.hlcMaxCounter, "", 0L)
                     .compareIgnoringDev(Hlc.of(remote.hlcMaxPhysical, remote.hlcMaxCounter, "", 0L)) <= 0;
             boolean same = contentSame && waterOk;
-            if (same && !forceUpload) {
+            if (same && !forcePut) {
                 if (etagOut[0] != null && etagOut[0].length() > 0) {
                     // ★ v4.3.0（r180-A）：内容一致 ⇒ 云端就是这份内容，原子配对
                     st.setRemoteSnapshot(sc, etagOut[0],
@@ -442,6 +469,7 @@ public final class SyncEngine {
                         + " content=" + contentSame
                         + " water=" + (contentSame ? String.valueOf(waterOk) : "-")
                         + " force=" + forceUpload
+                        + " forcePut=" + forcePut
                         + " recs=" + (merged.records == null ? 0 : merged.records.size())
                         + "/" + (remote.records == null ? 0 : remote.records.size())
                         + " hlc=" + merged.hlcMaxPhysical + "/" + remote.hlcMaxPhysical
@@ -1010,14 +1038,20 @@ public final class SyncEngine {
      * <p>上层（HSM）因此不需要再自己 {@code noteFailure()}，避免双重计数。</p>
      */
     public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload) {
-        return runSafe(owner, key, gen, forceUpload, false);
+        return runSafe(owner, key, gen, forceUpload, forceUpload, false);
     }
 
     /** ★ v4.2.2（B）：带 {@code lightFirstRound} 的版本，见 {@link #run(String, byte[], int, boolean, boolean)}。 */
     public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload,
                                   boolean lightFirstRound) {
+        return runSafe(owner, key, gen, forceUpload, forceUpload, lightFirstRound);
+    }
+
+    /** ★ r218：带 {@code forcePut} 的版本，语义见 {@link #run(String, byte[], int, boolean, boolean, boolean)}。 */
+    public static Outcome runSafe(String owner, byte[] key, int gen, boolean forceUpload,
+                                  boolean forcePut, boolean lightFirstRound) {
         try {
-            return run(owner, key, gen, forceUpload, lightFirstRound);
+            return run(owner, key, gen, forceUpload, forcePut, lightFirstRound);
         } catch (HistorySyncManager.SwitchAborted e) {
             // 切换账号作废：不计失败
             // ★ v99-r11-fix：通过返回值告知上层"这是作废、不是失败"（runSafe 不抛异常）

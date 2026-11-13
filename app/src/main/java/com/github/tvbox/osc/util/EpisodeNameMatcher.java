@@ -1948,6 +1948,110 @@ public final class EpisodeNameMatcher {
         return -1;
     }
 
+    /** ★ r218：判定「这条名字是否带明显内容词」的中文字数门槛（纯期号/纯日期条目为 0~2）。 */
+    private static final int CROSS_AXIS_CONTENT_MIN = 3;
+
+    /**
+     * ★ r218：去掉「日期 / 期号 / 分集 / 版本」这类结构字之后，还剩多少个中文字符。
+     *
+     * <p>用来区分两类条目：</p>
+     * <ul>
+     *   <li><b>纯索引式</b>：{@code 第20260427期}、{@code 第2期}、{@code 20260427}、{@code 第2期上}
+     *       —— 结构字剥完剩 0；</li>
+     *   <li><b>期内衍生式</b>：{@code 第20260427期十亿吨跑男的料} —— 剩「十亿吨跑男的料」7 个字。</li>
+     * </ul>
+     *
+     * <p><b>为什么不用正则</b>：本类已有 {@code HAS_CJK} 等静态 pattern，但本方法要的是
+     * 「剥掉若干单字后计数」，用 {@code replaceAll} 反而引入 O(n) 堆分配与正则维护成本；
+     * 逐字符扫描更直白、零分配。</p>
+     *
+     * <p><b>为什么「结构字」表要含衍生词单字</b>（加更/超前/纯享/直拍/花絮/预告）：这些词本身
+     * 已由 {@link #isNonMainEntryName(String)} 归类，这里只需要它们不把「是否带内容词」
+     * 的计数抬高，避免把『加更版』当成内容词丰富的衍生标题。</p>
+     */
+    public static int nonOrdinalCjkLength(String name) {
+        if (TextUtils.isEmpty(name)) {
+            return 0;
+        }
+        int n = 0;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c < '\u4e00' || c > '\u9fa5') {
+                continue;          // 数字 / 字母 / 符号不承载内容词
+            }
+            if (isStructuralChar(c)) {
+                continue;
+            }
+            n++;
+        }
+        return n;
+    }
+
+    /** 结构字：出现在「第N期 / 上中下 / 正片 / 加更 / 超前 / 纯享 / 直拍 / 花絮 / 预告」里的字。 */
+    private static boolean isStructuralChar(char c) {
+        switch (c) {
+            case '第':
+            case '期':
+            case '集':
+            case '话':
+            case '回':
+            case '篇':
+            case '上':
+            case '中':
+            case '下':
+            case '正':
+            case '片':
+            case '加':
+            case '更':
+            case '超':
+            case '前':
+            case '纯':
+            case '享':
+            case '直':
+            case '拍':
+            case '花':
+            case '絮':
+            case '预':
+            case '告':
+            case '版':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * ★ r218：「日期式 expected → 纯期号式 current」这种跨轴映射是否可信。
+     *
+     * <p><b>为什么需要这道门禁</b>：真机 1113 日志里，用户在看</p>
+     * <pre>
+     *   expected = 第20260427期十亿吨跑男的料   （api_6 / 20260427 这一期的加更）
+     *   current  = 第2期                      （切到 Clun 后被落到的位置）
+     * </pre>
+     * <p>而同一部片在 api_6 的列表里写着 {@code 20260501第2期} —— 即互译结果<b>整体偏移一期</b>。
+     * 更麻烦的是调用方 {@code confirmSameEpisodeInList} 用同一个 {@link #findIndex} 做「自证」：
+     * 定位到哪一条就认为哪一条是对的，于是定位器和守卫<b>一起错、守卫形同虚设</b>。</p>
+     *
+     * <p><b>本方法的口径</b>：只对「带明显内容词的日期式条目 × 纯期号式条目」这一种跨轴组合
+     * 判为不可信，其余情况一律返回 true（不受本门禁影响）：</p>
+     * <ul>
+     *   <li>{@code 第20260427期 × 20260427}（两侧都是日期式）→ true，交给既有严格判定；</li>
+     *   <li>{@code 第2期 × 第2期}（两侧都是纯期号）→ true；</li>
+     *   <li>{@code 第20260427期 × 第2期}（expected 无内容词）→ true，允许互译；</li>
+     *   <li>{@code 第20260427期十亿吨跑男的料 × 第2期} → <b>false</b>：期内衍生的期号↔日期
+     *       互译没有任何可靠依据，宁可拒绝（与 r117「宁不切也不猜」一致）。</li>
+     * </ul>
+     */
+    public static boolean isCrossAxisMappingTrusted(String expected, String current) {
+        boolean crossAxis = dateOf(expected) > 0
+                && dateOf(current) <= 0
+                && extractOrdinal(current) > 0;
+        if (!crossAxis) {
+            return true;
+        }
+        return nonOrdinalCjkLength(expected) < CROSS_AXIS_CONTENT_MIN;
+    }
+
     /**
      * 用「目标源自己的日期序列」把日期换算成本源口径的序号，再落位。
      *

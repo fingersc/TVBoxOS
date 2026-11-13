@@ -159,6 +159,16 @@ public class DetailActivity extends BaseActivity {
      * 已经跑通过的并发量，不引入新的带宽风险；变快的部分全部来自「不再等最慢的源」。</p>
      */
     private static final int DETAIL_FALLBACK_MAX_SEARCH = 20;
+    /**
+     * ★ r218：切源时把攒池并发提到 {@link #DETAIL_FALLBACK_MAX_SEARCH} 的持续时间，到时回落后台档。
+     *
+     * <p><b>为什么需要回落</b>：{@code ensurePoolFilling()} 里的调档分支只有
+     * {@code if (concurrency > detailFallbackPoolConcurrency)}，即<b>只升不降</b>。
+     * 一次切源把档位顶到 20 之后，本次会话后面所有「详情进页后台攒池」都会以 20 并发跑，
+     * 而 99 个源 × 20 并发在弱网上就是成片的 {@code SSL handshake aborted}（1113 日志实测），
+     * 反过来又拖慢播放分片下载。这里给切源的提档加一个 5s 的时效。</p>
+     */
+    private static final long POOL_SWITCH_BOOST_MS = 5000L;
     private static final long DETAIL_FALLBACK_SEARCH_TIMEOUT_MS = SwitchBudget.SEARCH_TIMEOUT_MS;
     /**
      * ★ v99-r57：正在加载候选详情（{@code detailFallbackLoadingCandidate}）时的补位并发上限。
@@ -1877,7 +1887,14 @@ public class DetailActivity extends BaseActivity {
                         boolean partConflict = fallbackResult
                                 && !TextUtils.isEmpty(detailFallbackAnchorEpisode)
                                 && episodePartConflicts(detailFallbackAnchorEpisode, currentEpisode.name);
-                        if ((!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) || partConflict) {
+                        // ★ r218：补一道已知绕过口 —— expectedName 为空时旧判据整体失效
+                        //   （`!TextUtils.isEmpty(expectedName) && ...` 短路为 false）。此时若
+                        //   restoreDetailFallbackEpisode() 已经判定「本线路没有内容级匹配」，
+                        //   就不要再放行：宁可拒这个源，也不按 index 0 猜一集播出去。
+                        boolean anchorMissingButNoMatch = TextUtils.isEmpty(expectedName)
+                                && detailFallbackRestoreNoContentMatch;
+                        if ((!TextUtils.isEmpty(expectedName) && !sameEpisodeConfirmed) || partConflict
+                                || anchorMissingButNoMatch) {
                             LOG.sw("[FB] alignNoEpisode source=" + sourceKey + " id=" + vodId
                                     + " expected=" + (TextUtils.isEmpty(expectedName) ? detailFallbackAnchorEpisode : expectedName)
                                     + " actual=" + currentEpisode.name
@@ -2746,6 +2763,12 @@ public class DetailActivity extends BaseActivity {
         }
         // 切源前：立即落盘当前播放进度，并记录实际播放位置快照（供迁移兜底）
         if (playFragment != null) playFragment.saveCurrentProgressNow();
+        // ★ r218：切源一开始就把上一轮的起播看门狗作废。
+        //   实测 1113：00:20:43.503 用户手动切源 → 00:20:44.293 旧看门狗照常到点，
+        //   又跑了一次「全部线路耗尽 → 自动换源」（switchStart manual=0），把手动那轮
+        //   在途的 detailResult 抢走；换个时机就是「刚切过去又被切走」。
+        //   放弃本轮不 release 播放器、也不记 PQ，play() 会重新布防。
+        if (playFragment != null) playFragment.abandonCurrentRound();
         syncActualPlayingIntoVodInfo();
         captureLivePlaybackSnapshot();
         detailFallbackKeepCurrentDetail = mVideo != null && vodInfo != null
@@ -3465,6 +3488,16 @@ public class DetailActivity extends BaseActivity {
     private static boolean confirmSameEpisodeInList(String expectedName, String currentName,
                                                     List<VodInfo.VodSeries> list) {
         if (TextUtils.isEmpty(expectedName)) {
+            return false;
+        }
+        // ★ r218：跨轴（日期式 expected → 纯期号式 current）且 expected 带内容词 ⇒ 判不可信。
+        //
+        //   必须放在 findIndex **之前**：下面那句 `equals(names.get(idx), currentName)` 是「自证」——
+        //   idx 正是刚才用来定 playIndex 的同一套定位器算出来的，currentName 就是 names.get(idx)，
+        //   于是定位器整体偏移（期号↔日期互译差一期）时它<b>必然成立</b>，守卫形同虚设。
+        //   实测 1113：expected=第20260427期十亿吨跑男的料 被落成 第2期（应为 20260501 那一期）。
+        if (!EpisodeNameMatcher.isCrossAxisMappingTrusted(expectedName, currentName)) {
+            LOG.sw("[FB] crossAxisReject expected=" + expectedName + " actual=" + currentName);
             return false;
         }
         if (list == null || list.isEmpty()) {
@@ -4315,6 +4348,11 @@ public class DetailActivity extends BaseActivity {
                 + " reuse=" + (reuseFilling ? 1 : 0));
         // 提速到前台档（已在跑则只提档不重建队列）；ensurePoolFilling 内部会处理派发与硬闸
         ensurePoolFilling(DETAIL_FALLBACK_MAX_SEARCH, "switch");
+        // ★ r218：提档是有时效的 —— 5s 后回落后台档，见 POOL_SWITCH_BOOST_MS 的说明。
+        if (llLayout != null) {
+            llLayout.removeCallbacks(detailFallbackPoolBoostRevert);
+            llLayout.postDelayed(detailFallbackPoolBoostRevert, POOL_SWITCH_BOOST_MS);
+        }
         // 方案A：探路。队列已复用时不探 —— 队列本身正在覆盖全部源，
         // 再朝同一个站单独打一枪等于把它搜两次。
         if (!reuseFilling) {
@@ -4977,9 +5015,18 @@ public class DetailActivity extends BaseActivity {
             // ★ v99-r62：源已全部派完（next 已到 size、pending 还在飞）时，挡不挡毫无区别，
             //   这种打点纯噪音（真机 16 条里 7 条是 next=101/101）⇒ 只在确实还有源可派时才记。
             if (LOG.isDebugEnabled() && detailFallbackNextSourceIndex < detailFallbackSourceOrder.size()) {
-                LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
-                        + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
-                        + " cap=" + detailFallbackPoolConcurrency);
+                // ★ r218：起播保护窗内每 300ms 重查一次，原实现每次都打一条（10s 窗口 ≈ 30 条）。
+                //   改为「最多 1 条/秒 + 附带被压掉的条数」，既保留可观测性又不再刷屏。
+                detailFallbackGuardBlockedSkipped++;
+                long nowGb = SystemClock.elapsedRealtime();
+                if (nowGb - detailFallbackGuardBlockedLastMs >= 1000L) {
+                    LOG.sw("[FB] guardBlocked task=t" + detailFallbackPoolTaskId
+                            + " next=" + detailFallbackNextSourceIndex + "/" + detailFallbackSourceOrder.size()
+                            + " cap=" + detailFallbackPoolConcurrency
+                            + " suppressed=" + (detailFallbackGuardBlockedSkipped - 1));
+                    detailFallbackGuardBlockedLastMs = nowGb;
+                    detailFallbackGuardBlockedSkipped = 0;
+                }
             }
             scheduleBusyRefill();
             return;
@@ -7002,8 +7049,30 @@ public class DetailActivity extends BaseActivity {
      * <b>只派发一次</b>，池子锁死在 30，32 次切源全在这 30 个源里转。</p>
      */
     private boolean detailFallbackPoolFilling = false;
+    /** ★ r218：{@code guardBlocked} 日志的时间节流（最多 1 条/秒）。 */
+    private long detailFallbackGuardBlockedLastMs = 0L;
+    private int detailFallbackGuardBlockedSkipped = 0;
     /** 当前并发档位：20（前台）/ 8（加载详情中）/ {@link #DETAIL_FALLBACK_POOL_CONC_BACKGROUND}（后台）。 */
     private int detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
+    /**
+     * ★ r218：切源提档的回落动作（{@link #POOL_SWITCH_BOOST_MS} 后执行）。
+     *
+     * <p>只降档、不重排队列：{@code detailFallbackPoolFilling}、任务令牌、派发游标都不动，
+     * 避免把在途请求变成「没身份证明的陌生人」—— 那正是 r57「池子锁死 30」的成因。</p>
+     */
+    private final Runnable detailFallbackPoolBoostRevert = new Runnable() {
+        @Override
+        public void run() {
+            if (detailFallbackPoolConcurrency <= DETAIL_FALLBACK_POOL_CONC_BACKGROUND) {
+                return;
+            }
+            LOG.sw("[FB] poolFillSpeed reason=boost-timeout conc="
+                    + detailFallbackPoolConcurrency + "->" + DETAIL_FALLBACK_POOL_CONC_BACKGROUND
+                    + " task=t" + detailFallbackPoolTaskId);
+            detailFallbackPoolConcurrency = DETAIL_FALLBACK_POOL_CONC_BACKGROUND;
+            scheduleDetailFallbackSearch();
+        }
+    };
     /**
      * 8s {@link #DETAIL_FALLBACK_SEARCH_TIMEOUT_MS} 前台窗口是否已关闭。
      *

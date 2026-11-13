@@ -126,8 +126,12 @@ public final class ConfigCenter {
     public static void requestReload(String reason) {
         ConfigPlan p = new ConfigPlan();
         p.set(ConfigPlan.RELOAD);
+        // ★ r218：账号切换换的是整套配置命名空间，不该和「设置变更」共用 60s 节流窗口。
+        //   实测真机：切号后的整包重载被节流拖到 44s 才生效，极端情况到进程结束都没执行。
+        p.bypassThrottle = isAccountSwitchReason(reason);
         mergeBack(p);
-        LOG.i("[Config] request reload reason=" + reason);
+        LOG.i("[Config] request reload reason=" + reason
+                + (p.bypassThrottle ? " (bypass throttle)" : ""));
         flush();
     }
 
@@ -135,9 +139,16 @@ public final class ConfigCenter {
     public static void requestPrewarmLive(String reason) {
         ConfigPlan p = new ConfigPlan();
         p.set(ConfigPlan.LIVE);
+        p.bypassThrottle = isAccountSwitchReason(reason);
         mergeBack(p);
-        LOG.i("[Config] request prewarm reason=" + reason);
+        LOG.i("[Config] request prewarm reason=" + reason
+                + (p.bypassThrottle ? " (bypass throttle)" : ""));
         flush();
+    }
+
+    /** 这条计划是否来自「换掉整套配置」的账号切换动作（切号 / 回退游客）。 */
+    private static boolean isAccountSwitchReason(String reason) {
+        return "switch".equals(reason) || "guest".equals(reason);
     }
 
     // ---------------------------------------------------------------- 门控 / 节流 / 执行
@@ -170,7 +181,7 @@ public final class ConfigCenter {
             }
             LOG.i("[Config] force flush: first screen still not ready after " + waited + "ms " + p);
         }
-        if (now - lastFlushAt < THROTTLE_MS) {
+        if (!p.bypassThrottle && now - lastFlushAt < THROTTLE_MS) {
             mergeBack(p);
             scheduleFlush(THROTTLE_MS - (now - lastFlushAt) + 50L);
             LOG.i("[Config] throttled, merged back " + p);
@@ -189,6 +200,7 @@ public final class ConfigCenter {
             PENDING.refreshHome = false;
             PENDING.prewarmLive = false;
             PENDING.refreshHistory = false;
+            PENDING.bypassThrottle = false;
         }
         return p;
     }
