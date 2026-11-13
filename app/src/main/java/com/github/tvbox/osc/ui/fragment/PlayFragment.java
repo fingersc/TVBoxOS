@@ -2305,11 +2305,13 @@ public class PlayFragment extends BaseLazyFragment {
     /** ★ r218b：本轮首次探到播放地址的时刻（{@code elapsedRealtime}）；0 = 还没探到。 */
     private long urlFoundAtMs;
     /**
-     * ★ r218b：本次换源尝试内「已经记过一次失败」的源 key。
+     * ★ r218b/r218c：失败去重窗口的键（{@code 源key|片id}），null = 窗口未打开。
      *
-     * <p>只由 {@link #play(boolean)} 重置（新一轮换源），不清空于换线 ——
-     * 目的正是让「同源换线后的第二次失败」被识别为重复并跳过。
-     * 见 {@link #recordPlaybackFailureOnce(String)}。</p>
+     * <p>只由两件事改变：① 结算成功 ⇒ 清空（{@link #recordPlaybackReady}）；
+     * ② 换到别的源或别的片 ⇒ 键自然变化（见 {@link #lastFailedWindowKey()}）。</p>
+     *
+     * <p><b>不由 {@code play()} 重置</b>：同源换线也会走 {@code play()}，那样会让去重完全失效
+     * —— r218b 的实测教训，见 {@link #recordPlaybackFailureOnce(String)}。</p>
      */
     private String lastFailedSourceKey;
     /**
@@ -3326,8 +3328,9 @@ public class PlayFragment extends BaseLazyFragment {
         // ★ r218：本轮地址标记随新一轮清零（仅日志用；判死逻辑见 r218b 注释）。
         roundUrlDelivered = false;
         urlFoundAtMs = 0L;
-        // ★ r218b：新一轮换源开始 ⇒ 失败去重窗口重置（跨尝试照常记账）。
-        lastFailedSourceKey = null;
+        // ★ r218c：这里**不能**重置 lastFailedSourceKey —— 同源换线也会走本方法
+        //   （autoRetry switch line → playRound），无条件重置会让去重完全失效。
+        //   去重窗口只由「源 key 变化」与「成功」两条路径控制，见 recordPlaybackFailureOnce()。
         playTimeoutBasePosition = 0;
         webPlayUrl = null;
         webHeaderMap = null;
@@ -3785,6 +3788,9 @@ public class PlayFragment extends BaseLazyFragment {
      * @param reason 触发来源（仅用于排查，不影响计分）
      */
     void recordPlaybackReady(String reason) {
+        // ★ r218c：出画面 ⇒ 关闭失败去重窗口。
+        //   此后这个源再失败必须重新记账（「失败→成功→又失败」是三条独立信息）。
+        lastFailedSourceKey = null;
         settlePlayQualityIfPending(true, 0, reason);
     }
 
@@ -3803,25 +3809,68 @@ public class PlayFragment extends BaseLazyFragment {
      * 对 {@code SourceQualityStore} 却等于「这个源失败了两回」，成功率被系统性低估 ——
      * 慢源因此被双重惩罚，切源时更容易被排到后面，形成「越慢越不用、越不用越慢」。</p>
      *
-     * <p><b>口径</b>：以「一次换源尝试」为窗口。{@link #play(boolean)}（即
-     * {@code jumpToPlay} → 新一轮）重置；同一次尝试内的第二次及以后只打
-     * {@code [PQ] dedupe} 日志、不进统计。跨尝试（用户又切回这个源）照常记。</p>
+     * <p><b>口径</b>：以「<b>同一个目标源、且自上次成功以来</b>」为窗口。判定只有两条：</p>
+     * <ul>
+     *   <li><b>成功</b>（{@link #recordPlaybackReady}）⇒ 清空窗口。此后这个源再失败要重新记
+     *       「同源先失败→又成功→再失败」是三条独立信息，不能合并。</li>
+     *   <li><b>失败且源 key 与上次相同</b> ⇒ 只打 {@code [PQ] dedupe}，不进统计；
+     *       <b>源 key 不同</b> ⇒ 正常记账并更新窗口。</li>
+     * </ul>
+     *
+     * <p><b>★ r218c 修正（r218b 的边界写错了）</b>：r218b 把「重置窗口」放在
+     * {@link #play(boolean)} 里，理由是「jumpToPlay = 新一轮换源」。但真机 1525 日志证明
+     * <b>同源换线也会走 play()</b>：</p>
+     * <pre>
+     *   15:27:46.749  [PQ] fail 4d6422f0... reason=switchLineTimeout
+     *   15:27:46.765  echo-autoRetry switch line: feifan -> ffm3u8     ← 同源换线
+     *   15:27:46.771  [FB] playRound ... flag=ffm3u8                    ← 又进 play()，窗口被清
+     *   15:27:56.909  [PQ] fail 4d6422f0... reason=switchLineTimeout    ← 没被去重
+     * </pre>
+     * <p>于是 {@code [PQ] dedupe} 全场 0 条，去重完全没生效。现在改为**不由 play() 重置**，
+     * 只按「源 key 是否相同」判定 —— 换线时 {@code sourceKey} 不变，窗口自然延续；
+     * 换源时 {@code sourceKey} 变化，窗口自然翻篇。</p>
      *
      * <p><b>为什么不在 {@code settlePlayQualityIfPending} 里做</b>：那里是所有结算的唯一入口，
      * 包括成功（{@code recordPlaybackReady}）。成功必须每次都能记（同源重试成功是有价值的信息），
      * 只有「同一尝试内的连续失败」才需要去重，因此放在失败专用的入口上。</p>
      */
     void recordPlaybackFailureOnce(String reason) {
-        String key = playReqSourceKey;
-        if (!TextUtils.isEmpty(key) && TextUtils.equals(key, lastFailedSourceKey)) {
+        String key = lastFailedWindowKey();
+        if (TextUtils.isEmpty(key)) {
+            // 没有待结算的尝试（计时器已清）⇒ 本来就记不了账，别去动窗口
+            settlePlayQualityIfPending(false, 0, reason);
+            return;
+        }
+        if (TextUtils.equals(key, lastFailedSourceKey)) {
             LOG.i("[PQ] dedupe " + key + " reason=" + reason
-                    + "（同一换源尝试内已记过一次失败）");
+                    + "（该源该片该集自上次成功以来已记过一次失败）");
             // 计时器仍要清掉，否则下一次 startPlayQualityTimer 会把它当「未结算」再补一次
             discardPlayQualityTimer();
             return;
         }
         lastFailedSourceKey = key;
         settlePlayQualityIfPending(false, 0, reason);
+    }
+
+    /**
+     * ★ r218c：失败去重窗口的键 = <b>源 key + 片 id + 集下标</b>。
+     *
+     * <p>为什么必须带片 id 与集下标：窗口不由 {@code play()} 重置之后，只有 {@code sourceKey}
+     * 做键会把三类<b>相互独立</b>的真实失败误吞掉 ——</p>
+     * <ul>
+     *   <li>同一个源刷完 A 片失败、再打开 B 片也失败（{@code sourceKey} 不变）；</li>
+     *   <li>同一部剧在第 1 集失败、用户换到第 2 集也失败（{@code sourceKey} 与片 id 都不变）。</li>
+     * </ul>
+     * <p>带上 {@code pkVodId} 与 {@code pkPlayIndex} 后，换片/换集天然换窗口；
+     * 而「同源同片同集换线」三者都不变，正是要去重的那种情形。</p>
+     */
+    private String lastFailedWindowKey() {
+        String src = playReqSourceKey;
+        if (TextUtils.isEmpty(src)) {
+            return null;
+        }
+        String vod = TextUtils.isEmpty(pkVodId) ? "" : pkVodId;
+        return src + "|" + vod + "|" + pkPlayIndex;
     }
 
     /**
