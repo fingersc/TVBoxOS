@@ -182,18 +182,17 @@ public class PlayFragment extends BaseLazyFragment {
      */
     private static final int MAX_BUFFERING_GRACE = 1;
 
-    /**
-     * ★ r218（决策 B）：「本轮连播放地址都还没下发」时用的短预算。
+    /*
+     * ★ r218（决策 B，r218a 暂停）：原本想给「本轮连播放地址都还没下发」用一个更短的 6s 预算。
      *
-     * <p>真机 1113 日志：{@code playRound 00:20:29.145 → parseStall 5.011s → 换线 →
-     * switchLinePlay 10.058s → 全部线路耗尽 → 换源}，首帧要到 00:20:49.109，用户干等 21 秒；
-     * 而那个源的 CDN 连接直到 00:20:45.043 才以 {@code 10672ms} 失败告终 —— 这段时间纯属白等。</p>
+     * 为什么撤回：真机 1406/1414 日志证明 SWITCH_LINE_PLAY_TIMEOUT_MS 只在 playUrl() 之后
+     * 武装（即地址已拿到），而「连地址都没有」由 RESOLVE_PLAY_URL_TIMEOUT_MS（15s）与
+     * parseStall（5s）兜底。换句话说更短的预算落不到目标场景，只会把「地址已下发、播放器
+     * 起播慢」的正常轮次砍短（实测 17 次成功起播里 2 次首帧 > 9.4s，均属临界生存）。
      *
-     * <p>区别对待：<b>地址已下发</b>（{@code [vod] start}）说明至少要连 CDN 了，给满
-     * {@link #SWITCH_LINE_PLAY_TIMEOUT_MS}；<b>地址都没下发</b>（全程 {@code STATE_IDLE}）
-     * 说明解析/嗅探卡住，6s 足够判死，把「源整体不可达」的最坏等待从 ~15s 压到 ~11s。</p>
+     * 决策 B 的正确定位点是 RESOLVE_PLAY_URL_TIMEOUT_MS，但那会把「解析 6~15s 才成功」的
+     * 慢源一并砍掉，属于需要重新拍板的取舍，故本版不动。
      */
-    private static final long SWITCH_LINE_NO_URL_TIMEOUT_MS = 6 * 1000L;
 
     /**
      * ★ r218（决策 D）：{@code STATE_PREPARING} 的<b>短</b>容忍。
@@ -1293,6 +1292,11 @@ public class PlayFragment extends BaseLazyFragment {
     }
 
     void playUrl(String url, HashMap<String, String> headers) {
+        // ★ r218a：进到这里就说明「本轮已经拿到可播地址」—— 必须在下面的武装**之前**置位。
+        //   原实现把置位放在 [vod] start 那行旁边（更晚），而 playUrl 入口就已经武装了一次，
+        //   于是那次武装永远读到 url=false、永远按 6s 算。真机 1406 日志：
+        //   `echo-switchLinePlay start timeout budget=6000 url=false` 与 `[vod] start` 同一毫秒。
+        roundUrlDelivered = true;
         startSwitchLinePlayTimeout();
         url = attachProxySiteKey(url);
         if(!url.startsWith("data:application"))EventBus.getDefault().post(new RefreshEvent(RefreshEvent.TYPE_REFRESH, url));//更新播放地址
@@ -2318,7 +2322,8 @@ public class PlayFragment extends BaseLazyFragment {
     private int preparingGraceCount;
     /**
      * ★ r218：本轮是否已经把播放地址交给播放器（即打过 {@code [vod] start}）。
-     * 用来决定用 {@link #SWITCH_LINE_PLAY_TIMEOUT_MS} 还是 {@link #SWITCH_LINE_NO_URL_TIMEOUT_MS}。
+     * 用来决定抖动复查是否值得做（地址都没下发时不可能有首帧，白等没意义），
+     * 并在日志里标明本轮到底走到过哪一步。
      */
     private boolean roundUrlDelivered;
     /** ★ r218：本轮是否已经做过一次 500ms 抖动复查（只做一次，避免变成无限等）。 */
@@ -3599,10 +3604,19 @@ public class PlayFragment extends BaseLazyFragment {
             cancelPlayTimeout();
             return;
         }
-        // ★ r218（决策 B）：地址都没下发 ⇒ 6s 预算；已下发 ⇒ 完整 10s。
-        final long budget = roundUrlDelivered ? SWITCH_LINE_PLAY_TIMEOUT_MS
-                                              : SWITCH_LINE_NO_URL_TIMEOUT_MS;
-        rearmSwitchLinePlayTimeout(budget);
+        // ★ r218a 撤回：这里恢复「恒定 10s」，不再按 roundUrlDelivered 分 6s/10s。
+        //
+        //   原因（真机 1406/1414 日志实测）：本闸门的两个武装点都在 playUrl() 之后 ——
+        //   1301 行（playUrl 入口）与 1383 行（setUrl 之后），也就是说它**只在「已经拿到
+        //   播放地址」之后才开始计时**，管的是「URL 已知 → 播放器起播 → 出首帧」这一段。
+        //   「连地址都没解析出来」根本不由它兜底：那条路是
+        //   MSG_RESOLVE_PLAY_URL_TIMEOUT（{@link #RESOLVE_PLAY_URL_TIMEOUT_MS}，15s）
+        //   与 parseStall（5s）。
+        //
+        //   所以 r218 把它砍到 6s 是砍错了闸门：实测 17 次成功起播里有 2 次首帧 > 9.4s
+        //   （9474ms 靠 dither 窗口 18ms 之差救下、10040ms 靠一次中途重排意外救下），
+        //   属于「砍了不该砍的」。决策 B 要收紧的是「无地址」那条闸门，另开一版再动。
+        rearmSwitchLinePlayTimeout(SWITCH_LINE_PLAY_TIMEOUT_MS);
     }
 
     /**
