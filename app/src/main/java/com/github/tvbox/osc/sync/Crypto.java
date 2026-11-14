@@ -44,12 +44,39 @@ public final class Crypto {
     private static final int GZIP_MIN_BYTES = 1024;
     /** 明文上限：超过不压，解压时也拒绝超过这个长度（防压缩炸弹）。 */
     private static final int GZIP_MAX_PLAIN = 4 * 1024 * 1024;
-    private static final int ITERATIONS = 200000;
+    /**
+     * ★ r223：PBKDF2 迭代次数，200000 → **10000**。
+     *
+     * <p><b>为什么降</b>：实测本机 PC 上 20 万轮 ≈ 926ms，电视盒 1~3 秒，是「账号切换慢」
+     * 的主要成本；而真正的数据加解密（AES-256-CBC + HMAC-SHA256）对 1~2KB 载荷只要
+     * 0.03~0.07ms，相差四个数量级。密码门控实际由 WebDAV 网盘密码承担，账号密码只做
+     * 同一网盘下的账号隔离，故可接受把 KDF 成本压到 1/20。</p>
+     *
+     * <p><b>这是破坏性变更</b>：改轮数 ⇒ 派生出的 key 不同 ⇒ 旧云端文件解不开、
+     * {@code profile.json} 的 verify 也对不上。因此必须先用桌面工具
+     * {@code out\r223迁移脚本\MigrateKdf} 把云端全部文件重加密，再升级本 App。
+     * 详见 {@code out\r223-说明.md}。</p>
+     *
+     * <p>配套：{@link com.github.tvbox.osc.sync.AccountContext#load()} 会比对本地缓存的
+     * {@code kdfIter}，不一致就丢弃旧密钥、强制重新登录（否则会拿旧 key 去解新文件）。</p>
+     */
+    private static final int ITERATIONS = 10000;
     private static final int KEY_BYTES = 64;
     private static final int IV_BYTES = 16;
     private static final int MAC_BYTES = 32;
 
     private Crypto() {
+    }
+
+    /**
+     * ★ r223：当前生效的 PBKDF2 迭代次数。
+     *
+     * <p>给 {@link com.github.tvbox.osc.sync.AccountContext} 用来比对「本地缓存密钥是按
+     * 多少轮派生的」——r223 把 200000 降为 10000 后，升级前缓存的 keyHex 是按旧轮数
+     * 派生的，必须丢弃并让用户重新登录，不能拿它去解迁移后的新文件。</p>
+     */
+    public static int iterations() {
+        return ITERATIONS;
     }
 
     /** 用户名 → 账号目录名（不可反推账号）。 */

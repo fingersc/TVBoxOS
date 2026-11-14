@@ -43,6 +43,18 @@ public final class AccountContext {
             String json = Hawk.get(HawkConfig.SYNC_ACCOUNT, "");
             if (json != null && json.length() > 0) {
                 JSONObject o = new JSONObject(json);
+                // ★ r223：KDF 轮数变更后，旧 keyHex 是用旧轮数派生的，继续用会报
+                //   「账号密码与云端不匹配」。这里比对派生轮数，不一致就丢弃登录态强制重登。
+                //   老数据没有 kdfIter 字段 ⇒ optInt 默认 200000，与当前 10000 不等 ⇒ 必定丢弃一次。
+                int storedIter = o.optInt("kdfIter", 200000);
+                if (storedIter != Crypto.iterations()) {
+                    Hawk.delete(HawkConfig.SYNC_ACCOUNT);
+                    ownerKey = "";
+                    displayName = "";
+                    key = null;
+                    AppDataManager.switchOwner("");
+                    return;
+                }
                 byte[] kb = hexToBytes(o.optString("keyHex", ""));
                 if (kb != null && kb.length == 64) {
                     ownerKey = o.optString("owner", "");
@@ -82,6 +94,8 @@ public final class AccountContext {
             o.put("owner", owner);
             o.put("name", name);
             o.put("keyHex", bytesToHex(derivedKey));
+            // ★ r223：记下这次密钥是用多少轮派生的，供 load() 判断是否需要强制重新登录。
+            o.put("kdfIter", Crypto.iterations());
             Hawk.put(HawkConfig.SYNC_ACCOUNT, o.toString());
         } catch (Throwable ignored) {
         }
