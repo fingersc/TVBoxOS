@@ -664,6 +664,13 @@ public final class SyncEngine {
             // 目录清单里没有 sync.meta ⇒ 不存在，零请求返回空 meta（首次/老账号不会多一次 404）。
             String remoteEtag = dirEntries == null ? null : dirEntries.get("sync.meta");
             if (remoteEtag == null || remoteEtag.isEmpty()) {
+                // ★ r224：云端已无 sync.meta ⇒ 本机缓存的 ETag/正文全部作废，必须清掉。
+                //   否则 saveMeta 会拿旧 If-Match 去写一个不存在的文件，服务端回 412，
+                //   saveMeta 的 catch(Throwable) 又把异常吞掉 ⇒ sync.meta 永远重建不出来。
+                //   真机现场（r223 迁移后按建议删掉 sync.meta）：每轮 `meta write reason=oldSeen 6h`
+                //   紧跟 `save meta failed (ignored)`，数据文件全正常、就它一直不出现。
+                st.metaEtag = null;
+                st.metaJson = null;
                 return new SyncMeta(owner);
             }
             // ETag 未变 ⇒ 用本机缓存的正文，避免重复下载。
@@ -722,17 +729,97 @@ public final class SyncEngine {
     private static void saveMeta(WebDavClient dav, byte[] key, String accountName,
                                  String owner, SyncMeta meta, Outcome o, SyncState st) {
         try {
+            String path = AccountPaths.metaFile(accountName);
             byte[] out = Crypto.encrypt(key,
                     HistorySyncManager.GSON.toJson(meta).getBytes("UTF-8"));
-            o.requests++;
-            String et = dav.put(AccountPaths.metaFile(accountName), out,
-                    (st.metaEtag == null || st.metaEtag.length() == 0) ? null : st.metaEtag);
+            String ifMatch = (st.metaEtag == null || st.metaEtag.length() == 0) ? null : st.metaEtag;
+            String et;
+            try {
+                o.requests++;
+                et = dav.put(path, out, ifMatch);
+            } catch (WebDavClient.ConflictException conflict) {
+                // ★ r224：If-Match 失效（云端 meta 被删后又被别的设备重建 / 旧 ETag 残留）。
+                //   原来这里直接冒泡到外层 catch(Throwable) 被吞掉，于是 sync.meta 永久缺失：
+                //   oldSeen=0 决定要写，PUT 却回 412，每轮重复同样失败。
+                //   现在先尽力拉回当前版本、按 id 合并设备记录后再重试（避免覆盖别的设备水位）；
+                //   拉不到（确实不存在）就用无条件写重建。
+                byte[] again = null;
+                String[] etagOut = new String[1];
+                try {
+                    o.requests++;
+                    again = dav.get(path, etagOut);
+                } catch (Throwable ignore) {
+                    // 拉不到就按「不存在」处理
+                }
+                if (again != null && again.length > 0) {
+                    try {
+                        SyncMeta remote = HistorySyncManager.GSON.fromJson(
+                                new String(Crypto.decrypt(key, again), "UTF-8"), SyncMeta.class);
+                        mergeMetaDevices(meta, remote);
+                    } catch (Throwable ignore) {
+                        // 解不开 ⇒ 视为无主残留，用本机 meta 覆盖重建（meta 只是提示文件）
+                    }
+                    out = Crypto.encrypt(key,
+                            HistorySyncManager.GSON.toJson(meta).getBytes("UTF-8"));
+                    String retryEtag = (etagOut[0] == null || etagOut[0].length() == 0) ? null : etagOut[0];
+                    o.requests++;
+                    et = dav.put(path, out, retryEtag);
+                } else {
+                    o.requests++;
+                    et = dav.put(path, out, null);
+                }
+            }
             if (et != null && et.length() > 0) {
                 st.metaEtag = et;
             }
             st.metaJson = HistorySyncManager.GSON.toJson(meta);
         } catch (Throwable t) {
-            LOG.e("[Sync] save meta failed (ignored)", t);
+            // ★ r224：至少把异常类型/消息打出来 —— 只有一句 "ignored" + 混淆栈，定位成本太高。
+            LOG.e("[Sync] save meta failed (ignored) type=" + t.getClass().getName()
+                    + " msg=" + t.getMessage(), t);
+        }
+    }
+
+    /**
+     * ★ r224：把云端 meta 里的设备记录并回本机 meta（按 id 取各字段最大值）。
+     *
+     * <p>用途：{@link #saveMeta} 遇到 412 重试前先调用 —— 重建自己的 ETag 时不能把别的设备的
+     * lastSeenAt / seen 水位一起覆盖掉，否则那台设备会重新退化成「无记录」（虽能自愈，但会白写一轮）。</p>
+     */
+    private static void mergeMetaDevices(SyncMeta dst, SyncMeta src) {
+        if (dst == null || src == null || src.devices == null) {
+            return;
+        }
+        for (SyncMeta.Device d : src.devices) {
+            if (d == null || d.id == null || d.id.length() == 0) {
+                continue;
+            }
+            SyncMeta.Device mine = dst.ensureDevice(d.id);
+            if (d.lastSeenAt > mine.lastSeenAt) {
+                mine.lastSeenAt = d.lastSeenAt;
+            }
+            if (d.seenRecordsPhysical > mine.seenRecordsPhysical
+                    || (d.seenRecordsPhysical == mine.seenRecordsPhysical
+                    && d.seenRecordsCounter > mine.seenRecordsCounter)) {
+                mine.seenRecordsPhysical = d.seenRecordsPhysical;
+                mine.seenRecordsCounter = d.seenRecordsCounter;
+            }
+            if (d.seenCollectsPhysical > mine.seenCollectsPhysical
+                    || (d.seenCollectsPhysical == mine.seenCollectsPhysical
+                    && d.seenCollectsCounter > mine.seenCollectsCounter)) {
+                mine.seenCollectsPhysical = d.seenCollectsPhysical;
+                mine.seenCollectsCounter = d.seenCollectsCounter;
+            }
+        }
+        // 档位：本机本轮没算出（0）才采纳云端的；本机已有值就保留（r185 的「合并结果」口径）。
+        if (dst.historyNum == 0 && src.historyNum != 0) {
+            dst.historyNum = src.historyNum;
+        }
+        if (src.resetHlcPhysical > dst.resetHlcPhysical
+                || (src.resetHlcPhysical == dst.resetHlcPhysical
+                && src.resetHlcCounter > dst.resetHlcCounter)) {
+            dst.resetHlcPhysical = src.resetHlcPhysical;
+            dst.resetHlcCounter = src.resetHlcCounter;
         }
     }
 
